@@ -1,0 +1,5 @@
+click>=8.0.0
+rich>=10.0.0
+pathlib>=1.0.1
+cocotb
+pytest

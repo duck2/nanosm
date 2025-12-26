@@ -1,0 +1,6 @@
+old/
+build/
+.vscode/
+__pycache__/
+env/
+sim_build/
