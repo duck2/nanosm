@@ -85,9 +85,10 @@ group_loop:
     addi  r19, r0, 0
     @p0 add r19, r1, r0
 
-    ; Store to scratchpad: row * 4 + group
-    shli  r17, r12, 2
-    add   r17, r17, r13
+    ; Store to scratchpad: row * 32 + px (lane-interleaved, conflict-free)
+    shli  r17, r12, 5       ; row * 32
+    add   r17, r17, r9      ; + px (already = group*8 + lane_id)
+    sub   r17, r17, r6      ; - tile_origin_x (get px within tile)
     sts   [r17+0], r19
 
     ; Next group

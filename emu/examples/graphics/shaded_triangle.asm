@@ -126,9 +126,10 @@ do_shade:
     or.s    r19, r19, r18
 
 shade_done:
-    ; Store to scratchpad
-    shli  r17, r12, 2
-    add   r17, r17, r13
+    ; Store to scratchpad: row * 32 + px (lane-interleaved, conflict-free)
+    shli  r17, r12, 5       ; row * 32
+    add   r17, r17, r9      ; + px (already = group*8 + lane_id)
+    sub   r17, r17, r6      ; - tile_origin_x (get px within tile)
     sts   [r17+0], r19
 
     ; Next group

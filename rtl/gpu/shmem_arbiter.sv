@@ -19,8 +19,8 @@ module shmem_arbiter #(
     output wire [LANES-1:0] grant,
     output wire [LANES-1:0] bank_en,
     output wire [ROW_BITS-1:0] bank_addr [LANES-1:0],
-    output wire [BANK_BITS-1:0] lane_sel_bank [LANES-1:0],  // xbar: lane L reads from bank
-    output wire [BANK_BITS-1:0] bank_sel_lane [LANES-1:0]   // xbar: bank B writes from lane
+    output wire [BANK_BITS-1:0] bank_lane [LANES-1:0], // "lane of this bank"
+    output wire [BANK_BITS-1:0] lane_bank [LANES-1:0]  // "bank of this lane"
 );
     localparam BANK_BITS = $clog2(LANES);
     localparam ROW_BITS = ADDR_W - BANK_BITS;
@@ -34,14 +34,12 @@ module shmem_arbiter #(
     assign busy = active;
     wire [LANES-1:0] remaining = mask_r & ~lane_done;
 
-    // Address decomposition
-    wire [BANK_BITS-1:0] lane_bank [LANES-1:0];
+    // Address decomposition: expose lane_bank directly from latched addresses
     wire [ROW_BITS-1:0] lane_row [LANES-1:0];
     generate
         for (genvar l = 0; l < LANES; l++) begin : g_addr
             assign lane_bank[l] = addr_r[l][BANK_BITS-1:0];
             assign lane_row[l] = addr_r[l][ADDR_W-1:BANK_BITS];
-            assign lane_sel_bank[l] = lane_bank[l];
         end
     endgenerate
 
@@ -76,23 +74,15 @@ module shmem_arbiter #(
             end
             assign bank_has_winner[b] = prefix[LANES];
 
-            // Bank address: one-hot mux via masked lanes then cascading OR
             assign bank_en[b] = active && bank_has_winner[b];
-            wire [ROW_BITS-1:0] row_masked [LANES-1:0];
-            wire [ROW_BITS-1:0] row_or [LANES:0];
-            assign row_or[0] = '0;
-            for (genvar l = 0; l < LANES; l++) begin : g_mask
-                assign row_masked[l] = {ROW_BITS{bank_winner[b][l]}} & lane_row[l];
-                assign row_or[l+1] = row_or[l] | row_masked[l];
-            end
-            assign bank_addr[b] = row_or[LANES];
 
             // One-hot to binary encoder for winning lane index
             wire [BANK_BITS-1:0] widx;
-            assign widx[0] = bank_winner[b][1] | bank_winner[b][3] | bank_winner[b][5] | bank_winner[b][7];
-            assign widx[1] = bank_winner[b][2] | bank_winner[b][3] | bank_winner[b][6] | bank_winner[b][7];
-            assign widx[2] = bank_winner[b][4] | bank_winner[b][5] | bank_winner[b][6] | bank_winner[b][7];
-            assign bank_sel_lane[b] = widx;
+            onehot_to_bin #(.N(LANES)) u_oh2b (.onehot(bank_winner[b]), .bin(widx));
+            assign bank_lane[b] = widx;
+
+            // Bank address: binary mux using widx (uses MUXF7/F8)
+            assign bank_addr[b] = lane_row[widx];
         end
     endgenerate
 
@@ -133,4 +123,25 @@ module shmem_arbiter #(
         end
     end
 
+endmodule
+
+
+/** Generic one-hot to binary encoder. */
+module onehot_to_bin #(
+    parameter N = 8,
+    parameter W = $clog2(N)
+) (
+    input wire [N-1:0] onehot,
+    output wire [W-1:0] bin
+);
+    // Each output bit is OR of inputs where that bit position is set
+    generate
+        for (genvar b = 0; b < W; b++) begin : g_bit
+            wire [N-1:0] mask;
+            for (genvar i = 0; i < N; i++) begin : g_mask
+                assign mask[i] = onehot[i] & i[b];
+            end
+            assign bin[b] = |mask;
+        end
+    endgenerate
 endmodule

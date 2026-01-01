@@ -64,8 +64,8 @@ module shmem #(
     wire [LANES-1:0] grant;
     wire [LANES-1:0] bank_en;
     wire [ROW_BITS-1:0] bank_addr [LANES-1:0];
-    wire [BANK_BITS-1:0] lane_sel_bank [LANES-1:0];
-    wire [BANK_BITS-1:0] bank_sel_lane [LANES-1:0];
+    wire [BANK_BITS-1:0] bank_lane [LANES-1:0];
+    wire [BANK_BITS-1:0] lane_bank [LANES-1:0];
 
     shmem_arbiter #(.LANES(LANES), .ADDR_W(ADDR_W)) u_arb (
         .clk(clk), .rst(rst),
@@ -77,8 +77,8 @@ module shmem #(
         .grant(grant),
         .bank_en(bank_en),
         .bank_addr(bank_addr),
-        .lane_sel_bank(lane_sel_bank),
-        .bank_sel_lane(bank_sel_lane)
+        .bank_lane(bank_lane),
+        .lane_bank(lane_bank)
     );
 
     assign w_ready = !busy;
@@ -92,18 +92,9 @@ module shmem #(
     end
     assign r_done = done_d && !is_write_d;
 
-    // ========================================================================
-    // Latch lane_sel_bank when granted (for read data routing after BRAM latency)
-    // ========================================================================
-    reg [BANK_BITS-1:0] lane_sel_bank_r [LANES-1:0];
+    // Grant delayed 1 cycle for rdata capture
     reg [LANES-1:0] grant_d;
-
-    always_ff @(posedge clk) begin
-        grant_d <= grant;
-        for (int l = 0; l < LANES; l++)
-            if (grant[l])
-                lane_sel_bank_r[l] <= lane_sel_bank[l];
-    end
+    always_ff @(posedge clk) grant_d <= grant;
 
     // ========================================================================
     // Unified data latch: captures wdata (from outside) or rdata (from xbar)
@@ -126,11 +117,13 @@ module shmem #(
             // Clear lane_captured on read start
             if (arb_start && !do_write)
                 lane_captured <= '0;
-            // Capture rdata as lanes complete
-            for (int l = 0; l < LANES; l++) begin
-                if (grant_d[l] && !lane_captured[l]) begin
-                    data_r[l] <= xbar_out[l];
-                    lane_captured[l] <= 1'b1;
+            // Capture rdata as lanes complete (skip on arb_start to avoid race)
+            if (!arb_start) begin
+                for (int l = 0; l < LANES; l++) begin
+                    if (grant_d[l] && !lane_captured[l]) begin
+                        data_r[l] <= xbar_out[l];
+                        lane_captured[l] <= 1'b1;
+                    end
                 end
             end
         end
@@ -150,12 +143,12 @@ module shmem #(
     endgenerate
 
     // Crossbar select: 3-bit index per output
-    // Write: sel[bank] = which lane to read from
-    // Read:  sel[lane] = which bank to read from (latched when granted)
+    // Write: sel[bank] = which lane to read from (bank_lane)
+    // Read:  sel[lane] = which bank to read from (lane_bank from arbiter)
     wire [BANK_BITS-1:0] xbar_sel [LANES-1:0];
     generate
         for (genvar o = 0; o < LANES; o++) begin : g_xbar_sel
-            assign xbar_sel[o] = is_write_r ? bank_sel_lane[o] : lane_sel_bank_r[o];
+            assign xbar_sel[o] = is_write_r ? bank_lane[o] : lane_bank[o];
         end
     endgenerate
 

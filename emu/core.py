@@ -40,7 +40,7 @@ class GPUState:
     pf: np.ndarray = field(default_factory=lambda: None)  # [8, lanes] predicate registers
     pc: int = 0
     active_mask: int = 0xFF  # all lanes active by default
-    scratchpad: np.ndarray = field(default_factory=lambda: None)  # [512, lanes]
+    scratchpad: np.ndarray = field(default_factory=lambda: None)  # [4096] lane-interleaved
     reconv_stack: List[ReconvStackEntry] = field(default_factory=list)
     descriptors: List[ResourceDescriptor] = field(default_factory=list)
     global_mem: bytearray = field(default_factory=lambda: bytearray(4 * 1024 * 1024))  # 4MB
@@ -52,7 +52,7 @@ class GPUState:
         if self.pf is None:
             self.pf = np.zeros((8, self.num_lanes), dtype=np.bool_)
         if self.scratchpad is None:
-            self.scratchpad = np.zeros((512, self.num_lanes), dtype=np.uint32)
+            self.scratchpad = np.zeros(4096, dtype=np.uint32)
         if not self.descriptors:
             self.descriptors = [ResourceDescriptor() for _ in range(16)]
 
@@ -250,20 +250,20 @@ class Emulator:
                     self.state.global_mem[addr:addr+4] = struct.pack('<I', int(data[lane]))
 
     def mem_load_scratch(self, addr: np.ndarray) -> np.ndarray:
-        """Load from scratchpad (per-lane address)."""
+        """Load from lane-interleaved scratchpad."""
         result = np.zeros(self.state.num_lanes, dtype=np.uint32)
         for lane in range(self.state.num_lanes):
             if self.is_lane_active(lane):
-                a = int(addr[lane]) & 0x1FF
-                result[lane] = self.state.scratchpad[a, lane]
+                a = int(addr[lane]) & 0xFFF  # 4KB = 4096 words
+                result[lane] = self.state.scratchpad[a]
         return result
 
     def mem_store_scratch(self, addr: np.ndarray, data: np.ndarray):
-        """Store to scratchpad (per-lane address)."""
+        """Store to lane-interleaved scratchpad."""
         for lane in range(self.state.num_lanes):
             if self.is_lane_active(lane):
-                a = int(addr[lane]) & 0x1FF
-                self.state.scratchpad[a, lane] = data[lane]
+                a = int(addr[lane]) & 0xFFF
+                self.state.scratchpad[a] = data[lane]
 
     # =========================================================================
     # Tile Operations
@@ -279,21 +279,18 @@ class Emulator:
         )
 
     def tile_commit(self, tile_x: int, tile_y: int, desc: RenderTargetDesc):
-        """Commit scratchpad tile buffer to framebuffer."""
+        """Commit scratchpad tile buffer to framebuffer (lane-interleaved layout)."""
         tw, th = desc.tile_width, desc.tile_height
-        pixels_per_row = tw // self.state.num_lanes
         for row in range(th):
-            for group in range(pixels_per_row):
-                scratch_addr = row * pixels_per_row + group
-                for lane in range(self.state.num_lanes):
-                    px = group * self.state.num_lanes + lane
-                    py = row
-                    fb_addr = (desc.base_addr
-                               + (tile_y * th + py) * desc.stride
-                               + (tile_x * tw + px) * 4)
-                    rgba = int(self.state.scratchpad[scratch_addr, lane])
-                    if fb_addr + 4 <= len(self.state.global_mem):
-                        struct.pack_into('<I', self.state.global_mem, fb_addr, rgba)
+            for px in range(tw):
+                scratch_addr = row * tw + px  # linear pixel order in scratchpad
+                py = row
+                fb_addr = (desc.base_addr
+                           + (tile_y * th + py) * desc.stride
+                           + (tile_x * tw + px) * 4)
+                rgba = int(self.state.scratchpad[scratch_addr & 0xFFF])
+                if fb_addr + 4 <= len(self.state.global_mem):
+                    struct.pack_into('<I', self.state.global_mem, fb_addr, rgba)
 
     # =========================================================================
     # Control Flow (SSY/Branch/.S model)
