@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 /**
- * 32x512 register bank using LUTRAM.
+ * 32x32xN register bank using LUTRAM.
  * write_en can be driven by a predicate register */
 module rf #(
     parameter LANES = 8
@@ -59,7 +59,7 @@ module ram32x32 (
 );
     /* actually, register the outputs. This is free since we are
      * using the LUT section of the slice, and there are 8 FFs per
-     * LUT, and one RAM32M consumes one slice to provide 6 bits of
+     * slice, and one RAM32M consumes one slice to provide 6 bits of
      * read so yeah you get the idea */
     logic [31:0] rd_data_a_comb, rd_data_b_comb, rd_data_c_comb;
 

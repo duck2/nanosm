@@ -14,8 +14,9 @@ loop:
     ; Decrement counter
     sub r2, r2, r4          ; counter -= 1
 
-    ; Loop while counter > 0 (uniform branch - all lanes same condition)
-    bne r2, r0, loop        ; if counter != 0, all lanes loop
+    ; Loop while counter != 0 (uniform branch - all lanes same condition)
+    setp.ne.i32 p0, r2, r0  ; p0 = counter != 0
+    @p0 bra.uni loop        ; if counter != 0, all lanes loop
 
 done:
     ; r3 = 10 + 9 + 8 + 7 + 6 + 5 + 4 + 3 + 2 + 1 = 55 for all lanes

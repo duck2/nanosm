@@ -5,7 +5,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-VIVADO_PATH = r"C:\Xilinx\Vivado\2024.2\bin\vivado.bat"
+VIVADO_PATH = r"/opt/vivado/2025.2/Vivado/bin/vivado"
 WORKSPACE = Path(__file__).parent.parent
 BUILD_DIR = WORKSPACE / "build"
 
@@ -35,11 +35,6 @@ MODULES = {
         "files": ["rtl/gpu/rf.sv"],
         "clock_period": 10.0,
     },
-    "sreg": {
-        "top": "sreg",
-        "files": ["rtl/gpu/sreg.sv"],
-        "clock_period": 10.0,
-    },
     "icache": {
         "top": "icache",
         "files": ["rtl/gpu/icache.sv"],
@@ -52,8 +47,16 @@ MODULES = {
     },
     "shmem": {
         "top": "shmem",
-        "files": ["rtl/gpu/shmem.sv"],
-        "clock_period": 10.0,
+        "files": [
+            "rtl/gpu/shmem.sv",
+            "rtl/gpu/shmem_arbiter.sv"
+        ],
+        "clock_period": 8.0,
+    },
+    "shmem_arbiter": {
+        "top": "shmem_arbiter",
+        "files": ["rtl/gpu/shmem_arbiter.sv"],
+        "clock_period": 8.0,
     },
     "cluster": {
         "top": "cluster",

@@ -1,0 +1,115 @@
+gpiu ISA Reference
+==================
+
+8-lane SIMD, 32-bit registers, predicated execution, reconvergence stack.
+
+REGISTERS
+---------
+r0-r31    General purpose (r0/x0 hardwired to 0)
+p0-p7     Predicate registers (1-bit per lane)
+
+SYNTAX
+------
+All instructions can have .s suffix for sync-after-execute.
+Predication prefix: @pN <instr>  (execute only in lanes where pN is true)
+Comments: ; or #
+
+ALU (R-type): op rd, rs1, rs2
+-----------------------------
+add    rd, rs1, rs2     rd = rs1 + rs2
+sub    rd, rs1, rs2     rd = rs1 - rs2
+muls   rd, rs1, rs2     rd = (i16)rs1 * (i16)rs2  (signed 16x16->32)
+mulu   rd, rs1, rs2     rd = (u16)rs1 * (u16)rs2  (unsigned 16x16->32)
+and    rd, rs1, rs2     rd = rs1 & rs2
+or     rd, rs1, rs2     rd = rs1 | rs2
+xor    rd, rs1, rs2     rd = rs1 ^ rs2
+
+ALU (I-type): op rd, rs1, imm16
+-------------------------------
+addi   rd, rs1, imm     rd = rs1 + sext(imm16)
+andi   rd, rs1, imm     rd = rs1 & zext(imm16)
+ori    rd, rs1, imm     rd = rs1 | zext(imm16)
+xori   rd, rs1, imm     rd = rs1 ^ zext(imm16)
+
+SHIFT: op rd, rs1, rs2/imm
+--------------------------
+shl    rd, rs1, rs2     rd = rs1 << (rs2 & 31)
+shr    rd, rs1, rs2     rd = rs1 >> (rs2 & 31) (logical)
+sra    rd, rs1, rs2     rd = (i32)rs1 >> (rs2 & 31) (arithmetic)
+shli   rd, rs1, imm     rd = rs1 << (imm & 31)
+shri   rd, rs1, imm     rd = rs1 >> (imm & 31)
+srai   rd, rs1, imm     rd = (i32)rs1 >> (imm & 31)
+
+FPU (IEEE 754 single precision)
+-------------------------------
+fadd   rd, rs1, rs2       rd = rs1 + rs2 (f32)
+fsub   rd, rs1, rs2       rd = rs1 - rs2 (f32)
+fmul   rd, rs1, rs2       rd = rs1 * rs2 (f32)
+fma    rd, rs1, rs2, rs3  rd = rs1 * rs2 + rs3 (f32)
+frcp   rd, rs1            rd = 1.0 / rs1 (f32)
+itof   rd, rs1            rd = (f32)(i32)rs1
+ftofx.N.clamp rd, pd, rs1    rd = clamp(trunc(rs1 * 2^N), -32767, 32767) -> i16, pd = clamped?
+ftofx.15.repeat rd, pd, rs1  rd = abs(frac(rs1)) * 2^15 -> u0.15, pd = sign(rs1)
+
+MEMORY (Global)
+---------------
+ldg    rd, [rs1+imm]       rd = mem[rs1 + imm]
+stg    [rs1+imm], rs2      mem[rs1 + imm] = rs2
+ld2d   rd, rx, ry, rdesc   rd = tex[ry * desc.stride + rx], desc at rdesc
+st2d   rx, ry, rdesc, rs   tex[ry * desc.stride + rx] = rs
+
+SCRATCHPAD (Per-warp, 512 entries x lanes)
+------------------------------------------
+lds    rd, [rs1+imm]     rd = scratch[rs1+imm]
+sts    [rs1+imm], rs2    scratch[rs1+imm] = rs2
+
+MOVE/LOAD IMMEDIATE
+-------------------
+mov    rd, rs1          rd = rs1
+lui    rd, imm          rd = imm << 16 (load upper 16 bits)
+lid    rd               rd = lane_id (0,1,2,...,lanes-1)
+
+SET PREDICATE: setp.cmp.type pd, rs1, rs2
+-----------------------------------------
+cmp: lt, le, eq, ne, ge, gt
+type: i32/s32 (signed), u32 (unsigned)
+Examples:
+  setp.lt.i32  p1, r1, r2   p1 = (i32)r1 < (i32)r2
+  setp.eq.u32  p2, r3, r4   p2 = r3 == r4
+  setp.ge.i32  p0, r5, r0   p0 = (i32)r5 >= 0
+
+PREDICATE LOGIC: op pd, ps1, ps2
+--------------------------------
+pand   pd, ps1, ps2     pd = ps1 & ps2
+por    pd, ps1, ps2     pd = ps1 | ps2
+pxor   pd, ps1, ps2     pd = ps1 ^ ps2
+
+CONTROL FLOW
+------------
+bra.uni label           Unconditional jump
+ssy label               Push (active_mask, label) onto reconvergence stack
+@pN bra label           Divergent branch: lanes where pN true go to label
+@pN bra.uni label       Uniform branch: assumes all active lanes have same pN
+<op>.s                  Sync suffix: pop reconvergence stack after instruction
+halt                    Stop execution
+nop                     No operation
+
+DIVERGENCE MODEL
+----------------
+1. ssy label            Push reconvergence point
+2. @pN bra target       Divergent branch
+   - If all lanes agree: jump or fall-through
+   - If divergent: push (taken_mask, target), continue with not-taken
+3. <instr>.s            Pop stack, restore mask, jump to saved PC
+
+TILE OPERATIONS (Graphics)
+--------------------------
+tile_commit rx, ry, rd  Commit scratchpad to framebuffer
+                        rx=tile_x, ry=tile_y, rd=render_target_desc_ptr
+tile_wait               Wait for tile commit to complete (nop in emulator)
+
+RenderTargetDesc layout (16 bytes at ptr):
+  [0:4]   base_addr
+  [4:8]   stride (bytes per row)
+  [8:12]  tile_width
+  [12:16] tile_height

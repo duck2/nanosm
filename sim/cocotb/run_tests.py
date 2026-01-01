@@ -1,6 +1,6 @@
 """Test runner for DSP ALU, FPU, multiplier, and shifter tests."""
 import os
-from cocotb.runner import get_runner
+from cocotb_tools.runner import get_runner
 
 os.environ["COCOTB_RESOLVE_X"] = "ZEROS"
 
@@ -73,6 +73,9 @@ def run_tests_sreg():
 def run_tests_ftofx():
     run_test("ftofx", "test_ftofx", ["rtl/gpu/ftofx.sv"], use_dsp=False)
 
+def run_tests_shmem_arbiter():
+    run_test("shmem_arbiter", "test_shmem_arbiter", ["rtl/gpu/shmem_arbiter.sv"], use_dsp=False)
+
 if __name__ == "__main__":
     #run_tests_alu()
     #run_tests_fpu()
@@ -82,4 +85,5 @@ if __name__ == "__main__":
     #run_tests_rf()
     #run_tests_icache()
     #run_tests_lsu()
-    run_tests_ftofx()
+    #run_tests_ftofx()
+    run_tests_shmem_arbiter()

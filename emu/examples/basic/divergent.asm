@@ -1,9 +1,10 @@
-; Divergent control flow example using SSY/Branch/.S model
+; Divergent control flow example using SSY/setp/@p bra/.S model
 ;
 ; Control flow model:
-;   SSY label  - push (active_mask, label_pc) for reconvergence
-;   Bcc label  - push (taken_mask, label_pc), fall through with not_taken_mask
-;   *.S        - pop (mask, pc) and switch to it
+;   SSY label           - push (active_mask, label_pc) for reconvergence
+;   setp.cmp.type pN    - set predicate based on comparison
+;   @pN bra label       - push (taken_mask, label_pc), fall through with not_taken_mask
+;   *.S                 - pop (mask, pc) and switch to it
 ;
 ; if (lane_id < 4) r5 = 100 else r5 = 200
 
@@ -13,7 +14,8 @@
     addi r4, r0, 200        ; value for not-taken path (lane_id >= 4)
 
     ssy reconv              ; push (0xFF, reconv) - all lanes rejoin here
-    blt r1, r2, taken       ; push (0x0F, taken), mask=0xF0, fall through
+    setp.lt.i32 p0, r1, r2  ; p0 = lane_id < 4
+    @p0 bra taken           ; push (0x0F, taken), mask=0xF0, fall through
 
 not_taken:
     ; Lanes 4-7 execute this path

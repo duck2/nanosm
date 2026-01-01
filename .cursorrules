@@ -1,0 +1,18 @@
+In general:
+- Do not create .md files unless specifically asked
+- Write succinct code
+- Keep comments to the top of the function unless doing something very tricky
+
+When writing SystemVerilog:
+- No need to align input/output names. Just leave one space
+- Use wire/assign instead of logic/always_comb for small stuff. Only use logic/always_comb if wire/assign gets too gnarly
+- Use always_comb and always_ff instead of just "always"
+
+When writing Python:
+- Do not try/catch. Let the program crash
+- Keep docstrings to one line where possible
+- Make use of typing
+
+When writing cocotb tests:
+- We are on cocotb 2.0.1. use unit= instead of units=
+- Use value.to_unsigned() instead of value.integer

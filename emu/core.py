@@ -25,21 +25,32 @@ class ReconvStackEntry:
     pc: int
 
 @dataclass
+class RenderTargetDesc:
+    """Render target descriptor for tile commit."""
+    base_addr: int = 0
+    stride: int = 0      # bytes per row
+    tile_width: int = 32
+    tile_height: int = 32
+
+@dataclass
 class GPUState:
     """Complete GPU state for one warp."""
     num_lanes: int = 8
     rf: np.ndarray = field(default_factory=lambda: None)  # [32, lanes] registers
+    pf: np.ndarray = field(default_factory=lambda: None)  # [8, lanes] predicate registers
     pc: int = 0
     active_mask: int = 0xFF  # all lanes active by default
     scratchpad: np.ndarray = field(default_factory=lambda: None)  # [512, lanes]
     reconv_stack: List[ReconvStackEntry] = field(default_factory=list)
     descriptors: List[ResourceDescriptor] = field(default_factory=list)
-    global_mem: bytearray = field(default_factory=lambda: bytearray(1024 * 1024))  # 1MB
+    global_mem: bytearray = field(default_factory=lambda: bytearray(4 * 1024 * 1024))  # 4MB
     halted: bool = False
 
     def __post_init__(self):
         if self.rf is None:
             self.rf = np.zeros((32, self.num_lanes), dtype=np.uint32)
+        if self.pf is None:
+            self.pf = np.zeros((8, self.num_lanes), dtype=np.bool_)
         if self.scratchpad is None:
             self.scratchpad = np.zeros((512, self.num_lanes), dtype=np.uint32)
         if not self.descriptors:
@@ -87,6 +98,16 @@ class Emulator:
         bits = np.array([f32_to_bits(float(v)) for v in values], dtype=np.uint32)
         self.write_reg(dst, bits)
 
+    def read_pred(self, pred: int) -> np.ndarray:
+        """Read predicate register."""
+        return self.state.pf[pred].copy()
+
+    def write_pred(self, pred: int, values: np.ndarray):
+        """Write predicate register respecting active mask."""
+        for lane in range(self.state.num_lanes):
+            if self.is_lane_active(lane):
+                self.state.pf[pred, lane] = bool(values[lane])
+
     # =========================================================================
     # ALU Operations (16x16 mul only)
     # =========================================================================
@@ -116,20 +137,6 @@ class Emulator:
 
     def alu_xor(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return a ^ b
-
-    def alu_slt(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Set less than (signed)."""
-        return (a.astype(np.int32) < b.astype(np.int32)).astype(np.uint32)
-
-    def alu_sltu(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Set less than unsigned."""
-        return (a < b).astype(np.uint32)
-
-    def alu_min(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.minimum(a.astype(np.int32), b.astype(np.int32)).astype(np.uint32)
-
-    def alu_max(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.maximum(a.astype(np.int32), b.astype(np.int32)).astype(np.uint32)
 
     # =========================================================================
     # Shifter Operations
@@ -171,6 +178,34 @@ class Emulator:
         zero = np.zeros(self.state.num_lanes, dtype=np.uint32)
         return self.fpu_fma(a, b, zero)
 
+    def fpu_rcp(self, a: np.ndarray) -> np.ndarray:
+        """Reciprocal: 1.0 / a."""
+        af = np.array([bits_to_f32(int(x)) for x in a], dtype=np.float32)
+        result = np.where(af != 0, 1.0 / af, np.float32(np.inf))
+        return np.array([f32_to_bits(float(x)) for x in result], dtype=np.uint32)
+
+    def fpu_itof(self, a: np.ndarray) -> np.ndarray:
+        """Signed int32 to float32."""
+        af = a.astype(np.int32).astype(np.float32)
+        return np.array([f32_to_bits(float(x)) for x in af], dtype=np.uint32)
+
+    def fpu_ftofx_clamp(self, a: np.ndarray, frac_bits: int) -> tuple[np.ndarray, np.ndarray]:
+        """Float32 to signed 16-bit fixed-point with clamping. Returns (result, clamped)."""
+        af = np.array([bits_to_f32(int(x)) for x in a], dtype=np.float32)
+        scaled = af * (1 << frac_bits)
+        clamped_vals = np.clip(scaled, -32767, 32767)
+        was_clamped = (scaled < -32767) | (scaled > 32767)
+        result = np.trunc(clamped_vals).astype(np.int16).astype(np.uint32) & 0xFFFF
+        return result, was_clamped
+
+    def fpu_ftofx_repeat(self, a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Float32 to u0.15 with repeat mode. Returns (result, sign)."""
+        af = np.array([bits_to_f32(int(x)) for x in a], dtype=np.float32)
+        sign = af < 0
+        frac = np.abs(af) - np.floor(np.abs(af))  # Get fractional part
+        result = (frac * (1 << 15)).astype(np.uint32) & 0x7FFF
+        return result, sign
+
     # =========================================================================
     # Memory Operations
     # =========================================================================
@@ -192,15 +227,73 @@ class Emulator:
                 if a + 4 <= len(self.state.global_mem):
                     self.state.global_mem[a:a+4] = struct.pack('<I', int(data[lane]))
 
-    def mem_load_scratch(self, addr: int) -> np.ndarray:
-        """Load from scratchpad (same address all lanes)."""
-        return self.state.scratchpad[addr & 0x1FF].copy()
-
-    def mem_store_scratch(self, addr: int, data: np.ndarray):
-        """Store to scratchpad (same address all lanes)."""
+    def mem_load_2d(self, rx: np.ndarray, ry: np.ndarray, desc_ptr: int) -> np.ndarray:
+        """Load from 2D texture using descriptor."""
+        desc = self.read_rt_desc(desc_ptr)
+        result = np.zeros(self.state.num_lanes, dtype=np.uint32)
         for lane in range(self.state.num_lanes):
             if self.is_lane_active(lane):
-                self.state.scratchpad[addr & 0x1FF, lane] = data[lane]
+                x, y = int(rx[lane]), int(ry[lane])
+                addr = desc.base_addr + y * desc.stride + x * 4
+                if addr + 4 <= len(self.state.global_mem):
+                    result[lane] = struct.unpack('<I', self.state.global_mem[addr:addr+4])[0]
+        return result
+
+    def mem_store_2d(self, rx: np.ndarray, ry: np.ndarray, desc_ptr: int, data: np.ndarray):
+        """Store to 2D texture using descriptor."""
+        desc = self.read_rt_desc(desc_ptr)
+        for lane in range(self.state.num_lanes):
+            if self.is_lane_active(lane):
+                x, y = int(rx[lane]), int(ry[lane])
+                addr = desc.base_addr + y * desc.stride + x * 4
+                if addr + 4 <= len(self.state.global_mem):
+                    self.state.global_mem[addr:addr+4] = struct.pack('<I', int(data[lane]))
+
+    def mem_load_scratch(self, addr: np.ndarray) -> np.ndarray:
+        """Load from scratchpad (per-lane address)."""
+        result = np.zeros(self.state.num_lanes, dtype=np.uint32)
+        for lane in range(self.state.num_lanes):
+            if self.is_lane_active(lane):
+                a = int(addr[lane]) & 0x1FF
+                result[lane] = self.state.scratchpad[a, lane]
+        return result
+
+    def mem_store_scratch(self, addr: np.ndarray, data: np.ndarray):
+        """Store to scratchpad (per-lane address)."""
+        for lane in range(self.state.num_lanes):
+            if self.is_lane_active(lane):
+                a = int(addr[lane]) & 0x1FF
+                self.state.scratchpad[a, lane] = data[lane]
+
+    # =========================================================================
+    # Tile Operations
+    # =========================================================================
+    def read_rt_desc(self, ptr: int) -> RenderTargetDesc:
+        """Read render target descriptor from global memory."""
+        mem = self.state.global_mem
+        return RenderTargetDesc(
+            base_addr=struct.unpack('<I', mem[ptr:ptr+4])[0],
+            stride=struct.unpack('<I', mem[ptr+4:ptr+8])[0],
+            tile_width=struct.unpack('<I', mem[ptr+8:ptr+12])[0],
+            tile_height=struct.unpack('<I', mem[ptr+12:ptr+16])[0],
+        )
+
+    def tile_commit(self, tile_x: int, tile_y: int, desc: RenderTargetDesc):
+        """Commit scratchpad tile buffer to framebuffer."""
+        tw, th = desc.tile_width, desc.tile_height
+        pixels_per_row = tw // self.state.num_lanes
+        for row in range(th):
+            for group in range(pixels_per_row):
+                scratch_addr = row * pixels_per_row + group
+                for lane in range(self.state.num_lanes):
+                    px = group * self.state.num_lanes + lane
+                    py = row
+                    fb_addr = (desc.base_addr
+                               + (tile_y * th + py) * desc.stride
+                               + (tile_x * tw + px) * 4)
+                    rgba = int(self.state.scratchpad[scratch_addr, lane])
+                    if fb_addr + 4 <= len(self.state.global_mem):
+                        struct.pack_into('<I', self.state.global_mem, fb_addr, rgba)
 
     # =========================================================================
     # Control Flow (SSY/Branch/.S model)
@@ -209,8 +302,9 @@ class Emulator:
         """SSY: Push current active mask and target PC for later reconvergence."""
         self.state.reconv_stack.append(ReconvStackEntry(self.state.active_mask, target_pc))
 
-    def do_branch(self, cond: np.ndarray, target_pc: int):
-        """Branch: push taken lanes with target, fall through with not-taken."""
+    def do_bra(self, pred: int, target_pc: int):
+        """Predicated branch with divergence handling."""
+        cond = self.read_pred(pred)
         taken_mask = 0
         for lane in range(self.state.num_lanes):
             if self.is_lane_active(lane) and cond[lane]:
@@ -218,16 +312,29 @@ class Emulator:
         not_taken_mask = self.state.active_mask & ~taken_mask
 
         if taken_mask == 0:
-            # No lanes take branch - just fall through
             self.state.pc += 1
         elif not_taken_mask == 0:
-            # All lanes take branch - just jump
             self.state.pc = target_pc
         else:
             # Divergence: push taken path, continue with not-taken
             self.state.reconv_stack.append(ReconvStackEntry(taken_mask, target_pc))
             self.state.active_mask = not_taken_mask
             self.state.pc += 1
+
+    def do_bra_uni(self, pred: Optional[int], target_pc: int):
+        """Uniform branch. If pred is None, unconditional jump."""
+        if pred is None:
+            self.state.pc = target_pc
+            return
+        cond = self.read_pred(pred)
+        for lane in range(self.state.num_lanes):
+            if self.is_lane_active(lane):
+                if cond[lane]:
+                    self.state.pc = target_pc
+                else:
+                    self.state.pc += 1
+                return
+        self.state.pc += 1
 
     def do_sync(self):
         """Pop stack entry and switch to that mask/PC."""
@@ -244,10 +351,17 @@ class Emulator:
     def exec_instr(self, op: str, args: dict):
         """Execute a single instruction."""
         sync_after = False
-        # Check for .s suffix (sync after instruction)
         if op.endswith('.s'):
             sync_after = True
             op = op[:-2]
+
+        # Handle predication: narrow active mask to lanes where predicate is true
+        saved_mask = None
+        if 'pred' in args and op not in ('bra', 'bra.uni'):
+            saved_mask = self.state.active_mask
+            pred_vals = self.read_pred(args['pred'])
+            pred_mask = sum((1 << i) for i in range(self.state.num_lanes) if pred_vals[i])
+            self.state.active_mask &= pred_mask
 
         # ALU R-type: op rd, rs1, rs2
         if op == 'add':
@@ -264,16 +378,8 @@ class Emulator:
             self.write_reg(args['rd'], self.alu_or(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
         elif op == 'xor':
             self.write_reg(args['rd'], self.alu_xor(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
-        elif op == 'slt':
-            self.write_reg(args['rd'], self.alu_slt(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
-        elif op == 'sltu':
-            self.write_reg(args['rd'], self.alu_sltu(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
-        elif op == 'min':
-            self.write_reg(args['rd'], self.alu_min(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
-        elif op == 'max':
-            self.write_reg(args['rd'], self.alu_max(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
 
-        # ALU I-type: op rd, rs1, imm (imm is small, fits in encoding)
+        # ALU I-type: op rd, rs1, imm
         elif op == 'addi':
             imm = np.full(self.state.num_lanes, args['imm'] & 0xFFFF, dtype=np.uint32)
             if args['imm'] & 0x8000:  # sign extend 16-bit
@@ -315,22 +421,49 @@ class Emulator:
             self.write_reg(args['rd'], self.fpu_sub(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
         elif op == 'fmul':
             self.write_reg(args['rd'], self.fpu_mul(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
+        elif op == 'frcp':
+            self.write_reg(args['rd'], self.fpu_rcp(self.read_reg(args['rs1'])))
+        elif op == 'itof':
+            self.write_reg(args['rd'], self.fpu_itof(self.read_reg(args['rs1'])))
+        elif op.startswith('ftofx.'):
+            parts = op.split('.')
+            if len(parts) >= 3 and parts[2] == 'repeat':
+                result, sign = self.fpu_ftofx_repeat(self.read_reg(args['rs1']))
+                self.write_reg(args['rd'], result)
+                self.write_pred(args['pd'], sign)
+            else:
+                frac_bits = int(parts[1])
+                result, clamped = self.fpu_ftofx_clamp(self.read_reg(args['rs1']), frac_bits)
+                self.write_reg(args['rd'], result)
+                self.write_pred(args['pd'], clamped)
 
-        # Load/Store global
-        elif op == 'ld':
+        # Load/Store global: ldg rd, [rs1+imm] / stg [rs1+imm], rs2
+        elif op == 'ldg':
             base = self.read_reg(args['rs1'])
             addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
             self.write_reg(args['rd'], self.mem_load_global(addr))
-        elif op == 'st':
+        elif op == 'stg':
             base = self.read_reg(args['rs1'])
             addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
             self.mem_store_global(addr, self.read_reg(args['rs2']))
 
-        # Scratchpad
+        # 2D texture load/store
+        elif op == 'ld2d':
+            desc_ptr = int(self.read_reg(args['rdesc'])[0])
+            self.write_reg(args['rd'], self.mem_load_2d(self.read_reg(args['rx']), self.read_reg(args['ry']), desc_ptr))
+        elif op == 'st2d':
+            desc_ptr = int(self.read_reg(args['rdesc'])[0])
+            self.mem_store_2d(self.read_reg(args['rx']), self.read_reg(args['ry']), desc_ptr, self.read_reg(args['rs']))
+
+        # Scratchpad: lds rd, [rs1+imm] / sts [rs1+imm], rs2
         elif op == 'lds':
-            self.write_reg(args['rd'], self.mem_load_scratch(args['addr']))
+            base = self.read_reg(args['rs1'])
+            addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
+            self.write_reg(args['rd'], self.mem_load_scratch(addr))
         elif op == 'sts':
-            self.mem_store_scratch(args['addr'], self.read_reg(args['rs1']))
+            base = self.read_reg(args['rs1'])
+            addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
+            self.mem_store_scratch(addr, self.read_reg(args['rs2']))
 
         # Move imm (upper 16 bits): lui rd, imm16
         elif op == 'lui':
@@ -352,27 +485,37 @@ class Emulator:
             self.state.pc += 1
             return
 
-        # Branch instructions - push taken, fall through with not-taken
-        elif op == 'blt':
-            cond = self.read_reg(args['rs1']).astype(np.int32) < self.read_reg(args['rs2']).astype(np.int32)
-            self.do_branch(cond, self.labels[args['label']])
-            return
-        elif op == 'bge':
-            cond = self.read_reg(args['rs1']).astype(np.int32) >= self.read_reg(args['rs2']).astype(np.int32)
-            self.do_branch(cond, self.labels[args['label']])
-            return
-        elif op == 'beq':
-            cond = self.read_reg(args['rs1']) == self.read_reg(args['rs2'])
-            self.do_branch(cond, self.labels[args['label']])
-            return
-        elif op == 'bne':
-            cond = self.read_reg(args['rs1']) != self.read_reg(args['rs2'])
-            self.do_branch(cond, self.labels[args['label']])
+        # Set predicate: setp.cmp.type pd, rs1, rs2
+        elif op.startswith('setp.'):
+            rs1 = self.read_reg(args['rs1'])
+            rs2 = self.read_reg(args['rs2'])
+            cmp_op = args['cmp']
+            typ = args.get('type', 'i32')
+            signed = typ in ('i32', 's32')
+            if cmp_op == 'lt':
+                cond = rs1.astype(np.int32) < rs2.astype(np.int32) if signed else rs1 < rs2
+            elif cmp_op == 'ge':
+                cond = rs1.astype(np.int32) >= rs2.astype(np.int32) if signed else rs1 >= rs2
+            elif cmp_op == 'eq':
+                cond = rs1 == rs2
+            elif cmp_op == 'ne':
+                cond = rs1 != rs2
+            elif cmp_op == 'le':
+                cond = rs1.astype(np.int32) <= rs2.astype(np.int32) if signed else rs1 <= rs2
+            elif cmp_op == 'gt':
+                cond = rs1.astype(np.int32) > rs2.astype(np.int32) if signed else rs1 > rs2
+            else:
+                raise ValueError(f"Unknown comparison: {cmp_op}")
+            self.write_pred(args['pd'], cond)
+
+        # Predicated branch (divergent): @pN bra label
+        elif op == 'bra':
+            self.do_bra(args['pred'], self.labels[args['label']])
             return
 
-        # Unconditional jump
-        elif op == 'jmp':
-            self.state.pc = self.labels[args['label']]
+        # Uniform branch: bra.uni label (unconditional) or @pN bra.uni label (predicated)
+        elif op == 'bra.uni':
+            self.do_bra_uni(args.get('pred'), self.labels[args['label']])
             return
 
         # Halt
@@ -384,8 +527,38 @@ class Emulator:
         elif op == 'nop':
             pass
 
+        # Tile commit: tile_commit rx, ry, rd (tile_x, tile_y, rt_desc_ptr)
+        elif op == 'tile_commit':
+            tile_x = int(self.read_reg(args['rx'])[0])
+            tile_y = int(self.read_reg(args['ry'])[0])
+            desc_ptr = int(self.read_reg(args['rd'])[0])
+            desc = self.read_rt_desc(desc_ptr)
+            self.tile_commit(tile_x, tile_y, desc)
+
+        # Tile wait: nop in emulator (no async DMA)
+        elif op == 'tile_wait':
+            pass
+
+        # Predicate logic: pand/por/pxor pd, ps1, ps2
+        elif op == 'pand':
+            p1 = self.read_pred(args['ps1'])
+            p2 = self.read_pred(args['ps2'])
+            self.write_pred(args['pd'], p1 & p2)
+        elif op == 'por':
+            p1 = self.read_pred(args['ps1'])
+            p2 = self.read_pred(args['ps2'])
+            self.write_pred(args['pd'], p1 | p2)
+        elif op == 'pxor':
+            p1 = self.read_pred(args['ps1'])
+            p2 = self.read_pred(args['ps2'])
+            self.write_pred(args['pd'], p1 ^ p2)
+
         else:
             raise ValueError(f"Unknown instruction: {op}")
+
+        # Restore active mask if we narrowed it for predication
+        if saved_mask is not None:
+            self.state.active_mask = saved_mask
 
         # Handle .s suffix - sync after instruction
         if sync_after:

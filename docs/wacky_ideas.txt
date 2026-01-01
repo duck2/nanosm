@@ -1,0 +1,2 @@
+-> triple pump 8x bram for 3R 3W big register file? 2 cycle RF but can support 16 warps
+

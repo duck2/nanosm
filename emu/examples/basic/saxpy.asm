@@ -17,12 +17,12 @@
     shli r2, r1, 2          ; offset = lane_id * 4 (sizeof float)
 
     ; Load x[lane_id]
-    ld r3, r2, 0            ; r3 = mem[offset] = x[lane_id]
+    ldg r3, [r2+0]          ; r3 = mem[offset] = x[lane_id]
 
     ; Load y[lane_id]
-    lui r4, 0x01            ; r4 = 0x100 (y base address)
+    addi r4, r0, 0x100      ; r4 = 0x100 (y base address)
     add r5, r4, r2          ; r5 = y_base + offset
-    ld r6, r5, 0            ; r6 = y[lane_id]
+    ldg r6, [r5+0]          ; r6 = y[lane_id]
 
     ; Load scalar a = 2.0 (float bit pattern 0x40000000)
     lui r10, 0x4000         ; r10 = 2.0f
@@ -31,7 +31,6 @@
     fma r7, r10, r3, r6     ; r7 = a * x[i] + y[i]
 
     ; Store result back to y[lane_id]
-    st r5, r7, 0            ; y[lane_id] = r7
+    stg [r5+0], r7          ; y[lane_id] = r7
 
     halt
-

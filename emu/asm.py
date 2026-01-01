@@ -10,6 +10,13 @@ def parse_reg(s: str) -> int:
         return int(s[1:])
     raise ValueError(f"Invalid register: {s}")
 
+def parse_pred(s: str) -> int:
+    """Parse predicate register name (p0-p7)."""
+    s = s.strip().lower()
+    if s.startswith('p'):
+        return int(s[1:])
+    raise ValueError(f"Invalid predicate register: {s}")
+
 def parse_imm(s: str) -> int:
     """Parse immediate value (decimal or hex)."""
     s = s.strip()
@@ -19,6 +26,21 @@ def parse_imm(s: str) -> int:
         return -int(s[1:], 16)
     return int(s)
 
+def parse_mem_operand(s: str) -> Tuple[int, int]:
+    """Parse [rs1+imm] or [rs1] memory operand. Returns (rs1, imm)."""
+    s = s.strip()
+    if not s.startswith('[') or not s.endswith(']'):
+        raise ValueError(f"Invalid memory operand: {s}")
+    inner = s[1:-1].strip()
+    if '+' in inner:
+        parts = inner.split('+')
+        return parse_reg(parts[0]), parse_imm(parts[1])
+    elif '-' in inner and not inner.startswith('-'):
+        parts = inner.split('-')
+        return parse_reg(parts[0]), -parse_imm(parts[1])
+    else:
+        return parse_reg(inner), 0
+
 def parse_line(line: str) -> Tuple[str, dict]:
     """Parse a single assembly line. Returns (opcode, args_dict) or (None, None) for empty/comment."""
     line = line.split(';')[0].split('#')[0].strip()
@@ -27,11 +49,22 @@ def parse_line(line: str) -> Tuple[str, dict]:
 
     parts = re.split(r'[,\s]+', line)
     parts = [p for p in parts if p]
+
+    # Handle predication prefix @pN
+    pred = None
+    if parts[0].startswith('@'):
+        pred = parse_pred(parts[0][1:])
+        parts = parts[1:]
+        if not parts:
+            return None, None
+
     op = parts[0].lower()
     args = {}
+    if pred is not None:
+        args['pred'] = pred
 
     # R-type: op rd, rs1, rs2
-    if op in ['add', 'sub', 'muls', 'mulu', 'and', 'or', 'xor', 'slt', 'sltu', 'min', 'max', 'shl', 'shr', 'sra', 'fadd', 'fsub', 'fmul']:
+    if op in ['add', 'sub', 'muls', 'mulu', 'and', 'or', 'xor', 'shl', 'shr', 'sra', 'fadd', 'fsub', 'fmul']:
         args['rd'] = parse_reg(parts[1])
         args['rs1'] = parse_reg(parts[2])
         args['rs2'] = parse_reg(parts[3])
@@ -43,50 +76,56 @@ def parse_line(line: str) -> Tuple[str, dict]:
         args['rs2'] = parse_reg(parts[3])
         args['rs3'] = parse_reg(parts[4])
 
+    # Unary FPU: frcp, itof
+    elif op in ['frcp', 'itof']:
+        args['rd'] = parse_reg(parts[1])
+        args['rs1'] = parse_reg(parts[2])
+
+    # ftofx.N.clamp rd, pd, rs1 OR ftofx.15.repeat rd, pd, rs1
+    elif op.startswith('ftofx.'):
+        args['rd'] = parse_reg(parts[1])
+        args['pd'] = parse_pred(parts[2])
+        args['rs1'] = parse_reg(parts[3])
+
     # I-type: op rd, rs1, imm
     elif op in ['addi', 'andi', 'ori', 'xori', 'shli', 'shri', 'srai']:
         args['rd'] = parse_reg(parts[1])
         args['rs1'] = parse_reg(parts[2])
         args['imm'] = parse_imm(parts[3])
 
-    # Load: ld rd, imm(rs1) or ld rd, rs1, imm
-    elif op == 'ld':
+    # Global load: ldg rd, [rs1+imm]
+    elif op == 'ldg':
         args['rd'] = parse_reg(parts[1])
-        if '(' in parts[2]:
-            m = re.match(r'(-?\d+|0x[0-9a-fA-F]+)?\((\w+)\)', parts[2])
-            if m:
-                args['imm'] = parse_imm(m.group(1)) if m.group(1) else 0
-                args['rs1'] = parse_reg(m.group(2))
-            else:
-                raise ValueError(f"Invalid load format: {parts[2]}")
-        else:
-            args['rs1'] = parse_reg(parts[2])
-            args['imm'] = parse_imm(parts[3]) if len(parts) > 3 else 0
+        args['rs1'], args['imm'] = parse_mem_operand(parts[2])
 
-    # Store: st rs2, imm(rs1) or st rs1, rs2, imm (base, data, offset)
-    elif op == 'st':
-        if '(' in parts[2]:
-            args['rs2'] = parse_reg(parts[1])  # data
-            m = re.match(r'(-?\d+|0x[0-9a-fA-F]+)?\((\w+)\)', parts[2])
-            if m:
-                args['imm'] = parse_imm(m.group(1)) if m.group(1) else 0
-                args['rs1'] = parse_reg(m.group(2))  # base
-            else:
-                raise ValueError(f"Invalid store format: {parts[2]}")
-        else:
-            args['rs1'] = parse_reg(parts[1])  # base
-            args['rs2'] = parse_reg(parts[2])  # data
-            args['imm'] = parse_imm(parts[3]) if len(parts) > 3 else 0
+    # Global store: stg [rs1+imm], rs2
+    elif op == 'stg':
+        args['rs1'], args['imm'] = parse_mem_operand(parts[1])
+        args['rs2'] = parse_reg(parts[2])
 
-    # Scratchpad load: lds rd, addr
+    # 2D load: ld2d rd, rx, ry, rdesc
+    elif op == 'ld2d':
+        args['rd'] = parse_reg(parts[1])
+        args['rx'] = parse_reg(parts[2])
+        args['ry'] = parse_reg(parts[3])
+        args['rdesc'] = parse_reg(parts[4])
+
+    # 2D store: st2d rx, ry, rdesc, rs
+    elif op == 'st2d':
+        args['rx'] = parse_reg(parts[1])
+        args['ry'] = parse_reg(parts[2])
+        args['rdesc'] = parse_reg(parts[3])
+        args['rs'] = parse_reg(parts[4])
+
+    # Scratchpad load: lds rd, [rs1+imm]
     elif op == 'lds':
         args['rd'] = parse_reg(parts[1])
-        args['addr'] = parse_imm(parts[2])
+        args['rs1'], args['imm'] = parse_mem_operand(parts[2])
 
-    # Scratchpad store: sts rs1, addr
+    # Scratchpad store: sts [rs1+imm], rs2
     elif op == 'sts':
-        args['rs1'] = parse_reg(parts[1])
-        args['addr'] = parse_imm(parts[2])
+        args['rs1'], args['imm'] = parse_mem_operand(parts[1])
+        args['rs2'] = parse_reg(parts[2])
 
     # LUI: lui rd, imm
     elif op == 'lui':
@@ -102,19 +141,47 @@ def parse_line(line: str) -> Tuple[str, dict]:
     elif op == 'lid':
         args['rd'] = parse_reg(parts[1])
 
-    # Branch: beq rs1, rs2, label
-    elif op in ['beq', 'bne', 'blt', 'bge']:
-        args['rs1'] = parse_reg(parts[1])
-        args['rs2'] = parse_reg(parts[2])
-        args['label'] = parts[3]
+    # Set predicate: setp.cmp.type pd, rs1, rs2 (e.g. setp.lt.i32, setp.eq.u32)
+    elif op.startswith('setp.'):
+        setp_parts = op.split('.')
+        if len(setp_parts) < 3:
+            raise ValueError(f"Invalid setp format: {op}, expected setp.cmp.type")
+        args['cmp'] = setp_parts[1]
+        args['type'] = setp_parts[2]
+        args['pd'] = parse_pred(parts[1])
+        args['rs1'] = parse_reg(parts[2])
+        args['rs2'] = parse_reg(parts[3])
 
-    # Jump: jmp label
-    elif op == 'jmp':
+    # Unconditional branch: bra.uni label (no predicate)
+    # Predicated uniform branch: @pN bra.uni label
+    elif op == 'bra.uni':
+        args['label'] = parts[1]
+
+    # Predicated divergent branch: @pN bra label
+    elif op == 'bra':
+        if 'pred' not in args:
+            raise ValueError(f"bra requires predicate prefix @pN")
         args['label'] = parts[1]
 
     # SSY: ssy label (set synchronization point)
     elif op == 'ssy':
         args['label'] = parts[1]
+
+    # Tile commit: tile_commit rx, ry, rd
+    elif op == 'tile_commit':
+        args['rx'] = parse_reg(parts[1])
+        args['ry'] = parse_reg(parts[2])
+        args['rd'] = parse_reg(parts[3])
+
+    # Tile wait: tile_wait
+    elif op == 'tile_wait':
+        pass
+
+    # Predicate logic: pand/por/pxor pd, ps1, ps2
+    elif op in ['pand', 'por', 'pxor']:
+        args['pd'] = parse_pred(parts[1])
+        args['ps1'] = parse_pred(parts[2])
+        args['ps2'] = parse_pred(parts[3])
 
     # halt, nop (possibly with .s suffix)
     elif op in ['halt', 'nop'] or op in ['halt.s', 'nop.s']:
@@ -123,8 +190,7 @@ def parse_line(line: str) -> Tuple[str, dict]:
     else:
         # Check if it's an instruction with .s suffix we haven't handled
         base_op = op[:-2] if op.endswith('.s') else op
-        if base_op in ['add', 'sub', 'muls', 'mulu', 'and', 'or', 'xor', 'slt', 'sltu', 'min', 'max', 'shl', 'shr', 'sra', 'fadd', 'fsub', 'fmul']:
-            # Re-parse as R-type with .s suffix
+        if base_op in ['add', 'sub', 'muls', 'mulu', 'and', 'or', 'xor', 'shl', 'shr', 'sra', 'fadd', 'fsub', 'fmul']:
             args['rd'] = parse_reg(parts[1])
             args['rs1'] = parse_reg(parts[2])
             args['rs2'] = parse_reg(parts[3])

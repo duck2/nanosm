@@ -1,4 +1,4 @@
-; Nested if example using SSY/Branch/.S model
+; Nested if example using SSY/setp/@p bra/.S model
 ;
 ; if (lane_id < 4) {
 ;     r5 = 10
@@ -17,7 +17,8 @@
     ; Outer if
     ssy outer_join          ; push (0xFF, outer_join)
     addi r2, r0, 4
-    blt r1, r2, outer_then  ; push (0x0F, outer_then), fall through with 0xF0
+    setp.lt.i32 p0, r1, r2  ; p0 = lane_id < 4
+    @p0 bra outer_then      ; push (0x0F, outer_then), fall through with 0xF0
 
 outer_else:
     ; Lanes 4-7
@@ -32,7 +33,8 @@ outer_then:
     ; Nested if (only lanes 0-3 are active here)
     ssy inner_join          ; push (0x0F, inner_join) - only active lanes
     addi r2, r0, 2
-    blt r1, r2, inner_then  ; push (0x03, inner_then), fall through with 0x0C
+    setp.lt.i32 p0, r1, r2  ; p0 = lane_id < 2
+    @p0 bra inner_then      ; push (0x03, inner_then), fall through with 0x0C
 
 inner_else:
     ; Lanes 2-3
@@ -57,4 +59,3 @@ outer_join:
     ;   Lane 3: r5=10, r6=200
     ;   Lane 4-7: r5=20, r6=300
     halt
-
