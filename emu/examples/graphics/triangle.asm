@@ -23,11 +23,11 @@
     sub   r31, r24, r28     ; dy20 = v0.y - v2.y
 
     ; Colors
-    lui   r1, 0xFFFF
-    ori   r1, r1, 0xFFFF    ; white = 0xFFFFFFFF
+    lui   r1, 0xFFFFF
+    ori   r1, r1, 0xFFF     ; white = 0xFFFFFFFF
 
     ; Lane ID
-    lid   r5
+    sread r5, LANE_ID
 
     ; Tile loop
     addi  r10, r0, 0        ; tile_y = 0
@@ -89,7 +89,7 @@ group_loop:
     shli  r17, r12, 5       ; row * 32
     add   r17, r17, r9      ; + px (already = group*8 + lane_id)
     sub   r17, r17, r6      ; - tile_origin_x (get px within tile)
-    sts   [r17+0], r19
+    sts   [r17], r19
 
     ; Next group
     addi  r13, r13, 1

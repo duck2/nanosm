@@ -1,8 +1,10 @@
 `timescale 1ns / 1ps
 
-/** Shared memory arbiter with broadcast detection.
- *  Broadcast compares all lanes to lane 0 to simplify logic (even if lane 0 is masked)
- *  Grant includes inactive lanes on broadcast. The user should handle write masking in RF */
+/**
+ * Shared memory arbiter with broadcast detection.
+ * Broadcast compares all lanes to lane 0 to simplify logic (even if lane 0 is masked)
+ * Grant includes inactive lanes on broadcast (mask in RF)
+ */
 module shmem_arbiter #(
     parameter LANES = 8,
     parameter ADDR_W = 12

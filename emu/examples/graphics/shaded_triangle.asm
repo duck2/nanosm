@@ -27,10 +27,10 @@
     sub   r31, r24, r28     ; dy20 = v0.y - v2.y
 
     ; Vertex colors as floats (0-255 range)
-    lui   r1, 0x437F        ; 255.0 = 0x437F0000
+    lui   r1, 0x437F0       ; 255.0 = 0x437F0000
 
     ; Lane ID
-    lid   r5
+    sread r5, LANE_ID
 
     ; Tile loop
     addi  r10, r0, 0        ; tile_y = 0
@@ -90,7 +90,7 @@ group_loop:
     ssy   shade_done
     @p0 bra do_shade
     ; Not-taken path (outside): r19 already black, just sync
-    nop.s
+    sync
 
 do_shade:
     ; Inside lanes only: compute shaded color
@@ -122,15 +122,16 @@ do_shade:
     shli  r17, r17, 16
     or    r19, r15, r16
     or    r19, r19, r17
-    lui   r18, 0xFF00
-    or.s    r19, r19, r18
+    lui   r18, 0xFF000
+    or  r19, r19, r18
+    sync
 
 shade_done:
     ; Store to scratchpad: row * 32 + px (lane-interleaved, conflict-free)
     shli  r17, r12, 5       ; row * 32
     add   r17, r17, r9      ; + px (already = group*8 + lane_id)
     sub   r17, r17, r6      ; - tile_origin_x (get px within tile)
-    sts   [r17+0], r19
+    sts   [r17], r19
 
     ; Next group
     addi  r13, r13, 1

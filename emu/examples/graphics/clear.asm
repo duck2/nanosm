@@ -7,11 +7,11 @@
 ;   scratchpad[0..1023] = color (32x32 tile, 1 pixel per address)
 
     ; Clear color: cornflower blue (0xFF6495ED) - ABGR packed
-    lui   r1, 0xFF64        ; upper 16 bits
-    ori   r1, r1, 0x95ED    ; lower 16 bits
+    lui   r1, 0xFF649       ; upper 20 bits
+    ori   r1, r1, 0x5ED     ; lower 12 bits
 
     ; Lane ID for conflict-free access
-    lid   r5
+    sread r5, LANE_ID
 
     ; Constants
     addi  r4, r0, 128       ; loop iterations (1024/8 = 128 per lane)
@@ -27,7 +27,7 @@ tile_x_loop:
     mov   r3, r5            ; scratch_addr = lane_id (each lane starts at different bank)
 
 fill_loop:
-    sts   [r3+0], r1        ; store clear color
+    sts   [r3], r1        ; store clear color
     addi  r3, r3, 8         ; next addr += 8 (each lane covers every 8th address)
     addi  r6, r0, 1024
     setp.lt.u32 p0, r3, r6  ; p0 = scratch_addr < 1024

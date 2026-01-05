@@ -144,7 +144,7 @@ async def run_single_fma(dut, in1_bits: int, in2_bits: int, in3_bits: int, test_
 @cocotb.test()
 async def test_fpu_mul_ops(dut):
     """Test MUL operations using numpy golden (expect bit-exact)."""
-    clock = Clock(dut.clk, 10, units="ns")
+    clock = Clock(dut.clk, 10, unit="ns")
     cocotb.start_soon(clock.start())
     await reset_dut(dut)
 

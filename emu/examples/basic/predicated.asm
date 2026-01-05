@@ -7,7 +7,7 @@
 ;   r4: lanes 0-3 = lane_id, lanes 4-7 = 999
 ;   r7: lanes 0-3 = 3.0f, lanes 4-7 = 0
 
-    lid r1              ; r1 = lane_id (0,1,2,3,4,5,6,7)
+    sread r1, LANE_ID   ; r1 = lane_id (0,1,2,3,4,5,6,7)
     addi r2, r0, 100    ; r2 = 100 (initial value for all lanes)
     addi r3, r0, 4
 
@@ -22,9 +22,8 @@
     @p0 mov r4, r1          ; r4 = lane_id for lanes 0-3, stays 999 for lanes 4-7
 
     ; Test predicated FPU op
-    lui r5, 0x3f80          ; r5 = 1.0f (all lanes)
-    lui r6, 0x4000          ; r6 = 2.0f (all lanes)
+    lui r5, 0x3f800         ; r5 = 1.0f (all lanes)
+    lui r6, 0x40000         ; r6 = 2.0f (all lanes)
     @p0 fadd r7, r5, r6     ; r7 = 3.0f for lanes 0-3 only
 
     halt
-

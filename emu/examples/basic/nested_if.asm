@@ -12,7 +12,7 @@
 ;     r6 = 300
 ; }
 
-    lid r1                  ; r1 = lane_id
+    sread r1, LANE_ID       ; r1 = lane_id
 
     ; Outer if
     ssy outer_join          ; push (0xFF, outer_join)
@@ -24,7 +24,7 @@ outer_else:
     ; Lanes 4-7
     addi r5, r0, 20         ; r5 = 20
     addi r6, r0, 300        ; r6 = 300
-    nop.s                   ; pop -> go to outer_then
+    sync                    ; pop -> go to outer_then
 
 outer_then:
     ; Lanes 0-3
@@ -39,16 +39,16 @@ outer_then:
 inner_else:
     ; Lanes 2-3
     addi r6, r0, 200        ; r6 = 200
-    nop.s                   ; pop -> go to inner_then
+    sync                    ; pop -> go to inner_then
 
 inner_then:
     ; Lanes 0-1
     addi r6, r0, 100        ; r6 = 100
-    nop.s                   ; pop -> go to inner_join
+    sync                    ; pop -> go to inner_join
 
 inner_join:
     ; Lanes 0-3 active again
-    nop.s                   ; pop -> go to outer_join
+    sync                    ; pop -> go to outer_join
 
 outer_join:
     ; All lanes active (0xFF)

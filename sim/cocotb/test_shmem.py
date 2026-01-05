@@ -31,7 +31,7 @@ async def reset(dut):
     await RisingEdge(dut.clk)
 
 
-async def write_lanes(dut, addrs: list[int], data: list[int], mask: int):
+async def write_lanes(dut, addrs: list[int], data: list[int], mask: int, debug: bool = False):
     """Perform a write operation. Wait until complete."""
     dut.w_valid.value = 1
     dut.w_lane_mask.value = mask
@@ -42,15 +42,37 @@ async def write_lanes(dut, addrs: list[int], data: list[int], mask: int):
     dut.w_valid.value = 0
 
     # Wait until arbiter finishes (busy goes low, w_ready goes high)
-    for _ in range(LANES + 2):
+    for cycle in range(LANES + 2):
         await RisingEdge(dut.clk)
         await Timer(1, unit='ps')
+        if debug:
+            grant = safe_int(dut.u_arb.grant.value)
+            bank_en = safe_int(dut.u_arb.bank_en.value)
+            is_write_r = safe_int(dut.is_write_r.value)
+            busy = safe_int(dut.u_arb.busy.value)
+            wdata_scratch = [safe_int(getattr(dut, f"g_scratch[{i}].u_wdata_scratch.dout").value) for i in range(LANES)]
+            xbar_out = [safe_int(getattr(dut, f"u_xbar.dout[{i}]").value) for i in range(LANES)]
+            dut._log.info(f"WR cycle {cycle}: grant=0x{grant:02x} bank_en=0x{bank_en:02x} is_write={is_write_r} busy={busy}")
+            dut._log.info(f"  wdata_scratch: {[f'0x{x:08x}' for x in wdata_scratch]}")
+            dut._log.info(f"  xbar_out: {[f'0x{x:08x}' for x in xbar_out]}")
         if dut.w_ready.value == 1:
             return
     raise TimeoutError("write_lanes timed out waiting for w_ready")
 
 
-async def read_lanes(dut, addrs: list[int], mask: int) -> list[int]:
+def safe_int(val) -> int:
+    """Convert a cocotb value to int, handling X/Z and Logic."""
+    try:
+        return val.to_unsigned()
+    except (ValueError, AttributeError):
+        # Single-bit Logic object or X/Z
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return -1
+
+
+async def read_lanes(dut, addrs: list[int], mask: int, debug: bool = False) -> list[int]:
     """Perform a read operation. Returns read data for all lanes."""
     dut.r_valid.value = 1
     dut.r_lane_mask.value = mask
@@ -60,9 +82,22 @@ async def read_lanes(dut, addrs: list[int], mask: int) -> list[int]:
     dut.r_valid.value = 0
 
     # Wait for r_done
-    for _ in range(LANES + 4):
+    for cycle in range(LANES + 4):
         await RisingEdge(dut.clk)
         await Timer(1, unit='ps')
+        if debug:
+            grant = safe_int(dut.u_arb.grant.value)
+            grant_d = safe_int(dut.grant_d.value)
+            bank_en = safe_int(dut.u_arb.bank_en.value)
+            is_write_r = safe_int(dut.is_write_r.value)
+            busy = safe_int(dut.u_arb.busy.value)
+            done = safe_int(dut.u_arb.done.value)
+            r_done = safe_int(dut.r_done.value)
+            xbar_out = [safe_int(getattr(dut, f"u_xbar.dout[{i}]").value) for i in range(LANES)]
+            rdata_scratch = [safe_int(getattr(dut, f"g_scratch[{i}].u_rdata_scratch.dout").value) for i in range(LANES)]
+            dut._log.info(f"RD cycle {cycle}: grant=0x{grant:02x} grant_d=0x{grant_d:02x} bank_en=0x{bank_en:02x} is_write={is_write_r} busy={busy} done={done} r_done={r_done}")
+            dut._log.info(f"  xbar_out: {[f'0x{x:08x}' for x in xbar_out]}")
+            dut._log.info(f"  rdata_scratch: {[f'0x{x:08x}' for x in rdata_scratch]}")
         if dut.r_done.value == 1:
             return [getattr(dut, f"rdata[{i}]").value.to_unsigned() for i in range(LANES)]
     raise TimeoutError("read_lanes timed out waiting for r_done")

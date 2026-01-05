@@ -5,7 +5,7 @@ from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, ReadOnly
 
 # Latency
-LAT = 2
+LAT = 3
 
 # ---- Helpers ----------------------------------------------------------------
 def mask24(n: int) -> int:

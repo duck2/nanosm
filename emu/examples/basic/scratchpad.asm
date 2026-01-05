@@ -7,8 +7,8 @@
 ;
 ; Lane-interleaved: each lane writes to different addr to avoid bank conflicts
 
-    lid r1              ; lane_id
+    sread r1, LANE_ID   ; lane_id
     shli r2, r1, 1      ; r2 = lane_id * 2
-    sts [r1+0], r2      ; scratchpad[lane_id] = lane_id * 2 (conflict-free)
-    lds r3, [r1+0]      ; r3 = scratchpad[lane_id]
+    sts [r1], r2      ; scratchpad[lane_id] = lane_id * 2 (conflict-free)
+    lds r3, [r1]      ; r3 = scratchpad[lane_id]
     halt

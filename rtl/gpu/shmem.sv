@@ -4,9 +4,6 @@
  * Lane-interleaved shared memory with bank conflict resolution.
  * addr[2:0] selects bank, addr[11:3] selects row within bank.
  * Total: 8 banks × 512 rows × 32 bits = 16KB
- * 
- * Single arbiter handles both read and write (mutual exclusion).
- * Uses single crossbar for both write (lane→bank) and read (bank→lane).
  */
 module shmem #(
     parameter LANES = 8,
@@ -51,14 +48,14 @@ module shmem #(
     endgenerate
 
     // Latch is_write on start
-    reg is_write_r;
+    logic is_write_r;
     always_ff @(posedge clk) begin
         if (arb_start)
             is_write_r <= do_write;
     end
 
     // ========================================================================
-    // Arbiter instance
+    // Arbiter instance. We share the same arbiter for writes and reads
     // ========================================================================
     wire done;
     wire [LANES-1:0] grant;
@@ -84,61 +81,53 @@ module shmem #(
     assign w_ready = !busy;
     assign r_ready = !busy;
 
-    // r_done delayed 1 cycle to align with BRAM latency
-    reg done_d, is_write_d;
+    // r_done delayed 2 cycles: 1 for BRAM latency, 1 for rdata_scratch capture
+    logic done_d, done_dd, is_write_d;
     always_ff @(posedge clk) begin
         done_d <= done;
+        done_dd <= done_d;
         is_write_d <= is_write_r;
     end
-    assign r_done = done_d && !is_write_d;
+    assign r_done = done_dd && !is_write_d;
 
-    // Grant delayed 1 cycle for rdata capture
-    reg [LANES-1:0] grant_d;
-    always_ff @(posedge clk) grant_d <= grant;
+    // Grant delayed 1 cycle for rdata capture (aligns with BRAM latency)
+    logic [LANES-1:0] grant_d;
+    always_ff @(posedge clk)
+        grant_d <= grant;
 
-    // ========================================================================
-    // Unified data latch: captures wdata (from outside) or rdata (from xbar)
-    // ========================================================================
-    reg [31:0] data_r [LANES-1:0];
-    reg [LANES-1:0] lane_captured;
-
-    // Forward declaration for xbar_out (used in data_r capture)
+    // Forward declaration for xbar_out
     wire [31:0] xbar_out [LANES-1:0];
 
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            lane_captured <= '0;
-        end else begin
-            // Capture wdata on write start
-            if (arb_start && do_write) begin
-                for (int i = 0; i < LANES; i++)
-                    data_r[i] <= wdata[i];
-            end
-            // Clear lane_captured on read start
-            if (arb_start && !do_write)
-                lane_captured <= '0;
-            // Capture rdata as lanes complete (skip on arb_start to avoid race)
-            if (!arb_start) begin
-                for (int l = 0; l < LANES; l++) begin
-                    if (grant_d[l] && !lane_captured[l]) begin
-                        data_r[l] <= xbar_out[l];
-                        lane_captured[l] <= 1'b1;
-                    end
-                end
-            end
+    // ========================================================================
+    // Scratchpad registers: separate for write and read paths
+    // ========================================================================
+    wire [31:0] wdata_scratch [LANES-1:0];
+    wire [31:0] rdata_scratch [LANES-1:0];
+    wire wdata_latch_en = arb_start && do_write;
+
+    generate
+        for (genvar i = 0; i < LANES; i++) begin : g_scratch
+            lane_scratchpad u_wdata_scratch (
+                .clk(clk), .en(wdata_latch_en),
+                .din(wdata[i]), .dout(wdata_scratch[i])
+            );
+            lane_scratchpad u_rdata_scratch (
+                .clk(clk), .en(grant_d[i]),
+                .din(xbar_out[i]), .dout(rdata_scratch[i])
+            );
         end
-    end
+    endgenerate
 
     // ========================================================================
     // Crossbar: shared for writes (lane→bank) and reads (bank→lane)
     // ========================================================================
     wire [31:0] bank_rdata [LANES-1:0];
 
-    // Crossbar inputs: data_r for writes, bank_rdata for reads
+    // Crossbar inputs: wdata_scratch for writes, bank_rdata for reads
     wire [31:0] xbar_in [LANES-1:0];
     generate
         for (genvar i = 0; i < LANES; i++) begin : g_xbar_in
-            assign xbar_in[i] = is_write_r ? data_r[i] : bank_rdata[i];
+            assign xbar_in[i] = is_write_r ? wdata_scratch[i] : bank_rdata[i];
         end
     endgenerate
 
@@ -152,7 +141,11 @@ module shmem #(
         end
     endgenerate
 
-    // Crossbar output (forward-declared above)
+    // Crossbar inst and its output.
+    // Actually keep the hierarchy here. the xbar packs pretty tightly
+    // into 512 LUTs for LANES=8. There's nothing for synth to optimize
+    // except messing with it for timing
+    (* keep_hierarchy = "yes" *)
     shmem_xbar #(.LANES(LANES)) u_xbar (
         .sel(xbar_sel),
         .din(xbar_in),
@@ -174,10 +167,10 @@ module shmem #(
         end
     endgenerate
 
-    // Output: use data_r for captured lanes, fresh xbar_out for just-completed
+    // Output: directly from rdata scratchpad (captured incrementally via grant_d)
     generate
         for (genvar l = 0; l < LANES; l++) begin : g_rout
-            assign rdata[l] = lane_captured[l] ? data_r[l] : xbar_out[l];
+            assign rdata[l] = rdata_scratch[l];
         end
     endgenerate
 
@@ -226,10 +219,10 @@ module ram512x32 (
     input wire [31:0] wdata,
     input wire re,
     input wire [8:0] raddr,
-    output reg [31:0] rdata
+    output logic [31:0] rdata
 );
     (* ram_style = "block" *)
-    reg [31:0] mem [511:0];
+    logic [31:0] mem [511:0];
 
     always_ff @(posedge clk) begin
         if (we) mem[waddr] <= wdata;
@@ -237,5 +230,18 @@ module ram512x32 (
 
     always_ff @(posedge clk) begin
         if (re) rdata <= mem[raddr];
+    end
+endmodule
+
+
+/** 32-bit scratchpad register with enable. */
+module lane_scratchpad (
+    input wire clk,
+    input wire en,
+    input wire [31:0] din,
+    output logic [31:0] dout
+);
+    always_ff @(posedge clk) begin
+        if (en) dout <= din;
     end
 endmodule

@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import numpy as np
 
+from encoding import Cmp, SType
+
 def f32_to_bits(f: float) -> int:
     return struct.unpack('<I', struct.pack('<f', f))[0]
 
@@ -70,6 +72,15 @@ class Emulator:
         self.labels = labels
         self.state.pc = 0
         self.state.halted = False
+
+    def resolve_target(self, args: dict) -> int:
+        """Resolve branch target from 'target' (int) or 'label' (string). Validates bounds."""
+        if 'target' in args:
+            pc = args['target']
+        else:
+            pc = self.labels[args['label']]
+        assert 0 <= pc < len(self.instructions), f"branch target {pc} out of bounds [0, {len(self.instructions)})"
+        return pc
 
     def is_lane_active(self, lane: int) -> bool:
         return bool(self.state.active_mask & (1 << lane))
@@ -335,28 +346,23 @@ class Emulator:
 
     def do_sync(self):
         """Pop stack entry and switch to that mask/PC."""
-        if self.state.reconv_stack:
-            entry = self.state.reconv_stack.pop()
-            self.state.active_mask = entry.mask
-            self.state.pc = entry.pc
-        else:
-            self.state.pc += 1
+        assert self.state.reconv_stack, "sync with empty reconvergence stack"
+        entry = self.state.reconv_stack.pop()
+        self.state.active_mask = entry.mask
+        self.state.pc = entry.pc
 
     # =========================================================================
     # Instruction Execution
     # =========================================================================
     def exec_instr(self, op: str, args: dict):
         """Execute a single instruction."""
-        sync_after = False
-        if op.endswith('.s'):
-            sync_after = True
-            op = op[:-2]
-
         # Handle predication: narrow active mask to lanes where predicate is true
         saved_mask = None
         if 'pred' in args and op not in ('bra', 'bra.uni'):
             saved_mask = self.state.active_mask
             pred_vals = self.read_pred(args['pred'])
+            if args.get('pred_neg', False):
+                pred_vals = ~pred_vals
             pred_mask = sum((1 << i) for i in range(self.state.num_lanes) if pred_vals[i])
             self.state.active_mask &= pred_mask
 
@@ -376,20 +382,21 @@ class Emulator:
         elif op == 'xor':
             self.write_reg(args['rd'], self.alu_xor(self.read_reg(args['rs1']), self.read_reg(args['rs2'])))
 
-        # ALU I-type: op rd, rs1, imm
+        # ALU I-type: op rd, rs1, imm (12-bit unsigned immediate)
         elif op == 'addi':
-            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFFF, dtype=np.uint32)
-            if args['imm'] & 0x8000:  # sign extend 16-bit
-                imm = (imm | 0xFFFF0000).astype(np.uint32)
+            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFF, dtype=np.uint32)
             self.write_reg(args['rd'], self.alu_add(self.read_reg(args['rs1']), imm))
+        elif op == 'subi':
+            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFF, dtype=np.uint32)
+            self.write_reg(args['rd'], self.alu_sub(self.read_reg(args['rs1']), imm))
         elif op == 'andi':
-            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFFF, dtype=np.uint32)
+            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFF, dtype=np.uint32)
             self.write_reg(args['rd'], self.alu_and(self.read_reg(args['rs1']), imm))
         elif op == 'ori':
-            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFFF, dtype=np.uint32)
+            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFF, dtype=np.uint32)
             self.write_reg(args['rd'], self.alu_or(self.read_reg(args['rs1']), imm))
         elif op == 'xori':
-            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFFF, dtype=np.uint32)
+            imm = np.full(self.state.num_lanes, args['imm'] & 0xFFF, dtype=np.uint32)
             self.write_reg(args['rd'], self.alu_xor(self.read_reg(args['rs1']), imm))
 
         # Shift ops
@@ -462,23 +469,29 @@ class Emulator:
             addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
             self.mem_store_scratch(addr, self.read_reg(args['rs2']))
 
-        # Move imm (upper 16 bits): lui rd, imm16
+        # Load upper immediate: lui rd, imm20 (stores imm << 12)
         elif op == 'lui':
-            val = np.full(self.state.num_lanes, (args['imm'] & 0xFFFF) << 16, dtype=np.uint32)
+            val = np.full(self.state.num_lanes, (args['imm'] & 0xFFFFF) << 12, dtype=np.uint32)
             self.write_reg(args['rd'], val)
 
         # Move: mov rd, rs1
         elif op == 'mov':
             self.write_reg(args['rd'], self.read_reg(args['rs1']))
 
-        # Lane ID: lid rd (writes 0,1,2,...,lanes-1 to each lane)
-        elif op == 'lid':
-            vals = np.arange(self.state.num_lanes, dtype=np.uint32)
+        # Special register read: sread rd, sreg
+        elif op == 'sread':
+            sreg = args['sreg']
+            if sreg == 0:  # LANE_ID
+                vals = np.arange(self.state.num_lanes, dtype=np.uint32)
+            elif sreg == 7:  # NUM_LANES
+                vals = np.full(self.state.num_lanes, self.state.num_lanes, dtype=np.uint32)
+            else:  # Other sregs return 0 for now
+                vals = np.zeros(self.state.num_lanes, dtype=np.uint32)
             self.write_reg(args['rd'], vals)
 
         # SSY: set synchronization point
         elif op == 'ssy':
-            self.do_ssy(self.labels[args['label']])
+            self.do_ssy(self.resolve_target(args))
             self.state.pc += 1
             return
 
@@ -487,19 +500,18 @@ class Emulator:
             rs1 = self.read_reg(args['rs1'])
             rs2 = self.read_reg(args['rs2'])
             cmp_op = args['cmp']
-            typ = args.get('type', 'i32')
-            signed = typ in ('i32', 's32')
-            if cmp_op == 'lt':
+            signed = args.get('type', SType.I32) == SType.I32
+            if cmp_op == Cmp.LT:
                 cond = rs1.astype(np.int32) < rs2.astype(np.int32) if signed else rs1 < rs2
-            elif cmp_op == 'ge':
+            elif cmp_op == Cmp.GE:
                 cond = rs1.astype(np.int32) >= rs2.astype(np.int32) if signed else rs1 >= rs2
-            elif cmp_op == 'eq':
+            elif cmp_op == Cmp.EQ:
                 cond = rs1 == rs2
-            elif cmp_op == 'ne':
+            elif cmp_op == Cmp.NE:
                 cond = rs1 != rs2
-            elif cmp_op == 'le':
+            elif cmp_op == Cmp.LE:
                 cond = rs1.astype(np.int32) <= rs2.astype(np.int32) if signed else rs1 <= rs2
-            elif cmp_op == 'gt':
+            elif cmp_op == Cmp.GT:
                 cond = rs1.astype(np.int32) > rs2.astype(np.int32) if signed else rs1 > rs2
             else:
                 raise ValueError(f"Unknown comparison: {cmp_op}")
@@ -507,12 +519,12 @@ class Emulator:
 
         # Predicated branch (divergent): @pN bra label
         elif op == 'bra':
-            self.do_bra(args['pred'], self.labels[args['label']])
+            self.do_bra(args['pred'], self.resolve_target(args))
             return
 
         # Uniform branch: bra.uni label (unconditional) or @pN bra.uni label (predicated)
         elif op == 'bra.uni':
-            self.do_bra_uni(args.get('pred'), self.labels[args['label']])
+            self.do_bra_uni(args.get('pred'), self.resolve_target(args))
             return
 
         # Halt
@@ -523,6 +535,13 @@ class Emulator:
         # Nop
         elif op == 'nop':
             pass
+
+        # Sync: pop reconvergence stack
+        elif op == 'sync':
+            if saved_mask is not None:
+                self.state.active_mask = saved_mask
+            self.do_sync()
+            return
 
         # Tile commit: tile_commit rx, ry, rd (tile_x, tile_y, rt_desc_ptr)
         elif op == 'tile_commit':
@@ -557,11 +576,7 @@ class Emulator:
         if saved_mask is not None:
             self.state.active_mask = saved_mask
 
-        # Handle .s suffix - sync after instruction
-        if sync_after:
-            self.do_sync()
-        else:
-            self.state.pc += 1
+        self.state.pc += 1
 
     def step(self) -> bool:
         """Execute one instruction. Returns True if still running."""

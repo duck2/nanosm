@@ -7,7 +7,7 @@
 ;   r4 = 10 - lane_id (10,9,8,7,6,5,4,3)
 ;   r5 = lane_id^2 (0,1,4,9,16,25,36,49)
 
-    lid r1              ; r1 = lane_id
+    sread r1, LANE_ID   ; r1 = lane_id
     addi r2, r0, 10     ; r2 = 10
     add r3, r1, r2      ; r3 = lane_id + 10
     sub r4, r2, r1      ; r4 = 10 - lane_id
