@@ -7,6 +7,8 @@ build/
 __pycache__/
 env/
 sim_build/
+docs/
+.cursorrules
 
 # Vivado / tool artifacts
 *.rpt
