@@ -14,25 +14,10 @@ def bits_to_f32(b: int) -> float:
     return struct.unpack('<f', struct.pack('<I', b & 0xFFFFFFFF))[0]
 
 @dataclass
-class ResourceDescriptor:
-    """Resource descriptor for texture/buffer addressing."""
-    base_addr: int = 0
-    stride: int = 0
-    type_: int = 0  # 0=buffer, 1=tex1d, 2=tex2d
-
-@dataclass
 class ReconvStackEntry:
     """Entry for the reconvergence stack. Holds mask and PC to switch to."""
     mask: int
     pc: int
-
-@dataclass
-class RenderTargetDesc:
-    """Render target descriptor for tile commit."""
-    base_addr: int = 0
-    stride: int = 0      # bytes per row
-    tile_width: int = 32
-    tile_height: int = 32
 
 @dataclass
 class GPUState:
@@ -44,7 +29,6 @@ class GPUState:
     active_mask: int = 0xFF  # all lanes active by default
     scratchpad: np.ndarray = field(default_factory=lambda: None)  # [4096] lane-interleaved
     reconv_stack: List[ReconvStackEntry] = field(default_factory=list)
-    descriptors: List[ResourceDescriptor] = field(default_factory=list)
     global_mem: bytearray = field(default_factory=lambda: bytearray(4 * 1024 * 1024))  # 4MB
     halted: bool = False
 
@@ -55,8 +39,6 @@ class GPUState:
             self.pf = np.zeros((8, self.num_lanes), dtype=np.bool_)
         if self.scratchpad is None:
             self.scratchpad = np.zeros(4096, dtype=np.uint32)
-        if not self.descriptors:
-            self.descriptors = [ResourceDescriptor() for _ in range(16)]
 
 class Emulator:
     """Functional GPU emulator."""
@@ -200,23 +182,6 @@ class Emulator:
         af = a.astype(np.int32).astype(np.float32)
         return np.array([f32_to_bits(float(x)) for x in af], dtype=np.uint32)
 
-    def fpu_ftofx_clamp(self, a: np.ndarray, frac_bits: int) -> tuple[np.ndarray, np.ndarray]:
-        """Float32 to signed 16-bit fixed-point with clamping. Returns (result, clamped)."""
-        af = np.array([bits_to_f32(int(x)) for x in a], dtype=np.float32)
-        scaled = af * (1 << frac_bits)
-        clamped_vals = np.clip(scaled, -32767, 32767)
-        was_clamped = (scaled < -32767) | (scaled > 32767)
-        result = np.trunc(clamped_vals).astype(np.int16).astype(np.uint32) & 0xFFFF
-        return result, was_clamped
-
-    def fpu_ftofx_repeat(self, a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Float32 to u0.15 with repeat mode. Returns (result, sign)."""
-        af = np.array([bits_to_f32(int(x)) for x in a], dtype=np.float32)
-        sign = af < 0
-        frac = np.abs(af) - np.floor(np.abs(af))  # Get fractional part
-        result = (frac * (1 << 15)).astype(np.uint32) & 0x7FFF
-        return result, sign
-
     # =========================================================================
     # Memory Operations
     # =========================================================================
@@ -238,28 +203,6 @@ class Emulator:
                 if a + 4 <= len(self.state.global_mem):
                     self.state.global_mem[a:a+4] = struct.pack('<I', int(data[lane]))
 
-    def mem_load_2d(self, rx: np.ndarray, ry: np.ndarray, desc_ptr: int) -> np.ndarray:
-        """Load from 2D texture using descriptor."""
-        desc = self.read_rt_desc(desc_ptr)
-        result = np.zeros(self.state.num_lanes, dtype=np.uint32)
-        for lane in range(self.state.num_lanes):
-            if self.is_lane_active(lane):
-                x, y = int(rx[lane]), int(ry[lane])
-                addr = desc.base_addr + y * desc.stride + x * 4
-                if addr + 4 <= len(self.state.global_mem):
-                    result[lane] = struct.unpack('<I', self.state.global_mem[addr:addr+4])[0]
-        return result
-
-    def mem_store_2d(self, rx: np.ndarray, ry: np.ndarray, desc_ptr: int, data: np.ndarray):
-        """Store to 2D texture using descriptor."""
-        desc = self.read_rt_desc(desc_ptr)
-        for lane in range(self.state.num_lanes):
-            if self.is_lane_active(lane):
-                x, y = int(rx[lane]), int(ry[lane])
-                addr = desc.base_addr + y * desc.stride + x * 4
-                if addr + 4 <= len(self.state.global_mem):
-                    self.state.global_mem[addr:addr+4] = struct.pack('<I', int(data[lane]))
-
     def mem_load_scratch(self, addr: np.ndarray) -> np.ndarray:
         """Load from lane-interleaved scratchpad."""
         result = np.zeros(self.state.num_lanes, dtype=np.uint32)
@@ -275,33 +218,6 @@ class Emulator:
             if self.is_lane_active(lane):
                 a = int(addr[lane]) & 0xFFF
                 self.state.scratchpad[a] = data[lane]
-
-    # =========================================================================
-    # Tile Operations
-    # =========================================================================
-    def read_rt_desc(self, ptr: int) -> RenderTargetDesc:
-        """Read render target descriptor from global memory."""
-        mem = self.state.global_mem
-        return RenderTargetDesc(
-            base_addr=struct.unpack('<I', mem[ptr:ptr+4])[0],
-            stride=struct.unpack('<I', mem[ptr+4:ptr+8])[0],
-            tile_width=struct.unpack('<I', mem[ptr+8:ptr+12])[0],
-            tile_height=struct.unpack('<I', mem[ptr+12:ptr+16])[0],
-        )
-
-    def tile_commit(self, tile_x: int, tile_y: int, desc: RenderTargetDesc):
-        """Commit scratchpad tile buffer to framebuffer (lane-interleaved layout)."""
-        tw, th = desc.tile_width, desc.tile_height
-        for row in range(th):
-            for px in range(tw):
-                scratch_addr = row * tw + px  # linear pixel order in scratchpad
-                py = row
-                fb_addr = (desc.base_addr
-                           + (tile_y * th + py) * desc.stride
-                           + (tile_x * tw + px) * 4)
-                rgba = int(self.state.scratchpad[scratch_addr & 0xFFF])
-                if fb_addr + 4 <= len(self.state.global_mem):
-                    struct.pack_into('<I', self.state.global_mem, fb_addr, rgba)
 
     # =========================================================================
     # Control Flow (SSY/Branch/.S model)
@@ -429,17 +345,6 @@ class Emulator:
             self.write_reg(args['rd'], self.fpu_rcp(self.read_reg(args['rs1'])))
         elif op == 'itof':
             self.write_reg(args['rd'], self.fpu_itof(self.read_reg(args['rs1'])))
-        elif op.startswith('ftofx.'):
-            parts = op.split('.')
-            if len(parts) >= 3 and parts[2] == 'repeat':
-                result, sign = self.fpu_ftofx_repeat(self.read_reg(args['rs1']))
-                self.write_reg(args['rd'], result)
-                self.write_pred(args['pd'], sign)
-            else:
-                frac_bits = int(parts[1])
-                result, clamped = self.fpu_ftofx_clamp(self.read_reg(args['rs1']), frac_bits)
-                self.write_reg(args['rd'], result)
-                self.write_pred(args['pd'], clamped)
 
         # Load/Store global: ldg rd, [rs1+imm] / stg [rs1+imm], rs2
         elif op == 'ldg':
@@ -450,14 +355,6 @@ class Emulator:
             base = self.read_reg(args['rs1'])
             addr = (base.astype(np.int64) + args.get('imm', 0)).astype(np.uint32)
             self.mem_store_global(addr, self.read_reg(args['rs2']))
-
-        # 2D texture load/store
-        elif op == 'ld2d':
-            desc_ptr = int(self.read_reg(args['rdesc'])[0])
-            self.write_reg(args['rd'], self.mem_load_2d(self.read_reg(args['rx']), self.read_reg(args['ry']), desc_ptr))
-        elif op == 'st2d':
-            desc_ptr = int(self.read_reg(args['rdesc'])[0])
-            self.mem_store_2d(self.read_reg(args['rx']), self.read_reg(args['ry']), desc_ptr, self.read_reg(args['rs']))
 
         # Scratchpad: lds rd, [rs1+imm] / sts [rs1+imm], rs2
         elif op == 'lds':
@@ -542,18 +439,6 @@ class Emulator:
                 self.state.active_mask = saved_mask
             self.do_sync()
             return
-
-        # Tile commit: tile_commit rx, ry, rd (tile_x, tile_y, rt_desc_ptr)
-        elif op == 'tile_commit':
-            tile_x = int(self.read_reg(args['rx'])[0])
-            tile_y = int(self.read_reg(args['ry'])[0])
-            desc_ptr = int(self.read_reg(args['rd'])[0])
-            desc = self.read_rt_desc(desc_ptr)
-            self.tile_commit(tile_x, tile_y, desc)
-
-        # Tile wait: nop in emulator (no async DMA)
-        elif op == 'tile_wait':
-            pass
 
         # Predicate logic: pand/por/pxor pd, ps1, ps2
         elif op == 'pand':

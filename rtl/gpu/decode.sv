@@ -22,7 +22,6 @@ module decode (
     output logic [4:0] op_r4,         // R4 format
     output logic [2:0] op_i,          // I format
     output logic [2:0] op_m,          // M format
-    output logic [4:0] op_m2,         // M2 format
     output logic [3:0] op_p,          // P format
     output logic [2:0] op_j,          // J format
     output logic [3:0] op_x,          // X format
@@ -37,11 +36,6 @@ module decode (
     output logic       cmp_unsigned,  // setp type (0=signed, 1=unsigned)
     output logic [2:0] pd,            // dest predicate
 
-    // M2-format extras
-    output logic [4:0] rx,
-    output logic [4:0] ry,
-    output logic [4:0] rdesc,
-
     // Decoded instruction class
     output logic is_alu,
     output logic is_alu_imm,
@@ -52,7 +46,6 @@ module decode (
     output logic is_load,
     output logic is_store,
     output logic is_shmem,            // lds/sts vs ldg/stg
-    output logic is_mem2d,
     output logic is_lui,
     output logic is_setp,
     output logic is_pred_logic,
@@ -72,7 +65,7 @@ module decode (
     localparam [2:0] FMT_R4 = 3'd0;
     localparam [2:0] FMT_I  = 3'd1;
     localparam [2:0] FMT_M  = 3'd2;
-    localparam [2:0] FMT_M2 = 3'd3;
+    // 3'd3 reserved (was memory 2D)
     localparam [2:0] FMT_U  = 3'd4;
     localparam [2:0] FMT_P  = 3'd5;
     localparam [2:0] FMT_J  = 3'd6;
@@ -93,7 +86,6 @@ module decode (
     assign op_r4 = instr[4:0];
     assign op_i  = instr[2:0];
     assign op_m  = instr[2:0];
-    assign op_m2 = instr[4:0];
     assign op_p  = instr[3:0];
     assign op_j  = instr[2:0];
     assign op_x  = instr[3:0];
@@ -107,18 +99,12 @@ module decode (
     assign cmp          = instr[11:9];
     assign cmp_unsigned = instr[8];
 
-    // M2-format
-    assign rx    = instr[19:15];
-    assign ry    = instr[14:10];
-    assign rdesc = instr[9:5];
-
     // ========================================================================
     // Instruction class decode
     // ========================================================================
     wire fmt_r4 = (fmt == FMT_R4);
     wire fmt_i  = (fmt == FMT_I);
     wire fmt_m  = (fmt == FMT_M);
-    wire fmt_m2 = (fmt == FMT_M2);
     wire fmt_u  = (fmt == FMT_U);
     wire fmt_p  = (fmt == FMT_P);
     wire fmt_j  = (fmt == FMT_J);
@@ -138,10 +124,6 @@ module decode (
     wire m_is_lds = fmt_m && (op_m == 3'd1);
     wire m_is_stg = fmt_m && (op_m == 3'd2);
     wire m_is_sts = fmt_m && (op_m == 3'd3);
-
-    // M2 opcodes
-    wire m2_is_ld = fmt_m2 && (op_m2 == 5'd0);
-    wire m2_is_st = fmt_m2 && (op_m2 == 5'd1);
 
     // P opcodes
     wire p_is_setp = fmt_p && (op_p == 4'd0);
@@ -166,10 +148,9 @@ module decode (
     assign is_shift_imm  = i_is_shift;
     assign is_fpu        = r4_is_fpu;
     assign is_mem        = fmt_m;
-    assign is_load       = m_is_ldg || m_is_lds || m2_is_ld;
-    assign is_store      = m_is_stg || m_is_sts || m2_is_st;
+    assign is_load       = m_is_ldg || m_is_lds;
+    assign is_store      = m_is_stg || m_is_sts;
     assign is_shmem      = m_is_lds || m_is_sts;
-    assign is_mem2d      = fmt_m2;
     assign is_lui        = fmt_u;
     assign is_setp       = p_is_setp;
     assign is_pred_logic = p_is_logic;
@@ -188,15 +169,10 @@ module decode (
     // Simulation-only: fatal on unimplemented instructions
     // ========================================================================
     // synthesis translate_off
-    wire x_is_tile_commit = fmt_x && (op_x == 4'd3);
-    wire x_is_tile_wait = fmt_x && (op_x == 4'd4);
     wire is_global_mem = m_is_ldg || m_is_stg;
 
     always_comb begin
-        if (is_mem2d) $fatal(1, "decode: mem2d (ld2d/st2d) not implemented");
         if (is_global_mem) $fatal(1, "decode: global memory (ldg/stg) not implemented");
-        if (x_is_tile_commit) $fatal(1, "decode: tile_commit not implemented");
-        if (x_is_tile_wait) $fatal(1, "decode: tile_wait not implemented");
     end
     // synthesis translate_on
 

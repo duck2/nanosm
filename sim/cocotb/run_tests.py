@@ -35,7 +35,6 @@ TESTS = {
     "shifter": ("shifter", ["rtl/gpu/shifter.sv"], False),
     "rf": ("rf", ["rtl/gpu/rf.sv", "rtl/sim_models/RAM32M.v"], False),
     #"icache": ("icache", ["rtl/gpu/icache.sv"], False),
-    #"ftofx": ("ftofx", ["rtl/gpu/ftofx.sv"], False),
     "shmem_arbiter": ("shmem_arbiter", ["rtl/gpu/shmem_arbiter.sv"], False),
     "shmem": ("shmem", ["rtl/gpu/shmem.sv", "rtl/gpu/shmem_arbiter.sv"], False),
     "decode": ("decode", ["rtl/gpu/decode.sv"], False),

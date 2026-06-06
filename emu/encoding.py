@@ -8,7 +8,6 @@
 # I-format imm is unsigned (12-bit). Use subi for subtraction (gives extra bit).
 # FMT_P has 5-bit rs1/rs2 fields even though pred logic only needs 3 bits.
 #   This wastes bits but simplifies decode (same field positions as setp).
-# ftofx encodes pd in rs2 field and frac bits in rs3.
 # Decoded instructions use 'target' for resolved addresses (not 'label').
 
 from dataclasses import dataclass
@@ -93,14 +92,6 @@ FMT_M = Format('M',
     Field('rd_rs2', 24, 20), Field('rs1', 19, 15), Field('imm', 14, 3), Field('op', 2, 0),
 )
 
-# M2: memory 2D (ld2d/st2d) - 5-bit op, 4 register fields
-# | fmt[31:29] | pred[28:25] | rd[24:20] | rx[19:15] | ry[14:10] | rdesc[9:5] | op[4:0] |
-FMT_M2 = Format('M2',
-    Field('fmt', 31, 29), Field('pred', 28, 25),
-    Field('rd', 24, 20), Field('rx', 19, 15), Field('ry', 14, 10),
-    Field('rdesc', 9, 5), Field('op', 4, 0),
-)
-
 # U: upper immediate (lui) - no op, just rd <- imm20 << 12
 # | fmt[31:29] | pred[28:25] | rd[24:20] | imm[19:0] |
 FMT_U = Format('U',
@@ -123,12 +114,11 @@ FMT_J = Format('J',
     Field('imm', 24, 3), Field('op', 2, 0),
 )
 
-# X: misc (sread, nop, halt, tile_commit, tile_wait) - 4-bit op
+# X: misc (sread, nop, halt) - 4-bit op
 # | fmt[31:29] | pred[28:25] | r1[24:20] | r2[19:15] | r3[14:10] | x[9:4] | op[3:0] |
 # Field usage varies by op:
-#   sread:       rd=r1, sreg=r2 (only bottom 3 bits used)
-#   tile_commit: rdesc=r1, rx=r2, ry=r3
-#   nop/halt/tile_wait: unused
+#   sread:        rd=r1, sreg=r2 (only bottom 3 bits used)
+#   nop/halt:     unused
 FMT_X = Format('X',
     Field('fmt', 31, 29), Field('pred', 28, 25),
     Field('r1', 24, 20), Field('r2', 19, 15), Field('r3', 14, 10),
@@ -143,7 +133,7 @@ class Fmt:
     R4 = 0  # compute: ALU, shift, FPU
     I  = 1  # immediate ALU/shift
     M  = 2  # memory 1D
-    M2 = 3  # memory 2D
+    # 3 reserved (was memory 2D)
     U  = 4  # upper immediate
     P  = 5  # predicates
     J  = 6  # jumps
@@ -161,7 +151,7 @@ class Op:
     # Shift: 8-15
     SHL, SHR, SRA = 8, 9, 10
     # FPU: 16-31
-    FADD, FSUB, FMUL, FMA, FRCP, ITOF, FTOFX_CLAMP, FTOFX_REPEAT = 16, 17, 18, 19, 20, 21, 22, 23
+    FADD, FSUB, FMUL, FMA, FRCP, ITOF = 16, 17, 18, 19, 20, 21
 
     # I format (3 bits = 8 values)
     ADDI, SUBI, ANDI, ORI, XORI = 0, 1, 2, 3, 4
@@ -169,9 +159,6 @@ class Op:
 
     # M format (3 bits = 8 values)
     LDG, LDS, STG, STS = 0, 1, 2, 3
-
-    # M2 format (5 bits = 32 values)
-    LD2D, ST2D = 0, 1
 
     # P format (4 bits = 16 values)
     SETP = 0
@@ -183,7 +170,6 @@ class Op:
     # X format (4 bits = 16 values)
     SREAD = 0
     NOP, HALT = 1, 2
-    TILE_COMMIT, TILE_WAIT = 3, 4
 
 
 class SReg:
@@ -254,10 +240,6 @@ ENCODE_TABLE = {
     'stg': (FMT_M, {'fmt': Fmt.M, 'op': Op.STG}),
     'sts': (FMT_M, {'fmt': Fmt.M, 'op': Op.STS}),
 
-    # M2: Memory 2D
-    'ld2d': (FMT_M2, {'fmt': Fmt.M2, 'op': Op.LD2D}),
-    'st2d': (FMT_M2, {'fmt': Fmt.M2, 'op': Op.ST2D}),
-
     # U: Upper immediate
     'lui': (FMT_U, {'fmt': Fmt.U}),
 
@@ -276,8 +258,6 @@ ENCODE_TABLE = {
     'sread':       (FMT_X, {'fmt': Fmt.X, 'op': Op.SREAD, 'r3': 0, 'x': 0}),
     'nop':         (FMT_X, {'fmt': Fmt.X, 'op': Op.NOP, 'r1': 0, 'r2': 0, 'r3': 0, 'x': 0}),
     'halt':        (FMT_X, {'fmt': Fmt.X, 'op': Op.HALT, 'r1': 0, 'r2': 0, 'r3': 0, 'x': 0}),
-    'tile_commit': (FMT_X, {'fmt': Fmt.X, 'op': Op.TILE_COMMIT, 'x': 0}),
-    'tile_wait':   (FMT_X, {'fmt': Fmt.X, 'op': Op.TILE_WAIT, 'r1': 0, 'r2': 0, 'r3': 0, 'x': 0}),
 }
 
 # =============================================================================
@@ -329,9 +309,6 @@ def encode(op: str, args: dict) -> int:
 
 
 def _encode_op(op: str, args: dict, pred: int) -> int:
-    # ftofx special handling
-    if op.startswith('ftofx.'):
-        return _encode_ftofx(op, args, pred)
     # setp special handling
     if op.startswith('setp.'):
         return _encode_setp(op, args, pred)
@@ -365,7 +342,7 @@ def _encode_op(op: str, args: dict, pred: int) -> int:
             if fmt == FMT_M:
                 vals['rd_rs2'] = v
             elif fmt == FMT_X:
-                vals['r1'] = v  # X format: rd -> r1 (for sread, tile_commit)
+                vals['r1'] = v  # X format: rd -> r1 (for sread)
             else:
                 vals['rd'] = v
         elif k == 'rs2':
@@ -373,20 +350,8 @@ def _encode_op(op: str, args: dict, pred: int) -> int:
                 vals['rd_rs2'] = v
             else:
                 vals['rs2'] = v
-        elif k == 'rs':  # M2 store source
-            vals['rd'] = v
         elif k == 'sreg':  # X format: sreg -> r2
             vals['r2'] = v
-        elif k == 'rx':  # X format tile_commit: rx -> r2
-            if fmt == FMT_X:
-                vals['r2'] = v
-            else:
-                vals['rx'] = v
-        elif k == 'ry':  # X format tile_commit: ry -> r3
-            if fmt == FMT_X:
-                vals['r3'] = v
-            else:
-                vals['ry'] = v
         elif k == 'ps1':
             vals['rs1'] = v
         elif k == 'ps2':
@@ -395,20 +360,6 @@ def _encode_op(op: str, args: dict, pred: int) -> int:
             vals[k] = v
 
     return fmt.encode(**vals)
-
-
-def _encode_ftofx(op: str, args: dict, pred: int) -> int:
-    parts = op.split('.')
-    if parts[2] == 'repeat':
-        opcode = Op.FTOFX_REPEAT
-        frac = 15
-    else:
-        opcode = Op.FTOFX_CLAMP
-        frac = int(parts[1])
-    return FMT_R4.encode(
-        fmt=Fmt.R4, op=opcode, pred=pred,
-        rd=args['rd'], rs1=args['rs1'], rs2=args['pd'], rs3=frac
-    )
 
 
 def _encode_setp(op: str, args: dict, pred: int) -> int:
@@ -454,9 +405,6 @@ def _decode_op(word: int, fmt: int) -> tuple[str, dict]:
     if fmt == Fmt.M:
         return _decode_m(word)
 
-    if fmt == Fmt.M2:
-        return _decode_m2(word)
-
     if fmt == Fmt.U:
         f = FMT_U.decode(word)
         return 'lui', {'rd': f['rd'], 'imm': f['imm']}
@@ -501,11 +449,6 @@ def _decode_r4(word: int) -> tuple[str, dict]:
         return 'frcp', {'rd': f['rd'], 'rs1': f['rs1']}
     if op == Op.ITOF:
         return 'itof', {'rd': f['rd'], 'rs1': f['rs1']}
-    if op == Op.FTOFX_CLAMP:
-        frac = f['rs3']
-        return f'ftofx.{frac}.clamp', {'rd': f['rd'], 'pd': f['rs2'], 'rs1': f['rs1']}
-    if op == Op.FTOFX_REPEAT:
-        return 'ftofx.15.repeat', {'rd': f['rd'], 'pd': f['rs2'], 'rs1': f['rs1']}
 
     raise ValueError(f"Unknown R4 op: {op}")
 
@@ -533,16 +476,6 @@ def _decode_m(word: int) -> tuple[str, dict]:
     if op_str in ('ldg', 'lds'):
         return op_str, {'rd': f['rd_rs2'], 'rs1': f['rs1'], 'imm': _sext12(f['imm'])}
     return op_str, {'rs1': f['rs1'], 'rs2': f['rd_rs2'], 'imm': _sext12(f['imm'])}
-
-
-def _decode_m2(word: int) -> tuple[str, dict]:
-    f = FMT_M2.decode(word)
-    op = f['op']
-    if op == Op.LD2D:
-        return 'ld2d', {'rd': f['rd'], 'rx': f['rx'], 'ry': f['ry'], 'rdesc': f['rdesc']}
-    if op == Op.ST2D:
-        return 'st2d', {'rx': f['rx'], 'ry': f['ry'], 'rdesc': f['rdesc'], 'rs': f['rd']}
-    raise ValueError(f"Unknown M2 op: {op}")
 
 
 def _decode_j(word: int) -> tuple[str, dict]:
@@ -587,10 +520,6 @@ def _decode_x(word: int) -> tuple[str, dict]:
         return 'nop', {}
     if op == Op.HALT:
         return 'halt', {}
-    if op == Op.TILE_COMMIT:
-        return 'tile_commit', {'rd': f['r1'], 'rx': f['r2'], 'ry': f['r3']}
-    if op == Op.TILE_WAIT:
-        return 'tile_wait', {}
     raise ValueError(f"Unknown X op: {op}")
 
 

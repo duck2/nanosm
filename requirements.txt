@@ -4,5 +4,3 @@ pathlib>=1.0.1
 cocotb
 pytest
 numpy
-matplotlib
-pillow

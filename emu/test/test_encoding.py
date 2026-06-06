@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from encoding import (
     Field, Format, encode, decode, assemble,
-    FMT_R4, FMT_I, FMT_M, FMT_M2, FMT_U, FMT_P, FMT_J, FMT_X,
+    FMT_R4, FMT_I, FMT_M, FMT_U, FMT_P, FMT_J, FMT_X,
     Fmt, Op
 )
 
@@ -14,7 +14,7 @@ from encoding import (
 class TestFormat:
     def test_no_overlap(self):
         """All formats should have no overlapping bits."""
-        for fmt in [FMT_R4, FMT_I, FMT_M, FMT_M2, FMT_U, FMT_P, FMT_J, FMT_X]:
+        for fmt in [FMT_R4, FMT_I, FMT_M, FMT_U, FMT_P, FMT_J, FMT_X]:
             assert fmt is not None  # _validate() runs in __init__
 
     def test_r4_bits_add_up(self):
@@ -82,13 +82,6 @@ class TestEncodeDecode:
             word = encode(op, args)
             dec_op, dec_args = decode(word)
             assert dec_op == op
-
-    def test_ftofx(self):
-        args = {'rd': 5, 'pd': 2, 'rs1': 10}
-        word = encode('ftofx.8.clamp', args)
-        dec_op, dec_args = decode(word)
-        assert dec_op == 'ftofx.8.clamp'
-        assert dec_args['rd'] == 5
 
     def test_memory_load(self):
         for op in ['ldg', 'lds']:
@@ -213,11 +206,11 @@ class TestEncodeDecode:
 
 class TestFmtCodes:
     def test_all_unique(self):
-        fmts = [Fmt.R4, Fmt.I, Fmt.M, Fmt.M2, Fmt.U, Fmt.P, Fmt.J, Fmt.X]
+        fmts = [Fmt.R4, Fmt.I, Fmt.M, Fmt.U, Fmt.P, Fmt.J, Fmt.X]
         assert len(fmts) == len(set(fmts))
 
     def test_fit_in_3_bits(self):
-        for f in [Fmt.R4, Fmt.I, Fmt.M, Fmt.M2, Fmt.U, Fmt.P, Fmt.J, Fmt.X]:
+        for f in [Fmt.R4, Fmt.I, Fmt.M, Fmt.U, Fmt.P, Fmt.J, Fmt.X]:
             assert 0 <= f <= 7
 
 

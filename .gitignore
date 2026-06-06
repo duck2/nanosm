@@ -1,8 +1,19 @@
 old/
 build/
 .vscode/
+.claude/
+.Xil/
+.pytest_cache/
 __pycache__/
 env/
 sim_build/
+
+# Vivado / tool artifacts
 *.rpt
 *_summary.json
+*.log
+*.jou
+*.backup.*
+clockInfo.txt
+.Xil
+vivado*.str

@@ -83,7 +83,7 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[dict]]:
     i_type = {'addi', 'subi', 'andi', 'ori', 'xori', 'shli', 'shri', 'srai'}
     unary_fpu = {'frcp', 'itof'}
     pred_logic = {'pand', 'por', 'pxor'}
-    nullary = {'halt', 'nop', 'sync', 'tile_wait'}
+    nullary = {'halt', 'nop', 'sync'}
 
     if op in r_type:
         args['rd'], args['rs1'], args['rs2'] = parse_reg(parts[1]), parse_reg(parts[2]), parse_reg(parts[3])
@@ -95,9 +95,6 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[dict]]:
     elif op in unary_fpu:
         args['rd'], args['rs1'] = parse_reg(parts[1]), parse_reg(parts[2])
 
-    elif op.startswith('ftofx.'):
-        args['rd'], args['pd'], args['rs1'] = parse_reg(parts[1]), parse_pred(parts[2]), parse_reg(parts[3])
-
     elif op in i_type:
         args['rd'], args['rs1'], args['imm'] = parse_reg(parts[1]), parse_reg(parts[2]), parse_imm(parts[3])
 
@@ -108,14 +105,6 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[dict]]:
     elif op == 'stg':
         args['rs1'], args['imm'] = parse_mem_operand(parts[1])
         args['rs2'] = parse_reg(parts[2])
-
-    elif op == 'ld2d':
-        args['rd'], args['rx'] = parse_reg(parts[1]), parse_reg(parts[2])
-        args['ry'], args['rdesc'] = parse_reg(parts[3]), parse_reg(parts[4])
-
-    elif op == 'st2d':
-        args['rx'], args['ry'] = parse_reg(parts[1]), parse_reg(parts[2])
-        args['rdesc'], args['rs'] = parse_reg(parts[3]), parse_reg(parts[4])
 
     elif op == 'lds':
         args['rd'] = parse_reg(parts[1])
@@ -154,9 +143,6 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[dict]]:
 
     elif op == 'ssy':
         args['label'] = parts[1]
-
-    elif op == 'tile_commit':
-        args['rx'], args['ry'], args['rd'] = parse_reg(parts[1]), parse_reg(parts[2]), parse_reg(parts[3])
 
     elif op in pred_logic:
         args['pd'], args['ps1'], args['ps2'] = parse_pred(parts[1]), parse_pred(parts[2]), parse_pred(parts[3])
