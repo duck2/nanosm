@@ -1,4 +1,4 @@
-; First executable nanosm kernel. The launch image contains three f32[64] arrays:
+; First global-memory nanosm kernel. The launch image contains three f32[64] arrays:
 ; A and B are inputs, C is zeroed output. Four 16-lane warps cover one element per lane.
 
 .equ A,   0
@@ -7,8 +7,8 @@
 
         sread  r0, THREAD_ID
         shli   r0, r0, 2
-        lds    r1, [r0 + A]
-        lds    r2, [r0 + B]
+        ldg    r1, [r0 + A]
+        ldg    r2, [r0 + B]
         fadd   r4, r1, r2
-        sts    [r0 + C], r4
+        stg    [r0 + C], r4
         halt

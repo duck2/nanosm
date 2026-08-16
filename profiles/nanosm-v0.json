@@ -1,0 +1,27 @@
+{
+  "name": "nanosm-v0",
+  "lanes": 16,
+  "rf": {
+    "banks": 3,
+    "rows_per_bank": 176,
+    "read_ports_per_bank": 1,
+    "write_ports_per_bank": 1
+  },
+  "shmem": {
+    "bytes": 65536,
+    "banks": 16
+  },
+  "core": {
+    "clock_hz": 1000000000,
+    "alu_latency_cycles": 1,
+    "fadd_latency_cycles": 4
+  },
+  "gmem": {
+    "bytes": 1048576,
+    "dram_clock_hz": 500000000,
+    "sector_bytes": 32,
+    "bus_bytes_per_dram_tick": 8,
+    "latency_dram_ticks": 50,
+    "queue_sectors": 64
+  }
+}

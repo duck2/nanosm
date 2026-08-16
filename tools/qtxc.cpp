@@ -1,21 +1,19 @@
 #include "compiler.hpp"
+#include "log.hpp"
 
 #include <fstream>
-#include <iostream>
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: qtxc INPUT.qtx OUTPUT.asm\n";
+    if (argc != 4) {
+        nanosm::err("usage: qtxc DEVICE.json INPUT.qtx OUTPUT.asm");
         return 2;
     }
-    try {
-        const auto program = nanosm::compile_qtx_file(argv[1]);
-        std::ofstream output(argv[2]);
-        if (!output) throw nanosm::SimError("cannot create output asm");
+    return nanosm::run_main([&] {
+        const auto profile = nanosm::load_device_profile(argv[1]);
+        const auto program = nanosm::compile_qtx_file(argv[2], profile);
+        std::ofstream output(argv[3]);
+        if (!output) nanosm::die("cannot create output asm '{}'", argv[3]);
         output << nanosm::emit_asm(program);
         return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
+    });
 }

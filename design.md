@@ -12,16 +12,24 @@ Milestone: it's a thing when it runs flash attention and emits a trace.
 
 ## isa
 - 64-bit instructions, ifetch from single-cycle icache. Kernels have to fit in icache. The word
-  format's spec is the constants and checks in src/isa.hpp; no separate format doc
+  format's spec is the constants and checks in src/isa.hpp; no separate format doc. Registers are
+  8 bit. The 38 bit payload is opcode-shaped: RRR uses three registers and leaves 14 bits reserved;
+  RRI/load/store uses two registers plus a signed 22 bit immediate. Do not spend bits on fields an
+  opcode cannot use
 - Families: mma.async, acc.ld (+epilogue), tma.async, sync (mbar.* / fence / atomics), simd core
-  (alu/fpu/sfu/lds/sts/ldg/stg/cvt).
+  (alu/fpu/sfu/setp/bra/lds/sts/ldg/stg/cvt).
 - Control bits: 5 bit stall count for fixed latency (room for FPGA-priced SFU), one set-depbar
   index and a 6 bit wait mask
   for variable latency. set increments on accepted issue; completion decrements; wait blocks while
   ANY selected counter is nonzero (so the instruction waits for ALL named dependencies)
 - qtx has semantic instructions and no controls. qtxc schedules it into human-editable asm with
   explicit {pred, stall, set, wait}; qtxas encodes that into annotated 64-bit hex. The simulator
-  fetches and decodes the hex, not the qtx IR
+  fetches and decodes the hex, not the qtx IR. qtxc, qtxas and the simulator consume the same
+  human-readable JSON device profile. asm and hex carry its name plus a fingerprint; qtxas and the
+  simulator reject a mismatch because scheduled stalls are profile-specific. qtxas derives the
+  kernel's contiguous register allocation as highest referenced register + 1 and hex carries it.
+  The fingerprint is 64 bit FNV-1a over the canonical compact JSON serialization; it is stable
+  across standard-library implementations
 - Written from one thread's point of view. Convention of per-warp PC & masked execution
 - PTX-like language, "qtx" for now. qtx -> asm -> hex, compiler takes gpu configuration
 - .v8 ldg/stg exist
@@ -39,7 +47,7 @@ Milestone: it's a thing when it runs flash attention and emits a trace.
 5. gmem (dram)
 
 ## RF
-3r 3w banked RF. This means three separate 1r 1w RFs. The reason to have this is to avoid
+3r 3w banked RF. The canonical profile says three separate 1r 1w banks. The reason to have this is to avoid
 the need for an operand collector while having peace of mind about draining MMA results on time.
 Should be OK if we have 2/3rd the RF capacity of an nvidia device? Maybe we could do with
 fewer warps by skipping operand collection latency...
@@ -61,8 +69,13 @@ There is no dynamic RF-ready scoreboard. The qtx compiler emits fixed stall coun
 waits. Hand asm that reads or overwrites a register before its scheduled write commits PANICS;
 only actual resource contention (for example a reserved write slot) may structurally stall issue.
 
-Bank mapping is reg mod 3, so three consecutive registers always cover the three banks. tma
-coordinate capture (rfc01) relies on this.
+Bank mapping is reg mod n_banks, so three consecutive registers cover the three banks in the
+canonical profile. tma coordinate capture (rfc01) relies on this. Capacity is rows per physical
+bank; one row holds one lane-wide 32 bit vector register. Allocation uses the kernel's exact
+contiguous register count, then active_warps * allocated rows must fit every bank. There is no
+independent magic max_warps field. Add scheduler warp slots only if we actually build that resource.
+The canonical 176 rows per bank are provisional; with a 64-register allocation they derive the old
+eight-warp result instead of declaring it independently.
 
 ## Shmem
 <64KB software managed cache. Banked to provide high bw access. Typically has n_banks = n_lanes.
@@ -172,6 +185,18 @@ Further rules get invented on the road (example kernels), not legislated here.
 Not much to describe. L lanes, W warps, pre-Volta reconv stack (we don't care about communication
 between divergent branches as it's not optimal to begin with)
 
+v0 branching is uniform-only: bra is unconditional, bra.uni is the only predicable opcode, and a
+bra.uni whose predicate is not warp-uniform PANICS. Divergence and the reconv stack stay reserved.
+setp.{eq,ne,lt,le,gt,ge} writes a per-lane predicate file p0..p6 at alu latency; predicate RAW/WAW
+before the scheduled write commits PANICS like any RF hazard (no scoreboard). Branch displacements
+are signed byte offsets from the following PC.
+
+Every branch is a block boundary in the toolchain: qtxc makes it wait all live depbars and carry a
+stall that covers outstanding fixed-latency writes, so any control transfer arrives with clean
+timing state and the linear scheduling scan stays sound. This is software-visible: depbar-based
+async (ldg prefetch) cannot stay in flight across a backedge. Deliberate v0 cost — mbar-based
+async (tma) is untouched by it, so pipelined loops keep their engine overlap.
+
 For now stick to shmem as the cross-lane/cross-warp channel. No shfl
 
 SFU instructions added as needed. Instruction latency/throughput configurable
@@ -209,8 +234,17 @@ Commands can be queued. Queue depth is configurable. Stalls via depbar when queu
   B = MMA.
 - gmem: uncached, ldg/stg kept. Vocabulary: SECTOR = 32B aligned unit; REQUEST = one sector in the
   controller queue; BEAT = one bus cycle (a sector transfers in ceil(32/B) beats). Sector rule: a warp
-  access becomes one request per unique sector touched; broadcast = 1. No L1/L2: locality is software's
-  job. 1 outstanding ldg per warp.
+  access becomes one request per unique sector touched; broadcast load = 1. Multiple lanes in one stg
+  writing the same 32 bit word PANIC before the command enters the controller. No L1/L2: locality is
+  software's job. 1 outstanding ldg per warp.
+- Current first controller is the honest placeholder: finite sector capacity, fixed ready latency,
+  FIFO selection and one shared fixed-width bus. A command admits all of its sectors atomically or
+  structurally stalls; a command bigger than the whole controller PANICS. Replacing FIFO/fixed-ready
+  with the bank/row policy below must not change coalescing, request shape, bus beats or depbar semantics.
+- Core cycle is the simulator master time. Integer core_clock_hz and dram_clock_hz in the device
+  profile drive a rational phase accumulator, which may produce zero, one or several DRAM ticks in
+  one core cycle. Controller ready latency and bus bytes are per DRAM tick; instruction latencies,
+  stall counts, issue, RF and on-chip engines remain in core cycles. No floating-point time.
 - atomics: the CUDA menu (add/sub/min/max/and/or/xor/exch/cas u32/s32 + f32 add); old value returns via
   dep-barrier. shmem = globally blocking RMW engine on port A; gmem = atomic station at the controller
   (read beat + ALU + write beat, per-address ordered).
@@ -221,7 +255,7 @@ Commands can be queued. Queue depth is configurable. Stalls via depbar when queu
   optional deterministic refresh. Wall: no bank groups / command timing / channels / ECC. Ordering:
   out-of-order service but PER-ADDRESS ordered (write-queue forwarding); on-chip paths remain true FIFOs.
   NO stochastic noise, ever. Trace: per-bank tracks, row hit/miss coloring, turnaround marks, queue depth.
-- tma: blessed-tile bulk copy. Request form: rfc01.md. 64B shmem descriptors, rank 1-3; the
+- tma: blessed-tile bulk copy. Request form: trash/rfc01.md (closed, synced here). 64B shmem descriptors, rank 1-3; the
   instruction carries a descriptor address and one coordinate-register-group base. OOB =
   zero-fill reads / dropped writes; transpose-at-load for K.
   Engine queue depth: CONFIGURABLE, default 1 (ISA-invisible knob, same as the mma engine's).
@@ -231,18 +265,29 @@ Commands can be queued. Queue depth is configurable. Stalls via depbar when queu
 - Jurisdiction (subject to change): absolute sizes are FPGA (fit 7-series: DSP→tile, BRAM→srams, clock);
   ratios are nvidia-shaped (declared gmem ≈ 2-4 B/cyc, few hundred cycles latency).
 - ONE canonical device profile, published as a datasheet. Configurable in emu2 (designer), fixed for users.
+  The ground truth is profiles/nanosm-v0.json; unit-bearing names distinguish core cycles from
+  DRAM ticks.
 
 ## implementation
+- Launch is only initial state: encoded kernel words, active warp count, sparse shmem image and sparse
+  gmem image. Memories are zeroed, image segments are applied in order before cycle 0, then warps start
+  at pc 0. The container or transfer format is tooling and not architectural.
 - Bookkeeping (mbar words, mbar wait records, dep-barriers, counters): tracked as state, never as busy resources.
 - Kernel completion: every warp halted, DMA/MMA/RMW engines idle, controller queues (including the
   write queue) drained. The harness reads gmem only after this, so a trailing fence.g is hygiene,
   not load-bearing.
 - Counters: every resource accounts every cycle, mandatory stall reasons, attribution sums to total (a test).
+- Trace is typed at the event source (`issue`, warp state, depbar, shmem request, gmem command/sector/bus,
+  queue depth), never reconstructed from rendered debug strings. Constant-size summary counters are
+  always on. Perfetto/Chrome JSON capture is opt-in, repeated warp states become duration intervals,
+  bus beats are debug-only, queue counters emit only on change, and a hard event limit emits an
+  explicit truncation marker. Scheduler attribution sums to cycles; warp attribution sums to
+  cycles * active_warps.
 - No traps: every error PANICS deterministically (pc, reason, cycle, full state) — hazard violation, mbar
   misuse, OOB (incl. shmem, no wrapping), misalign, stack overflow, cycle cap (the whole sandbox).
 - Initial state = FF reset: all architectural state zeroed; gmem = the loaded image.
 
 ## open
 - Per-row scale operand on mma accumulate (folds FA O-rescale). Paper kernel adjudicates.
-- Remaining writing: cvt list, sread set, final mbar field widths, launch ABI page, numbers (SFU, acc.ld
-  bandwidth, latency table, clock ratio, DRAM preset).
+- Remaining writing: cvt list, sread set, final mbar field widths, numbers (SFU, acc.ld bandwidth,
+  latency table, clock ratio, DRAM preset).
