@@ -15,19 +15,42 @@ The top-level Makefile is a convenience wrapper around the same CMake build:
 make
 make test
 make run
+make trace-pipeline
 ```
 
-The kernel path is deliberately visible and editable:
+The kernel path is deliberately visible and editable. qtxc and qtxas produce the kernel image;
+make_demo_image supplies example launch state and packs the complete launch image:
 
 ```sh
 build/qtxc profiles/nanosm-v0.json kernels/vadd.qtx build/vadd.asm
 build/qtxas profiles/nanosm-v0.json build/vadd.asm build/vadd.hex
-build/nanosm_demo profiles/nanosm-v0.json build/vadd.hex
+build/make_demo_image profiles/nanosm-v0.json vadd build/vadd.hex build/vadd.launch.json
+build/nanosm_run profiles/nanosm-v0.json build/vadd.launch.json
 ```
 
-CMake performs those steps automatically for `build/generated/vadd.{asm,hex}`. On this Windows
-checkout, `scripts/build.ps1` locates the installed CMake, Ninja and MinGW tools and runs the same
-configure/build/test flow.
+CMake performs those steps automatically for both vadd and pipeline under `build/generated`.
+On this Windows checkout, `scripts/build.ps1` locates the installed CMake, Ninja and MinGW tools
+and runs the same configure/build/test flow.
+
+Launch demos are ordinary Python files next to their kernels. They build sparse initial memory,
+invoke qtx compilation and simulation in-process through `libnanosm_capi`, inspect the result, and
+can optionally write a Perfetto trace:
+
+```sh
+python -m nanosm kernels/pipeline.launch.py
+python -m nanosm kernels/pipeline_tma.launch.py
+```
+
+No Python package or third-party binding generator is required; the wrapper uses the standard
+library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `build`. A launch may
+also call `write_image(path)` to produce a self-contained `.launch.json` replay artifact for
+`nanosm_run`. The Python file is the authoring interface; JSON is transport, not another source of
+truth.
+
+The public boundary is [src/capi.h](src/capi.h): fixed-width C values, integer session handles,
+pointer-plus-length inputs, and caller-owned output buffers. It performs no file I/O and exposes no
+C++ objects or exceptions. The same functions are marked `EMSCRIPTEN_KEEPALIVE` under Emscripten,
+so a later browser shell can put JSON/QTX in linear memory and use this ABI directly.
 
 `qtx` has semantic instructions and no control bits. `asm` is scheduled qtx with explicit control
 fields and is the intended human-editable layer. `hex` is one annotated 64-bit instruction word per
@@ -42,13 +65,39 @@ The current control-flow slice supports labels, unconditional `bra`, per-lane pr
 predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
 Qtx conservatively drains live depbars and fixed-latency writes at every branch.
 
+Mbar instructions currently take an address in a uniform register with no encoded offset:
+`mbar.init`, `mbar.arrive`, `mbar.arrive.expect_tx`, `mbar.test_wait`, and bounded
+`mbar.try_wait`. A failed try-wait parks in one of the profile-defined exact-wake slots, then
+returns false on timeout; software loops when it needs a long wait.
+Counts, byte counts, and parity accept either a register or an immediate. Mbar objects are
+8-byte-aligned 64-bit shmem words; the exact field layout lives in `src/mbar.hpp`. The serialized
+RMW device consumes one read and one write cycle on port A. DMA/MMA completion uses the simulator's
+engine-facing `complete_mbar_tx` entry point rather than a SIMT instruction.
+
 The JSON parser is the pinned nlohmann/json v3.12.0 single header under `third_party/nlohmann` so
 configuration and builds remain offline and reproducible.
+
+A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,
+active warp count, and ordered sparse shmem/gmem byte segments. Bytes and 64-bit words are written
+as hexadecimal strings, while addresses are JSON integers. Segments are applied in array order and
+later overlapping bytes win. The simulator runner does not know which workload authored the image.
 
 The demo launches sparse global-memory input state and runs scalar `ldg`/`fadd`/`stg` vector add.
 The first controller coalesces warp accesses into 32-byte sectors, uses a finite FIFO with fixed
 latency, and transfers sectors over one fixed-width bus. This is the replaceable timing policy in
 front of the eventual bank/row scheduler, not a fixed-latency whole-load shortcut.
+
+The first TMA slice implements rank-1/2/3 load and store through that same controller and through
+contended shmem port A. `tma.async [descriptor], rcoord` captures three signed coordinates and
+continues; its 64-byte live descriptor is fetched from shmem later. Completion subtracts the full
+logical box debt from the descriptor's mbar only after load writes commit or store source bytes are
+captured. The v0 engine accepts element sizes 1, 2 and 4, dense shmem tiles, and zero-fills/drops
+out-of-bounds elements. Swizzle and transpose are deliberately rejected in this slice.
+
+`kernels/pipeline_tma.launch.py` authors four descriptors with `launch.shmem.tma_desc`, runs the
+double-buffered A/B pipeline, validates output, and writes `build/pipeline-tma.perfetto.json`.
+The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared
+bus ownership, and logical/useful/physical byte totals.
 
 The core cycle is simulation time. `core_clock_hz` and `dram_clock_hz` derive deterministic DRAM
 ticks with an integer phase accumulator. Controller latency and bus bytes are in DRAM ticks;
@@ -58,11 +107,17 @@ The simulator always collects a constant-size performance summary. Generate an o
 timeline with:
 
 ```powershell
-.\build\nanosm_demo.exe profiles\nanosm-v0.json build\generated\vadd.hex `
-  --trace build\vadd.perfetto.json
+.\build\nanosm_run.exe profiles\nanosm-v0.json build\generated\pipeline.launch.json `
+  --trace build\pipeline.perfetto.json
 ```
 
-Open `build/vadd.perfetto.json` in https://ui.perfetto.dev using **Open trace file**. The default
+Or generate the same pipeline trace through CMake:
+
+```powershell
+cmake --build build --target trace_pipeline
+```
+
+Open `build/pipeline.perfetto.json` in https://ui.perfetto.dev using **Open trace file**. The default
 timeline contains interval-compressed warp states, issued instructions, shmem requests, gmem command
 lifetimes, sector bus occupancy, depbar changes, and queue-depth transitions. Individual bus beats
 are omitted; add `--trace-debug` when that detail is useful. Timeline recording is otherwise off,

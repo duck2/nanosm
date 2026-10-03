@@ -5,16 +5,47 @@
     "banks": 3,
     "rows_per_bank": 176,
     "read_ports_per_bank": 1,
-    "write_ports_per_bank": 1
+    "write_ports_per_bank": 1,
+    "arithmetic_read_cycles": 1
   },
   "shmem": {
     "bytes": 65536,
     "banks": 16
   },
+  "tmem": {
+    "banks": 2,
+    "words_per_bank": 4096,
+    "fine_banks": 16,
+    "max_vector_width": 8,
+    "simt_read_write_duplex": false
+  },
+  "mma": {
+    "m": 64,
+    "n": 64,
+    "k": 8,
+    "core_m": 4,
+    "core_n": 4,
+    "core_k": 4,
+    "queue_commands": 2,
+    "result_latency_cycles": 8,
+    "layout": "xor64"
+  },
+  "sync": {
+    "mbar_wait_slots": 8,
+    "mbar_try_wait_timeout_cycles": 64
+  },
+  "tma": {
+    "queue_commands": 4,
+    "sector_credits": 16
+  },
   "core": {
     "clock_hz": 1000000000,
     "alu_latency_cycles": 1,
     "fadd_latency_cycles": 4
+  },
+  "sfu": {
+    "lanes": 4,
+    "latency_cycles": 8
   },
   "gmem": {
     "bytes": 1048576,

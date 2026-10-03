@@ -1,0 +1,140 @@
+; Saturation experiment: the tma pipeline with 64-element (256B, 8-sector) tiles.
+; One stage is A+B = 512B, so two stages want 1KB in flight and the 16-sector credit
+; pool becomes the binding limit exactly as it was sized (512B >= the ~400B BDP).
+; Prediction on record: gmem bus occupancy in the 80-90s, max_credits pinned at 16.
+;
+; 512 elements per array, 8 stage-fills, C[i] = A[i] + B[i]. The consumer covers a
+; tile in 4 lane-width chunks using distinct register pairs so chunks can overlap;
+; pairs are chosen against the reg-mod-3 read-port rule (r28 would collide with r1).
+
+.equ C,      8192
+.equ SA0,    0
+.equ SB0,    256
+.equ SA1,    512
+.equ SB1,    768
+.equ FULL0,  1024
+.equ FULL1,  1032
+.equ EMPTY0, 1040
+.equ EMPTY1, 1048
+.equ ADESC0, 1152
+.equ BDESC0, 1216
+.equ ADESC1, 1280
+.equ BDESC1, 1344
+
+        sread r0, WARP_ID
+        setp.eq p0, r0, 0
+@p0     bra.uni PRODUCER
+
+; ---- consumer: warp 1 ----
+        sread r0, LANE_ID
+        shli  r0, r0, 2
+        addi  r10, r0, SA0
+        addi  r11, r0, SB0
+        addi  r12, r0, SA1
+        addi  r13, r0, SB1
+        addi  r1, r0, C
+        mov   r14, FULL0
+        mov   r15, FULL1
+        mov   r16, EMPTY0
+        mov   r17, EMPTY1
+        mov   r18, 0
+        mov   r19, 0
+        mov   r3, 4
+CLOOP:  setp.le p1, r3, 0
+@p1     bra.uni CDONE
+CF0:    mbar.try_wait p3, [r14], r18
+@!p3    bra.uni CF0
+        xori  r18, r18, 1
+        lds   r8, [r10]
+        lds   r9, [r11]
+        fadd  r8, r8, r9
+        stg   [r1], r8
+        addi  r1, r1, 64
+        lds   r24, [r10 + 64]
+        lds   r25, [r11 + 64]
+        fadd  r24, r24, r25
+        stg   [r1], r24
+        addi  r1, r1, 64
+        lds   r26, [r10 + 128]
+        lds   r27, [r11 + 128]
+        fadd  r26, r26, r27
+        stg   [r1], r26
+        addi  r1, r1, 64
+        lds   r30, [r10 + 192]
+        lds   r31, [r11 + 192]
+        fadd  r30, r30, r31
+        mbar.arrive [r16]
+        stg   [r1], r30
+        addi  r1, r1, 64
+CF1:    mbar.try_wait p3, [r15], r19
+@!p3    bra.uni CF1
+        xori  r19, r19, 1
+        lds   r8, [r12]
+        lds   r9, [r13]
+        fadd  r8, r8, r9
+        stg   [r1], r8
+        addi  r1, r1, 64
+        lds   r24, [r12 + 64]
+        lds   r25, [r13 + 64]
+        fadd  r24, r24, r25
+        stg   [r1], r24
+        addi  r1, r1, 64
+        lds   r26, [r12 + 128]
+        lds   r27, [r13 + 128]
+        fadd  r26, r26, r27
+        stg   [r1], r26
+        addi  r1, r1, 64
+        lds   r30, [r12 + 192]
+        lds   r31, [r13 + 192]
+        fadd  r30, r30, r31
+        mbar.arrive [r17]
+        stg   [r1], r30
+        addi  r1, r1, 64
+        addi  r3, r3, -1
+        bra.uni CLOOP
+CDONE:  halt
+
+; ---- producer: warp 0 ----
+PRODUCER:
+        mov   r14, FULL0
+        mov   r15, FULL1
+        mov   r16, EMPTY0
+        mov   r17, EMPTY1
+        mov   r18, 0
+        mov   r19, 0
+        mov   r20, 0
+        mov   r21, 0
+        mov   r22, 0
+
+        mbar.arrive.expect_tx [r14], 512
+        tma.async [ADESC0], r20
+        tma.async [BDESC0], r20
+        addi  r20, r20, 64
+        mbar.arrive.expect_tx [r15], 512
+        tma.async [ADESC1], r20
+        tma.async [BDESC1], r20
+        addi  r20, r20, 64
+
+        mov   r3, 6
+PLOOP:  setp.le p1, r3, 0
+@p1     bra.uni PDONE
+PE0:    mbar.try_wait p3, [r16], r18
+@!p3    bra.uni PE0
+        xori  r18, r18, 1
+        mbar.arrive.expect_tx [r14], 512
+        tma.async [ADESC0], r20
+        tma.async [BDESC0], r20
+        addi  r20, r20, 64
+        addi  r3, r3, -1
+        setp.le p1, r3, 0
+@p1     bra.uni PDONE
+PE1:    mbar.try_wait p3, [r17], r19
+@!p3    bra.uni PE1
+        xori  r19, r19, 1
+        mbar.arrive.expect_tx [r15], 512
+        tma.async [ADESC1], r20
+        tma.async [BDESC1], r20
+        addi  r20, r20, 64
+        addi  r3, r3, -1
+        bra.uni PLOOP
+PDONE:  halt

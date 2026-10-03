@@ -19,6 +19,10 @@ constexpr uint32_t shmem_track = 1000;
 constexpr uint32_t gmem_bus_track = 1001;
 constexpr uint32_t gmem_command_track = 1002;
 constexpr uint32_t gmem_queue_track = 1003;
+constexpr uint32_t tma_command_track = 1010;
+constexpr uint32_t tma_command_depth_track = 1011;
+constexpr uint32_t tma_credit_depth_track = 1012;
+constexpr uint32_t tma_return_depth_track = 1013;
 
 std::string category_name(TraceCategory category) {
     switch (category) {
@@ -27,6 +31,9 @@ std::string category_name(TraceCategory category) {
     case TraceCategory::shmem: return "shmem";
     case TraceCategory::gmem: return "gmem";
     case TraceCategory::sync: return "sync";
+    case TraceCategory::tma: return "tma";
+    case TraceCategory::tmem: return "tmem";
+    case TraceCategory::mma: return "mma";
     }
     return "unknown";
 }
@@ -43,6 +50,8 @@ std::string warp_state_name(WarpState state) {
     case WarpState::issued: return "issued";
     case WarpState::stall_count: return "stall count";
     case WarpState::depbar: return "depbar";
+    case WarpState::mbar_wait: return "mbar wait";
+    case WarpState::mbar_wait_slot: return "mbar wait slot";
     case WarpState::structural: return "structural";
     case WarpState::halted: return "halted";
     case WarpState::count: break;
@@ -50,9 +59,14 @@ std::string warp_state_name(WarpState state) {
     return "unknown";
 }
 
-TraceRecorder::TraceRecorder(uint32_t active_warps, uint64_t core_clock_hz, TraceOptions options)
+TraceRecorder::TraceRecorder(
+    uint32_t active_warps,
+    uint64_t core_clock_hz,
+    uint64_t dram_clock_hz,
+    TraceOptions options)
     : active_warps_(active_warps),
       core_clock_hz_(core_clock_hz),
+      dram_clock_hz_(dram_clock_hz),
       options_(options),
       warp_intervals_(active_warps) {
     if (options_.timeline) events_.reserve(std::min<std::size_t>(options_.max_events, 4096));
@@ -87,6 +101,21 @@ void TraceRecorder::issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Inst
     });
 }
 
+void TraceRecorder::rf_read(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank) {
+    if (!options_.debug) return;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::instruction,
+        "RF read",
+        "r" + std::to_string(reg) + ", bank=" + std::to_string(bank),
+        warp_track_base + warp,
+        cycle,
+        0,
+        static_cast<int64_t>(bank),
+        reg,
+    });
+}
+
 void TraceRecorder::scheduler_idle(bool draining) {
     if (draining) ++summary_.scheduler_draining_cycles;
     else ++summary_.scheduler_idle_cycles;
@@ -108,6 +137,7 @@ void TraceRecorder::close_warp_interval(uint32_t warp, uint64_t end_cycle) {
 
 void TraceRecorder::warp_state(uint64_t cycle, uint32_t warp, WarpState state, std::string detail) {
     ++summary_.warp_cycles.at(static_cast<std::size_t>(state));
+    if (state == WarpState::mbar_wait_slot) ++summary_.mbar_slot_full_stalls;
     auto& interval = warp_intervals_.at(warp);
     if (interval.active && interval.state == state && interval.detail == detail) return;
     close_warp_interval(warp, cycle);
@@ -128,6 +158,44 @@ void TraceRecorder::depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t 
     });
 }
 
+void TraceRecorder::tmem_beat(
+    uint64_t cycle, uint32_t warp, uint32_t bank, bool load, uint32_t column) {
+    if (load) ++summary_.tmem_load_beats;
+    else ++summary_.tmem_store_beats;
+    add({TraceEventKind::instant, TraceCategory::tmem, load ? "acc.ld beat" : "acc.st beat",
+        "warp=" + std::to_string(warp) + ", bank=" + std::to_string(bank) +
+            ", column=" + std::to_string(column),
+        1020 + bank, cycle, 0, static_cast<int64_t>(column)});
+}
+
+void TraceRecorder::mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init) {
+    ++summary_.mma_commands;
+    add({TraceEventKind::instant, TraceCategory::mma, init ? "mma.async.init" : "mma.async",
+        "warp=" + std::to_string(warp), 1040, cycle, 0, 0, command});
+}
+
+void TraceRecorder::mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step) {
+    ++summary_.mma_input_steps;
+    summary_.mma_shmem_rounds += rounds;
+    add({TraceEventKind::instant, TraceCategory::mma, "MMA input step",
+        "rounds=" + std::to_string(rounds), 1040, cycle, 0, step, command});
+}
+
+void TraceRecorder::mma_result(uint64_t cycle, uint64_t command, uint32_t step) {
+    ++summary_.mma_result_steps;
+    add({TraceEventKind::instant, TraceCategory::mma, "MMA tmem write",
+        {}, 1041, cycle, 0, step, command});
+}
+
+void TraceRecorder::mma_recurrence_stall() { ++summary_.mma_recurrence_stalls; }
+
+void TraceRecorder::sfu_accept(uint32_t occupancy_cycles) {
+    ++summary_.sfu_ops;
+    summary_.sfu_busy_cycles += occupancy_cycles;
+}
+
+void TraceRecorder::sfu_unit_stall() { ++summary_.sfu_unit_stalls; }
+
 void TraceRecorder::shmem_begin(uint64_t cycle, uint32_t warp, bool load, uint32_t rounds) {
     ++summary_.shmem_requests;
     shmem_slice_ = OpenSlice{
@@ -136,6 +204,19 @@ void TraceRecorder::shmem_begin(uint64_t cycle, uint32_t warp, bool load, uint32
         TraceCategory::shmem,
         load ? "lds" : "sts",
         "warp=" + std::to_string(warp) + ", rounds=" + std::to_string(rounds),
+    };
+}
+
+void TraceRecorder::tma_port_begin(
+    uint64_t cycle, uint64_t command, std::string operation, uint32_t rounds) {
+    ++summary_.shmem_requests;
+    shmem_slice_ = OpenSlice{
+        cycle,
+        shmem_track,
+        TraceCategory::tma,
+        std::move(operation),
+        "command=" + std::to_string(command) + ", rounds=" + std::to_string(rounds),
+        command,
     };
 }
 
@@ -164,6 +245,79 @@ void TraceRecorder::shmem_end(uint64_t end_cycle) {
     shmem_slice_.reset();
 }
 
+void TraceRecorder::mbar_rmw_begin(
+    uint64_t cycle, uint32_t byte_address, std::string operation) {
+    ++summary_.mbar_rmw_requests;
+    mbar_rmw_slice_ = OpenSlice{
+        cycle,
+        shmem_track,
+        TraceCategory::sync,
+        "mbar RMW",
+        std::move(operation) + ", address=" + std::to_string(byte_address),
+    };
+}
+
+void TraceRecorder::mbar_rmw_end(uint64_t end_cycle, bool phase_changed) {
+    if (!mbar_rmw_slice_.has_value()) throw std::runtime_error("trace mbar RMW end without begin");
+    if (phase_changed) ++summary_.mbar_phase_changes;
+    close_slice(std::move(*mbar_rmw_slice_), end_cycle);
+    mbar_rmw_slice_.reset();
+}
+
+void TraceRecorder::mbar_probe(
+    uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity, bool complete) {
+    ++summary_.mbar_initial_probes;
+    if (complete) ++summary_.mbar_immediate_successes;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::sync,
+        "mbar try-wait probe",
+        "address=" + std::to_string(byte_address) + ", parity=" + std::to_string(parity) +
+            ", complete=" + (complete ? "true" : "false"),
+        warp_track_base + warp,
+        cycle,
+    });
+}
+
+void TraceRecorder::mbar_sleep(
+    uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity) {
+    ++summary_.mbar_sleeps;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::sync,
+        "mbar sleep",
+        "address=" + std::to_string(byte_address) + ", parity=" + std::to_string(parity),
+        warp_track_base + warp,
+        cycle,
+    });
+}
+
+void TraceRecorder::mbar_wake(
+    uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t phase) {
+    ++summary_.mbar_wakes;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::sync,
+        "mbar wake",
+        "address=" + std::to_string(byte_address) + ", phase=" + std::to_string(phase),
+        warp_track_base + warp,
+        cycle,
+    });
+}
+
+void TraceRecorder::mbar_timeout(
+    uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity) {
+    ++summary_.mbar_timeouts;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::sync,
+        "mbar try-wait timeout",
+        "address=" + std::to_string(byte_address) + ", parity=" + std::to_string(parity),
+        warp_track_base + warp,
+        cycle,
+    });
+}
+
 void TraceRecorder::gmem_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, bool load) {
     ++summary_.gmem_commands;
     gmem_commands_.emplace(command, OpenSlice{
@@ -190,15 +344,76 @@ void TraceRecorder::gmem_sector_enqueue() {
 }
 
 void TraceRecorder::gmem_bus_begin(
-    uint64_t cycle, uint64_t request, uint64_t sector_address, bool load) {
+    uint64_t cycle, uint64_t request, uint64_t sector_address, bool load, std::string owner) {
     gmem_bus_requests_.emplace(request, OpenSlice{
         cycle,
         gmem_bus_track,
         TraceCategory::gmem,
         load ? "read sector" : "write sector",
-        "address=" + std::to_string(sector_address),
+        "address=" + std::to_string(sector_address) + ", owner=" + std::move(owner),
         request,
     });
+}
+
+void TraceRecorder::tma_command_begin(
+    uint64_t cycle, uint64_t command, uint32_t warp, uint32_t descriptor_address,
+    std::size_t command_depth) {
+    ++summary_.tma_commands;
+    tma_commands_.emplace(command, OpenSlice{
+        cycle,
+        tma_command_track,
+        TraceCategory::tma,
+        "tma command",
+        "warp=" + std::to_string(warp) + ", descriptor=" +
+            std::to_string(descriptor_address),
+        command,
+        true,
+    });
+    tma_depths(cycle, command_depth, last_tma_credit_depth_.value_or(0),
+        last_tma_return_depth_.value_or(0));
+}
+
+void TraceRecorder::tma_command_end(
+    uint64_t end_cycle, uint64_t command, uint64_t logical_bytes, uint64_t useful_bytes) {
+    const auto found = tma_commands_.find(command);
+    if (found == tma_commands_.end()) {
+        throw std::runtime_error("trace tma command end without begin");
+    }
+    ++summary_.tma_command_completions;
+    summary_.tma_logical_bytes += logical_bytes;
+    summary_.tma_useful_bytes += useful_bytes;
+    close_slice(std::move(found->second), end_cycle);
+    tma_commands_.erase(found);
+}
+
+void TraceRecorder::tma_sector(uint32_t sector_bytes) {
+    summary_.tma_sector_bytes += sector_bytes;
+}
+
+void TraceRecorder::tma_data_port(uint32_t rounds) {
+    ++summary_.tma_port_requests;
+    summary_.tma_port_rounds += rounds;
+}
+
+void TraceRecorder::tma_depths(
+    uint64_t cycle, std::size_t command_depth, std::size_t credit_depth,
+    std::size_t return_depth) {
+    summary_.tma_max_command_depth =
+        std::max<uint64_t>(summary_.tma_max_command_depth, command_depth);
+    summary_.tma_max_credit_depth =
+        std::max<uint64_t>(summary_.tma_max_credit_depth, credit_depth);
+    summary_.tma_max_return_depth =
+        std::max<uint64_t>(summary_.tma_max_return_depth, return_depth);
+    const auto counter = [&](std::optional<std::size_t>& previous, std::size_t value,
+                             uint32_t track, const char* name) {
+        if (previous == value) return;
+        previous = value;
+        add({TraceEventKind::counter, TraceCategory::tma, name, {}, track, cycle, 0,
+            static_cast<int64_t>(value)});
+    };
+    counter(last_tma_command_depth_, command_depth, tma_command_depth_track, "command depth");
+    counter(last_tma_credit_depth_, credit_depth, tma_credit_depth_track, "sector credits");
+    counter(last_tma_return_depth_, return_depth, tma_return_depth_track, "return depth");
 }
 
 void TraceRecorder::gmem_bus_beat(uint64_t cycle, uint64_t dram_tick, uint64_t request) {
@@ -265,23 +480,59 @@ std::string TraceRecorder::summary_text() const {
     }
     out << "shmem: requests=" << summary_.shmem_requests
         << " rounds=" << summary_.shmem_rounds << '\n';
+    out << "mbar: rmw=" << summary_.mbar_rmw_requests
+        << " phase_changes=" << summary_.mbar_phase_changes
+        << " probes=" << summary_.mbar_initial_probes
+        << " immediate=" << summary_.mbar_immediate_successes
+        << " slot_full=" << summary_.mbar_slot_full_stalls
+        << " sleeps=" << summary_.mbar_sleeps
+        << " wakes=" << summary_.mbar_wakes
+        << " timeouts=" << summary_.mbar_timeouts << '\n';
     out << "gmem: commands=" << summary_.gmem_commands
         << " sectors=" << summary_.gmem_sectors
         << " beats=" << summary_.gmem_bus_beats
         << " bytes=" << summary_.gmem_bytes
         << " max_queue=" << summary_.gmem_max_queue_depth << '\n';
+    // The achieved-vs-roofline number: beats are DRAM bus ticks, so occupancy is
+    // beats over the run's total DRAM ticks.
+    if (summary_.cycles != 0 && core_clock_hz_ != 0 && dram_clock_hz_ != 0) {
+        const auto dram_ticks = summary_.cycles * dram_clock_hz_ / core_clock_hz_;
+        if (dram_ticks != 0) {
+            out << "gmem bus occupancy             " << std::fixed << std::setprecision(1)
+                << percent(summary_.gmem_bus_beats, dram_ticks) << "% ("
+                << summary_.gmem_bus_beats << " of " << dram_ticks << " dram ticks)\n";
+        }
+    }
     if (summary_.gmem_commands != 0) {
         out << "gmem avg command latency       "
             << summary_.gmem_command_latency_cycles / summary_.gmem_commands << " cycles\n";
     }
+    out << "tma: commands=" << summary_.tma_commands
+        << " completed=" << summary_.tma_command_completions
+        << " logical_bytes=" << summary_.tma_logical_bytes
+        << " useful_bytes=" << summary_.tma_useful_bytes
+        << " sector_bytes=" << summary_.tma_sector_bytes
+        << " port_requests=" << summary_.tma_port_requests
+        << " port_rounds=" << summary_.tma_port_rounds
+        << " max_commands=" << summary_.tma_max_command_depth
+        << " max_credits=" << summary_.tma_max_credit_depth
+        << " max_returns=" << summary_.tma_max_return_depth << '\n';
+    out << "tmem: load_beats=" << summary_.tmem_load_beats
+        << " store_beats=" << summary_.tmem_store_beats << '\n';
+    out << "mma: commands=" << summary_.mma_commands
+        << " input_steps=" << summary_.mma_input_steps
+        << " result_steps=" << summary_.mma_result_steps
+        << " shmem_rounds=" << summary_.mma_shmem_rounds
+        << " recurrence_stalls=" << summary_.mma_recurrence_stalls << '\n';
+    out << "sfu: ops=" << summary_.sfu_ops
+        << " busy_cycles=" << summary_.sfu_busy_cycles
+        << " unit_stalls=" << summary_.sfu_unit_stalls << '\n';
     if (truncated()) out << "timeline events dropped        " << summary_.timeline_events_dropped << '\n';
     return out.str();
 }
 
-void TraceRecorder::write_perfetto(const std::string& path) const {
-    std::ofstream output(path);
-    if (!output) throw std::runtime_error("cannot create trace '" + path + "'");
-
+std::string TraceRecorder::perfetto_json() const {
+    std::ostringstream output;
     output << R"({"traceEvents":[)";
     bool first = true;
     const auto write = [&](const json& item) {
@@ -303,6 +554,10 @@ void TraceRecorder::write_perfetto(const std::string& path) const {
     metadata(gmem_bus_track, "gmem bus");
     metadata(gmem_command_track, "gmem commands");
     metadata(gmem_queue_track, "gmem queue");
+    metadata(tma_command_track, "tma commands");
+    metadata(tma_command_depth_track, "tma command depth");
+    metadata(tma_credit_depth_track, "tma sector credits");
+    metadata(tma_return_depth_track, "tma returns");
 
     const auto timestamp = [&](uint64_t cycle) {
         return static_cast<double>(cycle) * 1'000'000.0 / static_cast<double>(core_clock_hz_);
@@ -361,6 +616,13 @@ void TraceRecorder::write_perfetto(const std::string& path) const {
         });
     }
     output << R"(],"displayTimeUnit":"ns"})";
+    return output.str();
+}
+
+void TraceRecorder::write_perfetto(const std::string& path) const {
+    std::ofstream output(path);
+    if (!output) throw std::runtime_error("cannot create trace '" + path + "'");
+    output << perfetto_json();
 }
 
 } // namespace nanosm

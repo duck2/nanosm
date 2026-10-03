@@ -17,6 +17,8 @@ enum class WarpState : uint8_t {
     issued,
     stall_count,
     depbar,
+    mbar_wait,
+    mbar_wait_slot,
     structural,
     halted,
     count,
@@ -34,6 +36,9 @@ enum class TraceCategory : uint8_t {
     shmem,
     gmem,
     sync,
+    tma,
+    tmem,
+    mma,
 };
 
 struct TraceOptions {
@@ -67,41 +72,108 @@ struct TraceSummary {
     std::array<uint64_t, static_cast<std::size_t>(WarpState::count)> warp_cycles{};
     uint64_t shmem_requests = 0;
     uint64_t shmem_rounds = 0;
+    uint64_t mbar_rmw_requests = 0;
+    uint64_t mbar_phase_changes = 0;
+    uint64_t mbar_initial_probes = 0;
+    uint64_t mbar_immediate_successes = 0;
+    uint64_t mbar_slot_full_stalls = 0;
+    uint64_t mbar_sleeps = 0;
+    uint64_t mbar_wakes = 0;
+    uint64_t mbar_timeouts = 0;
     uint64_t gmem_commands = 0;
     uint64_t gmem_sectors = 0;
     uint64_t gmem_bus_beats = 0;
     uint64_t gmem_bytes = 0;
     uint64_t gmem_command_latency_cycles = 0;
     uint64_t gmem_max_queue_depth = 0;
+    uint64_t tma_commands = 0;
+    uint64_t tma_command_completions = 0;
+    uint64_t tma_logical_bytes = 0;
+    uint64_t tma_useful_bytes = 0;
+    uint64_t tma_sector_bytes = 0;
+    // Data placement/readback on port A: one request per TMA load-write (incl.
+    // synthetic OOB zero fills) or store-read, and the bank rounds those
+    // requests consume. Descriptor and mbar-phase reads are excluded.
+    uint64_t tma_port_requests = 0;
+    uint64_t tma_port_rounds = 0;
+    uint64_t tma_max_command_depth = 0;
+    uint64_t tma_max_credit_depth = 0;
+    uint64_t tma_max_return_depth = 0;
+    uint64_t tmem_load_beats = 0;
+    uint64_t tmem_store_beats = 0;
+    uint64_t mma_commands = 0;
+    uint64_t mma_input_steps = 0;
+    uint64_t mma_result_steps = 0;
+    uint64_t mma_recurrence_stalls = 0;
+    uint64_t mma_shmem_rounds = 0;
+    uint64_t sfu_ops = 0;
+    uint64_t sfu_busy_cycles = 0;
+    uint64_t sfu_unit_stalls = 0;
     uint64_t timeline_events_dropped = 0;
 };
 
 class TraceRecorder {
 public:
-    TraceRecorder(uint32_t active_warps, uint64_t core_clock_hz, TraceOptions options = {});
+    TraceRecorder(
+        uint32_t active_warps,
+        uint64_t core_clock_hz,
+        uint64_t dram_clock_hz,
+        TraceOptions options = {});
 
     void issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Instruction& instruction);
+    void rf_read(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank);
+    void sfu_accept(uint32_t occupancy_cycles);
+    void sfu_unit_stall();
     void scheduler_idle(bool draining);
     void warp_state(uint64_t cycle, uint32_t warp, WarpState state, std::string detail = {});
 
     void depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t value);
     void shmem_begin(uint64_t cycle, uint32_t warp, bool load, uint32_t rounds);
+    void tma_port_begin(
+        uint64_t cycle, uint64_t command, std::string operation, uint32_t rounds);
     void shmem_round();
     void shmem_end(uint64_t end_cycle);
+    void mbar_rmw_begin(uint64_t cycle, uint32_t byte_address, std::string operation);
+    void mbar_rmw_end(uint64_t end_cycle, bool phase_changed);
+    void mbar_probe(
+        uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity, bool complete);
+    void mbar_sleep(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
+    void mbar_wake(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t phase);
+    void mbar_timeout(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
 
     void gmem_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, bool load);
     void gmem_command_end(uint64_t end_cycle, uint64_t command);
     void gmem_sector_enqueue();
-    void gmem_bus_begin(uint64_t cycle, uint64_t request, uint64_t sector_address, bool load);
+    void gmem_bus_begin(
+        uint64_t cycle, uint64_t request, uint64_t sector_address, bool load,
+        std::string owner = "simt");
     void gmem_bus_beat(uint64_t cycle, uint64_t dram_tick, uint64_t request);
     void gmem_bus_end(uint64_t end_cycle, uint64_t request, uint32_t sector_bytes);
     void gmem_queue_depth(uint64_t cycle, std::size_t depth);
+
+    void tma_command_begin(
+        uint64_t cycle, uint64_t command, uint32_t warp, uint32_t descriptor_address,
+        std::size_t command_depth);
+    void tma_command_end(
+        uint64_t end_cycle, uint64_t command, uint64_t logical_bytes, uint64_t useful_bytes);
+    void tma_sector(uint32_t sector_bytes);
+    void tma_data_port(uint32_t rounds);
+    void tma_depths(
+        uint64_t cycle, std::size_t command_depth, std::size_t credit_depth,
+        std::size_t return_depth);
+    void tmem_beat(
+        uint64_t cycle, uint32_t warp, uint32_t bank, bool load, uint32_t column);
+    void mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init);
+    void mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step);
+    void mma_result(uint64_t cycle, uint64_t command, uint32_t step);
+    void mma_recurrence_stall();
 
     void finish(uint64_t cycle);
     [[nodiscard]] const TraceSummary& summary() const { return summary_; }
     [[nodiscard]] const std::vector<TimelineEvent>& events() const { return events_; }
     [[nodiscard]] bool truncated() const { return summary_.timeline_events_dropped != 0; }
     [[nodiscard]] std::string summary_text() const;
+    [[nodiscard]] std::string perfetto_json() const;
     void write_perfetto(const std::string& path) const;
 
 private:
@@ -124,14 +196,20 @@ private:
 
     uint32_t active_warps_ = 0;
     uint64_t core_clock_hz_ = 0;
+    uint64_t dram_clock_hz_ = 0;
     TraceOptions options_;
     TraceSummary summary_;
     std::vector<TimelineEvent> events_;
     std::vector<WarpInterval> warp_intervals_;
     std::optional<OpenSlice> shmem_slice_;
+    std::optional<OpenSlice> mbar_rmw_slice_;
     std::map<uint64_t, OpenSlice> gmem_commands_;
     std::map<uint64_t, OpenSlice> gmem_bus_requests_;
+    std::map<uint64_t, OpenSlice> tma_commands_;
     std::optional<std::size_t> last_gmem_queue_depth_;
+    std::optional<std::size_t> last_tma_command_depth_;
+    std::optional<std::size_t> last_tma_credit_depth_;
+    std::optional<std::size_t> last_tma_return_depth_;
 
     void add(TimelineEvent event);
     void close_warp_interval(uint32_t warp, uint64_t end_cycle);

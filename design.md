@@ -29,7 +29,9 @@ Milestone: it's a thing when it runs flash attention and emits a trace.
   simulator reject a mismatch because scheduled stalls are profile-specific. qtxas derives the
   kernel's contiguous register allocation as highest referenced register + 1 and hex carries it.
   The fingerprint is 64 bit FNV-1a over the canonical compact JSON serialization; it is stable
-  across standard-library implementations
+  across standard-library implementations. The profile also sizes independently scarce devices;
+  resident warp capacity comes from the RF while mbar parked-wait capacity comes from
+  mbar_wait_slots
 - Written from one thread's point of view. Convention of per-warp PC & masked execution
 - PTX-like language, "qtx" for now. qtx -> asm -> hex, compiler takes gpu configuration
 - .v8 ldg/stg exist
@@ -118,31 +120,41 @@ other agents' writes visible; warp-scoping it would buy nothing.
 4. shmem atomics
 5. mbar (sync device provided by shmem atomics)
 
-No hbar or hardware barrier file in v0. Mbar state stays in shmem; blocking mbar.wait keeps only
-one sleep/wakeup record next to each warp's scheduler state.
+No hbar or hardware barrier file in v0. Mbar state stays in shmem. A small profile-sized exact
+wake table holds only the warps currently parked in mbar.try_wait; it is not sized from RF
+residency.
 
 ## Mbar
 mbar is an opaque 8-byte-aligned 64 bit object in shmem. Physically it's two adjacent 32 bit
-words in two banks. Exact field widths later but conceptually it contains {phase, expected
-arrivals, remaining arrivals, remaining tx bytes}.
+words in two banks. From low to high its fields are phase:1, valid:1, expected arrivals:15,
+remaining arrivals:15, and remaining tx bytes:32. Thus one phase accepts at most 32767 arrival
+events and 2^32-1 exact transaction bytes. The valid bit distinguishes zeroed shmem from an
+initialized barrier.
 
-mbar.* is warp-uniform: thread 0 makes one request on behalf of the warp, test_wait broadcasts its
-predicate and wait sleeps the whole warp. Executing one under a nonuniform mask PANICS. expected
-counts arrival events from warps or engines; waiting warps and active lanes are not participants
-and don't affect the count.
+mbar.* is warp-uniform: thread 0 makes one request on behalf of the warp, test_wait and try_wait
+broadcast their predicate, and an incomplete try_wait sleeps the whole warp. Executing one under
+a nonuniform mask PANICS. expected counts arrival events from warps or engines; waiting warps and
+active lanes are not participants and don't affect the count.
 
-The RMW engine blocks shmem service, reads both words, updates the decoded 64 bit state, writes
-both words, and unblocks it. Since atomics block the banks anyway, making mbar 32 bit saves four
-bytes per barrier but doesn't buy useful concurrency. 64 bit also avoids prematurely squeezing
-the arrival and exact-byte tx counts.
+The RMW engine has no input FIFO, matching port A's single-request discipline. It serves one
+operation at a time; a SIMT mbar operation stalls structurally at issue while port A or the engine
+is busy, exactly like lds/sts, and each engine (DMA completing tx, MMA committing) holds at most
+one pending mbar event of its own and lines up for the free engine ahead of new SIMT work. Requests
+live with their requesters, so there is no shared queue to size. One update takes two core cycles:
+read both words, then validate/update/write both words and broadcast any phase change. A warp's own
+sts before mbar.arrive needs no fence: both serialize through port A, so the arrive cannot start
+until the store's rounds have committed. Since atomics block the banks anyway, making mbar 32 bit
+saves four bytes per barrier but doesn't buy useful concurrency. 64 bit also avoids prematurely
+squeezing the arrival and exact-byte tx counts.
 
 mbar.init [x], n: phase=0, expected=n, remaining=n, tx=0.
 mbar.arrive [x]: atomic remaining--.
 mbar.arrive.expect_tx [x], bytes: atomic remaining-- and tx+=bytes. These have to happen in
 one RMW bc doing arrive first could briefly complete the barrier before tx is added.
 
-complete_tx [x], bytes isn't a SIMT instruction. DMA does it internally after the corresponding
-shmem writes have actually committed. It atomically does tx-=bytes.
+complete_tx [x], bytes, parity isn't a SIMT instruction. DMA does it internally after the
+corresponding shmem writes have actually committed. The engine request carries the phase captured
+for that transfer; it atomically does tx-=bytes and PANICS if the mbar has already changed phase.
 
 MMA operand-consumed clears a depbar belonging to the issuing warp; it doesn't touch an mbar.
 Software may wait for that depbar and do an ordinary mbar.arrive to hand a consumed shmem stage
@@ -155,18 +167,29 @@ mbar.test_wait p, [x], parity is a plain single-cycle port A read of the word ho
 sets p=(phase != parity) and never blocks. The RMW engine writes phase last, so a test racing an
 update observes either the old or the new phase, and both are legal outcomes.
 
-mbar.wait [x], parity performs the same test. If the phase is already complete it retires;
-otherwise the warp sleeps with one {mbar address, parity} wait record in the scheduler and does
-not keep reading port A. When the RMW engine flips a phase it broadcasts {address, new phase} and
-every matching warp wakes. Installing the wait record before checking the phase visible after
-that cycle's RMW step closes the check/sleep race. Software keeps and flips the parity bit after
-either kind of successful wait.
+mbar.try_wait p, [x], parity first reserves one of the profile's mbar_wait_slots and installs
+{warp, address, parity, pdst}, then performs the same phase test. If complete it writes p=true and
+immediately frees the slot. Otherwise the warp parks without further port A reads. When the RMW
+engine flips a phase it broadcasts {address, new phase}; every exact matching slot writes p=true,
+wakes its warp and frees itself. Install-before-probe closes the check/sleep race. If all slots are
+occupied, a new try_wait stalls structurally before its probe; every warp may use the instruction,
+but only the profile-defined number may be parked concurrently.
 
-There is no central waiter structure or hardware barrier file. The RMW engine owns barrier state
-and phase-change events; the scheduler only owns one wait record per warp. Underflow, overflow,
-reinitializing or repurposing an mbar with a live waiter, completing bytes against the wrong phase,
-etc PANIC. A wait over several mbar addresses is not an instruction in v0; sequential mbar.wait
-does wait-all and unusual state machines can use mbar.test_wait.
+An incomplete wait that reaches mbar_try_wait_timeout_cycles writes p=false and frees its slot.
+Software loops on false for a long wait, for example `W: mbar.try_wait p0, [x], parity; @!p0 bra.uni
+W`. A phase flip on the deadline wins and returns true. Exact wake is correctness, not merely a
+latency hint, so timeout needs no second shmem probe. The canonical profile starts with eight slots
+and a 64-cycle timeout. Slot-full stalls, parked cycles, initial probes, exact wakes and timeouts
+are separate trace counts.
+
+One-bit parity names only the current incomplete phase or the immediately preceding phase.
+Software must successfully observe a phase before arrivals for the phase after it begin; a retry
+loop is not an ABA defense. Software keeps and flips parity only after a successful wait.
+
+The RMW engine owns barrier state and phase-change events; the waiter table owns only useful sleep
+state. Underflow, overflow, reinitializing or repurposing an mbar with a live waiter, completing
+bytes against the wrong phase, etc PANIC. A wait over several mbar addresses is not an instruction
+in v0; sequential try_wait loops do wait-all and unusual state machines can use mbar.test_wait.
 
 ## Memory ordering
 
@@ -175,7 +198,7 @@ that case we try to stay close to the "natural law" ie whatever is easier to imp
 there is heavy performance cost
 
 TMA complete_tx is issued only after its corresponding port A writes commit. Therefore a phase
-completion observed by mbar.wait or mbar.test_wait is enough to gate MMA reads of that tile;
+completion observed by mbar.try_wait or mbar.test_wait is enough to gate MMA reads of that tile;
 fence.sh is not needed on the TMA -> mbar -> MMA path. fence.sh is for explicitly ordering ordinary
 port A writes before a later cross-path handoff.
 
@@ -203,20 +226,24 @@ SFU instructions added as needed. Instruction latency/throughput configurable
 
 ## MMA (tensor core)
 
-Parallel fused-dot-product-add engine, M/N/K configurable. Physical MpxNpxKp core sweeps over
-shmem/tmem inputs managed by the engine. Tentatively 8x8x4, instruction width <64x64x8
+`mma.async[.init] ACC, [rA], [rB]` captures two uniform shmem byte addresses and autonomously
+walks the profile-static M,N,K shape in K/N/M order using the physical core shape. Both inputs
+are fp16; each output uses ascending-kk fused accumulation into fp32 tmem. `.init` starts the
+command from zero. The canonical 64x64x8, 4x4x4 profile uses RFC05's 64-byte-aligned XOR layout;
+`dense` is retained as a profile-fingerprinted diagnostic layout and unsupported XOR shapes reject.
 
-M input comes from shmem. Swizzle layout to prevent bank conflicts (need to specify this later).
-DMA swizzles gmem layout into mma-friendly layout.
+Physical input steps use shmem port B only. Distinct 32-bit words per bank determine conflict
+rounds (same-word half accesses broadcast); the canonical XOR footprint is one round. Result
+records are finite and retire to the targeted coarse tmem bank after `result_latency_cycles`.
+A matching in-flight output block causes an explicit recurrence bubble. Adjacent commands may
+feed while an older tail retires; there is no implicit command-boundary drain.
 
-Only provides an async instruction issued by thread 0. If thread 0 is masked, skip (no elect)
-
-The depbar attached to mma.async clears when that command's shmem operands have been consumed.
-Commands execute in order, so consumption of the last command in a batch means the batch's shmem
-stages may be reused. mma.commit can instead fire one mbar arrival when all earlier results have
-committed to tmem.
-
-Commands can be queued. Queue depth is configurable. Stalls via depbar when queue is full
+The attached depbar clears after the final input step, meaning operands consumed rather than
+results ready. `mma.commit [rM]` is an ordered queue marker which presents one ordinary mbar
+arrival only after all earlier tmem writes retire. MMA and acc.ld/st exclude one another on the
+same coarse bank, including outstanding result writes; queued commands do not claim ownership.
+Queue depth, initiation interval, result latency, logical/core shapes, and layout are in the
+device profile and fingerprint.
 
 ## acc.ld (accumulator load)
 - Load-shaped warp instruction, NONDESTRUCTIVE (pure read — two-pass softmax is legal): accumulator → RF
@@ -271,8 +298,14 @@ Commands can be queued. Queue depth is configurable. Stalls via depbar when queu
 ## implementation
 - Launch is only initial state: encoded kernel words, active warp count, sparse shmem image and sparse
   gmem image. Memories are zeroed, image segments are applied in order before cycle 0, then warps start
-  at pc 0. The container or transfer format is tooling and not architectural.
-- Bookkeeping (mbar words, mbar wait records, dep-barriers, counters): tracked as state, never as busy resources.
+  at pc 0. Tooling currently serializes this as self-contained nanosm-launch-v0 JSON with hex words
+  and byte strings. The format is not architectural; loading it produces the same Launch struct.
+- Demo launch state is authored in a Python file beside the qtx kernel. Python calls the simulator
+  in-process through a memory-only C ABI; it does not spawn the command-line runner. A self-contained
+  launch JSON may be emitted for replay, but it is a transport artifact, not competing ground truth.
+- Bookkeeping (mbar words, dep-barriers, counters) is tracked as state, never as a busy resource.
+  Mbar try-wait slots are the exception: they are a profile-sized device, and an instruction stalls
+  structurally when every slot is occupied.
 - Kernel completion: every warp halted, DMA/MMA/RMW engines idle, controller queues (including the
   write queue) drained. The harness reads gmem only after this, so a trailing fence.g is hygiene,
   not load-bearing.
@@ -289,5 +322,5 @@ Commands can be queued. Queue depth is configurable. Stalls via depbar when queu
 
 ## open
 - Per-row scale operand on mma accumulate (folds FA O-rescale). Paper kernel adjudicates.
-- Remaining writing: cvt list, sread set, final mbar field widths, numbers (SFU, acc.ld bandwidth,
+- Remaining writing: cvt list, sread set, numbers (SFU, acc.ld bandwidth,
   latency table, clock ratio, DRAM preset).

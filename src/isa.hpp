@@ -13,24 +13,60 @@ enum class Opcode : uint8_t {
     addi  = 0x04,
     shli  = 0x05,
     fadd  = 0x06,
+    xori  = 0x07,
     setp_eq = 0x08,
     setp_ne = 0x09,
     setp_lt = 0x0a,
     setp_le = 0x0b,
     setp_gt = 0x0c,
     setp_ge = 0x0d,
+    fmul  = 0x0e,
+    fsub  = 0x0f,
     lds   = 0x10,
     sts   = 0x11,
     ldg   = 0x12,
     stg   = 0x13,
+    fmax  = 0x14,
+    fma   = 0x15,
+    cvt_pack = 0x16, // cvt.pack.f16x2: rd = half(ra) | half(rb) << 16
+    ex2   = 0x17,    // SFU: 2^x
+    rcp   = 0x18,    // SFU: 1/x
+    and_  = 0x19,    // trailing underscores dodge the C++ operator tokens
+    or_   = 0x1a,
+    xor_  = 0x1b,
+    shl   = 0x1c,    // register shifts use the low 5 bits: a 5-bit shifter
+    shr   = 0x1d,    // logical
+    andi  = 0x1e,
+    ori   = 0x1f,
     bra   = 0x20,
     bra_uni = 0x21,
+    shri  = 0x22,    // logical; 0x19..0x1f were full
+    ldg_v8 = 0x23,
+    stg_v8 = 0x24,
+
     setpi_eq = 0x28,
     setpi_ne = 0x29,
     setpi_lt = 0x2a,
     setpi_le = 0x2b,
     setpi_gt = 0x2c,
     setpi_ge = 0x2d,
+    mbar_init_i = 0x30,
+    mbar_init_r = 0x31,
+    mbar_arrive = 0x32,
+    mbar_arrive_expect_tx_i = 0x33,
+    mbar_arrive_expect_tx_r = 0x34,
+    mbar_test_wait_i = 0x35,
+    mbar_test_wait_r = 0x36,
+    mbar_try_wait_i = 0x37,
+    mbar_try_wait_r = 0x38,
+    tma_async = 0x40,
+    acc_ld = 0x50,
+    acc_ld_v8 = 0x51,
+    acc_st = 0x52,
+    acc_st_v8 = 0x53,
+    mma_async = 0x60,
+    mma_async_init = 0x61,
+    mma_commit = 0x62,
     halt  = 0xff,
 };
 
@@ -44,6 +80,10 @@ enum class SpecialReg : uint8_t {
 struct Timing {
     uint8_t alu = 0;
     uint8_t fadd = 0;
+    // Effective SFU result latency from execution start: the unit serves
+    // sfu.lanes lanes per cycle, so this is (occupancy - 1) + sfu latency.
+    // Derived from the profile's sfu section at parse time.
+    uint8_t sfu = 0;
 };
 
 struct Control {
@@ -61,15 +101,24 @@ struct Instruction {
     uint8_t dst = 0;
     uint8_t src0 = 0;
     uint8_t src1 = 0;
+    uint8_t src2 = 0; // third source; only fma uses it (RRR reserved bits)
     int32_t imm = 0;
     uint32_t line = 0;
     std::string text;
 };
 
 struct Kernel {
+    struct Accumulator {
+        std::string name;
+        uint8_t bank = 0;
+        uint32_t base_word = 0;
+        uint16_t rows = 0;
+        uint16_t cols = 0;
+    };
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
     uint16_t register_count = 0;
+    std::vector<Accumulator> accumulators;
     std::vector<uint64_t> words;
 };
 
@@ -85,6 +134,10 @@ namespace encoding {
 // RI payload: dst[8], reserved[8], simm[22]
 // setp uses dst as p0..p6; immediate and register RHS forms have distinct opcodes.
 // Branch immediates are signed byte displacements relative to the following PC.
+// mbar addresses are held in a register; mbar immediates and register operands
+// have distinct opcodes, as do setp immediates and register operands.
+// tma.async uses src0 as a three-register coordinate-group base and its
+// immediate as a static 64-byte-aligned shmem descriptor address.
 // stall is 5 bits so a slow FPGA-priced SFU (20+ cycles) can still be a stall count.
 inline constexpr unsigned opcode_shift = 56;
 inline constexpr unsigned predicate_shift = 52;
@@ -106,6 +159,7 @@ inline constexpr int32_t immediate_max = (1 << 21) - 1;
 inline constexpr unsigned reg0_shift = 30;
 inline constexpr unsigned reg1_shift = 22;
 inline constexpr unsigned reg2_shift = 14;
+inline constexpr unsigned reg3_shift = 6; // fma's rc, in RRR reserved bits
 
 } // namespace encoding
 

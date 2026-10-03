@@ -54,7 +54,16 @@ uint64_t encode(const Instruction& inst) {
         word |= immediate;
         break;
     case Opcode::add:
+    case Opcode::and_:
+    case Opcode::or_:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
     case Opcode::fadd:
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::cvt_pack:
     case Opcode::setp_eq:
     case Opcode::setp_ne:
     case Opcode::setp_lt:
@@ -65,10 +74,26 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
         break;
+    case Opcode::fma:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        word |= static_cast<uint64_t>(inst.src2) << encoding::reg3_shift;
+        break;
+    case Opcode::ex2:
+    case Opcode::rcp:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        break;
     case Opcode::addi:
     case Opcode::shli:
+    case Opcode::shri:
+    case Opcode::xori:
+    case Opcode::andi:
+    case Opcode::ori:
     case Opcode::lds:
     case Opcode::ldg:
+    case Opcode::ldg_v8:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -79,8 +104,49 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
         break;
+    case Opcode::mbar_init_i:
+    case Opcode::mbar_arrive_expect_tx_i:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        word |= immediate;
+        break;
+    case Opcode::mbar_init_r:
+    case Opcode::mbar_arrive:
+    case Opcode::mbar_arrive_expect_tx_r:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
+        break;
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_try_wait_i:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= immediate;
+        break;
+    case Opcode::mbar_test_wait_r:
+    case Opcode::mbar_try_wait_r:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        break;
+    case Opcode::tma_async:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        word |= immediate;
+        break;
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
+    case Opcode::mma_async:
+    case Opcode::mma_async_init:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        break;
+    case Opcode::mma_commit:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        break;
     case Opcode::sts:
     case Opcode::stg:
+    case Opcode::stg_v8:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
         word |= immediate;
@@ -122,7 +188,16 @@ Instruction decode(uint64_t word) {
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::add:
+    case Opcode::and_:
+    case Opcode::or_:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
     case Opcode::fadd:
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::cvt_pack:
     case Opcode::setp_eq:
     case Opcode::setp_ne:
     case Opcode::setp_lt:
@@ -133,10 +208,26 @@ Instruction decode(uint64_t word) {
         inst.src0 = reg1;
         inst.src1 = reg2;
         break;
+    case Opcode::fma:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        inst.src2 = static_cast<uint8_t>((word >> encoding::reg3_shift) & encoding::register_mask);
+        break;
+    case Opcode::ex2:
+    case Opcode::rcp:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        break;
     case Opcode::addi:
     case Opcode::shli:
+    case Opcode::shri:
+    case Opcode::xori:
+    case Opcode::andi:
+    case Opcode::ori:
     case Opcode::lds:
     case Opcode::ldg:
+    case Opcode::ldg_v8:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -147,8 +238,49 @@ Instruction decode(uint64_t word) {
         inst.src0 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
         break;
+    case Opcode::mbar_init_i:
+    case Opcode::mbar_arrive_expect_tx_i:
+        inst.src0 = reg0;
+        inst.imm = static_cast<int32_t>(immediate);
+        break;
+    case Opcode::mbar_init_r:
+    case Opcode::mbar_arrive:
+    case Opcode::mbar_arrive_expect_tx_r:
+        inst.src0 = reg0;
+        inst.src1 = reg1;
+        break;
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_try_wait_i:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.imm = static_cast<int32_t>(immediate);
+        break;
+    case Opcode::mbar_test_wait_r:
+    case Opcode::mbar_try_wait_r:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        break;
+    case Opcode::tma_async:
+        inst.src0 = reg0;
+        inst.imm = static_cast<int32_t>(immediate);
+        break;
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
+    case Opcode::mma_async:
+    case Opcode::mma_async_init:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        break;
+    case Opcode::mma_commit:
+        inst.src0 = reg0;
+        break;
     case Opcode::sts:
     case Opcode::stg:
+    case Opcode::stg_v8:
         inst.src0 = reg0;
         inst.src1 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
@@ -169,8 +301,24 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::mov: return "mov";
     case Opcode::add: return "add";
     case Opcode::addi: return "addi";
+    case Opcode::and_: return "and";
+    case Opcode::andi: return "andi";
+    case Opcode::or_: return "or";
+    case Opcode::ori: return "ori";
+    case Opcode::xor_: return "xor";
+    case Opcode::shl: return "shl";
+    case Opcode::shr: return "shr";
     case Opcode::shli: return "shli";
+    case Opcode::shri: return "shri";
+    case Opcode::xori: return "xori";
     case Opcode::fadd: return "fadd";
+    case Opcode::fmul: return "fmul";
+    case Opcode::fsub: return "fsub";
+    case Opcode::fmax: return "fmax";
+    case Opcode::fma: return "fma";
+    case Opcode::cvt_pack: return "cvt.pack.f16x2";
+    case Opcode::ex2: return "ex2";
+    case Opcode::rcp: return "rcp";
     case Opcode::setp_eq: return "setp.eq";
     case Opcode::setp_ne: return "setp.ne";
     case Opcode::setp_lt: return "setp.lt";
@@ -183,10 +331,29 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::setpi_le: return "setp.le";
     case Opcode::setpi_gt: return "setp.gt";
     case Opcode::setpi_ge: return "setp.ge";
+    case Opcode::mbar_init_i:
+    case Opcode::mbar_init_r: return "mbar.init";
+    case Opcode::mbar_arrive: return "mbar.arrive";
+    case Opcode::mbar_arrive_expect_tx_i:
+    case Opcode::mbar_arrive_expect_tx_r: return "mbar.arrive.expect_tx";
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_test_wait_r: return "mbar.test_wait";
+    case Opcode::mbar_try_wait_i:
+    case Opcode::mbar_try_wait_r: return "mbar.try_wait";
+    case Opcode::tma_async: return "tma.async";
+    case Opcode::acc_ld: return "acc.ld";
+    case Opcode::acc_ld_v8: return "acc.ld.v8";
+    case Opcode::acc_st: return "acc.st";
+    case Opcode::acc_st_v8: return "acc.st.v8";
+    case Opcode::mma_async: return "mma.async";
+    case Opcode::mma_async_init: return "mma.async.init";
+    case Opcode::mma_commit: return "mma.commit";
     case Opcode::lds: return "lds";
     case Opcode::sts: return "sts";
     case Opcode::ldg: return "ldg";
     case Opcode::stg: return "stg";
+    case Opcode::ldg_v8: return "ldg.v8";
+    case Opcode::stg_v8: return "stg.v8";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
     case Opcode::halt: return "halt";
@@ -233,8 +400,25 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
         out << ' ' << reg(inst.dst) << ", " << inst.imm;
         break;
     case Opcode::add:
+    case Opcode::and_:
+    case Opcode::or_:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
     case Opcode::fadd:
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::cvt_pack:
         out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << reg(inst.src1);
+        break;
+    case Opcode::fma:
+        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << reg(inst.src1)
+            << ", " << reg(inst.src2);
+        break;
+    case Opcode::ex2:
+    case Opcode::rcp:
+        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0);
         break;
     case Opcode::setp_eq:
     case Opcode::setp_ne:
@@ -254,16 +438,68 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
             << ", " << inst.imm;
         break;
+    case Opcode::mbar_init_i:
+        out << " [" << reg(inst.src0) << "], " << inst.imm;
+        break;
+    case Opcode::mbar_init_r:
+        out << " [" << reg(inst.src0) << "], " << reg(inst.src1);
+        break;
+    case Opcode::mbar_arrive:
+        out << " [" << reg(inst.src0) << ']';
+        break;
+    case Opcode::mbar_arrive_expect_tx_i:
+        out << " [" << reg(inst.src0) << "], " << inst.imm;
+        break;
+    case Opcode::mbar_arrive_expect_tx_r:
+        out << " [" << reg(inst.src0) << "], " << reg(inst.src1);
+        break;
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_try_wait_i:
+        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
+            << "], " << inst.imm;
+        break;
+    case Opcode::mbar_test_wait_r:
+    case Opcode::mbar_try_wait_r:
+        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
+            << "], " << reg(inst.src1);
+        break;
+    case Opcode::tma_async:
+        out << " [" << inst.imm << "], " << reg(inst.src0);
+        break;
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
+        out << ' ' << reg(inst.dst) << ", ACC" << static_cast<unsigned>(inst.src0)
+            << ", " << reg(inst.src1);
+        break;
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
+            << ", " << reg(inst.src1);
+        break;
+    case Opcode::mma_async:
+    case Opcode::mma_async_init:
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
+            << "], [" << reg(inst.src1) << ']';
+        break;
+    case Opcode::mma_commit:
+        out << " [" << reg(inst.src0) << ']';
+        break;
     case Opcode::addi:
     case Opcode::shli:
+    case Opcode::shri:
+    case Opcode::xori:
+    case Opcode::andi:
+    case Opcode::ori:
         out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << inst.imm;
         break;
     case Opcode::lds:
     case Opcode::ldg:
+    case Opcode::ldg_v8:
         out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm);
         break;
     case Opcode::sts:
     case Opcode::stg:
+    case Opcode::stg_v8:
         out << ' ' << address(inst.src0, inst.imm) << ", " << reg(inst.src1);
         break;
     case Opcode::bra:
@@ -285,10 +521,29 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::mov:
     case Opcode::add:
     case Opcode::addi:
+    case Opcode::and_:
+    case Opcode::andi:
+    case Opcode::or_:
+    case Opcode::ori:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
     case Opcode::shli:
+    case Opcode::shri:
+    case Opcode::xori:
         return timing.alu;
     case Opcode::fadd:
+    // The new float ops ride the FPU pipeline: fsub is fadd with a negation,
+    // and fmul/fma/fmax/cvt are full-width float datapaths, not 1-cycle ALU.
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::fma:
+    case Opcode::cvt_pack:
         return timing.fadd;
+    case Opcode::ex2:
+    case Opcode::rcp:
+        return timing.sfu;
     case Opcode::setp_eq:
     case Opcode::setp_ne:
     case Opcode::setp_lt:
@@ -302,12 +557,32 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
         return timing.alu;
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_test_wait_r:
+        return 1;
     case Opcode::lds:
     case Opcode::sts:
     case Opcode::ldg:
     case Opcode::stg:
+    case Opcode::ldg_v8:
+    case Opcode::stg_v8:
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::mbar_init_i:
+    case Opcode::mbar_init_r:
+    case Opcode::mbar_arrive:
+    case Opcode::mbar_arrive_expect_tx_i:
+    case Opcode::mbar_arrive_expect_tx_r:
+    case Opcode::mbar_try_wait_i:
+    case Opcode::mbar_try_wait_r:
+    case Opcode::tma_async:
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
+    case Opcode::mma_async:
+    case Opcode::mma_async_init:
+    case Opcode::mma_commit:
     case Opcode::halt:
         return 0;
     }

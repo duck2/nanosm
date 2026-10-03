@@ -27,6 +27,7 @@ struct AssemblyProgram {
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
     uint16_t register_count = 0;
+    std::vector<Kernel::Accumulator> accumulators;
     std::vector<std::pair<std::string, int32_t>> constants;
     std::vector<AssemblyLabel> labels;
     std::vector<Instruction> instructions;
@@ -41,6 +42,7 @@ Kernel assemble_asm_file(const std::string& path, const DeviceProfile& profile);
 std::string emit_hex(const Kernel& kernel);
 Kernel load_hex(std::string_view source);
 Kernel load_hex_file(const std::string& path);
+void validate_kernel(const Kernel& kernel);
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);

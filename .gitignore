@@ -1,2 +1,4 @@
 build*/
 trash/
+__pycache__/
+*.pyc
