@@ -30,14 +30,16 @@ nanosm::ImageSegment f32_sequence(
 }
 
 nanosm::Launch make_vadd(const nanosm::DeviceProfile& profile) {
-    constexpr uint32_t elements = 64;
-    if (profile.lanes == 0 || elements % profile.lanes != 0) {
-        throw nanosm::SimError("vadd demo element count is not divisible by the profile lane count");
+    // kernels/vadd.qtx: A at 0, B at 32 KiB, C at 64 KiB, 8192 fp32 each,
+    // four warps streaming 512 B blocks with ldg.v8 / stg.v8.
+    constexpr uint32_t elements = 8192;
+    if (profile.lanes != 16) {
+        throw nanosm::SimError("vadd demo requires the canonical 16-lane profile");
     }
     nanosm::Launch launch;
-    launch.active_warps = elements / profile.lanes;
+    launch.active_warps = 4;
     launch.gmem_image.push_back(f32_sequence(0, elements, [](uint32_t i) { return i; }));
-    launch.gmem_image.push_back(f32_sequence(256, elements, [](uint32_t i) { return 2 * i; }));
+    launch.gmem_image.push_back(f32_sequence(32768, elements, [](uint32_t i) { return 2 * i; }));
     return launch;
 }
 

@@ -28,7 +28,8 @@
     "core_k": 4,
     "queue_commands": 2,
     "result_latency_cycles": 8,
-    "layout": "xor64"
+    "layout": "xor64",
+    "numeric_model": "fp16_raw_window25_rz_v1"
   },
   "sync": {
     "mbar_wait_slots": 8,
@@ -54,5 +55,16 @@
     "bus_bytes_per_dram_tick": 8,
     "latency_dram_ticks": 50,
     "queue_sectors": 64
+  },
+  "lsu": {
+    "active_commands": 2,
+    "staging_vectors": 2,
+    "read_streams": 2,
+    "pluck_words_per_cycle": 2,
+    "ingress_sectors": 8,
+    "egress_sectors": 8,
+    "sectors_in_flight": 16,
+    "ingress_latency_cycles": 1,
+    "egress_latency_cycles": 1
   }
 }

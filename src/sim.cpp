@@ -1,4 +1,5 @@
 #include "sim.hpp"
+#include "mma_numeric.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -231,6 +232,15 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         mbar_wait_slots_.resize(config_.mbar_wait_slots);
         read_reservations_.assign(
             config_.rf_arithmetic_read_cycles, std::vector<uint32_t>(config_.rf_banks, 0));
+        staging_.resize(config_.lsu_staging_vectors);
+        for (auto& assembly : staging_) {
+            assembly.words.assign(config_.lanes, 0);
+            assembly.valid.assign(config_.lanes, 0);
+        }
+        free_id_tags_.assign(config_.lsu_sectors_in_flight, 0);
+        ordered_stream_requests_.resize(config_.lsu_read_streams);
+        tma_sector_.data.assign(config_.gmem_sector_bytes, 0);
+        tma_store_sector_.data.assign(config_.gmem_sector_bytes, 0);
         warps_.reserve(launch.active_warps);
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
             Warp warp;
@@ -253,15 +263,45 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     apply_image(gmem_, launch.gmem_image, "gmem");
 }
 
+// One core cycle. The memory path of rfc09 3a runs CONSUMER BEFORE PRODUCER
+// (reverse pipeline order), so a datum written into a named register in this
+// tick cannot be read by the next stage until the next tick:
+//
+//   load path:  RF write (assembly -> RF)        advance_lsu_rf_writes
+//               TMA placement (TMA reg -> shmem) advance_tma / advance_shmem
+//               pluck (ingress FIFO -> TMA reg / assembly)  advance_ingress
+//               bus (-> ingress FIFO)            advance_dram_clock
+//   store path: egress write port (assembly / TMA store reg -> egress FIFO)
+//                                                advance_egress_writes
+//               TMA store read (shmem -> TMA store reg)     advance_shmem
+//               RF read (RF -> assembly): scalar at issue, vector after it
+//                                                issue_one / advance_lsu_rf_reads
+//
+// The two BRAM FIFOs carry a visibility cycle (write cycle + declared
+// latency >= 1), which the egress side needs because the bus must run after
+// the pluck. Every register also records its last write cycle and every
+// consumer asserts it is in the past (tripwire, never a timing input).
+// A register drained in cycle t may be refilled in cycle t (its consumer ran
+// first in the tick: a normal pipeline handoff, never a read-through).
+// Request channel: TMA store write requests, then the TMA walker, then the
+// LSU. The LSU's RF write is booked at the start of the tick for this cycle
+// (arithmetic booked at earlier issues keeps its port), its RF read after
+// issue (this cycle's issue reads keep theirs).
 void Machine::tick() {
     if (done()) return;
     port_a_written_words_.clear();
+    request_channel_used_ = false;
+    ingress_freed_this_cycle_ = 0;
+    return_ready_low_this_cycle_ = false;
+    advance_lsu_rf_writes();
     commit_writebacks();
+    advance_egress_writes();
+    advance_tma_write_requests();
     advance_tma();
+    advance_lsu_requests();
     advance_shmem();
     advance_mma();
     advance_acc_transfers();
-    advance_gmem_store_captures();
     if (tma_event_command_.has_value() && !engine_mbar_event_.has_value()) {
         const auto& command = tma_commands_.at(*tma_event_command_);
         trace_->tma_command_end(
@@ -272,8 +312,10 @@ void Machine::tick() {
             cycle_ + 1, tma_commands_.size(), tma_sector_credits_used_, tma_returns_.size());
     }
     advance_mbar_wait_timeouts();
+    advance_ingress();
     advance_dram_clock();
     issue_one();
+    advance_lsu_rf_reads();
     // Writeback precedes both old deferred captures and new issue-cycle reads.
     advance_rf_reads();
     ++cycle_;
@@ -305,10 +347,6 @@ bool Machine::mma_bank_busy(uint8_t bank) const {
 
 namespace {
 
-float mma_half_to_float(uint16_t bits) {
-    return bits_float(half_to_float_bits(bits));
-}
-
 uint32_t mma_a_address(const Config& config, uint32_t base, uint32_t m, uint32_t k) {
     if (!config.mma_xor_layout) return base + 2 * (m * config.mma_k + k);
     return xor64_operand_address(base, m, k, 0);
@@ -334,7 +372,7 @@ void Machine::advance_mma() {
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
                 tmem_[acc.bank][tmem_word_index(acc, it->m0 + mi, it->n0 + ni)] =
-                    float_bits(it->values[mi * config_.mma_core_n + ni]);
+                    it->values[mi * config_.mma_core_n + ni];
         trace_->mma_result(cycle_, it->command, it->m0 * config_.mma_n + it->n0);
         const auto id = it->command;
         auto command = std::find_if(mma_commands_.begin(), mma_commands_.end(),
@@ -452,7 +490,7 @@ void Machine::serve_mma_fetch_round() {
             throw SimError("MMA operand footprint is outside shmem");
         uint16_t bits = 0;
         std::memcpy(&bits, shmem_.data() + address, 2);
-        fetch.captured[address] = mma_half_to_float(bits);
+        fetch.captured[address] = bits;
     }
     ++fetch.next_round;
     if (fetch.next_round != fetch.round_words.size()) return;
@@ -484,16 +522,25 @@ void Machine::complete_mma_fetch() {
     result.m0 = fetch.m0;
     result.n0 = fetch.n0;
     result.values.resize(config_.mma_core_m * config_.mma_core_n);
+    // Gather raw operands once per step, not via map lookups per product.
+    // B is transposed here only in the simulator's local operand snapshot.
+    std::vector<uint16_t> a(config_.mma_core_m * config_.mma_core_k);
+    std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
+    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+            a[mi * config_.mma_core_k + kk] = captured(
+                mma_a_address(config_, fetch.a_base, fetch.m0 + mi, fetch.k0 + kk));
+    for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
+        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+            b[ni * config_.mma_core_k + kk] = captured(
+                mma_b_address(config_, fetch.b_base, fetch.k0 + kk, fetch.n0 + ni));
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            float value = fetch.init_step ? 0.0f : bits_float(tmem_[acc.bank][
-                tmem_word_index(acc, fetch.m0 + mi, fetch.n0 + ni)]);
-            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                value = std::fma(
-                    captured(mma_a_address(config_, fetch.a_base, fetch.m0 + mi, fetch.k0 + kk)),
-                    captured(mma_b_address(config_, fetch.b_base, fetch.k0 + kk, fetch.n0 + ni)),
-                    value);
-            result.values[mi * config_.mma_core_n + ni] = value;
+            const uint32_t c = fetch.init_step ? 0u : tmem_[acc.bank][
+                tmem_word_index(acc, fetch.m0 + mi, fetch.n0 + ni)];
+            result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
+                std::span<const uint16_t>(a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
+                std::span<const uint16_t>(b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
         }
     }
     mma_results_.push_back(std::move(result));
@@ -580,36 +627,6 @@ void Machine::advance_acc_transfers() {
     }
 }
 
-void Machine::advance_gmem_store_captures() {
-    for (auto& [command_id, command] : gmem_commands_) {
-        if (command.load || command.width == 1 || command.next_store_capture == command.width) continue;
-        auto& warp = warps_.at(command.warp);
-        const auto reg = static_cast<uint8_t>(command.dst + command.next_store_capture);
-        const std::vector<RfRead> reads{{reg, 0}};
-        if (!can_reserve_reads(reads)) continue;
-        reserve_reads(reads);
-        trace_->rf_read(cycle_, warp.id, reg, reg % config_.rf_banks);
-        for (auto& request : gmem_queue_) {
-            if (request.owner != GmemSectorRequest::Owner::simt || request.command != command_id) continue;
-            for (auto& access : request.accesses) {
-                if (access.word == command.next_store_capture)
-                    access.value = rf(warp, access.lane, reg);
-            }
-        }
-        auto& readers = warp.async_readers[reg];
-        if (readers == 0) throw SimError("internal stg.v8 reader underflow");
-        --readers;
-        ++command.next_store_capture;
-        if (command.next_store_capture == command.width) {
-            for (auto& request : gmem_queue_) {
-                if (request.owner == GmemSectorRequest::Owner::simt && request.command == command_id)
-                    request.ready = true;
-            }
-        }
-        return; // one lane-wide gmem store-source capture per core cycle
-    }
-}
-
 bool Machine::done() const {
     const bool warps_halted = std::all_of(warps_.begin(), warps_.end(), [](const Warp& warp) {
         return warp.halted;
@@ -621,7 +638,10 @@ bool Machine::done() const {
         !port_a_.has_value() && !tma_port_a_.has_value() &&
         !engine_mbar_event_.has_value() &&
         !mbar_rmw_.has_value() && !mbar_read_.has_value() && gmem_queue_.empty() &&
-        !gmem_bus_.has_value() && gmem_commands_.empty() && tma_commands_.empty() &&
+        !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.empty() &&
+        read_records_.empty() && ingress_fifo_.empty() && egress_fifo_.empty() &&
+        !tma_sector_.request.has_value() && !tma_store_sector_.busy &&
+        tma_commands_.empty() &&
         tma_returns_.empty() && !tma_event_command_.has_value() &&
         tma_sector_credits_used_ == 0 && writebacks_.empty() && arithmetic_reads_.empty() &&
         mma_commands_.empty() && mma_results_.empty() && !mma_fetch_.has_value() &&
@@ -707,11 +727,9 @@ void Machine::commit_writebacks() {
             --counter;
             trace_->depbar(cycle_, warp.id, *it->clear_depbar, counter);
         }
-        if (it->clear_outstanding_ldg) {
-            warp.outstanding_ldg = false;
-        }
         if (it->release_acc_transfer.has_value()) // sanitizer: acc.ld final RF write
             release_tmem_owner(TmemOwnerKind::acc_ld, *it->release_acc_transfer);
+        if (it->release_lsu_command.has_value()) release_lsu_command(*it->release_lsu_command);
         it = writebacks_.erase(it);
     }
     write_reservations_.erase(cycle_);
@@ -921,12 +939,15 @@ void Machine::advance_tma() {
     if (!tma_returns_.empty()) {
         auto value = std::move(tma_returns_.front());
         tma_returns_.pop_front();
+        // The placement's rounds read the TMA sector register directly; the
+        // register stays occupied until the last round (no port-A data latch).
         trace_->tma_depths(
             cycle_, tma_commands_.size(), tma_sector_credits_used_, tma_returns_.size());
         TmaPortRequest request;
         request.kind = TmaPortKind::load_write;
         request.command = value.command;
         request.sector_request = value.sector_request;
+        request.from_sector_register = value.from_sector_register;
         request.fragments = std::move(value.fragments);
         request.rounds = tma_port_rounds(request.fragments);
         trace_->tma_port_begin(
@@ -1168,121 +1189,6 @@ void Machine::advance_dram_clock() {
     }
 }
 
-void Machine::tick_gmem_controller() {
-    if (!gmem_bus_.has_value() && !gmem_queue_.empty() &&
-        gmem_queue_.front().ready &&
-        gmem_queue_.front().ready_dram_tick <= dram_tick_) {
-        gmem_bus_ = std::move(gmem_queue_.front());
-        gmem_queue_.pop_front();
-        std::string owner = "simt";
-        if (gmem_bus_->owner == GmemSectorRequest::Owner::tma_load) owner = "tma load";
-        if (gmem_bus_->owner == GmemSectorRequest::Owner::tma_store) owner = "tma store";
-        trace_->gmem_bus_begin(
-            cycle_, gmem_bus_->id, gmem_bus_->sector_address, gmem_bus_->load,
-            std::move(owner));
-        trace_->gmem_queue_depth(cycle_, gmem_outstanding_sectors());
-    }
-    if (!gmem_bus_.has_value()) return;
-
-    auto& request = *gmem_bus_;
-    if (request.beats_remaining == 0) throw SimError("gmem request has no bus beats");
-    --request.beats_remaining;
-    trace_->gmem_bus_beat(cycle_, dram_tick_, request.id);
-    if (request.beats_remaining != 0) return;
-
-    auto complete = std::move(request);
-    gmem_bus_.reset();
-    trace_->gmem_bus_end(cycle_ + 1, complete.id, config_.gmem_sector_bytes);
-    trace_->gmem_queue_depth(cycle_, gmem_outstanding_sectors());
-    complete_gmem_sector(std::move(complete));
-}
-
-void Machine::complete_gmem_sector(GmemSectorRequest request) {
-    if (request.owner == GmemSectorRequest::Owner::tma_load) {
-        for (auto& fragment : request.tma_fragments) {
-            std::memcpy(
-                fragment.data.data(),
-                gmem_.data() + static_cast<std::size_t>(fragment.gmem_address),
-                fragment.size);
-        }
-        TmaReturn returned;
-        returned.command = request.command;
-        returned.sector_request = request.id;
-        returned.fragments = std::move(request.tma_fragments);
-        tma_returns_.push_back(std::move(returned));
-        trace_->tma_depths(
-            cycle_, tma_commands_.size(), tma_sector_credits_used_, tma_returns_.size());
-        return;
-    }
-    if (request.owner == GmemSectorRequest::Owner::tma_store) {
-        for (const auto& fragment : request.tma_fragments) {
-            std::memcpy(
-                gmem_.data() + static_cast<std::size_t>(fragment.gmem_address),
-                fragment.data.data(),
-                fragment.size);
-        }
-        release_tma_credit();
-        return;
-    }
-
-    auto command_it = gmem_commands_.find(request.command);
-    if (command_it == gmem_commands_.end()) throw SimError("orphaned gmem sector request");
-    auto& command = command_it->second;
-    for (const auto& access : request.accesses) {
-        if (request.load) {
-            uint32_t value = 0;
-            std::memcpy(
-                &value,
-                gmem_.data() + static_cast<std::size_t>(access.byte_address),
-                sizeof(value));
-            command.load_values[access.word * config_.lanes + access.lane] = value;
-        } else {
-            std::memcpy(
-                gmem_.data() + static_cast<std::size_t>(access.byte_address),
-                &access.value,
-                sizeof(access.value));
-        }
-    }
-    if (command.remaining_sectors == 0) throw SimError("gmem command sector underflow");
-    --command.remaining_sectors;
-    if (command.remaining_sectors != 0) return;
-
-    Writeback completion;
-    completion.warp = command.warp;
-    completion.clear_depbar = command.depbar;
-    completion.reason = command.load ? "ldg" : "stg";
-    completion.ready_cycle = cycle_ + 1;
-    if (command.load) {
-        auto& warp = warps_.at(command.warp);
-        std::vector<Writeback> beats;
-        beats.reserve(command.width);
-        uint64_t next_beat_cycle = std::max(completion.ready_cycle, gmem_return_available_cycle_);
-        for (uint32_t word = 0; word < command.width; ++word) {
-            Writeback beat = completion;
-            beat.ready_cycle = next_beat_cycle;
-            while (!reserve_write(static_cast<uint8_t>(command.dst + word), beat.ready_cycle))
-                ++beat.ready_cycle;
-            beat.dst = static_cast<uint8_t>(command.dst + word);
-            beat.values.assign(
-                command.load_values.begin() + word * config_.lanes,
-                command.load_values.begin() + (word + 1) * config_.lanes);
-            beat.clear_depbar.reset();
-            beat.clear_outstanding_ldg = false;
-            warp.ready_cycle[command.dst + word] = beat.ready_cycle;
-            next_beat_cycle = beat.ready_cycle + 1; // one returned vector word per core cycle
-            beats.push_back(std::move(beat));
-        }
-        gmem_return_available_cycle_ = next_beat_cycle;
-        beats.back().clear_depbar = completion.clear_depbar;
-        beats.back().clear_outstanding_ldg = true;
-        for (auto& beat : beats) writebacks_.push_back(std::move(beat));
-    } else {
-        writebacks_.push_back(std::move(completion));
-    }
-    trace_->gmem_command_end(cycle_ + 1, request.command);
-    gmem_commands_.erase(command_it);
-}
-
 void Machine::complete_tma_port_request(TmaPortRequest request) {
     auto command_it = tma_commands_.find(request.command);
     if (command_it == tma_commands_.end()) throw SimError("orphaned tma port-A request");
@@ -1350,6 +1256,11 @@ void Machine::complete_tma_port_request(TmaPortRequest request) {
                 }
             }
         }
+        if (request.from_sector_register) { // its last round has read it: free
+            tma_sector_.request.reset();
+            tma_sector_.filled = 0;
+            tma_sector_.complete = false;
+        }
         --command.pending_load_writes;
         release_tma_credit();
         if (command.walker_done && command.pending_load_writes == 0) {
@@ -1358,21 +1269,13 @@ void Machine::complete_tma_port_request(TmaPortRequest request) {
         return;
     case TmaPortKind::store_read: {
         if (command.descriptor.direction != TmaDirection::store ||
-            command.pending_store_captures == 0) {
+            command.pending_store_captures == 0 || !tma_store_sector_.busy ||
+            tma_store_sector_.complete || tma_store_sector_.command != command.id) {
             throw SimError("unexpected tma store capture");
         }
-        auto* queued = queued_gmem_request(request.sector_request);
-        if (queued == nullptr || queued->owner != GmemSectorRequest::Owner::tma_store ||
-            queued->ready) {
-            throw SimError("tma store placeholder disappeared before source capture");
-        }
-        for (auto& fragment : request.fragments) {
-            if (static_cast<uint64_t>(fragment.shmem_address) + fragment.size > shmem_.size()) {
-                throw SimError("tma store source is outside shmem");
-            }
-        }
-        queued->tma_fragments = std::move(request.fragments);
-        queued->ready = true;
+        // The source is captured: the TMA store sector register is complete
+        // and goes to the egress FIFO from the next cycle on.
+        tma_store_sector_.complete = true;
         --command.pending_store_captures;
         if (command.walker_done && command.pending_store_captures == 0) {
             mark_tma_data_complete(command);
@@ -1527,20 +1430,45 @@ std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_round
     return result;
 }
 
+// One bank round of a TMA port-A transaction. A load placement reads the TMA
+// sector register (fall-through tripwire: written in an earlier cycle) or
+// writes zeros (OOB fill); a store read writes the TMA store sector register
+// in the cycle its round reads shmem.
 void Machine::serve_tma_port_round(TmaPortRequest& request) {
     const bool write = request.kind == TmaPortKind::load_write;
+    const bool store_read = request.kind == TmaPortKind::store_read;
+    if (write && request.from_sector_register &&
+        (!tma_sector_.complete || tma_sector_.last_write_cycle >= cycle_)) {
+        throw SimError("internal fall-through: TMA sector register read in the cycle it was written");
+    }
+    uint32_t bytes = 0;
     for (const auto& piece : request.rounds.at(request.next_round)) {
         auto& fragment = request.fragments.at(piece.fragment);
         const uint32_t address = fragment.shmem_address + piece.offset;
         if (static_cast<uint64_t>(address) + piece.size > shmem_.size()) {
             throw SimError("tma port service is outside shmem");
         }
+        bytes += piece.size;
         if (write) {
-            std::memcpy(shmem_.data() + address, fragment.data.data() + piece.offset, piece.size);
+            const uint8_t* source = fragment.data.data() + piece.offset; // OOB zero fill
+            if (request.from_sector_register) {
+                source = tma_sector_.data.data() +
+                    (fragment.gmem_address - tma_sector_.sector_address) + piece.offset;
+            }
+            std::memcpy(shmem_.data() + address, source, piece.size);
             record_port_a_shmem_write(address, piece.size);
+        } else if (store_read) {
+            std::memcpy(tma_store_sector_.data.data() +
+                    (fragment.gmem_address - tma_store_sector_.sector_address) + piece.offset,
+                shmem_.data() + address, piece.size);
         } else {
             std::memcpy(fragment.data.data() + piece.offset, shmem_.data() + address, piece.size);
         }
+    }
+    if (write) probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);
+    if (store_read) {
+        tma_store_sector_.last_write_cycle = cycle_;
+        probe(LsuEdge::tma_store_round, request.command, request.next_round, bytes);
     }
 }
 
@@ -1554,10 +1482,14 @@ bool Machine::tma_walker_step(TmaCommand& command) {
     }
     if (command.walker_done) return true;
     if (tma_sector_credits_used_ == config_.tma_sector_credits) return false;
+    // A store sector's source read writes the TMA store sector register,
+    // which must have drained into the egress FIFO.
+    if (!load && tma_store_sector_.busy) return false;
 
     std::vector<GmemSectorRequest::TmaFragment> fragments;
     const bool synthetic_zero = load && !tma_coordinate_in_bounds(command);
-    if (!synthetic_zero && gmem_outstanding_sectors() == config_.gmem_queue_sectors) {
+    if (load && !synthetic_zero &&
+        (!controller_request_ready() || !request_channel_grants(GmemClient::tma))) {
         return false;
     }
     uint64_t sector_address = 0;
@@ -1610,35 +1542,50 @@ bool Machine::tma_walker_step(TmaCommand& command) {
             cycle_, tma_commands_.size(), tma_sector_credits_used_, tma_returns_.size());
         return true;
     }
-    const auto beats = static_cast<uint32_t>(
-        (config_.gmem_sector_bytes + config_.gmem_bus_bytes_per_dram_tick - 1) /
-        config_.gmem_bus_bytes_per_dram_tick);
-    GmemSectorRequest request;
-    request.id = next_gmem_request_id_++;
-    request.command = command.id;
-    request.sector_address = sector_address;
-    request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
-    request.load = load;
-    request.ready = load;
-    request.owner = load
-        ? GmemSectorRequest::Owner::tma_load
-        : GmemSectorRequest::Owner::tma_store;
-    request.tma_fragments = fragments;
-    request.beats_remaining = beats;
-    const auto request_id = request.id;
-    gmem_queue_.push_back(std::move(request));
-    trace_->gmem_sector_enqueue();
     trace_->tma_sector(config_.gmem_sector_bytes);
-    trace_->gmem_queue_depth(cycle_, gmem_outstanding_sectors());
-
     if (load) {
+        GmemSectorRequest request;
+        request.id = next_gmem_request_id_++;
+        request.command = command.id;
+        request.stream = tma_stream;
+        request.sector_address = sector_address;
+        request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
+        request.load = true;
+        request.owner = GmemSectorRequest::Owner::tma_load;
+        request.beats = static_cast<uint32_t>(
+            (config_.gmem_sector_bytes + config_.gmem_bus_bytes_per_dram_tick - 1) /
+            config_.gmem_bus_bytes_per_dram_tick);
+        // The placement description rides in the SM's ID table; the data
+        // returns through the ingress FIFO and the TMA sector register.
+        ReadRecord record;
+        record.kind = ReadKind::tma;
+        record.stream = tma_stream;
+        record.command = command.id;
+        record.sector_address = sector_address;
+        record.fragments = fragments;
+        read_records_.emplace(request.id, std::move(record));
+        ordered_stream_requests_[tma_stream].push_back(request.id);
+        accept_gmem_request(std::move(request), GmemClient::tma);
         ++command.pending_load_writes;
     } else {
+        // No controller request yet: the write's request is issued from the
+        // egress FIFO once this sector's data is there (one write contract).
         ++command.pending_store_captures;
+        tma_store_sector_.busy = true;
+        tma_store_sector_.command = command.id;
+        tma_store_sector_.sector_address = sector_address;
+        std::fill(tma_store_sector_.data.begin(), tma_store_sector_.data.end(), 0);
+        tma_store_sector_.byte_enable = 0;
+        for (const auto& fragment : fragments) {
+            const auto offset = fragment.gmem_address - sector_address;
+            for (uint32_t byte = 0; byte < fragment.size; ++byte)
+                tma_store_sector_.byte_enable |= 1ull << (offset + byte);
+        }
+        tma_store_sector_.complete = false;
+        tma_store_sector_.words_out = 0;
         TmaPortRequest port_request;
         port_request.kind = TmaPortKind::store_read;
         port_request.command = command.id;
-        port_request.sector_request = request_id;
         port_request.fragments = std::move(fragments);
         port_request.rounds = tma_port_rounds(port_request.fragments);
         trace_->tma_port_begin(
@@ -1757,13 +1704,6 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
     if (command.descriptor.gmem_base > gmem_.size()) {
         throw SimError("tma global base is outside gmem");
     }
-}
-
-Machine::GmemSectorRequest* Machine::queued_gmem_request(uint64_t request) {
-    const auto found = std::find_if(gmem_queue_.begin(), gmem_queue_.end(), [&](const auto& entry) {
-        return entry.id == request;
-    });
-    return found == gmem_queue_.end() ? nullptr : &*found;
 }
 
 void Machine::release_tma_credit() {
@@ -1976,25 +1916,37 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
                 std::to_string(owner.depbar) + " of warp " + std::to_string(owner.warp) + " first");
         }
     }
-    if ((inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
-         is_mbar_rmw(inst.opcode) ||
-         is_mbar_test_wait(inst.opcode) || is_mbar_try_wait(inst.opcode)) && port_a_busy()) {
-        return {false, WarpState::structural, "port A busy"};
+    // Port-A arbiter, SIMT side. A started access (SIMT rounds, a TMA port
+    // request, the mbar engine) is never preempted. For the next free grant
+    // the order is: a held engine mbar event (claims the engine in
+    // advance_shmem), then the TMA (advance_tma, at the start of the next
+    // cycle), then SIMT. So SIMT may not take a free port while the TMA has
+    // a port-A request waiting: that is TMA priority, counted per warp-cycle.
+    if (inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
+        is_mbar_rmw(inst.opcode) ||
+        is_mbar_test_wait(inst.opcode) || is_mbar_try_wait(inst.opcode)) {
+        if (port_a_busy()) return {false, WarpState::structural, "port A busy"};
+        if (tma_wants_port_a()) {
+            trace_->shmem_tma_priority_wait();
+            return {false, WarpState::structural, "port A: TMA priority"};
+        }
     }
 
-    std::vector<std::vector<LaneAccess>> gmem_sectors;
-    if (inst.opcode == Opcode::ldg || inst.opcode == Opcode::stg ||
-        inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8) {
-        const bool load = inst.opcode == Opcode::ldg || inst.opcode == Opcode::ldg_v8;
-        if (load && warp.outstanding_ldg) {
-            return {false, WarpState::structural, "one outstanding ldg"};
+    // LSU admission: a command slot AND an assembly register, or the warp is
+    // ineligible this cycle. Addresses are checked first: a malformed access
+    // panics as soon as the warp tries it.
+    std::optional<LsuCommand> lsu_plan;
+    std::optional<uint32_t> lsu_assembly;
+    if (is_lsu(inst.opcode)) {
+        lsu_plan = plan_lsu_command(warp, inst);
+        if (lsu_commands_.size() >= config_.lsu_active_commands) {
+            ++trace_->lsu_counters().lsu_no_slot_cycles;
+            return {false, WarpState::structural, "LSU command slot"};
         }
-        gmem_sectors = build_gmem_sectors(warp, inst, load);
-        if (gmem_sectors.size() > config_.gmem_queue_sectors) {
-            panic(warp, inst, "one gmem command exceeds controller queue capacity");
-        }
-        if (gmem_outstanding_sectors() + gmem_sectors.size() > config_.gmem_queue_sectors) {
-            return {false, WarpState::structural, "gmem queue full"};
+        lsu_assembly = free_assembly_register();
+        if (!lsu_assembly.has_value()) {
+            ++trace_->lsu_counters().lsu_no_staging_cycles;
+            return {false, WarpState::structural, "LSU assembly register"};
         }
     }
 
@@ -2144,51 +2096,11 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
     case Opcode::ldg:
     case Opcode::stg:
     case Opcode::ldg_v8:
-    case Opcode::stg_v8: {
+    case Opcode::stg_v8:
+    case Opcode::ldg_uni:
         if (inst.control.set_depbar >= 6) panic(warp, inst, "global memory operation has no depbar");
-        const bool load = inst.opcode == Opcode::ldg || inst.opcode == Opcode::ldg_v8;
-        const uint8_t width = inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8 ? 8 : 1;
-        const auto command_id = next_gmem_command_id_++;
-        GmemCommand command;
-        command.load = load;
-        command.warp = warp.id;
-        command.dst = load ? inst.dst : inst.src1;
-        command.depbar = inst.control.set_depbar;
-        command.remaining_sectors = static_cast<uint32_t>(gmem_sectors.size());
-        command.width = width;
-        if (load) {
-            command.load_values.resize(config_.lanes * width, 0);
-            warp.outstanding_ldg = true;
-            for (uint32_t word = 0; word < width; ++word)
-                warp.ready_cycle[inst.dst + word] = std::numeric_limits<uint64_t>::max();
-        } else if (width == 8) {
-            for (uint32_t word = 0; word < width; ++word)
-                ++warp.async_readers[inst.src1 + word];
-        }
-        gmem_commands_.emplace(command_id, std::move(command));
-        trace_->gmem_command_begin(cycle_, command_id, warp.id, load);
-        ++warp.depbar[inst.control.set_depbar];
-        trace_->depbar(cycle_, warp.id, inst.control.set_depbar, warp.depbar[inst.control.set_depbar]);
-        const auto beats = static_cast<uint32_t>(
-            (config_.gmem_sector_bytes + config_.gmem_bus_bytes_per_dram_tick - 1) /
-            config_.gmem_bus_bytes_per_dram_tick);
-        for (auto& accesses : gmem_sectors) {
-            GmemSectorRequest request;
-            request.id = next_gmem_request_id_++;
-            request.command = command_id;
-            request.sector_address =
-                (accesses.front().byte_address / config_.gmem_sector_bytes) * config_.gmem_sector_bytes;
-            request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
-            request.load = load;
-            request.ready = load || width == 1;
-            request.accesses = std::move(accesses);
-            request.beats_remaining = beats;
-            trace_->gmem_sector_enqueue();
-            gmem_queue_.push_back(std::move(request));
-        }
-        trace_->gmem_queue_depth(cycle_, gmem_outstanding_sectors());
+        admit_lsu_command(warp, inst, std::move(*lsu_plan), *lsu_assembly);
         break;
-    }
     case Opcode::tma_async: {
         if (inst.imm < 0 || inst.imm % 64 != 0 ||
             static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_.size()) {
@@ -2336,7 +2248,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
     } else if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
                inst.opcode != Opcode::ldg && inst.opcode != Opcode::stg &&
                inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8 &&
-               inst.opcode != Opcode::tma_async &&
+               inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::tma_async &&
                inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
                inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
                inst.opcode != Opcode::mma_async && inst.opcode != Opcode::mma_async_init &&
@@ -2396,6 +2308,7 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::lds:
     case Opcode::ldg:
     case Opcode::ldg_v8:
+    case Opcode::ldg_uni:
     case Opcode::ex2:
     case Opcode::rcp:
     case Opcode::setpi_eq:
@@ -2466,7 +2379,8 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
     case Opcode::rcp:
     case Opcode::lds:
     case Opcode::ldg:
-    case Opcode::ldg_v8: return inst.dst;
+    case Opcode::ldg_v8:
+    case Opcode::ldg_uni: return inst.dst;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8: return inst.dst;
     default: return std::nullopt;
@@ -2659,39 +2573,6 @@ std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(
         }
     }
     return rounds;
-}
-
-std::vector<std::vector<Machine::LaneAccess>> Machine::build_gmem_sectors(
-    const Warp& warp, const Instruction& inst, bool load) const {
-    std::map<uint64_t, std::vector<LaneAccess>> sectors;
-    std::map<uint64_t, uint32_t> store_words;
-    const uint32_t width = inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8 ? 8 : 1;
-    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        const auto base = static_cast<int64_t>(rf(warp, lane, inst.src0));
-        const auto address = base + inst.imm;
-        if (address < 0) panic(warp, inst, "gmem address arithmetic underflow");
-        const auto first_byte_address = static_cast<uint64_t>(address);
-        if (first_byte_address % 4 != 0) panic(warp, inst, "unaligned 32-bit gmem access");
-        if (first_byte_address > UINT64_MAX - 4ull * width ||
-            first_byte_address + 4ull * width > gmem_.size()) {
-            panic(warp, inst, "gmem access out of bounds");
-        }
-        for (uint32_t word = 0; word < width; ++word) {
-            const auto byte_address = first_byte_address + 4ull * word;
-            if (!load && !store_words.emplace(byte_address, lane).second) {
-                panic(warp, inst, "multiple lanes write the same gmem word");
-            }
-            const auto sector = (byte_address / config_.gmem_sector_bytes) * config_.gmem_sector_bytes;
-            const auto value = !load && width == 1 ? rf(warp, lane, inst.src1) : 0;
-            sectors[sector].push_back({lane, static_cast<uint8_t>(word), byte_address, value});
-        }
-    }
-    std::vector<std::vector<LaneAccess>> result;
-    result.reserve(sectors.size());
-    for (auto& entry : sectors) {
-        result.push_back(std::move(entry.second));
-    }
-    return result;
 }
 
 std::size_t Machine::gmem_outstanding_sectors() const {

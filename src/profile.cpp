@@ -1,5 +1,6 @@
 #include "profile.hpp"
 #include "hash.hpp"
+#include "mma_numeric.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -41,6 +42,7 @@ json profile_json(const DeviceProfile& p) {
             {"queue_commands", p.mma_queue_commands},
             {"result_latency_cycles", p.mma_result_latency_cycles},
             {"layout", p.mma_xor_layout ? "xor64" : "dense"},
+            {"numeric_model", mma_numeric_model},
         }},
         {"sync", {
             {"mbar_wait_slots", p.mbar_wait_slots},
@@ -66,6 +68,17 @@ json profile_json(const DeviceProfile& p) {
             {"bus_bytes_per_dram_tick", p.gmem_bus_bytes_per_dram_tick},
             {"latency_dram_ticks", p.gmem_latency_dram_ticks},
             {"queue_sectors", p.gmem_queue_sectors},
+        }},
+        {"lsu", {
+            {"active_commands", p.lsu_active_commands},
+            {"staging_vectors", p.lsu_staging_vectors},
+            {"read_streams", p.lsu_read_streams},
+            {"pluck_words_per_cycle", p.lsu_pluck_words_per_cycle},
+            {"ingress_sectors", p.lsu_ingress_sectors},
+            {"egress_sectors", p.lsu_egress_sectors},
+            {"sectors_in_flight", p.lsu_sectors_in_flight},
+            {"ingress_latency_cycles", p.lsu_ingress_latency_cycles},
+            {"egress_latency_cycles", p.lsu_egress_latency_cycles},
         }},
     };
 }
@@ -133,6 +146,34 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.tma_sector_credits >= p.gmem_queue_sectors) {
         throw ProfileError("device profile: tma sector credits must be smaller than gmem queue");
     }
+    // LSU. A lane-wide register (lanes x 4 B) must be whole sectors, a sector
+    // whole words, and a bus beat whole words, so every plucked word has one
+    // lane and never straddles a beat.
+    if (p.gmem_sector_bytes > 64 || (p.lanes * 4) % p.gmem_sector_bytes != 0 ||
+        p.gmem_bus_bytes_per_dram_tick % 4 != 0 || p.lanes > 64) {
+        throw ProfileError(
+            "device profile: lsu needs sectors <= 64 B dividing a lane-wide register and a "
+            "bus beat of whole words");
+    }
+    if (p.lsu_active_commands == 0 || p.lsu_staging_vectors == 0 ||
+        p.lsu_pluck_words_per_cycle == 0 || p.lsu_sectors_in_flight == 0) {
+        throw ProfileError(
+            "device profile: lsu active_commands, staging_vectors, pluck_words_per_cycle and "
+            "sectors_in_flight must be nonzero");
+    }
+    if (p.lsu_read_streams < 2 || p.lsu_read_streams > 64) {
+        throw ProfileError(
+            "device profile: lsu read_streams must be in 2..64 (stream 0 TMA, 1..n-1 vector)");
+    }
+    if (p.lsu_ingress_sectors < 2 || p.lsu_egress_sectors < 2) {
+        throw ProfileError("device profile: lsu ingress and egress FIFOs must hold at least two sectors");
+    }
+    if (p.lsu_ingress_latency_cycles == 0 || p.lsu_egress_latency_cycles == 0 ||
+        p.lsu_ingress_latency_cycles > 64 || p.lsu_egress_latency_cycles > 64) {
+        throw ProfileError(
+            "device profile: lsu ingress/egress FIFO latency must be in 1..64 cycles (a BRAM FIFO "
+            "is never fall-through)");
+    }
 }
 
 DeviceProfile parse_device_profile(std::string_view source) {
@@ -177,6 +218,8 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.mma_queue_commands = field<uint32_t>(mma, "queue_commands");
     p.mma_result_latency_cycles = field<uint32_t>(mma, "result_latency_cycles");
     const auto layout = field<std::string>(mma, "layout");
+    if (field<std::string>(mma, "numeric_model") != mma_numeric_model)
+        throw ProfileError("device profile: unsupported MMA numeric_model (expected fp16_raw_window25_rz_v1)");
     if (layout != "dense" && layout != "xor64")
         throw ProfileError("device profile: MMA layout must be 'dense' or 'xor64'");
     p.mma_xor_layout = layout == "xor64";
@@ -210,6 +253,17 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.gmem_bus_bytes_per_dram_tick = field<uint32_t>(gmem, "bus_bytes_per_dram_tick");
     p.gmem_latency_dram_ticks = field<uint32_t>(gmem, "latency_dram_ticks");
     p.gmem_queue_sectors = field<uint32_t>(gmem, "queue_sectors");
+    if (!document.contains("lsu")) throw ProfileError("device profile: missing 'lsu' section");
+    const auto& lsu = document.at("lsu");
+    p.lsu_active_commands = field<uint32_t>(lsu, "active_commands");
+    p.lsu_staging_vectors = field<uint32_t>(lsu, "staging_vectors");
+    p.lsu_read_streams = field<uint32_t>(lsu, "read_streams");
+    p.lsu_pluck_words_per_cycle = field<uint32_t>(lsu, "pluck_words_per_cycle");
+    p.lsu_ingress_sectors = field<uint32_t>(lsu, "ingress_sectors");
+    p.lsu_egress_sectors = field<uint32_t>(lsu, "egress_sectors");
+    p.lsu_sectors_in_flight = field<uint32_t>(lsu, "sectors_in_flight");
+    p.lsu_ingress_latency_cycles = field<uint32_t>(lsu, "ingress_latency_cycles");
+    p.lsu_egress_latency_cycles = field<uint32_t>(lsu, "egress_latency_cycles");
     validate_device_profile(p);
     return p;
 }

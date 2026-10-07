@@ -41,8 +41,11 @@ enum class Opcode : uint8_t {
     bra   = 0x20,
     bra_uni = 0x21,
     shri  = 0x22,    // logical; 0x19..0x1f were full
+    // Interleaved vector (rfc09): rA warp-uniform, 64 B aligned, 512 contiguous
+    // bytes; register rD+j, lane l <-> word 16*j + l.
     ldg_v8 = 0x23,
     stg_v8 = 0x24,
+    ldg_uni = 0x25,  // rA warp-uniform: one sector request, the word fans out to every lane
 
     setpi_eq = 0x28,
     setpi_ne = 0x29,

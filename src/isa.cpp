@@ -94,6 +94,7 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::lds:
     case Opcode::ldg:
     case Opcode::ldg_v8:
+    case Opcode::ldg_uni:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -228,6 +229,7 @@ Instruction decode(uint64_t word) {
     case Opcode::lds:
     case Opcode::ldg:
     case Opcode::ldg_v8:
+    case Opcode::ldg_uni:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -354,6 +356,7 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::stg: return "stg";
     case Opcode::ldg_v8: return "ldg.v8";
     case Opcode::stg_v8: return "stg.v8";
+    case Opcode::ldg_uni: return "ldg.uni";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
     case Opcode::halt: return "halt";
@@ -495,6 +498,7 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
     case Opcode::lds:
     case Opcode::ldg:
     case Opcode::ldg_v8:
+    case Opcode::ldg_uni:
         out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm);
         break;
     case Opcode::sts:
@@ -566,6 +570,7 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::stg:
     case Opcode::ldg_v8:
     case Opcode::stg_v8:
+    case Opcode::ldg_uni:
     case Opcode::bra:
     case Opcode::bra_uni:
     case Opcode::mbar_init_i:

@@ -318,23 +318,26 @@ void TraceRecorder::mbar_timeout(
     });
 }
 
-void TraceRecorder::gmem_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, bool load) {
+void TraceRecorder::lsu_command_begin(
+    uint64_t cycle, uint64_t command, uint32_t warp, std::string name) {
     ++summary_.gmem_commands;
     gmem_commands_.emplace(command, OpenSlice{
         cycle,
         gmem_command_track,
         TraceCategory::gmem,
-        load ? "ldg command" : "stg command",
+        std::move(name),
         "warp=" + std::to_string(warp),
         command,
         true, // commands from different warps overlap in flight
     });
 }
 
-void TraceRecorder::gmem_command_end(uint64_t end_cycle, uint64_t command) {
+void TraceRecorder::lsu_command_end(
+    uint64_t end_cycle, uint64_t command, const std::string& phases) {
     const auto found = gmem_commands_.find(command);
-    if (found == gmem_commands_.end()) throw std::runtime_error("trace gmem command end without begin");
+    if (found == gmem_commands_.end()) throw std::runtime_error("trace lsu command end without begin");
     summary_.gmem_command_latency_cycles += end_cycle - found->second.start_cycle;
+    found->second.detail += ", " + phases;
     close_slice(std::move(found->second), end_cycle);
     gmem_commands_.erase(found);
 }
@@ -479,7 +482,8 @@ std::string TraceRecorder::summary_text() const {
             << summary_.warp_cycles[i] << '\n';
     }
     out << "shmem: requests=" << summary_.shmem_requests
-        << " rounds=" << summary_.shmem_rounds << '\n';
+        << " rounds=" << summary_.shmem_rounds
+        << " tma_priority_waits=" << summary_.shmem_tma_priority_waits << '\n';
     out << "mbar: rmw=" << summary_.mbar_rmw_requests
         << " phase_changes=" << summary_.mbar_phase_changes
         << " probes=" << summary_.mbar_initial_probes
@@ -507,6 +511,21 @@ std::string TraceRecorder::summary_text() const {
         out << "gmem avg command latency       "
             << summary_.gmem_command_latency_cycles / summary_.gmem_commands << " cycles\n";
     }
+    out << "lsu: vector_ld=" << summary_.lsu_vector_loads
+        << " vector_st=" << summary_.lsu_vector_stores
+        << " scalar_ld=" << summary_.lsu_scalar_loads
+        << " scalar_st=" << summary_.lsu_scalar_stores
+        << " uni=" << summary_.lsu_uniform_loads
+        << " sectors=" << summary_.lsu_sectors
+        << " bytes=" << summary_.lsu_bytes
+        << " useful_bytes=" << summary_.lsu_useful_bytes
+        << " no_slot=" << summary_.lsu_no_slot_cycles
+        << " no_staging=" << summary_.lsu_no_staging_cycles
+        << " request_wait=" << summary_.lsu_request_wait_cycles
+        << " ingress_full=" << summary_.lsu_ingress_full_cycles
+        << " rf_write_wait=" << summary_.lsu_rf_write_wait_cycles
+        << " rf_read_wait=" << summary_.lsu_rf_read_wait_cycles
+        << " egress_wait=" << summary_.lsu_egress_wait_cycles << '\n';
     out << "tma: commands=" << summary_.tma_commands
         << " completed=" << summary_.tma_command_completions
         << " logical_bytes=" << summary_.tma_logical_bytes

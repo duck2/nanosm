@@ -72,6 +72,9 @@ struct TraceSummary {
     std::array<uint64_t, static_cast<std::size_t>(WarpState::count)> warp_cycles{};
     uint64_t shmem_requests = 0;
     uint64_t shmem_rounds = 0;
+    // Warp-cycles a SIMT port-A op (lds/sts/mbar) was held off because the
+    // TMA had a port-A request waiting (TMA priority on the next free grant).
+    uint64_t shmem_tma_priority_waits = 0;
     uint64_t mbar_rmw_requests = 0;
     uint64_t mbar_phase_changes = 0;
     uint64_t mbar_initial_probes = 0;
@@ -86,6 +89,22 @@ struct TraceSummary {
     uint64_t gmem_bytes = 0;
     uint64_t gmem_command_latency_cycles = 0;
     uint64_t gmem_max_queue_depth = 0;
+    // LSU (trash/lsu-b2-2026-10-04.md has the exact definitions).
+    uint64_t lsu_vector_loads = 0;
+    uint64_t lsu_vector_stores = 0;
+    uint64_t lsu_scalar_loads = 0;
+    uint64_t lsu_scalar_stores = 0;
+    uint64_t lsu_uniform_loads = 0;
+    uint64_t lsu_sectors = 0;           // controller requests accepted from the LSU
+    uint64_t lsu_bytes = 0;             // their sector bytes on the bus
+    uint64_t lsu_useful_bytes = 0;      // bytes the instructions named
+    uint64_t lsu_no_slot_cycles = 0;    // warp-cycles: LSU op ineligible, no command slot
+    uint64_t lsu_no_staging_cycles = 0; // warp-cycles: slot free, no assembly register
+    uint64_t lsu_request_wait_cycles = 0; // LSU request ready, controller queue full
+    uint64_t lsu_ingress_full_cycles = 0; // cycles a read beat was held: ingress FIFO full
+    uint64_t lsu_rf_write_wait_cycles = 0;
+    uint64_t lsu_rf_read_wait_cycles = 0;
+    uint64_t lsu_egress_wait_cycles = 0;
     uint64_t tma_commands = 0;
     uint64_t tma_command_completions = 0;
     uint64_t tma_logical_bytes = 0;
@@ -141,12 +160,16 @@ public:
     void mbar_wake(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t phase);
     void mbar_timeout(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
 
-    void gmem_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, bool load);
-    void gmem_command_end(uint64_t end_cycle, uint64_t command);
+    void shmem_tma_priority_wait() { ++summary_.shmem_tma_priority_waits; }
+    // One event per LSU command (gmem commands track): admit .. completion,
+    // its phases and stall reasons in the detail. No per-word events.
+    void lsu_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, std::string name);
+    void lsu_command_end(uint64_t end_cycle, uint64_t command, const std::string& phases);
+    [[nodiscard]] TraceSummary& lsu_counters() { return summary_; }
     void gmem_sector_enqueue();
     void gmem_bus_begin(
         uint64_t cycle, uint64_t request, uint64_t sector_address, bool load,
-        std::string owner = "simt");
+        std::string owner = "lsu");
     void gmem_bus_beat(uint64_t cycle, uint64_t dram_tick, uint64_t request);
     void gmem_bus_end(uint64_t end_cycle, uint64_t request, uint32_t sector_bytes);
     void gmem_queue_depth(uint64_t cycle, std::size_t depth);

@@ -77,15 +77,36 @@ engine-facing `complete_mbar_tx` entry point rather than a SIMT instruction.
 The JSON parser is the pinned nlohmann/json v3.12.0 single header under `third_party/nlohmann` so
 configuration and builds remain offline and reproducible.
 
+MMA arithmetic is `mma.numeric_model = "fp16_raw_window25_rz_v1"`, included in the profile
+fingerprint. Each physical `core_k` step fuses its FP16 products with the FP32 accumulator:
+select the maximum nonzero term's raw exponent (operand exponent sums for products), align
+to a quantum of `2^(maximum - 25)` with magnitude truncation, sum signed integer units, and
+normalize/truncate once to FP32. Subnormal operands are preserved; exact zero and underflowed
+zero become +0, generated NaNs are `0x7fffffff`, and overflow produces signed infinity.
+Only FP32 survives between steps. The canonical core fuses four products, not the whole MMA
+instruction. There are no numerical tuning knobs or host floating-point operations in this path.
+
+The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
+at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
+[third_party/tcgen05-LICENSE](third_party/tcgen05-LICENSE). This borrows the measured arithmetic
+rules, not B200's fusion extent, and does not claim whole-instruction B200 equivalence.
+Tests include frozen B200 FP16 vectors, an upstream-derived 20,000-case regression digest,
+all FP16 encodings, and physical fusion-boundary checks. FA separately checks a logical dot4
+reference and double-precision attention. Older profiles must name the new model and regenerate
+their fingerprinted artifacts; serial scalar-FMA MMA arithmetic is no longer supported.
+
 A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,
 active warp count, and ordered sparse shmem/gmem byte segments. Bytes and 64-bit words are written
 as hexadecimal strings, while addresses are JSON integers. Segments are applied in array order and
 later overlapping bytes win. The simulator runner does not know which workload authored the image.
 
-The demo launches sparse global-memory input state and runs scalar `ldg`/`fadd`/`stg` vector add.
-The first controller coalesces warp accesses into 32-byte sectors, uses a finite FIFO with fixed
-latency, and transfers sectors over one fixed-width bus. This is the replaceable timing policy in
-front of the eventual bank/row scheduler, not a fixed-latency whole-load shortcut.
+The demo launches sparse global-memory input state and runs a four-warp `ldg.v8`/`fadd`/`stg.v8`
+vector add (`kernels/vadd.launch.py` checks it bit-exactly). There is no coalescer: a scalar
+`ldg`/`stg` is one sector request per lane, `ldg.v8`/`stg.v8` move 512 contiguous bytes from a
+warp-uniform 64 B-aligned base, and `ldg.uni` is one request fanned out to every lane. The placeholder
+controller is a finite FIFO with fixed latency and one fixed-width bus behind a small LSU declared
+in the profile's `lsu` section. This is the replaceable timing policy in front of the eventual
+bank/row scheduler, not a fixed-latency whole-load shortcut.
 
 The first TMA slice implements rank-1/2/3 load and store through that same controller and through
 contended shmem port A. `tma.async [descriptor], rcoord` captures three signed coordinates and

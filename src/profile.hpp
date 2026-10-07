@@ -65,6 +65,32 @@ struct DeviceProfile {
     uint32_t gmem_bus_bytes_per_dram_tick = 0;
     uint32_t gmem_latency_dram_ticks = 0;
     uint32_t gmem_queue_sectors = 0;
+
+    // The SM's load/store unit (trash/rfc09.md section 3, B2). All config,
+    // none canonical by ruling.
+    // Machine-wide outstanding ldg/stg commands (vector, scalar, uniform).
+    uint32_t lsu_active_commands = 0;
+    // 64 B (lane-wide) assembly registers. A command owns one from admission
+    // to its end, so admitted commands never exceed this number.
+    uint32_t lsu_staging_vectors = 0;
+    // Ordered read IDs (rfc09 3a): 0 = TMA (one 32 B sector register),
+    // 1..n-1 = vector streams assigned round-robin to vector loads (they
+    // pluck straight into the command's assembly register). >= 2. Scalar
+    // gathers and ldg.uni ride free IDs above these.
+    uint32_t lsu_read_streams = 0;
+    // Ingress FIFO read port and the shared egress FIFO write port, 32-bit
+    // words per cycle.
+    uint32_t lsu_pluck_words_per_cycle = 0;
+    // Ingress / egress FIFO capacity in 32 B sector slots.
+    uint32_t lsu_ingress_sectors = 0;
+    uint32_t lsu_egress_sectors = 0;
+    // BRAM FIFO write-to-read latency in core cycles: a beat (ingress) or a
+    // completed sector slot (egress) written in cycle t is readable at
+    // t + latency. Start 1 (registered-output simple dual port); never 0.
+    uint32_t lsu_ingress_latency_cycles = 0;
+    uint32_t lsu_egress_latency_cycles = 0;
+    // Outstanding scalar (gather, scatter, uniform) sectors = free-ID tags.
+    uint32_t lsu_sectors_in_flight = 0;
 };
 
 using Config = DeviceProfile;

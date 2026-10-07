@@ -13,6 +13,8 @@ add_library(nanosm
     src/trace.cpp
     src/compiler.cpp
     src/sim.cpp
+    src/mma_numeric.cpp
+    src/lsu.cpp
 )
 target_include_directories(nanosm PUBLIC src PRIVATE third_party)
 set_target_properties(nanosm PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -128,6 +130,13 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE} -B -m nanosm kernels/fa.launch.py
     )
     set_tests_properties(nanosm_python_fa PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(
+        NAME nanosm_python_vadd
+        COMMAND ${CMAKE_COMMAND} -E env
+            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
+            ${Python3_EXECUTABLE} -B -m nanosm kernels/vadd.launch.py
+    )
+    set_tests_properties(nanosm_python_vadd PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 add_custom_target(run

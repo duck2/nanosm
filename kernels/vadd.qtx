@@ -1,14 +1,35 @@
-; First global-memory nanosm kernel. The launch image contains three f32[64] arrays:
-; A and B are inputs, C is zeroed output. Four 16-lane warps cover one element per lane.
+; Vector add, C = A + B over 8192 fp32 (32 KiB per vector), four warps.
+; Warp w streams its own 512 B blocks w, w+4, w+8, ... (16 blocks each).
+; Interleaved v8 (rfc09): register r(base+j), lane l <-> word 16*j + l of the
+; block, so one ldg.v8 is eight full-width RF writes and one stg.v8 eight
+; full-width RF reads; memory order equals register order, no corner turn.
+; The block base is warp-uniform and 64 B aligned, as v8 requires.
+; Launch: kernels/vadd.launch.py.
 
-.equ A,   0
-.equ B,   256
-.equ C,   512
+.equ A, 0
+.equ B, 32768
+.equ C, 65536
+.equ BLOCKS_PER_WARP, 16
+.equ WARP_STRIDE, 2048        ; four warps x 512 B
 
-        sread  r0, THREAD_ID
-        shli   r0, r0, 2
-        ldg    r1, [r0 + A]
-        ldg    r2, [r0 + B]
-        fadd   r4, r1, r2
-        stg    [r0 + C], r4
+        sread  r20, WARP_ID
+        shli   r20, r20, 9            ; r20 = 512 * warp
+        mov    r21, BLOCKS_PER_WARP
+loop:
+        ldg.v8 r0, [r20 + A]
+        ldg.v8 r8, [r20 + B]
+        ; rj and r(8+j) are always in different RF banks (j vs j+2 mod 3)
+        fadd   r0, r0, r8
+        fadd   r1, r1, r9
+        fadd   r2, r2, r10
+        fadd   r3, r3, r11
+        fadd   r4, r4, r12
+        fadd   r5, r5, r13
+        fadd   r6, r6, r14
+        fadd   r7, r7, r15
+        stg.v8 [r20 + C], r0
+        addi   r20, r20, WARP_STRIDE
+        addi   r21, r21, -1
+        setp.ne p0, r21, 0
+        @p0 bra.uni loop
         halt
