@@ -13,7 +13,8 @@
 //      egress FIFO, one client per cycle, TMA priority
 //
 // Every named storage element is a register stage (see Machine::tick for the
-// consumer-before-producer order that makes fall-through impossible). Every
+// consumer-before-producer order that makes fall-through impossible; the
+// tripwires that would catch one live in the Sanitizer). Every
 // edge moves at most its declared width per cycle. No coalescer, no address
 // comparison: every lane of a scalar access is its own request.
 // Structures, owners and lifetimes: sim.hpp and trash/lsu-b21-2026-10-04.md.
@@ -32,12 +33,6 @@ namespace {
 uint32_t beats_per_sector(const Config& config) {
     return (config.gmem_sector_bytes + config.gmem_bus_bytes_per_dram_tick - 1) /
         config.gmem_bus_bytes_per_dram_tick;
-}
-
-std::string stream_name(const Config& config, uint32_t stream) {
-    if (stream == 0) return "0 (TMA)";
-    if (stream < config.lsu_read_streams) return std::to_string(stream) + " (vector)";
-    return std::to_string(stream) + " (free)";
 }
 
 uint64_t full_byte_enable(uint32_t sector_bytes) {
@@ -402,7 +397,7 @@ void Machine::admit_lsu_command(
     switch (command.kind) {
     case LsuKind::vector_load:
         for (uint32_t j = 0; j < 8; ++j)
-            warp.ready_cycle[command.reg + j] = std::numeric_limits<uint64_t>::max();
+            sanitizer_.record_reg_ready(warp.id, command.reg + j, std::numeric_limits<uint64_t>::max());
         // Ordered vector streams 1..read_streams-1, round-robin.
         command.stream = 1 + next_vector_stream_++ % (config_.lsu_read_streams - 1);
         ++counters.lsu_vector_loads;
@@ -410,12 +405,12 @@ void Machine::admit_lsu_command(
         break;
     case LsuKind::vector_store:
         // WAR protection: each source stays read-owned until its RF read beat.
-        for (uint32_t j = 0; j < 8; ++j) ++warp.async_readers[command.reg + j];
+        for (uint32_t j = 0; j < 8; ++j) sanitizer_.record_async_reader_add(warp.id, command.reg + j);
         ++counters.lsu_vector_stores;
         counters.lsu_useful_bytes += 32ull * config_.lanes;
         break;
     case LsuKind::scalar_load:
-        warp.ready_cycle[command.reg] = std::numeric_limits<uint64_t>::max();
+        sanitizer_.record_reg_ready(warp.id, command.reg, std::numeric_limits<uint64_t>::max());
         ++counters.lsu_scalar_loads;
         counters.lsu_useful_bytes += 4ull * config_.lanes;
         break;
@@ -427,13 +422,13 @@ void Machine::admit_lsu_command(
             staging.valid[lane] = 1;
         }
         staging.valid_count = config_.lanes;
-        staging.last_write_cycle = cycle_;
+        sanitizer_.record_assembly_write(assembly, cycle_);
         probe(LsuEdge::rf_read_beat, command.id, inst.src1, config_.lanes * 4);
         ++counters.lsu_scalar_stores;
         counters.lsu_useful_bytes += 4ull * config_.lanes;
         break;
     case LsuKind::uniform_load:
-        warp.ready_cycle[command.reg] = std::numeric_limits<uint64_t>::max();
+        sanitizer_.record_reg_ready(warp.id, command.reg, std::numeric_limits<uint64_t>::max());
         ++counters.lsu_uniform_loads;
         counters.lsu_useful_bytes += 4;
         break;
@@ -444,12 +439,7 @@ void Machine::admit_lsu_command(
     lsu_commands_.push_back(std::move(command));
     // Sanitizer: every admitted command owns one assembly register for its
     // whole life, so the admitted set can never exceed the pool.
-    if (lsu_commands_.size() > config_.lsu_staging_vectors ||
-        lsu_commands_.size() > config_.lsu_active_commands) {
-        throw SimError(
-            "internal LSU sanitizer: " + std::to_string(lsu_commands_.size()) +
-            " admitted commands exceed lsu.staging_vectors/active_commands");
-    }
+    sanitizer_.check_lsu_admitted(lsu_commands_.size());
 }
 
 // The egress FIFO's request pointer: the oldest slot whose write request has
@@ -562,7 +552,7 @@ void Machine::advance_lsu_requests() {
             request.sector_address = command.base + static_cast<uint64_t>(index) * config_.gmem_sector_bytes;
             record.kind = ReadKind::vector;
             record.sector_index = index;
-            ordered_stream_requests_.at(command.stream).push_back(request.id);
+            sanitizer_.record_ordered_request(command.stream, request.id);
         } else {
             const auto tag = free_id_tag();
             if (!tag.has_value()) throw SimError("internal scalar LSU request without a free-ID tag");
@@ -627,40 +617,13 @@ void Machine::advance_ingress() {
     }
 }
 
-// The boundary tripwire for an ordered ID: its beats must belong to its
-// oldest outstanding request, contiguous and in order. The placeholder
-// controller cannot violate this; a B4 controller that does panics here
-// instead of corrupting a register.
-void Machine::check_ordered_beat(uint32_t stream, const IngressBeat& beat) {
-    const auto& order = ordered_stream_requests_.at(stream);
-    if (order.empty() || order.front() != beat.request) {
-        if (!order.empty() && read_records_.at(order.front()).received != 0) {
-            const auto& front = read_records_.at(order.front());
-            controller_contract_panic(
-                "read stream " + stream_name(config_, stream) + " delivered a beat of request #" +
-                std::to_string(beat.request) + " while request #" + std::to_string(order.front()) +
-                " is mid-sector (" + std::to_string(front.received) + "/" +
-                std::to_string(config_.gmem_sector_bytes) + " bytes)");
-        }
-        controller_contract_panic(
-            "read stream " + stream_name(config_, stream) + " returned request #" +
-            std::to_string(beat.request) + " out of request order (expected #" +
-            (order.empty() ? std::string("none") : std::to_string(order.front())) + ")");
-    }
-    if (beat.offset + beat.consumed != read_records_.at(beat.request).received) {
-        controller_contract_panic(
-            "read stream " + stream_name(config_, stream) + " delivered request #" +
-            std::to_string(beat.request) + " bytes out of order");
-    }
-}
-
 // Ingress -> the TMA stream's 32 B sector register at the pluck rate. When
 // the sector is complete it becomes a placement ticket; the register stays
 // occupied until the placement's last port-A round has read it.
 bool Machine::pluck_tma(IngressBeat& beat, uint32_t take) {
     auto& reg = tma_sector_;
     if (reg.request.has_value() && reg.complete) return false; // unplaced sector: the head waits
-    check_ordered_beat(tma_stream, beat);
+    sanitizer_.check_ordered_beat(cycle_, tma_stream, beat.request, beat.offset + beat.consumed);
     auto& record = read_records_.at(beat.request);
     if (!reg.request.has_value()) {
         reg.request = beat.request;
@@ -671,11 +634,11 @@ bool Machine::pluck_tma(IngressBeat& beat, uint32_t take) {
     std::memcpy(reg.data.data() + reg.filled, beat.bytes.data() + beat.consumed, take);
     probe(LsuEdge::tma_reg_write, beat.request, reg.filled, take);
     reg.filled += take;
-    reg.last_write_cycle = cycle_;
+    sanitizer_.record_tma_sector_write(cycle_);
     record.received += take;
+    sanitizer_.record_ordered_pluck(tma_stream, take);
     if (reg.filled != config_.gmem_sector_bytes) return true;
 
-    ordered_stream_requests_[tma_stream].pop_front();
     TmaReturn returned;
     returned.command = record.command;
     returned.sector_request = beat.request;
@@ -696,7 +659,7 @@ bool Machine::pluck_vector(ReadRecord& record, IngressBeat& beat, uint32_t take)
     auto& command = lsu_command(record.command);
     auto& assembly = staging_.at(command.assembly);
     if (assembly.valid_count == config_.lanes) return false;
-    check_ordered_beat(record.stream, beat);
+    sanitizer_.check_ordered_beat(cycle_, record.stream, beat.request, beat.offset + beat.consumed);
     const uint32_t sectors_per_chunk = config_.lanes * 4 / config_.gmem_sector_bytes;
     if (record.sector_index / sectors_per_chunk != command.chunks_done) {
         throw SimError("internal vector sector reached the wrong chunk");
@@ -709,11 +672,11 @@ bool Machine::pluck_vector(ReadRecord& record, IngressBeat& beat, uint32_t take)
         assembly.valid[lane] = 1;
         ++assembly.valid_count;
     }
-    assembly.last_write_cycle = cycle_;
+    sanitizer_.record_assembly_write(command.assembly, cycle_);
     probe(LsuEdge::assembly_write, command.id, beat.request, take);
     record.received += take;
+    sanitizer_.record_ordered_pluck(record.stream, take);
     if (record.received == config_.gmem_sector_bytes) {
-        ordered_stream_requests_.at(record.stream).pop_front();
         read_records_.erase(beat.request); // record is dangling from here on
     }
     return true;
@@ -738,7 +701,7 @@ void Machine::pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint
                 ++assembly.valid_count;
             }
         }
-        assembly.last_write_cycle = cycle_;
+        sanitizer_.record_assembly_write(command.assembly, cycle_);
         probe(LsuEdge::assembly_write, command.id, beat.request, 4);
     }
     record.received += take;
@@ -774,9 +737,7 @@ void Machine::advance_lsu_rf_writes() {
             command.kind == LsuKind::scalar_store) continue;
         auto& assembly = staging_.at(command.assembly);
         if (assembly.valid_count != config_.lanes) continue;
-        if (assembly.last_write_cycle >= cycle_) {
-            throw SimError("internal fall-through: assembly register dumped in the cycle it was written");
-        }
+        sanitizer_.check_assembly_dump(command.assembly, cycle_);
         const bool vector = command.kind == LsuKind::vector_load;
         const auto reg = static_cast<uint8_t>(command.reg + (vector ? command.chunks_done : 0));
         if (!reserve_write(reg, cycle_)) {
@@ -797,7 +758,7 @@ void Machine::advance_lsu_rf_writes() {
         if (!vector || command.chunks_done == 8) {
             // rD..rD+7 count as in flight until the last write.
             const uint32_t width = vector ? 8 : 1;
-            for (uint32_t j = 0; j < width; ++j) warp.ready_cycle[command.reg + j] = cycle_;
+            for (uint32_t j = 0; j < width; ++j) sanitizer_.record_reg_ready(warp.id, command.reg + j, cycle_);
             writeback.clear_depbar = command.depbar;
             writeback.release_lsu_command = command.id;
             command.finishing = true;
@@ -832,11 +793,9 @@ void Machine::advance_lsu_rf_reads() {
             assembly.valid[lane] = 1;
         }
         assembly.valid_count = config_.lanes;
-        assembly.last_write_cycle = cycle_;
+        sanitizer_.record_assembly_write(command.assembly, cycle_);
         probe(LsuEdge::rf_read_beat, command.id, reg, config_.lanes * 4);
-        auto& readers = warp.async_readers[reg];
-        if (readers == 0) throw SimError("internal stg.v8 reader underflow");
-        --readers;
+        sanitizer_.record_async_reader_done(warp.id, reg, AsyncReader::stg_v8);
         ++command.chunks_done;
         break;
     }
@@ -920,9 +879,10 @@ void Machine::advance_egress_writes() {
     const uint32_t words = std::min(config_.lsu_pluck_words_per_cycle, open->words_total - open->words_written);
     if (open->client == GmemClient::tma) {
         auto& reg = tma_store_sector_;
-        if (!reg.busy || !reg.complete || reg.last_write_cycle >= cycle_) {
+        if (!reg.busy || !reg.complete) {
             throw SimError("internal fall-through: TMA store sector register read before it was complete");
         }
+        sanitizer_.check_tma_store_sector_read(cycle_);
         std::memcpy(open->data.data() + reg.words_out * 4, reg.data.data() + reg.words_out * 4, words * 4);
         reg.words_out += words;
         if (reg.words_out == sector_words) { // drained: the walker may start the next sector
@@ -932,9 +892,7 @@ void Machine::advance_egress_writes() {
     } else {
         auto& command = lsu_command(open->command);
         auto& assembly = staging_.at(command.assembly);
-        if (assembly.last_write_cycle >= cycle_) {
-            throw SimError("internal fall-through: store assembly register read in the cycle it was written");
-        }
+        sanitizer_.check_store_assembly_read(command.assembly, cycle_);
         for (uint32_t word = 0; word < words; ++word) {
             if (command.kind == LsuKind::vector_store) {
                 const uint32_t byte = command.words_plucked * 4 % config_.gmem_sector_bytes;
@@ -994,12 +952,6 @@ std::string Machine::lsu_phase_detail(const LsuCommand& command) const {
         << " rf_wait=" << command.rf_wait
         << " egress_wait=" << command.egress_wait;
     return out.str();
-}
-
-[[noreturn]] void Machine::controller_contract_panic(const std::string& reason) const {
-    throw SimError(
-        "PANIC cycle=" + std::to_string(cycle_) + " reason=gmem controller contract violation: " +
-        reason);
 }
 
 } // namespace nanosm

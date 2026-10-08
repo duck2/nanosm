@@ -5273,8 +5273,41 @@ int main() {
         {"trace attribution and limit", test_trace_attribution_and_limit},
         {"perfetto async commands", test_perfetto_overlapping_commands_are_async},
     };
+    // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
+    // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
+    // and counts them; every other test must pass there unchanged.
+    const std::set<std::string> expects_sanitizer_panic = {
+        "RF deferred WAR and branch",
+        "tmem ordering and store lifetime",
+        "MMA bare transfer race panics",
+        "MMA port collision sweep",
+        "sanitizer: sts into TMA store source",
+        "sanitizer: sts into MMA operand stage",
+        "sanitizer: lds from TMA load destination",
+        "sanitizer: mbar RMW into owned range",
+        "sanitizer: TMA/MMA accept conflicts",
+        "sanitizer: tmem ownership both directions",
+        "sanitizer: RMW port collision (C5)",
+        "lsu controller contract tripwire",
+        "lsu B2.1: read_streams generalized",
+        "missing wait panic",
+    };
+    for (const auto& name : expects_sanitizer_panic) {
+        if (std::none_of(tests.begin(), tests.end(), [&](const auto& test) { return test.first == name; })) {
+            nanosm::err("FAIL sanitizer-panic tag names no test: {}", name);
+            return 1;
+        }
+    }
     std::size_t passed = 0;
+    std::size_t skipped = 0;
     for (const auto& [name, test] : tests) {
+#if !NANOSM_SANITIZER
+        if (expects_sanitizer_panic.contains(name)) {
+            nanosm::log("SKIP {} (expects a sanitizer panic; NANOSM_SANITIZER=0)", name);
+            ++skipped;
+            continue;
+        }
+#endif
         try {
             test();
             nanosm::log("PASS {}", name);
@@ -5283,6 +5316,11 @@ int main() {
             nanosm::err("FAIL {}: {}", name, error.what());
         }
     }
-    nanosm::log("{}/{} tests passed", passed, tests.size());
-    return passed == tests.size() ? 0 : 1;
+    if (skipped == 0) {
+        nanosm::log("{}/{} tests passed", passed, tests.size());
+    } else {
+        nanosm::log("{}/{} tests passed ({} skipped: they expect a sanitizer panic)",
+            passed, tests.size() - skipped, skipped);
+    }
+    return passed + skipped == tests.size() ? 0 : 1;
 }

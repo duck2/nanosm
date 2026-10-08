@@ -143,11 +143,6 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
     return a > b ? a_bits : b_bits;
 }
 
-// Sanitizer diagnostics: a half-open range "[begin, end)".
-std::string half_open(uint64_t begin, uint64_t end) {
-    return "[" + std::to_string(begin) + ", " + std::to_string(end) + ")";
-}
-
 bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     switch (opcode) {
     case Opcode::setp_eq:
@@ -238,7 +233,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             assembly.valid.assign(config_.lanes, 0);
         }
         free_id_tags_.assign(config_.lsu_sectors_in_flight, 0);
-        ordered_stream_requests_.resize(config_.lsu_read_streams);
         tma_sector_.data.assign(config_.gmem_sector_bytes, 0);
         tma_store_sector_.data.assign(config_.gmem_sector_bytes, 0);
         warps_.reserve(launch.active_warps);
@@ -246,12 +240,10 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             Warp warp;
             warp.id = id;
             warp.rf.resize(static_cast<std::size_t>(config_.lanes) * kernel_.register_count, 0);
-            warp.ready_cycle.resize(kernel_.register_count, 0);
-            warp.read_until.resize(kernel_.register_count, 0);
-            warp.async_readers.resize(kernel_.register_count, 0);
             for (auto& predicate : warp.predicates) predicate.resize(config_.lanes, 0);
             warps_.push_back(std::move(warp));
         }
+        sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
         throw SimError("machine state does not fit in host memory");
     } catch (const std::length_error&) {
@@ -289,7 +281,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
 // issue (this cycle's issue reads keep theirs).
 void Machine::tick() {
     if (done()) return;
-    port_a_written_words_.clear();
+    sanitizer_.record_cycle_start();
     request_channel_used_ = false;
     ingress_freed_this_cycle_ = 0;
     return_ready_low_this_cycle_ = false;
@@ -359,12 +351,6 @@ uint32_t mma_b_address(const Config& config, uint32_t base, uint32_t k, uint32_t
 
 } // namespace
 
-void Machine::record_port_a_shmem_write(uint64_t byte_address, uint32_t size) {
-    const auto first = static_cast<uint32_t>(byte_address / 4);
-    const auto last = static_cast<uint32_t>((byte_address + size - 1) / 4);
-    for (uint32_t word = first; word <= last; ++word) port_a_written_words_.push_back(word);
-}
-
 void Machine::advance_mma() {
     for (auto it = mma_results_.begin(); it != mma_results_.end();) {
         if (it->ready_cycle > cycle_) { ++it; continue; }
@@ -384,7 +370,7 @@ void Machine::advance_mma() {
     }
     while (!mma_commands_.empty() && !mma_commands_.front().commit &&
            mma_commands_.front().operands_consumed && mma_commands_.front().outstanding_results == 0) {
-        release_tmem_owner(TmemOwnerKind::mma, mma_commands_.front().id); // last result retired
+        sanitizer_.record_mma_retired(mma_commands_.front().id); // last result retired
         mma_commands_.pop_front();
     }
     // Port service: one bank round per cycle for the in-flight fetch. A new
@@ -470,6 +456,7 @@ void Machine::advance_mma() {
     const uint32_t total_steps = blocks_per_k * (config_.mma_k / config_.mma_core_k);
     fetch.last_step = command.next_step + 1 == total_steps;
     ++command.next_step;
+    sanitizer_.record_mma_fetch_start(command.id);
     trace_->mma_input(cycle_, command.id, rounds, command.next_step - 1);
     mma_fetch_ = std::move(fetch);
     serve_mma_fetch_round();
@@ -477,14 +464,7 @@ void Machine::advance_mma() {
 
 void Machine::serve_mma_fetch_round() {
     auto& fetch = *mma_fetch_;
-    for (const auto word : fetch.round_words.at(fetch.next_round)) {
-        if (std::find(port_a_written_words_.begin(), port_a_written_words_.end(), word) !=
-            port_a_written_words_.end()) {
-            throw SimError(
-                "MMA port-B round and a port-A write touch shmem word " +
-                std::to_string(word) + " in the same cycle");
-        }
-    }
+    sanitizer_.check_port_b_round(fetch.round_words.at(fetch.next_round));
     for (const auto address : fetch.round_elements.at(fetch.next_round)) {
         if (static_cast<uint64_t>(address) + 2 > shmem_.size())
             throw SimError("MMA operand footprint is outside shmem");
@@ -547,7 +527,7 @@ void Machine::complete_mma_fetch() {
     ++command.outstanding_results;
     if (fetch.last_step) {
         command.operands_consumed = true;
-        release_mma_operands(command.id); // final operand read
+        sanitizer_.record_mma_operands_consumed(command.id); // final operand read
         auto& counter = warps_.at(command.warp).depbar[command.depbar];
         if (counter == 0) throw SimError("internal MMA depbar underflow");
         --counter;
@@ -592,10 +572,12 @@ void Machine::advance_acc_transfers() {
                 writeback.reason = "acc.ld";
                 if (transfer.next_column + 1 == transfer.width) {
                     writeback.clear_depbar = transfer.depbar;
-                    writeback.release_acc_transfer = transfer.id;
+                    // tmem read-ownership ends when this final RF write commits
+                    sanitizer_.record_acc_transfer_final_beat(
+                        static_cast<uint8_t>(bank), true, writeback.ready_cycle);
                 }
                 writebacks_.push_back(std::move(writeback));
-                warp.ready_cycle[reg] = cycle_ + 1;
+                sanitizer_.record_reg_ready(warp.id, reg, cycle_ + 1);
             } else {
                 const std::vector<RfRead> reads{{reg, 0}};
                 if (!can_reserve_reads(reads)) continue;
@@ -612,15 +594,15 @@ void Machine::advance_acc_transfers() {
             if (transfer.next_column != transfer.width) continue;
             if (!transfer.load) {
                 for (uint32_t j = 0; j < transfer.width; ++j) {
-                    auto& readers = warp.async_readers[transfer.rf_base + j];
-                    if (readers == 0) throw SimError("internal acc.st reader underflow");
-                    --readers;
+                    sanitizer_.record_async_reader_done(
+                        warp.id, transfer.rf_base + j, AsyncReader::acc_st);
                 }
                 auto& counter = warp.depbar[transfer.depbar];
                 if (counter == 0) throw SimError("internal acc.st depbar underflow");
                 --counter;
                 trace_->depbar(cycle_, warp.id, transfer.depbar, counter);
-                release_tmem_owner(TmemOwnerKind::acc_st, transfer.id); // final tmem write
+                // final tmem write: write-ownership ends
+                sanitizer_.record_acc_transfer_final_beat(static_cast<uint8_t>(bank), false, cycle_);
             }
             slot.reset();
         }
@@ -727,11 +709,10 @@ void Machine::commit_writebacks() {
             --counter;
             trace_->depbar(cycle_, warp.id, *it->clear_depbar, counter);
         }
-        if (it->release_acc_transfer.has_value()) // sanitizer: acc.ld final RF write
-            release_tmem_owner(TmemOwnerKind::acc_ld, *it->release_acc_transfer);
         if (it->release_lsu_command.has_value()) release_lsu_command(*it->release_lsu_command);
         it = writebacks_.erase(it);
     }
+    sanitizer_.record_writebacks_committed(cycle_); // acc.ld final RF writes end read-ownership
     write_reservations_.erase(cycle_);
 }
 
@@ -988,14 +969,9 @@ void Machine::advance_shmem() {
             active.request = std::move(*engine_mbar_event_);
             engine_mbar_event_.reset();
             // Sanitizer: an engine's RMW is admitted here (SIMT ones at issue).
-            if (const auto* owner = shmem_owner_overlapping(
-                    active.request.byte_address, active.request.byte_address + 8ull, false)) {
-                mbar_rmw_panic(active.request, shmem_race(
-                    std::string(active.request.operation == MbarRmwOperation::complete_tx
-                        ? "engine complete_tx" : "engine mma.commit arrive") +
-                        " writes mbar",
-                    active.request.byte_address, active.request.byte_address + 8ull, *owner));
-            }
+            // Engine events never carry a requesting warp.
+            sanitizer_.check_engine_mbar_rmw(cycle_, active.request.byte_address,
+                active.request.operation == MbarRmwOperation::complete_tx);
             mbar_rmw_ = std::move(active);
             advance_mbar_rmw();
         }
@@ -1008,7 +984,7 @@ void Machine::advance_shmem() {
             request.load_values[access.lane] = read_shmem_u32(access.byte_address);
         } else {
             std::memcpy(shmem_.data() + access.byte_address, &access.value, sizeof(access.value));
-            record_port_a_shmem_write(access.byte_address, sizeof(access.value));
+            sanitizer_.record_port_a_write(access.byte_address, sizeof(access.value));
         }
     }
     trace_->shmem_round();
@@ -1109,7 +1085,7 @@ void Machine::advance_mbar_rmw() {
     store_mbar(request.byte_address, state);
     // C5: the RMW write stage is a port-A write like any other; a same-cycle
     // same-word MMA port-B round must see it.
-    record_port_a_shmem_write(request.byte_address, 8);
+    sanitizer_.record_port_a_write(request.byte_address, 8);
     if (phase_changed) {
         wake_mbar_waiters(request.byte_address, static_cast<uint8_t>(state.phase));
     }
@@ -1134,7 +1110,7 @@ void Machine::advance_mbar_read() {
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             warp.predicates[request.predicate_dst][lane] = complete;
         }
-        warp.predicate_ready_cycle[request.predicate_dst] = cycle_;
+        sanitizer_.record_pred_ready(warp.id, request.predicate_dst, cycle_);
         return;
     }
     if (!request.wait_slot.has_value() || !warp.mbar_wait_slot.has_value() ||
@@ -1210,7 +1186,8 @@ void Machine::complete_tma_port_request(TmaPortRequest request) {
         command.descriptor = decode_tma_descriptor(bytes.data(), bytes.size());
         command.logical_bytes = tma_logical_bytes(command.descriptor);
         validate_tma_runtime_descriptor(command);
-        verify_tma_descriptor_ownership(command); // releases the descriptor read-ownership
+        // releases the descriptor read-ownership; verifies the accept-time peek
+        sanitizer_.record_tma_descriptor_read(command.id, command.descriptor);
         command.state = TmaCommandState::phase;
         return;
     }
@@ -1437,9 +1414,11 @@ std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_round
 void Machine::serve_tma_port_round(TmaPortRequest& request) {
     const bool write = request.kind == TmaPortKind::load_write;
     const bool store_read = request.kind == TmaPortKind::store_read;
-    if (write && request.from_sector_register &&
-        (!tma_sector_.complete || tma_sector_.last_write_cycle >= cycle_)) {
-        throw SimError("internal fall-through: TMA sector register read in the cycle it was written");
+    if (write && request.from_sector_register) {
+        if (!tma_sector_.complete) {
+            throw SimError("internal fall-through: TMA sector register read in the cycle it was written");
+        }
+        sanitizer_.check_tma_sector_read(cycle_);
     }
     uint32_t bytes = 0;
     for (const auto& piece : request.rounds.at(request.next_round)) {
@@ -1456,7 +1435,7 @@ void Machine::serve_tma_port_round(TmaPortRequest& request) {
                     (fragment.gmem_address - tma_sector_.sector_address) + piece.offset;
             }
             std::memcpy(shmem_.data() + address, source, piece.size);
-            record_port_a_shmem_write(address, piece.size);
+            sanitizer_.record_port_a_write(address, piece.size);
         } else if (store_read) {
             std::memcpy(tma_store_sector_.data.data() +
                     (fragment.gmem_address - tma_store_sector_.sector_address) + piece.offset,
@@ -1467,7 +1446,7 @@ void Machine::serve_tma_port_round(TmaPortRequest& request) {
     }
     if (write) probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);
     if (store_read) {
-        tma_store_sector_.last_write_cycle = cycle_;
+        sanitizer_.record_tma_store_sector_write(cycle_);
         probe(LsuEdge::tma_store_round, request.command, request.next_round, bytes);
     }
 }
@@ -1564,7 +1543,7 @@ bool Machine::tma_walker_step(TmaCommand& command) {
         record.sector_address = sector_address;
         record.fragments = fragments;
         read_records_.emplace(request.id, std::move(record));
-        ordered_stream_requests_[tma_stream].push_back(request.id);
+        sanitizer_.record_ordered_request(tma_stream, request.id);
         accept_gmem_request(std::move(request), GmemClient::tma);
         ++command.pending_load_writes;
     } else {
@@ -1797,16 +1776,10 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
     }
     if (is_setp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) {
         if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
-        if (warp.predicate_ready_cycle[inst.dst] > cycle_) {
-            panic(warp, inst, "predicate WAW hazard: missing stall for p" + std::to_string(inst.dst));
-        }
+        sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
     }
-    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7 &&
-        warp.predicate_ready_cycle[inst.control.predicate] > cycle_) {
-        panic(
-            warp,
-            inst,
-            "predicate RAW hazard: missing stall for p" + std::to_string(inst.control.predicate));
+    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+        sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate);
     }
     check_register_hazards(warp, inst);
     auto issue_sources = sources;
@@ -1844,10 +1817,10 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
             trace_->sfu_accept(occupancy);
         }
         for (const auto& read : reads) {
-            warp.read_until[read.reg] = std::max(warp.read_until[read.reg], cycle_ + read.offset + 1);
+            sanitizer_.record_reg_read_until(warp.id, read.reg, cycle_ + read.offset + 1);
         }
-        if (destination.has_value()) warp.ready_cycle[*destination] = result_cycle;
-        else warp.predicate_ready_cycle[inst.dst] = result_cycle;
+        if (destination.has_value()) sanitizer_.record_reg_ready(warp.id, *destination, result_cycle);
+        else sanitizer_.record_pred_ready(warp.id, inst.dst, result_cycle);
         ArithmeticRead pending;
         pending.issue_cycle = cycle_;
         pending.warp = warp.id;
@@ -1878,43 +1851,19 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         if (acc_id >= kernel_.accumulators.size()) panic(warp, inst, "accumulator id out of range");
         // Racing accepted MMA work is UB (cases 01/02): no ownership hardware
         // exists, but the simulator has global knowledge and diagnoses it.
-        // An accepted MMA (queued or not) write-owns its whole accumulator
-        // until its last result retires (sanitizer tmem owner table).
-        for (const auto& owner : tmem_owners_) {
-            if (owner.kind == TmemOwnerKind::mma && owner.accumulator == acc_id) {
-                panic(warp, inst,
-                    "accumulator transfer races accepted MMA work on '" +
-                    kernel_.accumulators[acc_id].name + "' owned by " +
-                    describe_tmem_owner(owner) + ": wait on the mma.commit mbar phase first");
-            }
-        }
+        sanitizer_.check_acc_transfer_vs_mma(site(warp, inst), acc_id);
         if (!acc_slot_available(kernel_.accumulators[acc_id].bank, acc_load)) {
             return {false, WarpState::structural, "tmem bank transfer busy"};
         }
-        // Admitted. Transfer vs transfer (store vs load, store vs store) is
-        // checked here, after the structural slot stall: whole-transfer
-        // (non-duplex) slots structurally order same-bank transfers, so only
-        // a duplex profile can admit an overlapping pair.
+        // Admitted. Transfer vs transfer is checked after the structural slot
+        // stall. The coordinates are read here only to name the region (the
+        // same uniform reads, with the same panics, recur at execution below).
         const uint8_t coord = acc_load ? inst.src1 : inst.src0;
-        TmemOwner region;
-        region.accumulator = acc_id;
-        region.row_begin = uniform_reg(warp, inst, coord, "accumulator row coordinate");
-        region.col_begin = uniform_reg(
+        const auto row = uniform_reg(warp, inst, coord, "accumulator row coordinate");
+        const auto col = uniform_reg(
             warp, inst, static_cast<uint8_t>(coord + 1), "accumulator column coordinate");
-        region.row_end = region.row_begin + config_.lanes;
-        region.col_end = region.col_begin +
-            (inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u);
-        for (const auto& owner : tmem_owners_) {
-            if (owner.kind == TmemOwnerKind::mma) continue;
-            if (acc_load && owner.kind == TmemOwnerKind::acc_ld) continue; // two readers
-            if (!tmem_overlap(owner, region)) continue;
-            panic(warp, inst, std::string("tmem race: ") + (acc_load ? "acc.ld reads" : "acc.st writes") +
-                " '" + kernel_.accumulators[acc_id].name + "' rows " +
-                half_open(region.row_begin, region.row_end) + " cols " +
-                half_open(region.col_begin, region.col_end) + " overlapping " +
-                describe_tmem_owner(owner) + "; wait that transfer's depbar sb" +
-                std::to_string(owner.depbar) + " of warp " + std::to_string(owner.warp) + " first");
-        }
+        sanitizer_.check_acc_transfer_overlap(site(warp, inst), acc_id, acc_load, row, col,
+            inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u);
     }
     // Port-A arbiter, SIMT side. A started access (SIMT rounds, a TMA port
     // request, the mbar engine) is never preempted. For the next free grant
@@ -1987,7 +1936,8 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         command.depbar = inst.control.set_depbar;
         command.a_base = a;
         command.b_base = b;
-        sanitize_mma_accept(warp, inst, command);
+        sanitizer_.record_mma_accept(site(warp, inst), command.id, command.accumulator,
+            command.depbar, mma_operand_span(a, true), mma_operand_span(b, false));
         mma_commands_.push_back(std::move(command));
         trace_->mma_command(cycle_, mma_commands_.back().id, warp.id,
             inst.opcode == Opcode::mma_async_init);
@@ -2023,7 +1973,6 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         ++warp.depbar[inst.control.set_depbar];
         trace_->depbar(cycle_, warp.id, inst.control.set_depbar, warp.depbar[inst.control.set_depbar]);
         AccTransfer transfer;
-        transfer.id = next_acc_transfer_id_++;
         transfer.load = load;
         transfer.warp = warp.id;
         transfer.accumulator = acc_id;
@@ -2034,23 +1983,13 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         transfer.width = width;
         if (load) {
             for (uint32_t j = 0; j < width; ++j)
-                warp.ready_cycle[rf_base + j] = std::numeric_limits<uint64_t>::max();
+                sanitizer_.record_reg_ready(warp.id, rf_base + j, std::numeric_limits<uint64_t>::max());
         } else {
-            for (uint32_t j = 0; j < width; ++j) ++warp.async_readers[rf_base + j];
+            for (uint32_t j = 0; j < width; ++j) sanitizer_.record_async_reader_add(warp.id, rf_base + j);
         }
-        TmemOwner owner; // sanitizer; conflicts were checked at admission above
-        owner.kind = load ? TmemOwnerKind::acc_ld : TmemOwnerKind::acc_st;
-        owner.id = transfer.id;
-        owner.accumulator = acc_id;
-        owner.row_begin = row;
-        owner.row_end = row + config_.lanes;
-        owner.col_begin = col;
-        owner.col_end = col + width;
-        owner.warp = warp.id;
-        owner.pc = warp.pc;
-        owner.issue_cycle = cycle_;
-        owner.depbar = inst.control.set_depbar;
-        tmem_owners_.push_back(owner);
+        // conflicts were checked at admission above
+        sanitizer_.record_acc_transfer_accept(site(warp, inst), acc.bank, load, acc_id,
+            row, col, width, inst.control.set_depbar);
         acc_transfers_[acc.bank][load ? 0 : 1] = std::move(transfer);
         break;
     }
@@ -2061,8 +2000,9 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         if (!reserve_write(inst.dst, complete_cycle)) {
             return {false, WarpState::structural, "RF write reservation"};
         }
-        check_simt_shmem_access(warp, inst, rounds, true); // admitted: sanitizer check
-        warp.ready_cycle[inst.dst] = complete_cycle;
+        // admitted: sanitizer check
+        sanitizer_.check_simt_shmem_access(site(warp, inst), access_addresses(rounds), true);
+        sanitizer_.record_reg_ready(warp.id, inst.dst, complete_cycle);
         ++warp.depbar[inst.control.set_depbar];
         trace_->depbar(cycle_, warp.id, inst.control.set_depbar, warp.depbar[inst.control.set_depbar]);
         ShmemRequest request;
@@ -2080,7 +2020,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
     case Opcode::sts: {
         if (inst.control.set_depbar >= 6) panic(warp, inst, "sts has no depbar");
         auto rounds = build_shmem_rounds(warp, inst, false);
-        check_simt_shmem_access(warp, inst, rounds, false);
+        sanitizer_.check_simt_shmem_access(site(warp, inst), access_addresses(rounds), false);
         ++warp.depbar[inst.control.set_depbar];
         trace_->depbar(cycle_, warp.id, inst.control.set_depbar, warp.depbar[inst.control.set_depbar]);
         ShmemRequest request;
@@ -2119,7 +2059,8 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
             static_cast<int32_t>(uniform_reg(warp, inst, inst.src0 + 1, "tma y coordinate")),
             static_cast<int32_t>(uniform_reg(warp, inst, inst.src0 + 2, "tma z coordinate")),
         };
-        sanitize_tma_accept(warp, inst, command);
+        sanitizer_.record_tma_accept(site(warp, inst), command_id, command.descriptor_address,
+            pending_tma_descriptor_bytes(command.descriptor_address));
         tma_commands_.emplace(command_id, std::move(command));
         trace_->tma_command_begin(
             cycle_, command_id, warp.id, static_cast<uint32_t>(inst.imm), tma_commands_.size());
@@ -2154,14 +2095,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
                 ? static_cast<uint32_t>(inst.imm)
                 : uniform_reg(warp, inst, inst.src1, "mbar tx byte count");
         }
-        // Sanitizer: the RMW writes both mbar words; checked at admission
-        // like sts (its same-cycle port-B collision is the C5 record).
-        if (const auto* owner = shmem_owner_overlapping(
-                request.byte_address, request.byte_address + 8ull, false)) {
-            panic(warp, inst, shmem_race(
-                opcode_name(inst.opcode) + " writes mbar", request.byte_address,
-                request.byte_address + 8ull, *owner));
-        }
+        sanitizer_.check_simt_mbar_rmw(site(warp, inst), request.byte_address);
         // The engine was free (port A busy is a structural stall above), so the
         // accepted request claims it directly; its read cycle is next advance.
         ActiveMbarRmw active;
@@ -2189,7 +2123,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
         request.pc = warp.pc;
         request.instruction = inst;
         if (test) {
-            warp.predicate_ready_cycle[inst.dst] = result_cycle;
+            sanitizer_.record_pred_ready(warp.id, inst.dst, result_cycle);
         } else {
             const auto slot_index = free_mbar_wait_slot();
             if (!slot_index.has_value()) {
@@ -2202,7 +2136,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
             slot.predicate_dst = request.predicate_dst;
             mbar_wait_slots_[*slot_index] = slot;
             warp.mbar_wait_slot = *slot_index;
-            warp.predicate_ready_cycle[inst.dst] = std::numeric_limits<uint64_t>::max();
+            sanitizer_.record_pred_ready(warp.id, inst.dst, std::numeric_limits<uint64_t>::max());
             request.wait_slot = *slot_index;
         }
         mbar_read_ = std::move(request);
@@ -2387,23 +2321,15 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
     }
 }
 
+// No scoreboard: a hazard is a PANIC, diagnosed by the sanitizer. Only the
+// destination range check is a property of the instruction itself.
 void Machine::check_register_hazards(const Warp& warp, const Instruction& inst) const {
-    for (const auto reg : source_registers(inst)) {
-        if (warp.ready_cycle.at(reg) > cycle_) {
-            panic(warp, inst, "RF RAW hazard: missing stall or depbar wait for r" + std::to_string(reg));
-        }
-    }
+    sanitizer_.check_rf_raw(site(warp, inst), source_registers(inst));
     if (const auto dst = destination_register(inst); dst.has_value()) {
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-        if (static_cast<unsigned>(*dst) + width > warp.ready_cycle.size())
+        if (static_cast<unsigned>(*dst) + width > kernel_.register_count)
             panic(warp, inst, "RF destination range out of bounds");
-        for (unsigned j = 0; j < width; ++j) {
-            const auto reg = *dst + j;
-            if (warp.ready_cycle[reg] > cycle_)
-                panic(warp, inst, "RF WAW hazard: missing stall or depbar wait for r" + std::to_string(reg));
-            if (warp.read_until[reg] > cycle_ || warp.async_readers[reg] != 0)
-                panic(warp, inst, "RF WAR hazard: pending reader of r" + std::to_string(reg));
-        }
+        sanitizer_.check_rf_waw_war(site(warp, inst), *dst, width);
     }
 }
 
@@ -2501,7 +2427,7 @@ void Machine::complete_mbar_try_wait(uint32_t index, bool result) {
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
         warp.predicates[slot.predicate_dst][lane] = result;
     }
-    warp.predicate_ready_cycle[slot.predicate_dst] = cycle_;
+    sanitizer_.record_pred_ready(warp.id, slot.predicate_dst, cycle_);
     warp.mbar_wait_slot.reset();
     mbar_wait_slots_[index].reset();
 }
@@ -2600,7 +2526,7 @@ void Machine::schedule_register_write(
     uint64_t ready_cycle,
     std::vector<uint32_t> values,
     std::string reason) {
-    warp.ready_cycle[dst] = ready_cycle;
+    sanitizer_.record_reg_ready(warp.id, dst, ready_cycle);
     Writeback writeback;
     writeback.ready_cycle = ready_cycle;
     writeback.warp = warp.id;
@@ -2615,7 +2541,7 @@ void Machine::schedule_predicate_write(
     uint8_t dst,
     uint64_t ready_cycle,
     std::vector<uint32_t> values) {
-    warp.predicate_ready_cycle[dst] = ready_cycle;
+    sanitizer_.record_pred_ready(warp.id, dst, ready_cycle);
     Writeback writeback;
     writeback.ready_cycle = ready_cycle;
     writeback.warp = warp.id;
@@ -2626,106 +2552,21 @@ void Machine::schedule_predicate_write(
 }
 
 // ---------------------------------------------------------------------------
-// Race sanitizer. Pure bookkeeping over the machine's global knowledge: owner
-// records are added at accepted issue and erased at existing completion
-// events, and the only control flow they feed is panic(). See
-// trash/shmem-ownership-sanitizer-2026-10-03.md for the ownership table.
+// Sanitizer argument builders. Pure reads of hardware state; their results go
+// only to sanitizer_ (src/sanitizer.hpp). Nothing here feeds the machine.
 // ---------------------------------------------------------------------------
 
-const Machine::ShmemOwner* Machine::shmem_owner_overlapping(
-    uint64_t begin, uint64_t end, bool writers_only) const {
-    for (const auto& owner : shmem_owners_) {
-        if (writers_only && !owner.write) continue;
-        if (begin < owner.end && owner.begin < end) return &owner;
-    }
-    return nullptr;
+IssueSite Machine::site(const Warp& warp, const Instruction& inst) const {
+    return IssueSite{cycle_, warp.id, warp.pc, inst};
 }
 
-std::string Machine::describe_shmem_owner(const ShmemOwner& owner) const {
-    std::string text;
-    std::string role;
-    switch (owner.kind) {
-    case ShmemOwnerKind::tma_load:
-        text = "tma load #" + std::to_string(owner.command);
-        role = "write-owner of its destination " + half_open(owner.begin, owner.end) +
-            " until its last shmem write commits";
-        break;
-    case ShmemOwnerKind::tma_store:
-        text = "tma store #" + std::to_string(owner.command);
-        role = "read-owner of its source " + half_open(owner.begin, owner.end) +
-            " until its last source read";
-        break;
-    case ShmemOwnerKind::tma_descriptor:
-        text = "tma #" + std::to_string(owner.command);
-        role = "read-owner of its descriptor " + half_open(owner.begin, owner.end) +
-            " until the engine reads it";
-        break;
-    case ShmemOwnerKind::mma_a:
-    case ShmemOwnerKind::mma_b: {
-        text = "mma.async #" + std::to_string(owner.command);
-        const auto command = std::find_if(mma_commands_.begin(), mma_commands_.end(),
-            [&](const auto& candidate) { return candidate.id == owner.command; });
-        if (command != mma_commands_.end())
-            text += command->next_step == 0 ? " [queued]" : " [fetching]";
-        role = std::string("read-owner of its ") +
-            (owner.kind == ShmemOwnerKind::mma_a ? "A" : "B") + " operand " +
-            half_open(owner.begin, owner.end) + " until its final operand read";
-        break;
+std::vector<uint32_t> Machine::access_addresses(
+    const std::vector<std::vector<LaneAccess>>& rounds) {
+    std::vector<uint32_t> addresses;
+    for (const auto& round : rounds) {
+        for (const auto& access : round) addresses.push_back(static_cast<uint32_t>(access.byte_address));
     }
-    }
-    return text + " (warp " + std::to_string(owner.warp) + " pc " + std::to_string(owner.pc) +
-        ", accepted cycle " + std::to_string(owner.issue_cycle) + "; " + role + ")";
-}
-
-std::string Machine::shmem_race(
-    const std::string& access, uint64_t begin, uint64_t end, const ShmemOwner& owner) const {
-    const auto overlap_begin = std::max<uint64_t>(begin, owner.begin);
-    const auto overlap_end = std::min<uint64_t>(end, owner.end);
-    std::string fix;
-    switch (owner.kind) {
-    case ShmemOwnerKind::tma_load:
-    case ShmemOwnerKind::tma_store:
-    case ShmemOwnerKind::tma_descriptor:
-        fix = "wait the TMA completion mbar" +
-            (owner.completion_mbar.has_value()
-                ? " [" + std::to_string(*owner.completion_mbar) + "]" : std::string()) +
-            " first";
-        break;
-    case ShmemOwnerKind::mma_a:
-    case ShmemOwnerKind::mma_b:
-        fix = "wait the operand-consumed depbar sb" + std::to_string(owner.depbar) +
-            " of warp " + std::to_string(owner.warp) + " / commit mbar first";
-        break;
-    }
-    return "shmem race: " + access + " bytes " + half_open(overlap_begin, overlap_end) +
-        " owned by " + describe_shmem_owner(owner) + "; " + fix;
-}
-
-void Machine::check_simt_shmem_access(
-    const Warp& warp, const Instruction& inst,
-    const std::vector<std::vector<LaneAccess>>& rounds, bool load) const {
-    // Issue-time check over every word of every round. An sts still conflicts
-    // with read-owners (it would change bytes an engine has yet to read); an
-    // lds only with write-owners.
-    for (const auto& owner : shmem_owners_) {
-        if (load && !owner.write) continue;
-        uint64_t first = std::numeric_limits<uint64_t>::max();
-        uint64_t last = 0;
-        uint32_t words = 0;
-        for (const auto& round : rounds) {
-            for (const auto& access : round) {
-                if (access.byte_address + 4 <= owner.begin || access.byte_address >= owner.end) continue;
-                first = std::min<uint64_t>(first, access.byte_address);
-                last = std::max<uint64_t>(last, access.byte_address + 4);
-                ++words;
-            }
-        }
-        if (words == 0) continue;
-        panic(warp, inst, shmem_race(
-            std::string(load ? "lds reads " : "sts writes ") + std::to_string(words) +
-                (words == 1 ? " word," : " words,"),
-            first, last, owner));
-    }
+    return addresses;
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
@@ -2748,12 +2589,13 @@ std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
     return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
 }
 
-std::optional<TmaDescriptor> Machine::peek_tma_descriptor(uint32_t address) const {
-    // Sanitizer-only read of the descriptor the engine will read later. The
-    // engine's descriptor read is a port-A request, so a SIMT sts still
-    // draining through port A is ordered before it (one path, issue order):
-    // overlay its unserved rounds. Writes accepted after this point would
-    // conflict with the descriptor's read-ownership and panic.
+std::array<uint8_t, tma_descriptor_bytes> Machine::pending_tma_descriptor_bytes(
+    uint32_t address) const {
+    // The descriptor the engine will read later. The engine's descriptor read
+    // is a port-A request, so a SIMT sts still draining through port A is
+    // ordered before it (one path, issue order): overlay its unserved rounds.
+    // Writes accepted after this point would conflict with the descriptor's
+    // read-ownership and panic.
     std::array<uint8_t, tma_descriptor_bytes> bytes{};
     std::memcpy(bytes.data(), shmem_.data() + address, bytes.size());
     if (port_a_.has_value() && !port_a_->load) {
@@ -2766,200 +2608,28 @@ std::optional<TmaDescriptor> Machine::peek_tma_descriptor(uint32_t address) cons
             }
         }
     }
-    try {
-        auto descriptor = decode_tma_descriptor(bytes.data(), bytes.size());
-        (void)tma_shmem_span(descriptor);
-        return descriptor;
-    } catch (const SimError&) {
-        return std::nullopt; // the engine's own descriptor read will panic
-    }
+    return bytes;
 }
 
-void Machine::sanitize_tma_accept(
-    const Warp& warp, const Instruction& inst, const TmaCommand& command) {
-    ShmemOwner descriptor_owner;
-    descriptor_owner.kind = ShmemOwnerKind::tma_descriptor;
-    descriptor_owner.command = command.id;
-    descriptor_owner.begin = command.descriptor_address;
-    descriptor_owner.end = command.descriptor_address + static_cast<uint32_t>(tma_descriptor_bytes);
-    descriptor_owner.warp = warp.id;
-    descriptor_owner.pc = warp.pc;
-    descriptor_owner.issue_cycle = cycle_;
-
-    std::optional<ShmemOwner> data_owner;
-    if (const auto descriptor = peek_tma_descriptor(command.descriptor_address)) {
-        const bool load = descriptor->direction == TmaDirection::load;
-        const auto [begin, end] = tma_shmem_span(*descriptor);
-        descriptor_owner.completion_mbar = descriptor->completion_mbar;
-        const auto label = std::string(load ? "tma load #" : "tma store #") +
-            std::to_string(command.id) + (load ? " destination" : " source");
-        // A load writes its box: any owner conflicts. A store reads it: only
-        // a pending writer conflicts.
-        if (const auto* owner = shmem_owner_overlapping(begin, end, !load))
-            panic(warp, inst, shmem_race(label, begin, end, *owner));
-        if (end <= std::numeric_limits<uint32_t>::max()) {
-            ShmemOwner owner = descriptor_owner;
-            owner.kind = load ? ShmemOwnerKind::tma_load : ShmemOwnerKind::tma_store;
-            owner.write = load;
-            owner.begin = static_cast<uint32_t>(begin);
-            owner.end = static_cast<uint32_t>(end);
-            data_owner = owner;
-        }
-    }
-    if (const auto* owner = shmem_owner_overlapping(
-            descriptor_owner.begin, descriptor_owner.end, true)) {
-        panic(warp, inst, shmem_race(
-            "tma #" + std::to_string(command.id) + " descriptor", descriptor_owner.begin,
-            descriptor_owner.end, *owner));
-    }
-    shmem_owners_.push_back(descriptor_owner);
-    if (data_owner.has_value()) shmem_owners_.push_back(*data_owner);
-}
-
-void Machine::verify_tma_descriptor_ownership(const TmaCommand& command) {
-    // The descriptor was read-owned since accept, so the engine must decode
-    // exactly what the sanitizer peeked. A mismatch is a sanitizer bug.
-    std::erase_if(shmem_owners_, [&](const ShmemOwner& owner) {
-        return owner.kind == ShmemOwnerKind::tma_descriptor && owner.command == command.id;
-    });
-    const auto [begin, end] = tma_shmem_span(command.descriptor);
-    const bool load = command.descriptor.direction == TmaDirection::load;
-    const auto owner = std::find_if(shmem_owners_.begin(), shmem_owners_.end(),
-        [&](const ShmemOwner& candidate) {
-            return candidate.command == command.id &&
-                (candidate.kind == ShmemOwnerKind::tma_load ||
-                 candidate.kind == ShmemOwnerKind::tma_store);
-        });
-    if (owner == shmem_owners_.end() || owner->begin != begin || owner->end != end ||
-        owner->write != load) {
-        throw SimError("internal sanitizer: tma #" + std::to_string(command.id) +
-            " decoded a descriptor different from the one peeked at accept (a write still in "
-            "flight at accept changed it; the owner record cannot be trusted)");
-    }
-}
-
+// Hardware: the command's data movement is done. Sanitizer: its box
+// ownership ends here.
 void Machine::mark_tma_data_complete(TmaCommand& command) {
     command.state = TmaCommandState::data_complete;
-    std::erase_if(shmem_owners_, [&](const ShmemOwner& owner) {
-        return owner.command == command.id &&
-            (owner.kind == ShmemOwnerKind::tma_load || owner.kind == ShmemOwnerKind::tma_store);
-    });
-}
-
-void Machine::sanitize_mma_accept(
-    const Warp& warp, const Instruction& inst, const MmaCommand& command) {
-    for (const bool a_operand : {true, false}) {
-        const auto span = mma_operand_span(a_operand ? command.a_base : command.b_base, a_operand);
-        if (!span.has_value()) continue; // footprint check above already panicked
-        const auto label = "mma.async #" + std::to_string(command.id) +
-            (a_operand ? " A operand" : " B operand");
-        if (const auto* owner = shmem_owner_overlapping(span->first, span->second, true))
-            panic(warp, inst, shmem_race(label, span->first, span->second, *owner));
-        ShmemOwner owner;
-        owner.kind = a_operand ? ShmemOwnerKind::mma_a : ShmemOwnerKind::mma_b;
-        owner.command = command.id;
-        owner.begin = span->first;
-        owner.end = span->second;
-        owner.warp = warp.id;
-        owner.pc = warp.pc;
-        owner.issue_cycle = cycle_;
-        owner.depbar = command.depbar;
-        shmem_owners_.push_back(owner);
-    }
-
-    TmemOwner mma;
-    mma.kind = TmemOwnerKind::mma;
-    mma.id = command.id;
-    mma.accumulator = command.accumulator;
-    mma.row_end = kernel_.accumulators.at(command.accumulator).rows;
-    mma.col_end = kernel_.accumulators.at(command.accumulator).cols;
-    mma.warp = warp.id;
-    mma.pc = warp.pc;
-    mma.issue_cycle = cycle_;
-    mma.depbar = command.depbar;
-    // MMA after MMA on one accumulator is ordered by the engine queue; only
-    // SIMT transfers race it.
-    for (const auto& owner : tmem_owners_) {
-        if (owner.kind == TmemOwnerKind::mma || !tmem_overlap(owner, mma)) continue;
-        panic(warp, inst, "tmem race: mma.async #" + std::to_string(command.id) + " on '" +
-            kernel_.accumulators.at(command.accumulator).name +
-            "' (read-modify-write of the whole accumulator) overlaps " +
-            describe_tmem_owner(owner) + "; wait that transfer's depbar sb" +
-            std::to_string(owner.depbar) + " of warp " + std::to_string(owner.warp) +
-            " (or an mbar its warp arrives on after it) first");
-    }
-    tmem_owners_.push_back(mma);
-}
-
-void Machine::release_mma_operands(uint64_t command) {
-    std::erase_if(shmem_owners_, [&](const ShmemOwner& owner) {
-        return owner.command == command &&
-            (owner.kind == ShmemOwnerKind::mma_a || owner.kind == ShmemOwnerKind::mma_b);
-    });
-}
-
-bool Machine::tmem_overlap(const TmemOwner& a, const TmemOwner& b) {
-    // The toolchain rejects overlapping accumulator allocations, so regions
-    // of different accumulators never alias.
-    return a.accumulator == b.accumulator &&
-        a.row_begin < b.row_end && b.row_begin < a.row_end &&
-        a.col_begin < b.col_end && b.col_begin < a.col_end;
-}
-
-std::string Machine::describe_tmem_owner(const TmemOwner& owner) const {
-    std::string text;
-    std::string mode;
-    std::string until;
-    switch (owner.kind) {
-    case TmemOwnerKind::mma:
-        text = "mma.async #" + std::to_string(owner.id);
-        mode = "write-owner";
-        until = "until its last result retires";
-        break;
-    case TmemOwnerKind::acc_ld:
-        text = "acc.ld #" + std::to_string(owner.id);
-        mode = "read-owner";
-        until = "until its final RF write";
-        break;
-    case TmemOwnerKind::acc_st:
-        text = "acc.st #" + std::to_string(owner.id);
-        mode = "write-owner";
-        until = "until its final tmem write";
-        break;
-    }
-    return text + " (warp " + std::to_string(owner.warp) + " pc " + std::to_string(owner.pc) +
-        ", accepted cycle " + std::to_string(owner.issue_cycle) + "; " + mode + " of '" +
-        kernel_.accumulators.at(owner.accumulator).name + "' rows " +
-        half_open(owner.row_begin, owner.row_end) + " cols " +
-        half_open(owner.col_begin, owner.col_end) + " " + until + ")";
-}
-
-void Machine::release_tmem_owner(TmemOwnerKind kind, uint64_t id) {
-    std::erase_if(tmem_owners_, [&](const TmemOwner& owner) {
-        return owner.kind == kind && owner.id == id;
-    });
+    sanitizer_.record_tma_data_complete(command.id);
 }
 
 [[noreturn]] void Machine::panic(
     const Warp& warp, const Instruction& inst, const std::string& reason) const {
-    throw SimError(
-        "PANIC cycle=" + std::to_string(cycle_) + " warp=" + std::to_string(warp.id) +
-        " pc=" + std::to_string(warp.pc) + " reason=" + reason + " inst='" +
-        format_instruction(inst) + "'");
+    throw_issue_panic(site(warp, inst), reason);
 }
 
 [[noreturn]] void Machine::mbar_rmw_panic(
     const MbarRmwRequest& request, const std::string& reason) const {
-    std::string message = "PANIC cycle=" + std::to_string(cycle_) + " mbar_rmw address=" +
-        std::to_string(request.byte_address) + " reason=" + reason;
     if (request.warp.has_value()) {
-        message += " warp=" + std::to_string(*request.warp) +
-            " pc=" + std::to_string(request.pc) +
-            " inst='" + format_instruction(request.instruction) + "'";
-    } else {
-        message += " source=engine";
+        const IssueSite requester{cycle_, *request.warp, request.pc, request.instruction};
+        throw_mbar_rmw_panic(cycle_, request.byte_address, reason, &requester);
     }
-    throw SimError(message);
+    throw_mbar_rmw_panic(cycle_, request.byte_address, reason, nullptr);
 }
 
 } // namespace nanosm

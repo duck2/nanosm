@@ -5,6 +5,7 @@
 #include "mbar.hpp"
 #include "profile.hpp"
 #include "rf.hpp"
+#include "sanitizer.hpp"
 #include "trace.hpp"
 #include "tma.hpp"
 
@@ -108,13 +109,8 @@ private:
         uint64_t stall_until = 0;
         std::array<uint32_t, 6> depbar{};
         std::vector<uint32_t> rf;
-        std::vector<uint64_t> ready_cycle;
-        // Sanitizer metadata, not a runtime dependency scoreboard. Exclusive end.
-        std::vector<uint64_t> read_until;
-        // Async acc.st readers; a younger write is illegal until all stores finish.
-        std::vector<uint32_t> async_readers;
+        // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
         std::array<std::vector<uint8_t>, 7> predicates;
-        std::array<uint64_t, 7> predicate_ready_cycle{};
         std::optional<uint32_t> mbar_wait_slot;
     };
 
@@ -125,8 +121,6 @@ private:
         std::optional<uint8_t> predicate_dst;
         std::vector<uint32_t> values;
         std::optional<uint8_t> clear_depbar;
-        // Sanitizer only: the final acc.ld beat releases its tmem read-ownership.
-        std::optional<uint64_t> release_acc_transfer;
         // The final LSU RF write / last-ack completion ends its command: the
         // command slot and its assembly register are released at this commit.
         std::optional<uint64_t> release_lsu_command;
@@ -158,8 +152,8 @@ private:
         std::vector<uint32_t> load_values;
     };
 
+    // The sanitizer keys its tmem owner by the slot [bank][direction].
     struct AccTransfer {
-        uint64_t id = 0; // sanitizer ownership key only
         bool load = false;
         uint32_t warp = 0;
         uint8_t accumulator = 0;
@@ -331,15 +325,14 @@ private:
     // The TMA stream's 32 B sector register (flops). Filled from the ingress
     // FIFO at the pluck rate; when complete, placed into shmem by port A in
     // its bank rounds, which read the register directly. Free after the last
-    // round. last_write_cycle is the fall-through tripwire: a consumer may
-    // only read it in a later cycle.
+    // round. Its fall-through tripwire (a consumer may only read it in a
+    // later cycle) is in the Sanitizer.
     struct TmaSectorRegister {
         std::optional<uint64_t> request;
         uint64_t sector_address = 0;
         std::vector<uint8_t> data;
         uint32_t filled = 0;        // bytes plucked in
         bool complete = false;      // all bytes in; its ticket is in tma_returns_
-        uint64_t last_write_cycle = 0;
     };
 
     // The TMA store sector register (32 B flops). Allocated when the walker
@@ -354,7 +347,6 @@ private:
         uint64_t byte_enable = 0;
         bool complete = false;
         uint32_t words_out = 0;     // words already written into the egress FIFO
-        uint64_t last_write_cycle = 0;
     };
 
     // A 64 B (lane-wide) assembly register from the lsu.staging_vectors pool.
@@ -371,7 +363,6 @@ private:
         std::vector<uint32_t> words;     // one per lane
         std::vector<uint8_t> valid;      // lane enables
         uint32_t valid_count = 0;
-        uint64_t last_write_cycle = 0;   // fall-through tripwire
     };
 
     enum class LsuKind : uint8_t { vector_load, vector_store, scalar_load, scalar_store, uniform_load };
@@ -515,53 +506,6 @@ private:
         std::string reason;
     };
 
-    // ---- Race sanitizer (pure bookkeeping; trash/shmem-ownership-sanitizer-2026-10-03.md) ----
-    // There is no ownership hardware. An outstanding engine command is modeled
-    // as owning shmem byte ranges from its accepted issue until an existing
-    // completion event; a conflicting access PANICS naming the owner and the
-    // wait that would have ordered it. Nothing here is consulted by admission,
-    // port arbitration or data movement.
-    enum class ShmemOwnerKind : uint8_t {
-        tma_load,       // write-owner of the destination box until its last shmem write commits
-        tma_store,      // read-owner of the source box until its last source read
-        tma_descriptor, // read-owner of the 64-byte descriptor until the engine reads it
-        mma_a,          // read-owner of the A operand until the final operand read
-        mma_b,          // read-owner of the B operand until the final operand read
-    };
-
-    struct ShmemOwner {
-        ShmemOwnerKind kind = ShmemOwnerKind::tma_load;
-        uint64_t command = 0; // tma or mma command id
-        bool write = false;
-        uint32_t begin = 0;   // byte range [begin, end)
-        uint32_t end = 0;
-        uint32_t warp = 0;
-        uint32_t pc = 0;
-        uint64_t issue_cycle = 0;
-        std::optional<uint32_t> completion_mbar; // tma; unknown if the descriptor is invalid
-        uint8_t depbar = 0;                      // mma operand-consumed depbar
-    };
-
-    enum class TmemOwnerKind : uint8_t {
-        mma,    // write-owner (read-modify-write) of the whole accumulator until its last result retires
-        acc_ld, // read-owner of its rows x columns until its final RF write commits
-        acc_st, // write-owner of its rows x columns until its final tmem write
-    };
-
-    struct TmemOwner {
-        TmemOwnerKind kind = TmemOwnerKind::mma;
-        uint64_t id = 0; // mma command id or acc transfer id
-        uint8_t accumulator = 0;
-        uint32_t row_begin = 0;
-        uint32_t row_end = 0;
-        uint32_t col_begin = 0;
-        uint32_t col_end = 0;
-        uint32_t warp = 0;
-        uint32_t pc = 0;
-        uint64_t issue_cycle = 0;
-        uint8_t depbar = 0;
-    };
-
     Config config_;
     Kernel kernel_;
     std::vector<Warp> warps_;
@@ -579,9 +523,6 @@ private:
     // op's execution start (window end) for ceil(lanes / sfu_lanes) cycles;
     // a later SFU op stalls structurally until its own execution start fits.
     uint64_t sfu_busy_until_ = 0;
-    // Shmem words written through port A this cycle (sts rounds, TMA load
-    // returns). A same-cycle same-word MMA port-B read is UB and panics.
-    std::vector<uint32_t> port_a_written_words_;
     std::optional<ShmemRequest> port_a_;
     std::optional<TmaPortRequest> tma_port_a_;
     // No RMW input FIFO: the engine serves one operation, SIMT requesters stall
@@ -599,7 +540,6 @@ private:
     std::deque<WriteAck> pending_write_acks_;
     // SM side of the boundary (LSU state).
     std::map<uint64_t, ReadRecord> read_records_;
-    std::vector<std::deque<uint64_t>> ordered_stream_requests_; // request order per ordered ID
     uint32_t next_vector_stream_ = 0;     // round-robin over 1..read_streams-1
     std::optional<uint32_t> last_served_read_stream_; // interleave_ordered_streams test order
     std::deque<IngressBeat> ingress_fifo_;
@@ -636,40 +576,26 @@ private:
     uint32_t scheduler_cursor_ = 0;
     uint64_t next_gmem_request_id_ = 0;
     uint64_t next_tma_command_id_ = 0;
-    // Sanitizer state. n is tiny (a few outstanding commands); checks are a
-    // linear scan, chosen for clarity over speed.
-    std::vector<ShmemOwner> shmem_owners_;
-    std::vector<TmemOwner> tmem_owners_;
-    uint64_t next_acc_transfer_id_ = 0;
+    // Shadow state that only decides whether to PANIC. Write-only from here:
+    // the rule is at the top of sanitizer.hpp.
+    Sanitizer sanitizer_;
 
-    // Sanitizer helpers. Every check either returns or panics; none feeds a
-    // timing or admission decision.
-    [[nodiscard]] const ShmemOwner* shmem_owner_overlapping(
-        uint64_t begin, uint64_t end, bool writers_only) const;
-    [[nodiscard]] std::string describe_shmem_owner(const ShmemOwner& owner) const;
-    [[nodiscard]] std::string shmem_race(
-        const std::string& access, uint64_t begin, uint64_t end, const ShmemOwner& owner) const;
-    void check_simt_shmem_access(
-        const Warp& warp, const Instruction& inst,
-        const std::vector<std::vector<LaneAccess>>& rounds, bool load) const;
+    // Sanitizer argument builders: pure reads of hardware state whose results
+    // go only to sanitizer_.
+    [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
+    [[nodiscard]] static std::vector<uint32_t> access_addresses(
+        const std::vector<std::vector<LaneAccess>>& rounds);
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, bool a_operand) const;
-    [[nodiscard]] std::optional<TmaDescriptor> peek_tma_descriptor(uint32_t address) const;
-    void sanitize_tma_accept(const Warp& warp, const Instruction& inst, const TmaCommand& command);
-    void sanitize_mma_accept(const Warp& warp, const Instruction& inst, const MmaCommand& command);
-    void verify_tma_descriptor_ownership(const TmaCommand& command);
+    [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> pending_tma_descriptor_bytes(
+        uint32_t address) const;
     void mark_tma_data_complete(TmaCommand& command);
-    void release_mma_operands(uint64_t command);
-    [[nodiscard]] static bool tmem_overlap(const TmemOwner& a, const TmemOwner& b);
-    [[nodiscard]] std::string describe_tmem_owner(const TmemOwner& owner) const;
-    void release_tmem_owner(TmemOwnerKind kind, uint64_t id);
 
     void commit_writebacks();
     void advance_rf_reads();
     void advance_mma();
     void serve_mma_fetch_round();
     void complete_mma_fetch();
-    void record_port_a_shmem_write(uint64_t byte_address, uint32_t size);
     [[nodiscard]] bool mma_bank_busy(uint8_t bank) const;
     void execute_arithmetic(ArithmeticRead& pending);
     void advance_tma();
@@ -730,7 +656,6 @@ private:
     void advance_tma_write_requests();
     void advance_lsu_requests();
     void advance_ingress();
-    void check_ordered_beat(uint32_t stream, const IngressBeat& beat);
     [[nodiscard]] bool pluck_tma(IngressBeat& beat, uint32_t take);
     [[nodiscard]] bool pluck_vector(ReadRecord& record, IngressBeat& beat, uint32_t take);
     void pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t take);
@@ -742,7 +667,6 @@ private:
     void finish_lsu_command(LsuCommand& command);
     void release_lsu_command(uint64_t id);
     [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;
-    [[noreturn]] void controller_contract_panic(const std::string& reason) const;
     void advance_tma_frontend();
     void present_tma_mbar_event();
     [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command() const;
