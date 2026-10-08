@@ -1,7 +1,21 @@
+"""The TMA pipeline with 64-element (8-sector) tiles: the 16-sector credit pool
+binds. Checks C = A + B.
+
+Run from emu2: python -B -m nanosm kernels/pipeline_tma_wide.launch.py [--trace PATH]
+No trace is written unless --trace names one: a fixed output path would be
+shared by every overlapping run (ctest -j, the sanitizer ON/OFF check,
+build and build_nosan at once).
+"""
+
+import argparse
 from pathlib import Path
 
 from nanosm import Launch
 
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--trace", type=Path, help="Perfetto output (default: no trace)")
+args = parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[1]
 A = 0
@@ -42,7 +56,7 @@ for address, base, tile in [
         completion_mbar=FULL0 if tile < 512 else FULL1,
     )
 
-with launch.run(trace=ROOT / "build" / "pipeline-tma-wide.perfetto.json") as result:
+with launch.run(trace=args.trace) as result:
     expected = [float(3 * i) for i in range(ELEMENTS)]
     actual = result.gmem_f32(C, ELEMENTS)
     if actual != expected:

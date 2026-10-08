@@ -116,7 +116,8 @@ captured. The v0 engine accepts element sizes 1, 2 and 4, dense shmem tiles, and
 out-of-bounds elements. Swizzle and transpose are deliberately rejected in this slice.
 
 `kernels/pipeline_tma.launch.py` authors four descriptors with `launch.shmem.tma_desc`, runs the
-double-buffered A/B pipeline, validates output, and writes `build/pipeline-tma.perfetto.json`.
+double-buffered A/B pipeline, validates output, and with `--trace PATH` writes a Perfetto trace
+(no launch writes a trace unless asked, so overlapping runs never share an output file).
 The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared
 bus ownership, and logical/useful/physical byte totals.
 

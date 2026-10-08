@@ -75,6 +75,9 @@ public:
     [[nodiscard]] const std::vector<LsuEdgeEvent>& edge_events() const { return edge_events_; }
     [[nodiscard]] uint32_t tma_sector_credits_used() const { return tma_sector_credits_used_; }
     [[nodiscard]] std::size_t lsu_commands_in_flight() const { return lsu_commands_.size(); }
+    // Test seams: whether each engine's one-entry mbar event register is full.
+    [[nodiscard]] bool tma_mbar_event_held() const { return tma_mbar_event_.has_value(); }
+    [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.has_value(); }
 
     void tick();
     void run(uint64_t cycle_limit = 100000);
@@ -90,6 +93,8 @@ public:
     [[nodiscard]] MbarState read_mbar_state(uint32_t byte_address) const;
     [[nodiscard]] uint32_t read_reg(
         uint32_t warp, uint32_t lane, uint32_t reg) const;
+    // Host/test seam for a DMA complete_tx: it is written into the TMA's event
+    // register (throws if that register is full; the MMA's is independent).
     void complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t parity);
 
 private:
@@ -226,10 +231,16 @@ private:
         Instruction instruction;
     };
 
+    // The two engines that present mbar events to the RMW engine.
+    enum class MbarEngine : uint8_t { tma, mma };
+
     struct ActiveMbarRmw {
         MbarRmwRequest request;
         MbarState state;
         bool write_stage = false;
+        // (T) Whose engine event this is (none: SIMT). Read only for the
+        // trace label and the engine_waits_on_other counter.
+        std::optional<MbarEngine> engine;
     };
 
     struct MbarReadRequest {
@@ -526,8 +537,20 @@ private:
     std::optional<ShmemRequest> port_a_;
     std::optional<TmaPortRequest> tma_port_a_;
     // No RMW input FIFO: the engine serves one operation, SIMT requesters stall
-    // structurally at issue, and each engine holds at most one pending event.
-    std::optional<MbarRmwRequest> engine_mbar_event_;
+    // structurally at issue, and each engine holds at most one pending event
+    // in its own one-entry register (design.md Mbar). An engine stalls only on
+    // its own register being full, never on the other's.
+    //   TMA: complete_tx {address, bytes, parity} (TMA data complete, or the
+    //        host's complete_mbar_tx).
+    //   MMA: a commit's arrive {address}.
+    // Both line up for the free RMW engine ahead of new SIMT work; when both
+    // hold an event as it frees, they alternate (last-served bit below).
+    std::optional<MbarRmwRequest> tma_mbar_event_;
+    std::optional<MbarRmwRequest> mma_mbar_event_;
+    // The engine whose event the RMW engine claimed last (set on every engine
+    // claim, contested or not). On a tie the other engine is served. Starts
+    // at mma, so the first contested free point serves the TMA.
+    MbarEngine mbar_engine_last_served_ = MbarEngine::mma;
     std::optional<ActiveMbarRmw> mbar_rmw_;
     std::optional<MbarReadRequest> mbar_read_;
     std::vector<std::optional<MbarWaitSlot>> mbar_wait_slots_;

@@ -77,6 +77,9 @@ struct TraceSummary {
     uint64_t shmem_tma_priority_waits = 0;
     uint64_t mbar_rmw_requests = 0;
     uint64_t mbar_phase_changes = 0;
+    // Cycles an engine's held mbar event (TMA complete_tx / MMA commit arrive)
+    // waited while the RMW engine served the OTHER engine's event.
+    uint64_t mbar_engine_waits_on_other = 0;
     uint64_t mbar_initial_probes = 0;
     uint64_t mbar_immediate_successes = 0;
     uint64_t mbar_slot_full_stalls = 0;
@@ -154,6 +157,7 @@ public:
     void shmem_end(uint64_t end_cycle);
     void mbar_rmw_begin(uint64_t cycle, uint32_t byte_address, std::string operation);
     void mbar_rmw_end(uint64_t end_cycle, bool phase_changed);
+    void mbar_engine_wait_on_other() { ++summary_.mbar_engine_waits_on_other; }
     void mbar_probe(
         uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity, bool complete);
     void mbar_sleep(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);

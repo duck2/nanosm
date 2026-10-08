@@ -491,7 +491,8 @@ std::string TraceRecorder::summary_text() const {
         << " slot_full=" << summary_.mbar_slot_full_stalls
         << " sleeps=" << summary_.mbar_sleeps
         << " wakes=" << summary_.mbar_wakes
-        << " timeouts=" << summary_.mbar_timeouts << '\n';
+        << " timeouts=" << summary_.mbar_timeouts
+        << " engine_waits_on_other=" << summary_.mbar_engine_waits_on_other << '\n';
     out << "gmem: commands=" << summary_.gmem_commands
         << " sectors=" << summary_.gmem_sectors
         << " beats=" << summary_.gmem_bus_beats

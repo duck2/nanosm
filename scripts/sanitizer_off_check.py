@@ -28,30 +28,29 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# (name, launch script, arguments, trace) -- trace is "arg" when the script
-# takes --trace PATH, else the fixed path the script always writes.
+# (name, launch script, arguments). Every script takes --trace PATH; the trace
+# goes into this run's private temporary directory, never a shared fixed path
+# (overlapping runs -- ctest -j, build and build_nosan at once -- would read
+# each other's files).
 LAUNCHES = [
-    ("fa_rising", "kernels/fa.launch.py", ["--case", "rising"], "arg"),
-    ("fa_stable", "kernels/fa.launch.py", ["--case", "stable"], "arg"),
-    ("pipeline", "kernels/pipeline.launch.py", [], "build/pipeline-python.perfetto.json"),
-    ("pipeline_tma", "kernels/pipeline_tma.launch.py", [], "build/pipeline-tma.perfetto.json"),
-    ("pipeline_tma_wide", "kernels/pipeline_tma_wide.launch.py", [],
-     "build/pipeline-tma-wide.perfetto.json"),
-    ("vadd", "kernels/vadd.launch.py", [], "arg"),
-    ("vadd_warps2", "kernels/vadd.launch.py", ["--warps", "2"], "arg"),
+    ("fa_rising", "kernels/fa.launch.py", ["--case", "rising"]),
+    ("fa_stable", "kernels/fa.launch.py", ["--case", "stable"]),
+    ("pipeline", "kernels/pipeline.launch.py", []),
+    ("pipeline_tma", "kernels/pipeline_tma.launch.py", []),
+    ("pipeline_tma_wide", "kernels/pipeline_tma_wide.launch.py", []),
+    ("vadd", "kernels/vadd.launch.py", []),
+    ("vadd_warps2", "kernels/vadd.launch.py", ["--warps", "2"]),
 ]
 
 SKIP_PREFIX = "SKIP "
 SKIP_REASON = " (expects a sanitizer panic"  # tests/tests.cpp main()
 
 
-def run_launch(library: Path, script: str, arguments: list[str], trace: str, scratch: Path):
+def run_launch(library: Path, script: str, arguments: list[str], scratch: Path):
     env = dict(os.environ)
     env["NANOSM_LIBRARY"] = str(library)
-    command = [sys.executable, "-B", "-m", "nanosm", script, *arguments]
-    trace_path = scratch / "trace.json" if trace == "arg" else ROOT / trace
-    if trace == "arg":
-        command += ["--trace", str(trace_path)]
+    trace_path = scratch / "trace.json"
+    command = [sys.executable, "-B", "-m", "nanosm", script, *arguments, "--trace", str(trace_path)]
     if trace_path.exists():
         trace_path.unlink()
     done = subprocess.run(command, cwd=ROOT, env=env, capture_output=True)
@@ -113,10 +112,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as scratch_name:
         scratch = Path(scratch_name)
-        for name, script, arguments, trace in LAUNCHES:
+        for name, script, arguments in LAUNCHES:
             results = {}
             for label, library in variants:
-                code, stdout, stderr, trace_bytes = run_launch(library, script, arguments, trace, scratch)
+                code, stdout, stderr, trace_bytes = run_launch(library, script, arguments, scratch)
                 results[label] = (code, stdout, trace_bytes)
                 save(f"{name}.{label}.stdout.txt", stdout)
                 manifest.append(

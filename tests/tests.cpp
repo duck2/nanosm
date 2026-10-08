@@ -9,17 +9,25 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -50,6 +58,35 @@ std::vector<uint8_t>& image_bytes(
     image.push_back({0, std::vector<uint8_t>(size, 0)});
     return image.back().bytes;
 }
+
+// A test that must write a file writes it here: the system temp directory
+// plus this process's id and a per-process counter, so overlapping runs of
+// this binary (ctest -j, the sanitizer ON/OFF twin, build and build_nosan at
+// once) never share a path. The file is removed when the guard goes away.
+class ScratchFile {
+public:
+    explicit ScratchFile(const std::string& stem) {
+        static uint64_t counter = 0;
+#ifdef _WIN32
+        const auto pid = static_cast<long long>(_getpid());
+#else
+        const auto pid = static_cast<long long>(getpid());
+#endif
+        path_ = std::filesystem::temp_directory_path() /
+            ("nanosm_tests_" + stem + "_" + std::to_string(pid) + "_" +
+                std::to_string(counter++) + ".json");
+    }
+    ScratchFile(const ScratchFile&) = delete;
+    ScratchFile& operator=(const ScratchFile&) = delete;
+    ~ScratchFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+    [[nodiscard]] std::string string() const { return path_.string(); }
+
+private:
+    std::filesystem::path path_;
+};
 
 const nanosm::DeviceProfile& canonical_profile() {
     static const auto profile = nanosm::load_device_profile("profiles/nanosm-v0.json");
@@ -3203,13 +3240,15 @@ void test_perfetto_overlapping_commands_are_async() {
         halt
     )"), std::move(launch), {.timeline = true});
     machine.run();
-    const std::string path = "build/test_async_trace.json";
-    machine.trace().write_perfetto(path);
+    const ScratchFile file("async_trace");
+    machine.trace().write_perfetto(file.string());
 
-    std::ifstream input(path);
-    require(static_cast<bool>(input), "trace file was not written");
     nlohmann::json document;
-    input >> document;
+    {
+        std::ifstream input(file.string());
+        require(static_cast<bool>(input), "trace file was not written");
+        input >> document;
+    }
 
     // Complete 'X' slices that partially overlap on one tid are ambiguous to nest and
     // trigger Perfetto's slice_spill_overlapping_complete_event; overlapping lifetimes
@@ -3862,6 +3901,264 @@ void test_worker_acc_store_mbar_handoff() {
     machine.run(2000);
     require(machine.read_mbar_state(4096).phase,
         "shared worker mbar did not receive exactly one post-store arrival per warp");
+}
+
+// ---- Per-engine mbar event registers (design.md Mbar; 2026-10-07) ----
+
+using RmwService = std::pair<uint64_t, std::string>; // start cycle, trace detail
+
+// The RMW engine's service order: every "mbar RMW" slice, by start cycle.
+std::vector<RmwService> mbar_rmw_services(const nanosm::Machine& machine) {
+    std::vector<RmwService> services;
+    for (const auto& event : machine.trace().events())
+        if (event.name == "mbar RMW") services.emplace_back(event.start_cycle, event.detail);
+    std::sort(services.begin(), services.end());
+    return services;
+}
+
+void write_mbar(std::vector<uint8_t>& shmem, uint32_t address, uint16_t remaining,
+    uint32_t tx_bytes) {
+    nanosm::MbarState state;
+    state.valid = true;
+    state.expected = 1;
+    state.remaining = remaining;
+    state.tx_bytes = tx_bytes;
+    write_u64(shmem, address, nanosm::encode_mbar_state(state));
+}
+
+// A TMA complete_tx and an MMA commit become pending in the same cycle r, while
+// the RMW engine is still busy (the write stage of an earlier TMA event). Both
+// are served, alternating TMA, MMA, TMA, and the mma.async queued behind the
+// commit is accepted in cycle r and starts fetching in r + 1, exactly as in a
+// run with no TMA event at all: the commit presents into the MMA's own register.
+// (The alternation here follows the last-served bit: T1 was served last, so
+// the tie at r + 1 goes to the MMA.)
+// Before 2026-10-07 the two engines shared ONE event slot. In cycle r the
+// commit found it holding the TMA event and stayed at the head of the MMA
+// queue: the order was TMA, TMA, MMA, and the mma.async behind it (accepted
+// at r into the entry the retired init command freed) could not start
+// fetching until r + 2, one cycle late -- one cycle for every cycle the TMA
+// event sat in the slot. (Measured on 29e320f: fetch 525 instead of 524.)
+void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
+    constexpr uint32_t commit_mbar = 4096;
+    constexpr uint32_t tx_mbar = 4104;
+    const auto kernel = compile(R"(
+        .acc C, 0, 0, 64, 64
+        mov r0, 0
+        mov r1, 1024
+        mov r4, 4096
+        mma.async.init C, [r0], [r1]
+        mma.commit [r4]
+        mma.async C, [r0], [r1]
+        halt
+    )");
+    const auto make_launch = [&] {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        write_mbar(shmem, commit_mbar, 1, 0);
+        write_mbar(shmem, tx_mbar, 0, 128); // arrived; waits for 2 x 64 bytes
+        return launch;
+    };
+    // The queued mma.async is command 3 (1 = the init command, 2 = the commit).
+    const auto queued_accept_and_fetch = [](const nanosm::Machine& machine) {
+        uint64_t accept = 0;
+        uint64_t fetch = std::numeric_limits<uint64_t>::max();
+        for (const auto& event : machine.trace().events()) {
+            if (event.category != nanosm::TraceCategory::mma || event.id != 3) continue;
+            if (event.name == "mma.async") accept = event.start_cycle;
+            if (event.name == "MMA input step") fetch = std::min(fetch, event.start_cycle);
+        }
+        return std::pair{accept, fetch};
+    };
+
+    // Reference, no TMA event: the commit presents in cycle r, the cycle its
+    // predecessor retires, and frees the queue slot the mma.async waits for.
+    nanosm::Machine reference(canonical_profile(), kernel, make_launch(), {.timeline = true});
+    reference.run(5000);
+    const auto [r, fetch] = queued_accept_and_fetch(reference);
+    require(r > 2 && fetch == r + 1, "reference MMA queue timing changed; re-derive the test");
+    require(mbar_rmw_services(reference) ==
+            std::vector<RmwService>{{r + 1, "arrive (mma.commit), address=4096"}},
+        "reference commit was not served at r + 1");
+
+    nanosm::Machine machine(canonical_profile(), kernel, make_launch(), {.timeline = true});
+    while (machine.cycle() + 1 < r) machine.tick();
+    machine.complete_mbar_tx(tx_mbar, 64, 0); // T1, pending in r - 1: the engine is free
+    machine.tick();
+    require(!machine.tma_mbar_event_held(), "T1 did not take the free RMW engine");
+    machine.complete_mbar_tx(tx_mbar, 64, 0); // T2, pending in r: the engine is in T1's write
+    require(!machine.mma_mbar_event_held(), "the commit presented before cycle r");
+    machine.tick(); // cycle r
+    require(machine.tma_mbar_event_held() && machine.mma_mbar_event_held(),
+        "the TMA event and the commit were not pending together in cycle r");
+    machine.run(5000);
+
+    require(queued_accept_and_fetch(machine) == std::pair{r, fetch},
+        "a held TMA event stalled the MMA queue behind the commit");
+    require(mbar_rmw_services(machine) == std::vector<RmwService>{
+                {r - 1, "complete_tx (tma), address=4104"},
+                {r + 1, "arrive (mma.commit), address=4096"},
+                {r + 3, "complete_tx (tma), address=4104"}},
+        "engine events were not served once each, alternating TMA, MMA, TMA");
+    require(machine.trace().summary().mbar_engine_waits_on_other == 2,
+        "T2 should wait exactly the two cycles of the commit's RMW");
+    require(machine.read_mbar_state(commit_mbar).phase, "the commit's arrive was lost");
+    const auto tx = machine.read_mbar_state(tx_mbar);
+    require(tx.phase && tx.tx_bytes == 0, "a TMA completion was lost");
+}
+
+// Both engines hold an event at the first free point: the TMA goes first (the
+// last-served bit starts at MMA). The TMA presents again before the next free
+// point, so both are pending again: the MMA goes first. Then the second
+// commit and that TMA event tie, and the TMA goes. complete_mbar_tx's
+// occupied PANIC belongs to the TMA's register alone.
+void test_mbar_engine_events_alternate_tma_first() {
+    constexpr uint32_t commit0 = 4096;
+    constexpr uint32_t tx_mbar = 4104;
+    constexpr uint32_t commit1 = 4112;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    write_mbar(shmem, commit0, 1, 0);
+    write_mbar(shmem, commit1, 1, 0);
+    write_mbar(shmem, tx_mbar, 0, 128);
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        mov r4, 4096
+        mov r6, 4112
+        mma.commit [r4]
+        mma.commit [r6]
+        halt
+    )"), std::move(launch), {.timeline = true});
+
+    while (!machine.mma_mbar_event_held()) machine.tick(); // the first commit presented
+    require(!machine.tma_mbar_event_held() && mbar_rmw_services(machine).empty(),
+        "an engine event was served before the first commit");
+    const auto first = machine.cycle(); // the first free point with an engine event
+    machine.complete_mbar_tx(tx_mbar, 64, 0); // accepted although the MMA register is full
+    try {
+        machine.complete_mbar_tx(tx_mbar, 64, 0);
+        throw std::runtime_error("a second event entered the full TMA register");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("TMA mbar event register is occupied") !=
+                std::string::npos, "wrong full-register PANIC");
+    }
+    machine.tick(); // first: both held
+    require(!machine.tma_mbar_event_held() && machine.mma_mbar_event_held(),
+        "the first tie did not serve the TMA");
+    machine.tick(); // the TMA event's write stage; the commit still waits
+    machine.complete_mbar_tx(tx_mbar, 64, 0); // both pending again at first + 2
+    machine.run(1000);
+
+    require(mbar_rmw_services(machine) == std::vector<RmwService>{
+                {first, "complete_tx (tma), address=4104"},
+                {first + 2, "arrive (mma.commit), address=4096"},
+                {first + 4, "complete_tx (tma), address=4104"},
+                {first + 6, "arrive (mma.commit), address=4112"}},
+        "tied engine events did not alternate TMA, MMA, TMA, MMA");
+    // Each of the three ties holds the loser through both cycles of the
+    // winner's RMW.
+    require(machine.trace().summary().mbar_engine_waits_on_other == 6,
+        "engine_waits_on_other does not count 2 cycles per tie");
+    require(machine.read_mbar_state(commit0).phase && machine.read_mbar_state(commit1).phase,
+        "a commit's arrive was lost");
+    const auto tx = machine.read_mbar_state(tx_mbar);
+    require(tx.phase && tx.tx_bytes == 0, "a TMA completion was lost");
+}
+
+// The same-cycle case with a real TMA load. Filler movs before tma.async set
+// its issue delay; the sweep moves its completion across cycle r (the commit's
+// presentation) in two-cycle steps (DRAM clock), and the test finds the delay
+// at which both present in cycle r. The TMA presents first in the tick and
+// takes the free RMW engine at once; the commit follows at r + 2. At every
+// delay the queued mma.async is still accepted at r (the MMA queue never waits
+// on the TMA) and the TMA command ends the cycle after its event is claimed.
+// Before 2026-10-07, at the aligned delay the commit filled the shared slot
+// right behind the TMA's claimed event, and the TMA command could not end
+// (nor free its queue entry) until that slot emptied: r + 3, not r + 1
+// (measured on 29e320f: 529 instead of 527).
+void test_mbar_engine_real_tma_and_commit_same_cycle() {
+    constexpr uint32_t commit_mbar = 4096;
+    constexpr uint32_t tx_mbar = 4104;
+    constexpr uint32_t tile = 2048;
+    constexpr uint32_t descriptor_address = 6144;
+    struct Observed {
+        uint64_t accept = 0;  // the queued mma.async (command 3)
+        uint64_t tma_end = 0; // end of the "tma command" slice
+        std::vector<RmwService> services;
+        uint64_t waits = 0;
+    };
+    const auto run = [&](std::optional<uint32_t> delay) {
+        std::ostringstream qtx;
+        qtx << ".acc C, 0, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
+            << "mov r8, 0\nmov r9, 0\nmov r10, 0\n"
+            << "mma.async.init C, [r0], [r1]\nmma.commit [r4]\n";
+        if (delay.has_value()) {
+            for (uint32_t i = 0; i < *delay; ++i) qtx << "mov r" << 12 + i % 8 << ", " << i << '\n';
+            qtx << "tma.async [" << descriptor_address << "], r8\n";
+        }
+        qtx << "mma.async C, [r0], [r1]\nhalt\n";
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& gmem = image_bytes(launch.gmem_image, 64);
+        for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
+        write_mbar(shmem, commit_mbar, 1, 0);
+        write_mbar(shmem, tx_mbar, 0, 64);
+        nanosm::TmaDescriptor descriptor;
+        descriptor.dimensions = {16, 1, 1};
+        descriptor.box = {16, 1, 1};
+        descriptor.shmem_base = tile;
+        descriptor.completion_mbar = tx_mbar;
+        write_tma_descriptor(shmem, descriptor_address, descriptor);
+        nanosm::Machine machine(canonical_profile(), compile(qtx.str()), std::move(launch),
+            {.timeline = true});
+        machine.run(5000);
+        Observed observed;
+        for (const auto& event : machine.trace().events()) {
+            if (event.category == nanosm::TraceCategory::mma && event.name == "mma.async" &&
+                event.id == 3) observed.accept = event.start_cycle;
+            if (event.name == "tma command") observed.tma_end = event.start_cycle + event.duration_cycles;
+        }
+        observed.services = mbar_rmw_services(machine);
+        observed.waits = machine.trace().summary().mbar_engine_waits_on_other;
+        if (delay.has_value()) {
+            require(machine.read_mbar_state(tx_mbar).phase &&
+                    machine.read_shmem_u32(tile + 60) == 0x10fu, "the TMA load did not complete");
+        }
+        return observed;
+    };
+    const RmwService tma_service{0, "complete_tx (tma), address=4104"};
+    const RmwService mma_service{0, "arrive (mma.commit), address=4096"};
+    const auto at = [](RmwService service, uint64_t cycle) { service.first = cycle; return service; };
+
+    const auto reference = run(std::nullopt); // no TMA
+    const auto r = reference.accept;
+    require(reference.services == std::vector<RmwService>{at(mma_service, r + 1)},
+        "reference commit was not served at r + 1");
+    const auto early = run(0u); // the TMA completes long before r
+    require(early.services.size() == 2 && early.services[0].second == tma_service.second &&
+            early.services[0].first < r, "a delay-0 TMA did not complete before the commit");
+    // The fillers issue one per cycle, so this delay lands the TMA near r.
+    const auto estimate = static_cast<uint32_t>(r - early.services[0].first);
+    bool aligned = false;
+    for (uint32_t delay = estimate - 6; delay <= estimate + 6; ++delay) {
+        const auto observed = run(delay);
+        const auto where = " (delay " + std::to_string(delay) + ")";
+        require(observed.accept == r, "the TMA's completion delayed the MMA queue" + where);
+        require(observed.services.size() == 2, "an engine event was lost" + where);
+        const auto tma_claim = observed.services[0].second == tma_service.second
+            ? observed.services[0].first : observed.services[1].first;
+        require(observed.tma_end == tma_claim + 1,
+            "the TMA command outlived its claimed event (held by the MMA's?)" + where);
+        if (tma_claim != r) continue;
+        aligned = true;
+        require(observed.services ==
+                std::vector<RmwService>{at(tma_service, r), at(mma_service, r + 2)},
+            "same-cycle TMA completion and commit were not served TMA, then MMA" + where);
+        require(observed.waits == 1, "the commit should wait one cycle (the TMA's write)" + where);
+    }
+    require(aligned, "no delay made the TMA completion and the commit present in one cycle");
 }
 
 void test_mma_dense_profile_recurrence_bubbles() {
@@ -5191,6 +5488,11 @@ int main() {
         {"MMA fusion boundaries", test_mma_fusion_boundaries},
         {"autonomous MMA GEMM and commit", test_autonomous_mma_gemm_and_commit},
         {"worker acc.store mbar handoff", test_worker_acc_store_mbar_handoff},
+        {"mbar engines: TMA event does not stall MMA queue",
+            test_mbar_engine_tma_event_does_not_stall_mma_queue},
+        {"mbar engines: tie alternates, TMA first", test_mbar_engine_events_alternate_tma_first},
+        {"mbar engines: real TMA and commit in one cycle",
+            test_mbar_engine_real_tma_and_commit_same_cycle},
         {"MMA dense profile recurrence bubbles", test_mma_dense_profile_recurrence_bubbles},
         {"MMA bare transfer race panics", test_mma_bare_transfer_race_panics},
         {"MMA multi-round fetch timing", test_mma_multi_round_fetch_timing},

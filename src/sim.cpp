@@ -294,7 +294,9 @@ void Machine::tick() {
     advance_shmem();
     advance_mma();
     advance_acc_transfers();
-    if (tma_event_command_.has_value() && !engine_mbar_event_.has_value()) {
+    // A TMA command ends once the RMW engine has claimed its completion event
+    // from the TMA's register (an MMA event pending meanwhile is irrelevant).
+    if (tma_event_command_.has_value() && !tma_mbar_event_.has_value()) {
         const auto& command = tma_commands_.at(*tma_event_command_);
         trace_->tma_command_end(
             cycle_ + 1, command.id, command.logical_bytes, command.useful_bytes);
@@ -387,11 +389,13 @@ void Machine::advance_mma() {
     if (command_it == mma_commands_.end()) return;
     auto& command = *command_it;
     if (command.commit) {
-        if (command_it != mma_commands_.begin() || engine_mbar_event_.has_value()) return;
+        // A commit at the queue head presents into the MMA's own event
+        // register; it waits only while that register is full.
+        if (command_it != mma_commands_.begin() || mma_mbar_event_.has_value()) return;
         MbarRmwRequest request;
         request.operation = MbarRmwOperation::arrive;
         request.byte_address = command.mbar_address;
-        engine_mbar_event_ = std::move(request);
+        mma_mbar_event_ = std::move(request);
         mma_commands_.pop_front();
         return;
     }
@@ -618,7 +622,7 @@ bool Machine::done() const {
         [](const auto& slot) { return !slot.has_value(); });
     return warps_halted && wait_slots_empty &&
         !port_a_.has_value() && !tma_port_a_.has_value() &&
-        !engine_mbar_event_.has_value() &&
+        !tma_mbar_event_.has_value() && !mma_mbar_event_.has_value() &&
         !mbar_rmw_.has_value() && !mbar_read_.has_value() && gmem_queue_.empty() &&
         !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.empty() &&
         read_records_.empty() && ingress_fifo_.empty() && egress_fifo_.empty() &&
@@ -659,15 +663,16 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
         throw SimError("invalid engine mbar address");
     }
     if (parity > 1) throw SimError("invalid engine mbar parity");
-    if (engine_mbar_event_.has_value()) {
-        throw SimError("engine mbar event slot is occupied; an engine holds one event at a time");
+    // A DMA complete_tx: it belongs in the TMA's event register.
+    if (tma_mbar_event_.has_value()) {
+        throw SimError("TMA mbar event register is occupied; an engine holds one event at a time");
     }
     MbarRmwRequest request;
     request.operation = MbarRmwOperation::complete_tx;
     request.byte_address = byte_address;
     request.value = bytes;
     request.parity = parity;
-    engine_mbar_event_ = std::move(request);
+    tma_mbar_event_ = std::move(request);
 }
 
 uint32_t Machine::read_reg(
@@ -958,22 +963,40 @@ void Machine::advance_shmem() {
         return;
     }
     if (!port_a_.has_value()) {
+        std::optional<MbarEngine> serving; // (T) counter attribution only
         if (mbar_read_.has_value()) {
             advance_mbar_read();
         } else if (mbar_rmw_.has_value()) {
+            // A started operation (SIMT or engine) is never preempted.
+            serving = mbar_rmw_->engine;
             advance_mbar_rmw();
-        } else if (engine_mbar_event_.has_value()) {
-            // Engines line up ahead of new SIMT work: the held event takes the free
+        } else if (tma_mbar_event_.has_value() || mma_mbar_event_.has_value()) {
+            // Engines line up ahead of new SIMT work: a held event takes the free
             // engine here, before this cycle's issue can see the port as idle.
+            // One holder is served; when both hold an event they alternate.
+            const MbarEngine engine = !mma_mbar_event_.has_value() ? MbarEngine::tma
+                : !tma_mbar_event_.has_value() ? MbarEngine::mma
+                : mbar_engine_last_served_ == MbarEngine::tma ? MbarEngine::mma
+                : MbarEngine::tma;
+            auto& held = engine == MbarEngine::tma ? tma_mbar_event_ : mma_mbar_event_;
             ActiveMbarRmw active;
-            active.request = std::move(*engine_mbar_event_);
-            engine_mbar_event_.reset();
+            active.request = std::move(*held);
+            active.engine = engine;
+            held.reset();
+            mbar_engine_last_served_ = engine;
             // Sanitizer: an engine's RMW is admitted here (SIMT ones at issue).
             // Engine events never carry a requesting warp.
             sanitizer_.check_engine_mbar_rmw(cycle_, active.request.byte_address,
                 active.request.operation == MbarRmwOperation::complete_tx);
             mbar_rmw_ = std::move(active);
+            serving = engine;
             advance_mbar_rmw();
+        }
+        // An event held through a cycle the RMW engine spends on the OTHER
+        // engine's event (the claim cycle or its write stage).
+        if (serving.has_value() &&
+            (*serving == MbarEngine::tma ? mma_mbar_event_ : tma_mbar_event_).has_value()) {
+            trace_->mbar_engine_wait_on_other();
         }
         return;
     }
@@ -1018,6 +1041,9 @@ void Machine::advance_mbar_rmw() {
         case MbarRmwOperation::arrive: operation = "arrive"; break;
         case MbarRmwOperation::arrive_expect_tx: operation = "arrive.expect_tx"; break;
         case MbarRmwOperation::complete_tx: operation = "complete_tx"; break;
+        }
+        if (active.engine.has_value()) {
+            operation += *active.engine == MbarEngine::tma ? " (tma)" : " (mma.commit)";
         }
         trace_->mbar_rmw_begin(cycle_, active.request.byte_address, std::move(operation));
         return; // read cycle
@@ -1328,8 +1354,10 @@ void Machine::advance_tma_frontend() {
     }
 }
 
+// The TMA presents into its own event register; it waits only while that
+// register is full or its previous command has not ended.
 void Machine::present_tma_mbar_event() {
-    if (engine_mbar_event_.has_value() || tma_event_command_.has_value()) return;
+    if (tma_mbar_event_.has_value() || tma_event_command_.has_value()) return;
     const auto command_id = next_data_complete_tma_command();
     if (!command_id.has_value()) return;
     auto& command = tma_commands_.at(*command_id);
@@ -1341,7 +1369,7 @@ void Machine::present_tma_mbar_event() {
     request.byte_address = command.descriptor.completion_mbar;
     request.value = static_cast<uint32_t>(command.logical_bytes);
     request.parity = command.mbar_phase;
-    engine_mbar_event_ = std::move(request);
+    tma_mbar_event_ = std::move(request);
     command.state = TmaCommandState::event_presented;
     tma_event_command_ = *command_id;
 }
@@ -1867,10 +1895,11 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp) {
     }
     // Port-A arbiter, SIMT side. A started access (SIMT rounds, a TMA port
     // request, the mbar engine) is never preempted. For the next free grant
-    // the order is: a held engine mbar event (claims the engine in
-    // advance_shmem), then the TMA (advance_tma, at the start of the next
-    // cycle), then SIMT. So SIMT may not take a free port while the TMA has
-    // a port-A request waiting: that is TMA priority, counted per warp-cycle.
+    // the order is: held engine mbar events (the TMA's and MMA's registers;
+    // they claim the engine in advance_shmem), then the TMA (advance_tma, at
+    // the start of the next cycle), then SIMT. So SIMT may not take a free
+    // port while the TMA has a port-A request waiting: that is TMA priority,
+    // counted per warp-cycle.
     if (inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
         is_mbar_rmw(inst.opcode) ||
         is_mbar_test_wait(inst.opcode) || is_mbar_try_wait(inst.opcode)) {
@@ -2365,7 +2394,7 @@ bool Machine::reserve_write(uint8_t reg, uint64_t at_cycle) {
 bool Machine::port_a_busy() const {
     return port_a_.has_value() || tma_port_a_.has_value() ||
         mbar_read_.has_value() || mbar_rmw_.has_value() ||
-        engine_mbar_event_.has_value();
+        tma_mbar_event_.has_value() || mma_mbar_event_.has_value();
 }
 
 uint32_t Machine::uniform_reg(

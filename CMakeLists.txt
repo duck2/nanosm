@@ -124,6 +124,10 @@ if(NANOSM_SANITIZER)
 endif()
 
 enable_testing()
+# No test writes a fixed path: the unit tests write into a per-process temp
+# file, launches write a trace only under --trace, and the sanitizer check
+# passes --trace into its own temp dir. So the targets need no RESOURCE_LOCK
+# under ctest -j, and build/ and build_nosan/ may run their tests at once.
 add_test(NAME nanosm_tests COMMAND nanosm_tests)
 set_tests_properties(nanosm_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME nanosm_capi_tests COMMAND nanosm_capi_tests)
