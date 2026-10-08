@@ -4,6 +4,7 @@
 #include "image.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
+#include "reg.hpp"
 #include "rf.hpp"
 #include "sanitizer.hpp"
 #include "trace.hpp"
@@ -15,6 +16,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -70,14 +72,36 @@ struct LsuEdgeEvent {
 class Machine {
 public:
     Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace_options = {});
+    // The registers are registered by address (src/reg.hpp): never copied or moved.
+    Machine(const Machine&) = delete;
+    Machine& operator=(const Machine&) = delete;
+
     void set_controller_test_order(ControllerTestOrder order) { controller_test_order_ = order; }
     void enable_edge_probe() { edge_probe_enabled_ = true; }
+    // Test seam (the driver-shuffle regression guard): run the register
+    // drivers, and the independent request generators, in a random order every
+    // cycle. Every result, trace byte and counter must be unchanged.
+    void set_driver_shuffle_seed(uint64_t seed);
     [[nodiscard]] const std::vector<LsuEdgeEvent>& edge_events() const { return edge_events_; }
-    [[nodiscard]] uint32_t tma_sector_credits_used() const { return tma_sector_credits_used_; }
-    [[nodiscard]] std::size_t lsu_commands_in_flight() const { return lsu_commands_.size(); }
+    [[nodiscard]] uint32_t tma_sector_credits_used() const { return tma_.cur().credits_used; }
+    [[nodiscard]] std::size_t lsu_commands_in_flight() const { return lsu_commands_.cur().size(); }
     // Test seams: whether each engine's one-entry mbar event register is full.
-    [[nodiscard]] bool tma_mbar_event_held() const { return tma_mbar_event_.has_value(); }
-    [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.has_value(); }
+    [[nodiscard]] bool tma_mbar_event_held() const { return tma_mbar_event_.cur().has_value(); }
+    [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.cur().has_value(); }
+    // Test seams (Q, between ticks): a warp's depbar counter; the MMA queue's depth.
+    [[nodiscard]] uint32_t depbar_value(uint32_t warp, uint8_t bar) const { return depbar_.cur().at(warp).at(bar); }
+    [[nodiscard]] std::size_t mma_queue_depth() const { return mma_.cur().queue.size(); }
+    // Test seams (Q, between ticks): an assembly register's owner (an LSU
+    // command id), its lane valid bits and their count.
+    [[nodiscard]] std::optional<uint64_t> assembly_owner(uint32_t index) const {
+        return staging_.at(index).cur().owner;
+    }
+    [[nodiscard]] const std::vector<uint8_t>& assembly_valid(uint32_t index) const {
+        return staging_.at(index).cur().valid;
+    }
+    [[nodiscard]] uint32_t assembly_valid_count(uint32_t index) const {
+        return staging_.at(index).cur().valid_count;
+    }
 
     void tick();
     void run(uint64_t cycle_limit = 100000);
@@ -94,10 +118,16 @@ public:
     [[nodiscard]] uint32_t read_reg(
         uint32_t warp, uint32_t lane, uint32_t reg) const;
     // Host/test seam for a DMA complete_tx: it is written into the TMA's event
-    // register (throws if that register is full; the MMA's is independent).
+    // register between ticks (throws if that register is full; the MMA's is
+    // independent).
     void complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t parity);
 
 private:
+    // =======================================================================
+    // Machine structures (unchanged meaning; see trash/lsu-b21-2026-10-04.md
+    // and trash/harness-and-mbar-events-2026-10-07.md)
+    // =======================================================================
+
     struct MbarWaitSlot {
         uint32_t warp = 0;
         uint32_t byte_address = 0;
@@ -107,16 +137,17 @@ private:
         uint64_t deadline_cycle = 0;
     };
 
+    // Issue-internal warp state (only the scheduler reads or writes it), plus
+    // the warp's RF and predicate memories. The depbar counters and the mbar
+    // wait slots, which other units complete, are registers (below).
     struct Warp {
         uint32_t id = 0;
         uint32_t pc = 0; // byte PC; every decoded instruction still occupies one 64-bit slot
         bool halted = false;
         uint64_t stall_until = 0;
-        std::array<uint32_t, 6> depbar{};
         std::vector<uint32_t> rf;
         // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
         std::array<std::vector<uint8_t>, 7> predicates;
-        std::optional<uint32_t> mbar_wait_slot;
     };
 
     struct Writeback {
@@ -183,7 +214,6 @@ private:
         uint32_t next_step = 0;
         uint32_t outstanding_results = 0;
         bool operands_consumed = false;
-        bool event_presented = false;
     };
 
     struct MmaResult {
@@ -324,7 +354,8 @@ private:
     // Capacity lsu.ingress_sectors x sector bytes. Written by the bus (one
     // beat per DRAM tick); readable from visible_cycle = write cycle +
     // lsu.ingress_latency_cycles; read lsu.pluck_words_per_cycle words per
-    // cycle. Never fall-through.
+    // cycle. Never fall-through. (Room freed by a read is a separate
+    // contract: reusable from the next cycle, see tick_gmem_controller.)
     struct IngressBeat {
         uint64_t request = 0;
         uint32_t offset = 0;        // byte offset of this beat in its sector
@@ -335,15 +366,14 @@ private:
 
     // The TMA stream's 32 B sector register (flops). Filled from the ingress
     // FIFO at the pluck rate; when complete, placed into shmem by port A in
-    // its bank rounds, which read the register directly. Free after the last
-    // round. Its fall-through tripwire (a consumer may only read it in a
-    // later cycle) is in the Sanitizer.
+    // its bank rounds, which read the register's Q directly. Free after the
+    // last round (and refillable in that cycle).
     struct TmaSectorRegister {
         std::optional<uint64_t> request;
         uint64_t sector_address = 0;
         std::vector<uint8_t> data;
         uint32_t filled = 0;        // bytes plucked in
-        bool complete = false;      // all bytes in; its ticket is in tma_returns_
+        bool complete = false;      // all bytes in; its ticket is in the TMA queue's returns
     };
 
     // The TMA store sector register (32 B flops). Allocated when the walker
@@ -407,8 +437,12 @@ private:
         uint32_t chunks_plucked = 0; // vector store: chunks moved into the egress FIFO
         uint32_t words_plucked = 0; // stores: words of the current chunk (vector) / lanes (scalar) in egress
         uint32_t acks = 0;
-        bool finishing = false;     // completion writeback scheduled
-        // Trace phases and per-command stall reasons.
+    };
+
+    // (T) Trace phases and per-command stall reasons of an LSU command. Read
+    // only for its trace slice; updated in place by the decisions that see
+    // the stall (increments and set-once fields, so order cannot matter).
+    struct LsuCommandPhases {
         uint64_t admit_cycle = 0;
         std::optional<uint64_t> requests_done_cycle;
         std::optional<uint64_t> first_return_cycle;
@@ -517,92 +551,391 @@ private:
         std::string reason;
     };
 
+    // =======================================================================
+    // Register contents that change together (one Reg each, below)
+    // =======================================================================
+
+    // The RMW engine: the operation in flight and the round-robin bit between
+    // the two engines' events (they change together, at an engine claim).
+    struct RmwEngine {
+        std::optional<ActiveMbarRmw> active;
+        // The engine whose event was claimed last (set on every engine claim,
+        // contested or not). On a tie the other engine is served. Starts at
+        // mma, so the first contested free point serves the TMA.
+        MbarEngine last_served = MbarEngine::mma;
+    };
+
+    using WaitSlots = std::vector<std::optional<MbarWaitSlot>>;
+    using DepbarCounters = std::vector<std::array<uint32_t, 6>>;             // [warp][sb]
+    using AccSlots = std::vector<std::array<std::optional<AccTransfer>, 2>>; // [tmem bank][0 load, 1 store]
+
+    // The MMA engine's queue and pipeline. One group: a command's next_step
+    // and operands_consumed track the fetch, its outstanding_results the
+    // result list. (Its event register is separate.)
+    struct MmaPipeline {
+        std::deque<MmaCommand> queue;   // mma.queue_commands; issue pushes at the back
+        std::optional<MmaFetch> fetch;  // the operand fetch in port-B service
+        std::deque<MmaResult> results;  // computed steps waiting for their tmem write
+    };
+
+    // The TMA engine's command queue and walker bookkeeping. One group:
+    // credits, tickets and each command's pending counts move together. (Its
+    // event register, port-A transaction and the two sector registers are
+    // separate registers.)
+    struct TmaQueue {
+        std::map<uint64_t, TmaCommand> commands; // tma.queue_commands; issue inserts
+        std::optional<uint64_t> frontend;        // the command the descriptor/phase/walker frontend serves
+        std::optional<uint64_t> event_command;   // whose completion event is in the TMA's event register
+        uint32_t credits_used = 0;               // of tma.sector_credits
+        std::deque<TmaReturn> returns;           // sectors ready for port-A placement
+    };
+
+    struct IngressFifo {
+        std::deque<IngressBeat> beats;
+        uint32_t bytes = 0;
+    };
+
+    // =======================================================================
+    // Wires: this cycle's decisions. Each is computed once in tick(), in the
+    // dependency order written there, from register Q values, memories and
+    // earlier wires. The register drivers read only Q and these.
+    // =======================================================================
+
+    // A port-A write. shmem takes it at the clock edge: every read of shmem
+    // this cycle (port A's own, port B's) sees the start-of-cycle contents.
+    // (Port A serves one user per cycle, so it never reads what it writes in
+    // the same cycle; a same-word port-A write and port-B read is case 08's
+    // collision PANIC.)
+    struct ShmemWrite {
+        uint32_t address = 0;
+        std::vector<uint8_t> bytes;
+    };
+
+    struct DepbarEvent {
+        uint32_t warp = 0;
+        uint8_t bar = 0;
+    };
+
+    // LSU: assembly register -> RF (the RF write port at this cycle).
+    struct LsuRfDrain {
+        std::optional<uint64_t> command;  // the load drained this cycle
+        uint32_t assembly = 0;
+        uint8_t reg = 0;
+        bool last = false;                // its final write: the command completes
+    };
+
+    // LSU / TMA -> egress FIFO (the shared egress write port).
+    struct EgressWrite {
+        std::optional<GmemClient> client;              // who writes the egress FIFO this cycle
+        std::optional<EgressSlot> new_slot;            // a new grant opens this slot
+        std::vector<std::pair<uint32_t, uint32_t>> words; // (byte offset in the slot, word)
+        bool slot_complete = false;                    // the open slot's last word lands now
+        uint64_t lsu_command = 0;
+        uint32_t lsu_assembly = 0;
+        bool lsu_chunk_drained = false;                // a vector store's assembly register empties
+        bool tma_store_drained = false;                // the TMA store register's last word leaves
+    };
+
+    // The TMA walker's next sector, planned from Q.
+    struct TmaWalkerPlan {
+        enum class Sector : uint8_t { none, zero_fill, load, store };
+        Sector sector = Sector::none;
+        TmaCommand command_after;   // the command after this cycle's walk
+        std::vector<GmemSectorRequest::TmaFragment> fragments;
+        uint64_t sector_address = 0;
+        uint64_t store_byte_enable = 0;
+    };
+
+    // What the TMA wants this cycle, from Q (independent of the LSU's wants).
+    struct TmaRequests {
+        std::optional<uint64_t> present;           // the command whose completion event it presents
+        std::optional<MbarRmwRequest> present_event; // that event (complete_tx)
+        bool port_a_idle = false;                  // port A free for a new TMA transaction
+        std::optional<TmaPortRequest> port_a;      // the transaction it starts on idle port A
+        bool placement = false;                    // port_a places the front ticket
+        std::optional<uint64_t> frontend;          // the frontend command (selection persists)
+        bool frontend_reset = false;
+        std::optional<TmaWalkerPlan> walker;
+        bool write_request = false;                // a TMA store sector waits at the egress request pointer
+    };
+
+    // What the LSU wants on the request channel, from Q.
+    struct LsuRequestWant {
+        std::optional<uint64_t> command;           // its oldest command with requests left, if ready
+    };
+
+    // The gmem request channel: one accepted request per core cycle.
+    struct RequestChannel {
+        std::optional<GmemClient> granted;
+        uint64_t lsu_command = 0;                  // the LSU command granted
+        bool tma_write = false;                    // the TMA's grant is its store write (else its walker's read)
+        std::optional<uint64_t> tma_write_slot;    // the egress slot whose write request is accepted now
+        std::optional<uint64_t> lsu_write_slot;
+        bool walker_proceeds = false;              // the walker emits its sector this cycle
+        // Request ids, assigned in the fixed order TMA write, walker sector, LSU.
+        uint64_t tma_write_id = 0;
+        uint64_t walker_id = 0;
+        uint64_t lsu_id = 0;
+        std::optional<uint32_t> lsu_tag;           // the free-ID tag an LSU scalar request takes
+        std::optional<GmemSectorRequest> accepted; // the request the controller queue takes
+        std::vector<std::pair<uint64_t, ReadRecord>> new_read_records; // reads accepted now
+    };
+
+    // shmem port A: the one user this cycle, chosen by select_port_a().
+    struct PortAGrant {
+        enum class User : uint8_t {
+            idle,
+            tma_transaction,   // a started TMA transaction: its next round
+            simt_access,       // a started SIMT lds/sts: its next round
+            mbar_read,         // a SIMT mbar test/try-wait read
+            rmw,               // the RMW engine's next stage
+            engine_event,      // a held engine event claims the free RMW engine (read stage now)
+            tma_start,         // the TMA starts a new transaction (round 0 now)
+        };
+        User user = User::idle;
+        MbarEngine engine = MbarEngine::tma; // engine_event: whose event
+    };
+
+    // What port A did this cycle (its data path).
+    struct PortAService {
+        PortAGrant grant;
+        std::vector<ShmemWrite> writes;                   // applied at the clock edge
+        std::optional<TmaPortRequest> tma_after;          // the TMA transaction after this round (none: done)
+        std::optional<TmaPortRequest> tma_completed;      // the TMA transaction that finished, with its data
+        std::vector<std::pair<uint32_t, uint8_t>> store_bytes; // TMA store read: (register offset, byte)
+        std::optional<ShmemRequest> simt_after;           // the SIMT access after this round (none: done)
+        std::optional<ActiveMbarRmw> rmw_after;           // the RMW engine's operation after this cycle
+        bool tma_event_claimed = false;
+        bool mma_event_claimed = false;
+        std::optional<std::pair<uint32_t, uint64_t>> park; // try-wait: (slot, deadline)
+    };
+
+    // LSU: the ingress FIFO read port this cycle.
+    struct IngressPluck {
+        uint32_t bytes = 0;                               // read from the FIFO head
+        struct LaneWrite { uint32_t assembly = 0; uint32_t lane = 0; uint32_t word = 0; };
+        std::vector<LaneWrite> lanes;
+        std::optional<TmaSectorRegister> tma_sector_after; // the TMA sector register after its fill
+        std::optional<TmaReturn> tma_ticket;               // the sector completed: placement ticket
+        std::map<uint64_t, std::optional<ReadRecord>> records; // updated (none: erased)
+        std::vector<uint32_t> freed_tags;
+    };
+
+    // The placeholder controller's DRAM ticks this core cycle.
+    struct ControllerTick {
+        std::vector<IngressBeat> ingress_beats;          // bus -> ingress FIFO
+        uint32_t egress_slots_freed = 0;                 // last beats left the FIFO head
+        uint32_t tma_credit_releases = 0;                // TMA write acks
+        std::vector<uint32_t> freed_tags;                // scatter write acks
+        std::map<uint64_t, uint32_t> lsu_acks;           // command -> write acks
+    };
+
+    // LSU: RF -> assembly register (vector stores), below issue in priority.
+    struct LsuRfRead {
+        std::optional<uint64_t> command;
+        uint32_t assembly = 0;
+        std::vector<uint32_t> values;
+    };
+
+    // Everything an issued instruction hands to other units.
+    struct IssueDecision {
+        std::optional<DepbarEvent> depbar_admission;
+        std::optional<ShmemRequest> port_a;              // lds / sts
+        std::optional<ActiveMbarRmw> rmw;                // SIMT mbar RMW: the engine was free
+        std::optional<MbarReadRequest> mbar_read;
+        std::optional<std::pair<uint32_t, MbarWaitSlot>> wait_slot; // try-wait: (slot, record)
+        std::optional<MmaCommand> mma;
+        struct AccAdmission { uint8_t bank = 0; bool load = false; AccTransfer transfer; };
+        std::optional<AccAdmission> acc;
+        struct LsuAdmission {
+            LsuCommand command;
+            std::optional<std::vector<uint32_t>> store_data; // scalar stg: the issue-cycle RF read
+        };
+        std::optional<LsuAdmission> lsu;
+        std::optional<TmaCommand> tma;
+    };
+
+    // All of a cycle's wires, in the order tick() computes them.
+    struct Wires {
+        // The RF write port (write-first).
+        LsuRfDrain lsu_drain;
+        std::vector<uint64_t> released_lsu_commands;  // their last write / ack committed now
+        // Collected as they happen, from several steps below.
+        std::vector<DepbarEvent> depbar_completions;  // in the order they happened
+        std::vector<uint32_t> completed_waits;        // try-wait slots completed this cycle
+        std::vector<Writeback> new_writebacks;        // RF writes booked now, in wire order
+        // The store path's last stage; request generation; the two selects.
+        EgressWrite egress;
+        TmaRequests tma;
+        LsuRequestWant lsu_want;
+        RequestChannel channel;
+        PortAService port_a;
+        // Next state of the units issue looks ahead at (committed by their
+        // drivers, with issue's additions).
+        MmaPipeline mma_next;
+        std::optional<MbarRmwRequest> mma_present;    // a commit presented into the MMA's event register
+        AccSlots acc_next;
+        IngressPluck ingress;
+        ControllerTick controller;
+        TmaQueue tma_next;
+        bool tma_store_allocated = false;             // the walker took the TMA store register
+        // Issue, then what ranks below it.
+        IssueDecision issue;
+        LsuRfRead lsu_rf_read;
+    };
+
+    // =======================================================================
+    // State
+    // =======================================================================
+
     Config config_;
     Kernel kernel_;
-    std::vector<Warp> warps_;
-    std::vector<uint8_t> shmem_;
-    std::vector<uint8_t> gmem_;
-    std::vector<std::vector<uint32_t>> tmem_;
-    // Slots are [coarse bank][0=load, 1=store]. In whole-transfer mode either
-    // slot blocks the other; duplex mode permits one of each.
-    std::vector<std::array<std::optional<AccTransfer>, 2>> acc_transfers_;
-    std::deque<MmaCommand> mma_commands_;
-    std::deque<MmaResult> mma_results_;
-    std::optional<MmaFetch> mma_fetch_;
-    uint64_t next_mma_command_id_ = 1;
+    uint64_t cycle_ = 0;
+    // Shadow state that only decides whether to PANIC. Write-only from here:
+    // the rule is at the top of sanitizer.hpp.
+    Sanitizer sanitizer_;
+    // Every Reg below registers itself here; tick() ends with registers_.commit().
+    RegisterFile registers_{sanitizer_, cycle_};
+
+    // ---- Memories (not registers: written through their ports, see tick()) ----
+    std::vector<Warp> warps_;                     // + RF and predicate files (write-first)
+    std::vector<uint8_t> shmem_;                  // port-A writes land at the clock edge
+    std::vector<uint8_t> gmem_;                   // the controller's
+    std::vector<std::vector<uint32_t>> tmem_;     // MMA results / acc beats, banks exclusive
+
+    // ---- Registers: the declared storage boundaries ----
+    // Scheduler-visible state other units complete.
+    Reg<DepbarCounters> depbar_{registers_, "depbar counters"};
+    Reg<WaitSlots> mbar_wait_slots_{registers_, "mbar wait slots"};
+    // shmem port A, the RMW engine and the engines' event registers. Each
+    // engine holds at most one pending event in its own one-entry register
+    // (design.md Mbar) and stalls only on its own register being full:
+    //   TMA: complete_tx {address, bytes, parity} (TMA data complete, or the
+    //        host's complete_mbar_tx).
+    //   MMA: a commit's arrive {address}.
+    // A presented event is visible to the RMW engine from the next cycle.
+    Reg<std::optional<ShmemRequest>> port_a_{registers_, "SIMT port-A access"};
+    Reg<std::optional<MbarReadRequest>> mbar_read_{registers_, "SIMT mbar read"};
+    Reg<RmwEngine> rmw_{registers_, "RMW engine"};
+    Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{registers_, "TMA mbar event register"};
+    Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
+    // MMA and accumulator transfers.
+    Reg<MmaPipeline> mma_{registers_, "MMA queue and pipeline"};
+    Reg<AccSlots> acc_transfers_{registers_, "acc transfer slots"};
+    // TMA.
+    Reg<TmaQueue> tma_{registers_, "TMA command queue"};
+    // A TMA port-A transaction's rounds after its first. Round 0 is served in
+    // the grant cycle straight from tma_requests (bypass (h) in tick()).
+    Reg<std::optional<TmaPortRequest>> tma_port_a_{registers_, "TMA port-A transaction"};
+    Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
+    Reg<TmaStoreRegister> tma_store_sector_{registers_, "TMA store sector register"};
+    // LSU.
+    Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
+    std::deque<Reg<AssemblyRegister>> staging_;   // the lsu.staging_vectors pool, one register each
+    Reg<IngressFifo> ingress_{registers_, "ingress FIFO"};
+    Reg<std::deque<EgressSlot>> egress_fifo_{registers_, "egress FIFO"};
+    Reg<std::map<uint64_t, ReadRecord>> read_records_{registers_, "read ID table"};
+    Reg<std::vector<uint8_t>> free_id_tags_{registers_, "free-ID tags"}; // 1 = in flight
+    // The RF write port's schedule: bookings that execute at their cycle.
+    Reg<std::deque<Writeback>> writebacks_{registers_, "RF writeback schedule"};
+
+    // ---- Unit-internal state (only its own unit's code touches it) ----
+    // Issue: scheduler cursor, SFU occupancy, the arithmetic operand latches.
+    uint32_t scheduler_cursor_ = 0;
     // First cycle the SFU is free again. The unit is occupied from an SFU
     // op's execution start (window end) for ceil(lanes / sfu_lanes) cycles;
     // a later SFU op stalls structurally until its own execution start fits.
     uint64_t sfu_busy_until_ = 0;
-    std::optional<ShmemRequest> port_a_;
-    std::optional<TmaPortRequest> tma_port_a_;
-    // No RMW input FIFO: the engine serves one operation, SIMT requesters stall
-    // structurally at issue, and each engine holds at most one pending event
-    // in its own one-entry register (design.md Mbar). An engine stalls only on
-    // its own register being full, never on the other's.
-    //   TMA: complete_tx {address, bytes, parity} (TMA data complete, or the
-    //        host's complete_mbar_tx).
-    //   MMA: a commit's arrive {address}.
-    // Both line up for the free RMW engine ahead of new SIMT work; when both
-    // hold an event as it frees, they alternate (last-served bit below).
-    std::optional<MbarRmwRequest> tma_mbar_event_;
-    std::optional<MbarRmwRequest> mma_mbar_event_;
-    // The engine whose event the RMW engine claimed last (set on every engine
-    // claim, contested or not). On a tie the other engine is served. Starts
-    // at mma, so the first contested free point serves the TMA.
-    MbarEngine mbar_engine_last_served_ = MbarEngine::mma;
-    std::optional<ActiveMbarRmw> mbar_rmw_;
-    std::optional<MbarReadRequest> mbar_read_;
-    std::vector<std::optional<MbarWaitSlot>> mbar_wait_slots_;
-    std::deque<GmemSectorRequest> gmem_queue_;
-    std::optional<GmemSectorRequest> gmem_bus_;
-    ControllerTestOrder controller_test_order_ = ControllerTestOrder::fifo;
-    // Request channel: one accepted request per core cycle, TMA/LSU alternate.
-    bool request_channel_used_ = false;
-    GmemClient request_channel_last_ = GmemClient::lsu;
-    std::deque<WriteAck> pending_write_acks_;
-    // SM side of the boundary (LSU state).
-    std::map<uint64_t, ReadRecord> read_records_;
-    uint32_t next_vector_stream_ = 0;     // round-robin over 1..read_streams-1
-    std::optional<uint32_t> last_served_read_stream_; // interleave_ordered_streams test order
-    std::deque<IngressBeat> ingress_fifo_;
-    uint32_t ingress_bytes_ = 0;
-    // Bytes read out of the ingress FIFO this cycle: room they free is seen by
-    // the write side only next cycle (the full flag comes from the pointers
-    // as registered at the start of the cycle).
-    uint32_t ingress_freed_this_cycle_ = 0;
-    bool return_ready_low_this_cycle_ = false;
-    TmaSectorRegister tma_sector_;
-    TmaStoreRegister tma_store_sector_;
-    std::vector<AssemblyRegister> staging_;
-    std::deque<LsuCommand> lsu_commands_; // admission order
-    std::deque<EgressSlot> egress_fifo_;
-    uint64_t next_egress_slot_id_ = 0;
-    std::vector<uint8_t> free_id_tags_;   // lsu.sectors_in_flight; 1 = in flight
-    uint64_t next_lsu_command_id_ = 0;
-    bool edge_probe_enabled_ = false;
-    std::vector<LsuEdgeEvent> edge_events_;
-    std::map<uint64_t, TmaCommand> tma_commands_;
-    std::deque<TmaReturn> tma_returns_;
-    std::optional<uint64_t> tma_frontend_command_;
-    std::optional<uint64_t> tma_event_command_;
-    uint32_t tma_sector_credits_used_ = 0;
-    std::deque<Writeback> writebacks_;
+    std::deque<ArithmeticRead> arithmetic_reads_;
+    // The RF ports' reservation calendar (the arbiter's schedule). Booked only
+    // by the decisions in tick(), in the order of rf_requester (below).
     std::map<uint64_t, std::vector<uint32_t>> write_reservations_;
     // Ring horizon and maximum live operand-latch records equal the fixed window.
     std::vector<std::vector<uint32_t>> read_reservations_;
-    std::deque<ArithmeticRead> arithmetic_reads_;
-    std::optional<TraceRecorder> trace_;
-    uint64_t cycle_ = 0;
+    // gmem controller (outside the SM): its queue, bus and B channel.
+    std::deque<GmemSectorRequest> gmem_queue_;
+    std::optional<GmemSectorRequest> gmem_bus_;
+    std::deque<WriteAck> pending_write_acks_;
+    ControllerTestOrder controller_test_order_ = ControllerTestOrder::fifo;
+    // Request channel: TMA/LSU alternate (the client granted last yields a tie).
+    GmemClient request_channel_last_ = GmemClient::lsu;
+    std::optional<uint32_t> last_served_read_stream_; // interleave_ordered_streams test order
     uint64_t dram_tick_ = 0;
     uint64_t dram_phase_ = 0;
-    uint32_t scheduler_cursor_ = 0;
+    // Id counters, advanced only by the decisions that allocate (fixed order).
+    uint32_t next_vector_stream_ = 0;     // round-robin over 1..read_streams-1
+    uint64_t next_egress_slot_id_ = 0;
+    uint64_t next_lsu_command_id_ = 0;
     uint64_t next_gmem_request_id_ = 0;
     uint64_t next_tma_command_id_ = 0;
-    // Shadow state that only decides whether to PANIC. Write-only from here:
-    // the rule is at the top of sanitizer.hpp.
-    Sanitizer sanitizer_;
+    uint64_t next_mma_command_id_ = 1;
+    // (T) trace-only per-command LSU phases.
+    std::map<uint64_t, LsuCommandPhases> lsu_phases_;
+    bool edge_probe_enabled_ = false;
+    std::vector<LsuEdgeEvent> edge_events_;
+    std::optional<TraceRecorder> trace_;
 
+    // The driver-shuffle test seam.
+    std::optional<std::mt19937_64> shuffle_;
+
+    // =======================================================================
+    // tick(): decisions (wires) in dependency order, then drivers, then commit
+    // =======================================================================
+
+    // ---- RF write port, write-first ----
+    LsuRfDrain decide_lsu_rf_drain();
+    void execute_rf_writes(Wires& w);
+    // ---- store path ----
+    EgressWrite decide_egress_write();
+    // ---- request generation (independent; any order) ----
+    [[nodiscard]] TmaRequests tma_requests(const EgressWrite& egress) const;
+    [[nodiscard]] LsuRequestWant lsu_request_want() const;
+    // ---- shared resources: one select each ----
+    RequestChannel select_request_channel(const TmaRequests& tma, const LsuRequestWant& lsu);
+    void assign_channel_requests(RequestChannel& channel, const TmaRequests& tma);
+    void accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan);
+    void accept_lsu_request(RequestChannel& channel);
+    [[nodiscard]] PortAGrant select_port_a(const TmaRequests& tma) const;
+    PortAService serve_port_a(const PortAGrant& grant, const TmaRequests& tma, Wires& w);
+    // ---- units whose next state issue looks ahead at ----
+    void step_mma(Wires& w);
+    void step_acc_transfers(Wires& w);
+    void decide_mbar_timeouts(Wires& w);
+    IngressPluck decide_ingress(const Wires& w);
+    void step_gmem_controller(Wires& w);
+    void step_tma(Wires& w);
+    // ---- issue (the scheduler) ----
+    void decide_issue(Wires& w);
+    IssueAttempt try_issue(Warp& warp, Wires& w);
+    // ---- below issue ----
+    LsuRfRead decide_lsu_rf_read(const Wires& w);
+    void step_arithmetic_reads(Wires& w);
+
+    // ---- register drivers: next state from Q + wires; any order ----
+    using Driver = void (Machine::*)(const Wires&);
+    void drive_depbar(const Wires& w);
+    void drive_wait_slots(const Wires& w);
+    void drive_port_a_access(const Wires& w);
+    void drive_mbar_read(const Wires& w);
+    void drive_rmw_engine(const Wires& w);
+    void drive_tma_event(const Wires& w);
+    void drive_mma_event(const Wires& w);
+    void drive_mma(const Wires& w);
+    void drive_acc_transfers(const Wires& w);
+    void drive_tma_queue(const Wires& w);
+    void drive_tma_transaction(const Wires& w);
+    void drive_tma_sector(const Wires& w);
+    void drive_tma_store_sector(const Wires& w);
+    void drive_lsu_commands(const Wires& w);
+    void drive_assembly_pool(const Wires& w);
+    void drive_ingress(const Wires& w);
+    void drive_egress(const Wires& w);
+    void drive_read_records(const Wires& w);
+    void drive_free_id_tags(const Wires& w);
+    void drive_writebacks(const Wires& w);
+    void run_drivers(const Wires& w);
+
+    // ---- helpers ----
     // Sanitizer argument builders: pure reads of hardware state whose results
     // go only to sanitizer_.
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
@@ -611,118 +944,121 @@ private:
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, bool a_operand) const;
     [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> pending_tma_descriptor_bytes(
-        uint32_t address) const;
-    void mark_tma_data_complete(TmaCommand& command);
+        uint32_t address, const Wires& w) const;
 
-    void commit_writebacks();
-    void advance_rf_reads();
-    void advance_mma();
-    void serve_mma_fetch_round();
-    void complete_mma_fetch();
-    [[nodiscard]] bool mma_bank_busy(uint8_t bank) const;
-    void execute_arithmetic(ArithmeticRead& pending);
-    void advance_tma();
-    void advance_shmem();
-    void advance_acc_transfers();
-    void advance_mbar_rmw();
-    void advance_mbar_read();
-    void advance_mbar_wait_timeouts();
-    void advance_dram_clock();
-    void tick_gmem_controller();
-    void issue_one();
-    IssueAttempt try_issue(Warp& warp);
-
-    [[nodiscard]] Instruction instruction(const Warp& warp) const;
-    [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
-    [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
-    void check_register_hazards(const Warp& warp, const Instruction& inst) const;
+    // RF port reservation calendar. Same-cycle requests for the same bank and
+    // target cycle are decided by booking order, which is the declared
+    // priority: LSU assembly drain, acc transfers, issue, LSU store read.
+    enum class RfRequester : uint8_t { lsu_drain, acc_transfer, issue, lsu_store_read };
     [[nodiscard]] bool can_reserve_reads(const std::vector<RfRead>& reads) const;
-    void reserve_reads(const std::vector<RfRead>& reads);
-    [[nodiscard]] bool reserve_write(uint8_t reg, uint64_t at_cycle);
-    [[nodiscard]] bool port_a_busy() const;
-    [[nodiscard]] bool acc_slot_available(uint8_t bank, bool load) const;
+    void reserve_reads(const std::vector<RfRead>& reads, RfRequester requester);
+    [[nodiscard]] bool reserve_write(uint8_t reg, uint64_t at_cycle, RfRequester requester);
+    void note_rf_requester(RfRequester requester);
+    RfRequester rf_requester_ = RfRequester::lsu_drain;
+
+    // depbar: completions recorded as they happen (issue sees cur - completions).
+    void record_depbar_completion(Wires& w, uint32_t warp, uint8_t bar, const std::string& underflow);
+    [[nodiscard]] uint32_t depbar_after_completions(const Wires& w, uint32_t warp, uint8_t bar) const;
+    void admit_depbar(Wires& w, uint32_t warp, uint8_t bar);
+    // mbar wait slots, as issue sees them after this cycle's completions.
+    [[nodiscard]] bool wait_slot_completed(const Wires& w, uint32_t slot) const;
+    [[nodiscard]] std::optional<uint32_t> waiting_slot_of(const Wires& w, uint32_t warp) const;
+    [[nodiscard]] std::optional<uint32_t> free_mbar_wait_slot(const Wires& w) const;
+    void complete_mbar_try_wait(Wires& w, uint32_t slot, bool result);
+
+    // Port-A users.
+    [[nodiscard]] bool port_a_idle() const;
+    [[nodiscard]] bool port_a_busy_next_cycle(const Wires& w) const;
+    [[nodiscard]] bool tma_wants_port_a_next_cycle(const Wires& w) const;
+    void serve_tma_round(TmaPortRequest request, PortAService& service);
+    void serve_simt_round(ShmemRequest request, PortAService& service, Wires& w);
+    void serve_mbar_read(PortAService& service, Wires& w);
+    void serve_rmw_stage(ActiveMbarRmw active, PortAService& service, Wires& w);
+    [[nodiscard]] MbarEngine engine_to_claim(bool tma_held, bool mma_held) const;
+    [[nodiscard]] static std::string rmw_label(const ActiveMbarRmw& active);
+    void wake_mbar_waiters(Wires& w, uint32_t byte_address, uint8_t new_phase);
+
+    // MMA, acc.
+    [[nodiscard]] bool mma_bank_busy(const MmaPipeline& mma, uint8_t bank) const;
+    [[nodiscard]] bool acc_slot_available(const Wires& w, uint8_t bank, bool load) const;
+    void advance_mma(MmaPipeline& mma, Wires& w);
+    void serve_mma_fetch_round(MmaPipeline& mma);
+    void complete_mma_fetch(MmaPipeline& mma, Wires& w);
     [[nodiscard]] std::size_t tmem_word_index(
         const Kernel::Accumulator& acc, uint32_t row, uint32_t col) const;
-    [[nodiscard]] uint32_t uniform_reg(
-        const Warp& warp, const Instruction& inst, uint8_t reg, const std::string& name) const;
-    [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
-    void store_mbar(uint32_t byte_address, const MbarState& state);
-    void wake_mbar_waiters(uint32_t byte_address, uint8_t new_phase);
-    [[nodiscard]] std::optional<uint32_t> free_mbar_wait_slot() const;
-    void complete_mbar_try_wait(uint32_t slot, bool result);
+    void execute_arithmetic(ArithmeticRead& pending, Wires& w);
 
-    [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);
-    [[nodiscard]] uint32_t rf(const Warp& warp, uint32_t lane, uint32_t reg) const;
-    [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(
-        const Warp& warp, const Instruction& inst, bool load) const;
-    [[nodiscard]] std::size_t gmem_outstanding_sectors() const;
-    void complete_tma_port_request(TmaPortRequest request);
-
-    // ---- gmem controller + LSU (src/lsu.cpp) ----
-    [[nodiscard]] bool controller_request_ready() const; // queue has room
-    [[nodiscard]] bool request_channel_grants(GmemClient client) const;
-    void accept_gmem_request(GmemSectorRequest request, GmemClient client);
-    [[nodiscard]] std::optional<std::size_t> select_controller_entry() const;
-    void finish_gmem_write(GmemSectorRequest request);
-    void deliver_write_acks();
-    [[nodiscard]] bool tma_wants_port_a() const;
-    [[nodiscard]] static bool is_lsu(Opcode opcode);
-    LsuCommand plan_lsu_command(const Warp& warp, const Instruction& inst) const;
-    [[nodiscard]] std::optional<uint32_t> free_assembly_register() const;
-    void admit_lsu_command(Warp& warp, const Instruction& inst, LsuCommand command, uint32_t assembly);
-    [[nodiscard]] const LsuCommand* lsu_request_candidate() const;
-    [[nodiscard]] LsuCommand& lsu_command(uint64_t id);
-    [[nodiscard]] std::optional<uint32_t> free_id_tag() const;
-    [[nodiscard]] const EgressSlot* egress_request_slot() const;
-    [[nodiscard]] bool egress_slot_visible(const EgressSlot& slot) const;
-    void accept_write_request(EgressSlot& slot, GmemClient client, std::optional<uint32_t> tag);
-    void advance_tma_write_requests();
-    void advance_lsu_requests();
-    void advance_ingress();
-    [[nodiscard]] bool pluck_tma(IngressBeat& beat, uint32_t take);
-    [[nodiscard]] bool pluck_vector(ReadRecord& record, IngressBeat& beat, uint32_t take);
-    void pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t take);
-    void note_first_return(uint64_t command);
-    void advance_lsu_rf_writes();
-    void advance_egress_writes();
-    void advance_lsu_rf_reads();
-    void probe(LsuEdge edge, uint64_t id, uint64_t aux, uint32_t bytes);
-    void finish_lsu_command(LsuCommand& command);
-    void release_lsu_command(uint64_t id);
-    [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;
-    void advance_tma_frontend();
-    void present_tma_mbar_event();
-    [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command() const;
-    [[nodiscard]] std::optional<uint64_t> next_data_complete_tma_command() const;
+    // TMA.
+    void apply_tma_requests(TmaQueue& tma, Wires& w);
+    void apply_tma_walker(TmaQueue& tma, Wires& w);
+    void complete_tma_port_request(TmaQueue& tma, const TmaPortRequest& request, const Wires& w);
+    void mark_tma_data_complete(TmaCommand& command);
+    void release_tma_credit(TmaQueue& tma);
+    void trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle);
+    [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command(const TmaQueue& tma) const;
+    [[nodiscard]] std::optional<uint64_t> next_data_complete_tma_command(const TmaQueue& tma) const;
     [[nodiscard]] std::vector<std::vector<TmaPortRequest::Piece>> tma_port_rounds(
         const std::vector<GmemSectorRequest::TmaFragment>& fragments) const;
-    void serve_tma_port_round(TmaPortRequest& request);
-    [[nodiscard]] bool tma_walker_step(TmaCommand& command);
-    [[nodiscard]] bool tma_advance_coordinate(TmaCommand& command);
+    [[nodiscard]] TmaWalkerPlan plan_tma_walker(const TmaCommand& command, uint32_t credits_used,
+        bool store_register_free) const;
+    [[nodiscard]] static bool tma_advance_coordinate(TmaCommand& command);
     [[nodiscard]] bool tma_coordinate_in_bounds(const TmaCommand& command) const;
     [[nodiscard]] uint64_t tma_gmem_address(const TmaCommand& command) const;
     [[nodiscard]] uint32_t tma_shmem_address(const TmaCommand& command) const;
     void validate_tma_runtime_descriptor(const TmaCommand& command) const;
-    void release_tma_credit();
+
+    // Issue.
+    [[nodiscard]] Instruction instruction(const Warp& warp) const;
+    [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
+    [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
+    void check_register_hazards(const Warp& warp, const Instruction& inst) const;
+    [[nodiscard]] uint32_t uniform_reg(
+        const Warp& warp, const Instruction& inst, uint8_t reg, const std::string& name) const;
+    [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
+    [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);
+    [[nodiscard]] uint32_t rf(const Warp& warp, uint32_t lane, uint32_t reg) const;
+    [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(
+        const Warp& warp, const Instruction& inst, bool load, const Wires& w) const;
     void apply_image(
         std::vector<uint8_t>& memory,
         const std::vector<ImageSegment>& image,
         const std::string& name);
-
-    void schedule_register_write(
-        Warp& warp,
-        uint8_t dst,
-        uint64_t ready_cycle,
-        std::vector<uint32_t> values,
-        std::string reason);
-    void schedule_predicate_write(
-        Warp& warp,
-        uint8_t dst,
-        uint64_t ready_cycle,
-        std::vector<uint32_t> values);
+    Writeback register_writeback(
+        Warp& warp, uint8_t dst, uint64_t ready_cycle, std::vector<uint32_t> values, std::string reason);
+    Writeback predicate_writeback(
+        Warp& warp, uint8_t dst, uint64_t ready_cycle, std::vector<uint32_t> values);
     [[noreturn]] void panic(const Warp& warp, const Instruction& inst, const std::string& reason) const;
     [[noreturn]] void mbar_rmw_panic(
         const MbarRmwRequest& request, const std::string& reason) const;
+
+    // ---- gmem controller + LSU (src/lsu.cpp) ----
+    [[nodiscard]] std::size_t gmem_outstanding_sectors() const;
+    [[nodiscard]] std::optional<std::size_t> select_controller_entry() const;
+    void tick_gmem_controller(Wires& w, bool& return_ready_low);
+    [[nodiscard]] std::optional<uint64_t> egress_slot_request(const EgressSlot& slot, const Wires& w) const;
+    void finish_gmem_write(GmemSectorRequest request);
+    void deliver_write_acks(Wires& w);
+    [[nodiscard]] static bool is_lsu(Opcode opcode);
+    [[nodiscard]] static bool is_store(LsuKind kind);
+    LsuCommand plan_lsu_command(const Warp& warp, const Instruction& inst) const;
+    [[nodiscard]] std::optional<uint32_t> free_assembly_register(const Wires& w) const;
+    [[nodiscard]] const LsuCommand* find_lsu_command(uint64_t id) const;
+    [[nodiscard]] std::optional<uint32_t> free_id_tag() const;
+    [[nodiscard]] const EgressSlot* egress_request_slot(std::optional<uint64_t> requested_now) const;
+    [[nodiscard]] bool egress_slot_visible(const EgressSlot& slot) const;
+    [[nodiscard]] const LsuCommand* lsu_request_candidate(std::optional<uint64_t> requested_now) const;
+    GmemSectorRequest write_request(const EgressSlot& slot, GmemClient client, uint64_t id,
+        std::optional<uint32_t> tag);
+    GmemSectorRequest lsu_read_request(const LsuCommand& command, uint64_t id, std::optional<uint32_t> tag);
+    void pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t take, TmaSectorRegister& reg,
+        ReadRecord& record, IngressPluck& pluck);
+    [[nodiscard]] bool pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
+        uint32_t take, IngressPluck& pluck, const Wires& w);
+    void pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed, uint32_t take,
+        IngressPluck& pluck);
+    void note_first_return(uint64_t command);
+    void probe(LsuEdge edge, uint64_t id, uint64_t aux, uint32_t bytes);
+    [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;
 };
 
 uint32_t float_bits(float value);

@@ -8,6 +8,7 @@
 #include "tma.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -52,6 +53,15 @@ nanosm::TraceOptions trace_options(uint32_t flags, uint64_t max_events) {
     options.debug = (flags & NANOSM_TRACE_DEBUG) != 0;
     if (max_events != 0) options.max_events = static_cast<std::size_t>(max_events);
     return options;
+}
+
+// Test seam (scripts/driver_shuffle_check.py): with NANOSM_DRIVER_SHUFFLE_SEED
+// set, every session runs its register drivers in a random order each cycle.
+// The results must not change; see Machine::set_driver_shuffle_seed.
+void apply_test_environment(nanosm::Machine& machine) {
+    const char* seed = std::getenv("NANOSM_DRIVER_SHUFFLE_SEED");
+    if (seed == nullptr || *seed == '\0') return;
+    machine.set_driver_shuffle_seed(std::stoull(seed, nullptr, 0));
 }
 
 Session& session(uint32_t handle) {
@@ -205,6 +215,7 @@ uint32_t nanosm_session_create_qtx(
         value->machine = std::make_unique<nanosm::Machine>(
             profile, std::move(kernel), std::move(launch),
             trace_options(trace_flags, max_trace_events));
+        apply_test_environment(*value->machine);
         return insert(std::move(value));
     } catch (const std::exception& error) {
         fail(error.what());
@@ -229,6 +240,7 @@ uint32_t nanosm_session_create_image(
         value->machine = std::make_unique<nanosm::Machine>(
             profile, std::move(image.kernel), std::move(image.launch),
             trace_options(trace_flags, max_trace_events));
+        apply_test_environment(*value->machine);
         return insert(std::move(value));
     } catch (const std::exception& error) {
         fail(error.what());

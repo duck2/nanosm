@@ -76,6 +76,10 @@ NANOSM_CAPI uint32_t nanosm_session_create_qtx(
     uint32_t trace_flags,
     uint64_t max_trace_events);
 
+// Test seam: if the environment variable NANOSM_DRIVER_SHUFFLE_SEED is set
+// when a session is created, the machine runs its register drivers in a
+// random order every cycle (seeded). Results must be byte-identical; the
+// ctest target nanosm_driver_shuffle_identical checks every launch.
 NANOSM_CAPI uint32_t nanosm_session_create_image(
     const char* profile_json,
     uint64_t profile_size,

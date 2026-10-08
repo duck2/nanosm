@@ -55,7 +55,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         accumulator_shapes_.emplace_back(acc.rows, acc.cols);
     }
     acc_transfer_in_slot_.resize(config.tmem_banks);
-    assembly_last_write_.assign(config.lsu_staging_vectors, 0);
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
     for (auto& warp : warps_) {
@@ -67,6 +66,7 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
 
 void Sanitizer::record_cycle_start() {
     port_a_written_words_.clear();
+    register_writes_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -545,43 +545,24 @@ void Sanitizer::check_port_b_round(const std::vector<uint32_t>& words) const {
 }
 
 // ---------------------------------------------------------------------------
-// Fall-through tripwires
+// Clocked registers: at most one write per register per tick (src/reg.hpp).
+// Only the tags live here; whether D was written is the register's own
+// mechanism.
 // ---------------------------------------------------------------------------
 
-void Sanitizer::record_tma_sector_write(uint64_t cycle) {
-    tma_sector_last_write_ = cycle;
+void Sanitizer::record_register_write(uint32_t id, const char* tag) {
+    register_writes_.emplace_back(id, tag);
 }
 
-void Sanitizer::check_tma_sector_read(uint64_t cycle) const {
-    if (tma_sector_last_write_ >= cycle) {
-        throw SimError("internal fall-through: TMA sector register read in the cycle it was written");
+void Sanitizer::check_register_rewrite(
+    uint32_t id, const std::string& name, uint64_t cycle, const char* tag) const {
+    const char* first = "?";
+    for (const auto& [written, first_tag] : register_writes_) {
+        if (written == id) first = first_tag;
     }
-}
-
-void Sanitizer::record_tma_store_sector_write(uint64_t cycle) {
-    tma_store_sector_last_write_ = cycle;
-}
-
-void Sanitizer::check_tma_store_sector_read(uint64_t cycle) const {
-    if (tma_store_sector_last_write_ >= cycle) {
-        throw SimError("internal fall-through: TMA store sector register read before it was complete");
-    }
-}
-
-void Sanitizer::record_assembly_write(uint32_t index, uint64_t cycle) {
-    assembly_last_write_.at(index) = cycle;
-}
-
-void Sanitizer::check_assembly_dump(uint32_t index, uint64_t cycle) const {
-    if (assembly_last_write_.at(index) >= cycle) {
-        throw SimError("internal fall-through: assembly register dumped in the cycle it was written");
-    }
-}
-
-void Sanitizer::check_store_assembly_read(uint32_t index, uint64_t cycle) const {
-    if (assembly_last_write_.at(index) >= cycle) {
-        throw SimError("internal fall-through: store assembly register read in the cycle it was written");
-    }
+    throw SimError(
+        "PANIC cycle=" + std::to_string(cycle) + " reason=register '" + name +
+        "' written twice in one tick: first by '" + first + "', then by '" + tag + "'");
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +627,17 @@ void Sanitizer::check_lsu_admitted(std::size_t admitted) const {
         throw SimError(
             "internal LSU sanitizer: " + std::to_string(admitted) +
             " admitted commands exceed lsu.staging_vectors/active_commands");
+    }
+}
+
+void Sanitizer::check_assembly_lanes_valid(uint64_t cycle, uint32_t assembly, const std::vector<uint8_t>& valid,
+    uint32_t first_lane, uint32_t lanes, const char* reader) const {
+    for (uint32_t lane = first_lane; lane < first_lane + lanes; ++lane) {
+        if (valid.at(lane) != 0) continue;
+        throw SimError(
+            "internal LSU sanitizer: cycle " + std::to_string(cycle) + ": the " + reader +
+            " read lane " + std::to_string(lane) + " of assembly register " + std::to_string(assembly) +
+            ", which is not valid");
     }
 }
 

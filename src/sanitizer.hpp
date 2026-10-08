@@ -124,15 +124,12 @@ public:
     void record_port_a_write(uint64_t byte_address, uint32_t size);
     void check_port_b_round(const std::vector<uint32_t>& words) const;
 
-    // ---- fall-through tripwires: a register stage is read only after the
-    // cycle it was written ----
-    void record_tma_sector_write(uint64_t cycle);
-    void check_tma_sector_read(uint64_t cycle) const;
-    void record_tma_store_sector_write(uint64_t cycle);
-    void check_tma_store_sector_read(uint64_t cycle) const;
-    void record_assembly_write(uint32_t index, uint64_t cycle);
-    void check_assembly_dump(uint32_t index, uint64_t cycle) const;
-    void check_store_assembly_read(uint32_t index, uint64_t cycle) const;
+    // ---- clocked registers (src/reg.hpp): at most one write per tick ----
+    // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
+    // registers) are retired: those registers are Reg<T>, read through cur().
+    void record_register_write(uint32_t id, const char* tag);
+    void check_register_rewrite(
+        uint32_t id, const std::string& name, uint64_t cycle, const char* tag) const;
 
     // ---- boundary tripwire: an ordered read ID returns in request order ----
     void record_ordered_request(uint32_t stream, uint64_t request);
@@ -141,6 +138,11 @@ public:
 
     // ---- rfc09 3: admitted LSU commands never exceed the assembly pool ----
     void check_lsu_admitted(std::size_t admitted) const;
+    // A reader of an assembly register (the RF drain, the egress write port)
+    // takes only lanes marked valid: lanes [first_lane, first_lane + lanes)
+    // of `valid`, the register's Q. A lost valid bit panics here.
+    void check_assembly_lanes_valid(uint64_t cycle, uint32_t assembly, const std::vector<uint8_t>& valid,
+        uint32_t first_lane, uint32_t lanes, const char* reader) const;
 
 private:
     enum class ShmemOwnerKind : uint8_t {
@@ -229,9 +231,8 @@ private:
     std::vector<PendingAccLoadRelease> pending_acc_ld_releases_;
     std::vector<WarpHazards> warps_;
     std::vector<uint32_t> port_a_written_words_; // this cycle
-    uint64_t tma_sector_last_write_ = 0;
-    uint64_t tma_store_sector_last_write_ = 0;
-    std::vector<uint64_t> assembly_last_write_;
+    // Registers written this tick and their first writer's tag.
+    std::vector<std::pair<uint32_t, const char*>> register_writes_;
     std::vector<std::deque<OrderedRequest>> ordered_requests_; // per ordered read ID
 };
 
@@ -269,17 +270,13 @@ public:
     NANOSM_SANITIZER_NOOP(record_writebacks_committed)
     NANOSM_SANITIZER_NOOP(record_port_a_write)
     NANOSM_SANITIZER_NOOP(check_port_b_round)
-    NANOSM_SANITIZER_NOOP(record_tma_sector_write)
-    NANOSM_SANITIZER_NOOP(check_tma_sector_read)
-    NANOSM_SANITIZER_NOOP(record_tma_store_sector_write)
-    NANOSM_SANITIZER_NOOP(check_tma_store_sector_read)
-    NANOSM_SANITIZER_NOOP(record_assembly_write)
-    NANOSM_SANITIZER_NOOP(check_assembly_dump)
-    NANOSM_SANITIZER_NOOP(check_store_assembly_read)
+    NANOSM_SANITIZER_NOOP(record_register_write)
+    NANOSM_SANITIZER_NOOP(check_register_rewrite)
     NANOSM_SANITIZER_NOOP(record_ordered_request)
     NANOSM_SANITIZER_NOOP(check_ordered_beat)
     NANOSM_SANITIZER_NOOP(record_ordered_pluck)
     NANOSM_SANITIZER_NOOP(check_lsu_admitted)
+    NANOSM_SANITIZER_NOOP(check_assembly_lanes_valid)
 #undef NANOSM_SANITIZER_NOOP
 };
 

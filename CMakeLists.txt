@@ -171,6 +171,15 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE} -B -m nanosm kernels/vadd.launch.py
     )
     set_tests_properties(nanosm_python_vadd PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # The stepping discipline's regression guard: register drivers run in a
+    # random order every cycle (NANOSM_DRIVER_SHUFFLE_SEED); every launch's
+    # stdout and Perfetto trace must be byte-identical to the unshuffled run.
+    add_test(
+        NAME nanosm_driver_shuffle_identical
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/driver_shuffle_check.py
+            --lib $<TARGET_FILE:nanosm_capi>
+    )
+    set_tests_properties(nanosm_driver_shuffle_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 if(NANOSM_SANITIZER)
