@@ -46,6 +46,7 @@ enum class Opcode : uint8_t {
     ldg_v8 = 0x23,
     stg_v8 = 0x24,
     ldg_uni = 0x25,  // rA warp-uniform: one sector request, the word fans out to every lane
+    lds_uni = 0x26,  // rA warp-uniform: one shmem bank access, the word fans out to every lane
 
     setpi_eq = 0x28,
     setpi_ne = 0x29,

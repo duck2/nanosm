@@ -180,6 +180,7 @@ private:
 
     struct ShmemRequest {
         bool load = false;
+        bool fan_out = false; // lds.uni: its one word goes to every lane
         uint32_t warp = 0;
         uint8_t dst = 0;
         uint8_t depbar = 0;
@@ -941,6 +942,7 @@ private:
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] static std::vector<uint32_t> access_addresses(
         const std::vector<std::vector<LaneAccess>>& rounds);
+    [[nodiscard]] std::vector<uint32_t> lane_values(const Warp& warp, uint8_t reg) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, bool a_operand) const;
     [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> pending_tma_descriptor_bytes(
@@ -1017,8 +1019,16 @@ private:
     [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
     [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);
     [[nodiscard]] uint32_t rf(const Warp& warp, uint32_t lane, uint32_t reg) const;
+    // SIMT shmem bank rounds (lds/sts by bank decode; lds.uni: one access).
     [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(
         const Warp& warp, const Instruction& inst, bool load, const Wires& w) const;
+    [[nodiscard]] std::vector<std::vector<LaneAccess>> build_uniform_shmem_round(
+        const Warp& warp, const Instruction& inst) const;
+    [[nodiscard]] uint32_t shmem_lane_address(const Warp& warp, const Instruction& inst, uint32_t lane) const;
+    void panic_if_store_hits_live_mbar(
+        const Warp& warp, const Instruction& inst, uint32_t byte_address, const Wires& w) const;
+    void panic_if_word_already_stored(const Warp& warp, const Instruction& inst,
+        const std::vector<LaneAccess>& bank_lanes, uint32_t byte_address) const;
     void apply_image(
         std::vector<uint8_t>& memory,
         const std::vector<ImageSegment>& image,

@@ -150,7 +150,7 @@ public:
     void warp_state(uint64_t cycle, uint32_t warp, WarpState state, std::string detail = {});
 
     void depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t value);
-    void shmem_begin(uint64_t cycle, uint32_t warp, bool load, uint32_t rounds);
+    void shmem_begin(uint64_t cycle, uint32_t warp, std::string operation, uint32_t rounds);
     void tma_port_begin(
         uint64_t cycle, uint64_t command, std::string operation, uint32_t rounds);
     void shmem_round();

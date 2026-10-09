@@ -196,13 +196,13 @@ void TraceRecorder::sfu_accept(uint32_t occupancy_cycles) {
 
 void TraceRecorder::sfu_unit_stall() { ++summary_.sfu_unit_stalls; }
 
-void TraceRecorder::shmem_begin(uint64_t cycle, uint32_t warp, bool load, uint32_t rounds) {
+void TraceRecorder::shmem_begin(uint64_t cycle, uint32_t warp, std::string operation, uint32_t rounds) {
     ++summary_.shmem_requests;
     shmem_slice_ = OpenSlice{
         cycle,
         shmem_track,
         TraceCategory::shmem,
-        load ? "lds" : "sts",
+        std::move(operation),
         "warp=" + std::to_string(warp) + ", rounds=" + std::to_string(rounds),
     };
 }

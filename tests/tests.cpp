@@ -3040,8 +3040,14 @@ void test_dram_uses_its_own_clock() {
 }
 
 void test_lds_is_nonblocking_and_depbar_waits() {
+    // Re-pinned in B3: was `mov r0, 0` (all sixteen lanes on one word, one
+    // round by the old same-word merge). Without the merge that is sixteen
+    // rounds (sixteen lanes on bank 0), which holds port A and would block the
+    // second lds structurally. Lane-strided addresses keep each lds at one
+    // round (one lane per bank), the premise of this test.
     const auto program = nanosm::compile_qtx(R"(
-        mov  r0, 0
+        sread r0, LANE_ID
+        shli r0, r0, 2
         lds  r1, [r0]
         lds  r2, [r0 + 64]
         fadd r4, r1, r2
@@ -3098,7 +3104,11 @@ void test_missing_wait_panics_instead_of_scoreboarding() {
     }
 }
 
-void test_broadcast_is_one_round() {
+// Re-pinned in B3 (was "broadcast", 1 round): sixteen lanes reading one word
+// were merged into one round. Uniformity is now declared, never detected:
+// they are sixteen lanes on bank 0, served one per round, 16 rounds. Every
+// lane still gets the word. The one-round broadcast is lds.uni (B3 tests).
+void test_plain_lds_of_one_word_is_sixteen_rounds() {
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, 4);
@@ -3112,7 +3122,8 @@ void test_broadcast_is_one_round() {
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine.read_reg(0, lane, 1) == 0x12345678u, "broadcast value mismatch");
     }
-    require(machine.trace().summary().shmem_rounds == 1, "broadcast did not use exactly one bank round");
+    require(machine.trace().summary().shmem_rounds == 16,
+        "sixteen lanes on one word did not take sixteen bank rounds");
 }
 
 void test_bank_conflict_serializes() {
@@ -6199,6 +6210,320 @@ void test_driver_shuffle_unit_kernels() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B3 (rfc09 pin 3): uniformity is declared, never detected.
+// - lds / sts: rounds = the most lanes on any one bank, bank = (address / 4)
+//   % 16. Two lanes on one word are two lanes on one bank. Each bank serves
+//   its lanes in ascending lane order, one per round.
+// - lds.uni: one access at lane 0's address, the word fanned out to every
+//   lane, one RF write. A nonuniform address is UB: a sanitizer PANIC.
+// trash/b3-uniformity-2026-10-08.md.
+// ---------------------------------------------------------------------------
+
+// Below b3_table, the shmem word at byte address a holds b3_word(a). The
+// table holds one address per lane (lane l at b3_table + 4l: one lane per
+// bank, so loading it is one round).
+constexpr uint32_t b3_table = 4096;
+
+uint32_t b3_word(uint32_t address) {
+    return 0xb3000000u | address;
+}
+
+nanosm::Launch b3_launch(const std::vector<uint32_t>& lane_addresses = {}) {
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, b3_table + 64);
+    for (uint32_t address = 0; address < b3_table; address += 4) write_u32(shmem, address, b3_word(address));
+    for (uint32_t lane = 0; lane < lane_addresses.size(); ++lane) {
+        write_u32(shmem, b3_table + 4 * lane, lane_addresses[lane]);
+    }
+    return launch;
+}
+
+std::unique_ptr<nanosm::Machine> b3_machine(const std::string& program, nanosm::Launch launch,
+    const nanosm::DeviceProfile& profile = canonical_profile()) {
+    return std::make_unique<nanosm::Machine>(
+        profile, compile(program, profile), std::move(launch), nanosm::TraceOptions{.timeline = true});
+}
+
+// Loads lane l's address from the table into r0, then runs `operation` on [r0].
+std::string b3_table_program(const std::string& operation) {
+    return "sread r2, LANE_ID\nshli r2, r2, 2\nlds r0, [r2 + " + std::to_string(b3_table) + "]\n" +
+        operation + "\nhalt\n";
+}
+
+// Every SIMT shmem request's round count, in issue order (its trace slice).
+std::vector<uint32_t> shmem_request_rounds(const nanosm::Machine& machine) {
+    std::vector<std::pair<uint64_t, uint32_t>> requests;
+    for (const auto& event : machine.trace().events()) {
+        if (event.category != nanosm::TraceCategory::shmem) continue;
+        const auto rounds = event.detail.substr(event.detail.find("rounds=") + 7);
+        requests.emplace_back(event.start_cycle, static_cast<uint32_t>(std::stoul(rounds)));
+    }
+    std::sort(requests.begin(), requests.end());
+    std::vector<uint32_t> result;
+    for (const auto& request : requests) result.push_back(request.second);
+    return result;
+}
+
+// Every write of warp 0's register `reg`, seen tick by tick: the cycle that
+// wrote it, how many lanes changed, and the lane values after it.
+struct RegisterWrite {
+    uint64_t cycle = 0;
+    uint32_t lanes_changed = 0;
+    std::vector<uint32_t> values;
+};
+
+std::vector<RegisterWrite> watch_register(nanosm::Machine& machine, uint32_t reg) {
+    const auto lanes = [&] {
+        std::vector<uint32_t> values(canonical_profile().lanes);
+        for (uint32_t lane = 0; lane < values.size(); ++lane) values[lane] = machine.read_reg(0, lane, reg);
+        return values;
+    };
+    std::vector<RegisterWrite> writes;
+    auto before = lanes();
+    while (!machine.done()) {
+        const auto cycle = machine.cycle();
+        tick_capped(machine);
+        const auto after = lanes();
+        uint32_t changed = 0;
+        for (uint32_t lane = 0; lane < after.size(); ++lane) changed += after[lane] != before[lane] ? 1 : 0;
+        if (changed != 0) writes.push_back({cycle, changed, after});
+        before = after;
+    }
+    return writes;
+}
+
+// lds.uni: one port-A round, every lane gets the word, one full-width RF
+// write at issue + 2 (the round, then the write port). The plain lds of the
+// same word takes sixteen rounds: still one RF write, at issue + 17.
+void test_b3_lds_uni_one_round_one_write() {
+    for (const std::string operation : {"lds.uni", "lds"}) {
+        const uint32_t rounds = operation == "lds.uni" ? 1 : 16;
+        // r1 differs in every lane before the load, so one write of the load
+        // changes all sixteen lanes in one cycle.
+        auto machine = b3_machine(
+            "sread r1, LANE_ID\nmov r0, 60\n" + operation + " r1, [r0 + 16]\nhalt\n", b3_launch());
+        const auto writes = watch_register(*machine, 1);
+        require(writes.size() == 2, operation + ": r1 was not written exactly twice (sread, load)");
+        const auto& load = writes[1];
+        require(load.lanes_changed == 16, operation + ": the load did not write all sixteen lanes at once");
+        for (const auto value : load.values) require(value == b3_word(76), operation + ": a lane missed the word");
+        require(shmem_request_rounds(*machine) == std::vector<uint32_t>{rounds}, operation + ": wrong round count");
+        require(machine->trace().summary().shmem_rounds == rounds, operation + ": port A served extra rounds");
+        const auto issue = issued_at(*machine, 16);
+        require(issue.size() == 1 && load.cycle == issue[0] + rounds + 1,
+            operation + ": the RF write did not land one cycle after the last round");
+    }
+}
+
+// k lanes on each word, one word per bank (lane l reads word (l / k) * k):
+// k rounds, one lane per round per bank (the old same-word merge: 1 round).
+void test_b3_lds_k_lanes_on_one_word() {
+    for (const auto& [k, log_k] : {std::pair{1u, 0u}, std::pair{2u, 1u}, std::pair{16u, 4u}}) {
+        const auto what = "lds, " + std::to_string(k) + " lanes per word";
+        auto machine = b3_machine("sread r0, LANE_ID\nshri r0, r0, " + std::to_string(log_k) +
+            "\nshli r0, r0, " + std::to_string(log_k + 2) + "\nlds r1, [r0]\nhalt\n", b3_launch());
+        machine->run();
+        require(shmem_request_rounds(*machine) == std::vector<uint32_t>{k}, what + ": rounds != k");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine->read_reg(0, lane, 1) == b3_word(lane / k * k * 4), what + ": lane value");
+        }
+    }
+}
+
+// Lanes spread over banks: rounds = the most lanes on one bank, counting
+// lanes, not words.
+void test_b3_rounds_are_max_lanes_per_bank() {
+    const auto spread = [](uint32_t stride) {
+        std::vector<uint32_t> addresses(16);
+        for (uint32_t lane = 0; lane < 16; ++lane) addresses[lane] = stride * lane;
+        return addresses;
+    };
+    // Lanes 0..3 on byte 0, lanes 4..7 on byte 64 (both bank 0); 8..15 alone.
+    std::vector<uint32_t> two_words(16);
+    // Bank 1: lanes 0..2 on three words; bank 2: lanes 3..7 on one word; 8..15 alone.
+    std::vector<uint32_t> mixed(16);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        two_words[lane] = lane < 4 ? 0 : lane < 8 ? 64 : 4 * lane;
+        mixed[lane] = lane < 3 ? 4 + 64 * lane : lane < 8 ? 8 : 4 * lane;
+    }
+    struct Case {
+        std::string what;
+        std::vector<uint32_t> addresses;
+        uint32_t rounds;
+        bool distinct_words; // run as sts too (two lanes on one word is a store PANIC)
+    };
+    const std::vector<Case> cases = {
+        {"stride 4 B, one lane per bank", spread(4), 1, true},
+        {"stride 8 B, two lanes per even bank", spread(8), 2, true},
+        {"stride 64 B, sixteen lanes on bank 0", spread(64), 16, true},
+        {"two bank-0 words, four lanes each (old merge: 2)", two_words, 8, false},
+        {"five lanes on one bank-2 word, three on bank 1 (old merge: 3)", mixed, 5, false},
+    };
+    for (const auto& c : cases) {
+        auto load = b3_machine(b3_table_program("lds r1, [r0]"), b3_launch(c.addresses));
+        load->run();
+        require(shmem_request_rounds(*load) == std::vector<uint32_t>{1, c.rounds}, c.what + ": lds rounds");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(load->read_reg(0, lane, 1) == b3_word(c.addresses[lane]), c.what + ": lds lane value");
+        }
+        if (!c.distinct_words) continue;
+        auto store = b3_machine(b3_table_program("addi r1, r2, 500\nsts [r0], r1"), b3_launch(c.addresses));
+        store->run();
+        require(shmem_request_rounds(*store) == std::vector<uint32_t>{1, c.rounds}, c.what + ": sts rounds");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(store->read_shmem_u32(c.addresses[lane]) == 500 + 4 * lane, c.what + ": sts lane value");
+        }
+    }
+}
+
+// Each bank serves its lanes in ascending lane order. Lanes 0 and 1 share
+// bank 0, lane 0 at byte 64 and lane 1 at byte 0; every other lane is alone
+// on its bank. Round 0 writes lane 0's word and lanes 2..15; round 1 lane 1's
+// word (the old grouping served the lower address, lane 1's, first).
+void test_b3_sts_bank_serves_lanes_in_order() {
+    std::vector<uint32_t> addresses(16);
+    for (uint32_t lane = 0; lane < 16; ++lane) addresses[lane] = 4 * lane;
+    addresses[0] = 64;
+    addresses[1] = 0;
+    auto machine = b3_machine(b3_table_program("addi r1, r2, 1000\nsts [r0], r1"), b3_launch(addresses));
+    std::map<uint32_t, uint64_t> written; // byte address -> the cycle whose clock edge wrote it
+    while (!machine->done()) {
+        const auto cycle = machine->cycle();
+        tick_capped(*machine);
+        for (const auto address : addresses) {
+            if (!written.contains(address) && machine->read_shmem_u32(address) != b3_word(address)) {
+                written[address] = cycle;
+            }
+        }
+    }
+    require(shmem_request_rounds(*machine) == std::vector<uint32_t>{1, 2}, "sts: bank 0 holds two lanes");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_shmem_u32(addresses[lane]) == 1000 + 4 * lane, "sts: lane value");
+    }
+    require(written.at(0) == written.at(64) + 1, "bank 0 did not serve lane 0 before lane 1");
+    for (uint32_t lane = 2; lane < 16; ++lane) {
+        require(written.at(addresses[lane]) == written.at(64), "a lane alone on its bank missed round 0");
+    }
+}
+
+// lds.uni composes with the RF read window, WAR, WAW and depbars exactly as
+// a one-round lds does: the same compiled controls, the same issue timeline.
+// The plain lds reads word 16 + l in lane l (one lane per bank); lds.uni
+// reads word 16 in every lane.
+void test_b3_lds_uni_composes_like_lds() {
+    const auto program = [](const std::string& address_source, const std::string& load) {
+        return address_source + "\nshli r0, r0, 2\n" + load + " r1, [r0 + 64]\n" +
+            "mov r0, 7\n"        // WAR on the load's address register
+            "fadd r2, r1, r1\n"  // RAW through the load's depbar
+            "mov r1, 3\n"        // WAW on the load's destination
+            "halt\n";
+    };
+    const auto plain = program("sread r0, LANE_ID", "lds");
+    const auto uniform = program("mov r0, 0", "lds.uni");
+    const auto timeline = [](const nanosm::Machine& machine) {
+        std::vector<std::pair<uint64_t, uint64_t>> issues; // cycle, pc
+        for (const auto& event : machine.trace().events()) {
+            if (event.category == nanosm::TraceCategory::instruction && event.name != "RF read") {
+                issues.emplace_back(event.start_cycle, event.id);
+            }
+        }
+        return issues;
+    };
+    const auto twice = [](uint32_t word) {
+        return nanosm::float_bits(nanosm::bits_float(word) + nanosm::bits_float(word));
+    };
+    for (const uint32_t window : {1u, 3u}) {
+        const auto what = "window " + std::to_string(window);
+        auto profile = canonical_profile();
+        profile.rf_arithmetic_read_cycles = window;
+        const auto plain_asm = nanosm::compile_qtx(plain, profile);
+        const auto uniform_asm = nanosm::compile_qtx(uniform, profile);
+        for (std::size_t i = 0; i < plain_asm.instructions.size(); ++i) {
+            const auto& a = plain_asm.instructions[i].control;
+            const auto& b = uniform_asm.instructions[i].control;
+            require(a.stall == b.stall && a.set_depbar == b.set_depbar && a.wait_mask == b.wait_mask,
+                what + ": qtxc scheduled lds.uni differently from lds");
+        }
+        auto plain_run = b3_machine(plain, b3_launch(), profile);
+        auto uniform_run = b3_machine(uniform, b3_launch(), profile);
+        plain_run->run();
+        uniform_run->run();
+        require(timeline(*plain_run) == timeline(*uniform_run), what + ": issue timelines differ");
+        require(plain_run->cycle() == uniform_run->cycle(), what + ": run lengths differ");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(plain_run->read_reg(0, lane, 2) == twice(b3_word(64 + 4 * lane)), what + ": lds value");
+            require(uniform_run->read_reg(0, lane, 2) == twice(b3_word(64)), what + ": lds.uni value");
+            require(uniform_run->read_reg(0, lane, 0) == 7 && uniform_run->read_reg(0, lane, 1) == 3,
+                what + ": lds.uni WAR/WAW order");
+        }
+    }
+}
+
+// Sanitizer ON only (tagged): compiled out, hardware reads lane 0's address
+// and the program runs.
+void test_b3_lds_uni_nonuniform_panics() {
+    // Lane 15's base is 128, the others 64: both aligned and in bounds, so
+    // only the uniformity rule can fire (the ldg.uni contract test's setup).
+    auto machine = b3_machine(R"(
+        sread r1, LANE_ID
+        addi r1, r1, 1
+        shri r1, r1, 4
+        shli r1, r1, 6
+        addi r0, r1, 64
+        lds.uni r8, [r0]
+        halt
+    )", b3_launch());
+    expect_sim_panic(*machine, "lds.uni base address is not warp-uniform", "non-uniform lds.uni base");
+}
+
+// Alignment and bounds: the machine's own panics, as for lds, in both builds.
+void test_b3_lds_uni_alignment_and_bounds() {
+    const auto expect = [](const std::string& program, const std::string& needle, const std::string& what) {
+        auto machine = b3_machine(program, b3_launch());
+        expect_sim_panic(*machine, needle, what);
+    };
+    expect("mov r0, 6\nlds.uni r1, [r0]\nhalt\n", "unaligned 32-bit shmem access", "2-byte aligned lds.uni");
+    expect("mov r0, 65532\nlds.uni r1, [r0 + 4]\nhalt\n", "shmem access out of bounds", "lds.uni past shmem");
+    expect("mov r0, 0\nlds.uni r1, [r0 - 4]\nhalt\n", "shmem address arithmetic overflow",
+        "negative lds.uni address");
+    auto last_word = b3_machine("mov r0, 65532\nlds.uni r1, [r0]\nhalt\n", b3_launch());
+    last_word->run();
+    require(last_word->read_reg(0, 9, 1) == 0, "lds.uni of the last shmem word");
+}
+
+// qtxc and qtxas: opcode 0x26, the RRI payload, a depbar like every memory op.
+void test_b3_lds_uni_encoding() {
+    const auto& profile = canonical_profile();
+    const auto kernel = compile("mov r3, 0\nlds.uni r5, [r3 + 8]\nhalt\n");
+    const auto decoded = nanosm::decode(kernel.words[1]);
+    require(static_cast<unsigned>(decoded.opcode) == 0x26 && decoded.dst == 5 && decoded.src0 == 3 &&
+            decoded.imm == 8 && decoded.control.set_depbar < 6,
+        "lds.uni did not survive qtxc + qtxas");
+    require(nanosm::format_instruction(decoded, false) == "lds.uni r5, [r3 + 8]", "lds.uni formatting");
+    auto negative = decoded;
+    negative.imm = -2048;
+    require(nanosm::decode(nanosm::encode(negative)).imm == -2048, "lds.uni negative immediate");
+    const auto header = ".profile " + profile.name + ", 0x" +
+        nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + "\n";
+    (void)nanosm::assemble_asm(header + R"(
+        mov r0, 0 {pred=PT, stall=1, set=-, wait=-}
+        lds.uni r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    )", profile);
+    try {
+        (void)nanosm::assemble_asm(header + R"(
+            lds.uni r1, [r0] {pred=PT, stall=0, set=-, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=-}
+        )", profile);
+        throw std::runtime_error("qtxas accepted lds.uni without a depbar");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("memory operation requires set=sb0..sb5") != std::string::npos,
+            std::string("lds.uni without a depbar: wrong error: ") + error.what());
+    }
+}
+
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"encoding round trip", test_encoding_round_trip},
@@ -6304,7 +6629,7 @@ int main() {
         {"DRAM clock domain", test_dram_uses_its_own_clock},
         {"nonblocking lds", test_lds_is_nonblocking_and_depbar_waits},
         {"missing wait panic", test_missing_wait_panics_instead_of_scoreboarding},
-        {"broadcast", test_broadcast_is_one_round},
+        {"plain lds of one word: 16 rounds", test_plain_lds_of_one_word_is_sixteen_rounds},
         {"bank conflict", test_bank_conflict_serializes},
         {"write collision", test_write_collision_panics},
         {"gmem write collision", test_gmem_write_collision_panics_without_writing},
@@ -6329,6 +6654,14 @@ int main() {
         {"simultaneous: full queue pop and push", test_simultaneous_full_queue_pop_and_push},
         {"simultaneous: ingress FIFO push and pop", test_simultaneous_ingress_push_and_pop},
         {"driver shuffle: unit kernels unchanged", test_driver_shuffle_unit_kernels},
+        {"B3: lds.uni one round, one RF write", test_b3_lds_uni_one_round_one_write},
+        {"B3: lds k lanes on one word", test_b3_lds_k_lanes_on_one_word},
+        {"B3: rounds = max lanes per bank", test_b3_rounds_are_max_lanes_per_bank},
+        {"B3: sts bank serves lanes in order", test_b3_sts_bank_serves_lanes_in_order},
+        {"B3: lds.uni composes like lds", test_b3_lds_uni_composes_like_lds},
+        {"B3: lds.uni nonuniform PANIC", test_b3_lds_uni_nonuniform_panics},
+        {"B3: lds.uni alignment and bounds", test_b3_lds_uni_alignment_and_bounds},
+        {"B3: lds.uni encoding", test_b3_lds_uni_encoding},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
@@ -6350,6 +6683,7 @@ int main() {
         "missing wait panic",
         "reg: duplicate write PANIC",
         "sanitizer: assembly reader takes only valid lanes",
+        "B3: lds.uni nonuniform PANIC",
     };
     for (const auto& name : expects_sanitizer_panic) {
         if (std::none_of(tests.begin(), tests.end(), [&](const auto& test) { return test.first == name; })) {

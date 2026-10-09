@@ -58,8 +58,8 @@
         shli  r3, r1, 2
         addi  r3, r3, STATS
         mov   r8, CONSTANTS
-        lds   r9, [r8]
-        lds   r10, [r8+4]          ; -infinity
+        lds.uni r9, [r8]
+        lds.uni r10, [r8+4]        ; -infinity
         mov   r11, 0              ; denominator = 0.0
         mov   r6, 0
         mov   r34, SCORE_DONE
@@ -79,7 +79,7 @@ S_READY:
 @!p1    bra.uni S_READY
 
 ; Pass 1: row max. Keep only eight scores resident, not a whole row.
-        lds   r12, [r8+4]
+        lds.uni r12, [r8+4]
         mov   r33, 0
 ROW_MAX:
         acc.ld.v8 r16, S, r32

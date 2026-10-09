@@ -85,6 +85,12 @@ public:
     void check_rf_raw(const IssueSite& site, const std::vector<uint8_t>& sources) const;
     void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width) const;
 
+    // ---- declared uniformity (rfc09 pin 3) ----
+    // lds.uni's address register must hold one value in every lane (UB
+    // otherwise: hardware reads lane 0 only). lane_values: that register, by lane.
+    void check_warp_uniform(
+        const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const;
+
     // ---- shmem ownership (trash/shmem-ownership-sanitizer-2026-10-03.md) ----
     // word_addresses: every lane access of every round, duplicates included.
     void check_simt_shmem_access(
@@ -253,6 +259,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_pred_raw)
     NANOSM_SANITIZER_NOOP(check_rf_raw)
     NANOSM_SANITIZER_NOOP(check_rf_waw_war)
+    NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
     NANOSM_SANITIZER_NOOP(check_engine_mbar_rmw)

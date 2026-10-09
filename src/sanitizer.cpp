@@ -132,6 +132,18 @@ void Sanitizer::check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned wi
 }
 
 // ---------------------------------------------------------------------------
+// Declared uniformity (rfc09 pin 3): hardware never compares lanes'
+// addresses; an lds.uni address that differs across lanes is UB, diagnosed here.
+// ---------------------------------------------------------------------------
+
+void Sanitizer::check_warp_uniform(
+    const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const {
+    for (const auto value : lane_values) {
+        if (value != lane_values.front()) throw_issue_panic(site, what + " is not warp-uniform");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shmem ownership. An outstanding engine command is modeled as owning shmem
 // byte ranges from its accepted issue until an existing completion event; a
 // conflicting access PANICS naming the owner and the wait that would have

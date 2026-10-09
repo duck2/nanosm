@@ -771,7 +771,12 @@ void Machine::serve_simt_round(ShmemRequest request, PortAService& service, Wire
     const auto& round = request.rounds.at(request.next_round);
     for (const auto& access : round) {
         if (request.load) {
-            request.load_values[access.lane] = read_shmem_u32(static_cast<uint32_t>(access.byte_address));
+            const auto word = read_shmem_u32(static_cast<uint32_t>(access.byte_address));
+            if (request.fan_out) {
+                std::fill(request.load_values.begin(), request.load_values.end(), word);
+            } else {
+                request.load_values[access.lane] = word;
+            }
         } else {
             std::vector<uint8_t> bytes(4);
             std::memcpy(bytes.data(), &access.value, sizeof(access.value));
@@ -2088,7 +2093,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
     // cycle, so it needs port A free next cycle; and SIMT may not take that
     // free grant while the TMA will want it (TMA priority, counted per
     // warp-cycle). Both as this cycle leaves them (look-ahead (c)).
-    if (inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
+    if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::sts ||
         is_mbar_rmw(inst.opcode) ||
         is_mbar_test_wait(inst.opcode) || is_mbar_try_wait(inst.opcode)) {
         if (port_a_busy_next_cycle(w)) return {false, WarpState::structural, "port A busy"};
@@ -2209,9 +2214,12 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         w.issue.acc = IssueDecision::AccAdmission{acc.bank, load, std::move(transfer)};
         break;
     }
-    case Opcode::lds: {
-        if (inst.control.set_depbar >= 6) panic(warp, inst, "lds has no depbar");
-        auto rounds = build_shmem_rounds(warp, inst, true, w);
+    case Opcode::lds:
+    case Opcode::lds_uni: {
+        if (inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(inst.opcode) + " has no depbar");
+        const bool fan_out = inst.opcode == Opcode::lds_uni;
+        auto rounds = fan_out ? build_uniform_shmem_round(warp, inst)
+                              : build_shmem_rounds(warp, inst, true, w);
         const auto complete_cycle = cycle_ + rounds.size() + 1;
         if (!reserve_write(inst.dst, complete_cycle, RfRequester::issue)) {
             return {false, WarpState::structural, "RF write reservation"};
@@ -2222,13 +2230,14 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         admit_depbar(w, warp.id, inst.control.set_depbar);
         ShmemRequest request;
         request.load = true;
+        request.fan_out = fan_out;
         request.warp = warp.id;
         request.dst = inst.dst;
         request.depbar = inst.control.set_depbar;
         request.rounds = std::move(rounds);
         request.load_values.resize(config_.lanes, 0);
         trace_->shmem_begin(
-            cycle_, warp.id, true, static_cast<uint32_t>(request.rounds.size()));
+            cycle_, warp.id, opcode_name(inst.opcode), static_cast<uint32_t>(request.rounds.size()));
         w.issue.port_a = std::move(request);
         break;
     }
@@ -2243,7 +2252,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         request.depbar = inst.control.set_depbar;
         request.rounds = std::move(rounds);
         trace_->shmem_begin(
-            cycle_, warp.id, false, static_cast<uint32_t>(request.rounds.size()));
+            cycle_, warp.id, opcode_name(inst.opcode), static_cast<uint32_t>(request.rounds.size()));
         w.issue.port_a = std::move(request);
         break;
     }
@@ -2443,7 +2452,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         if (latency != 1) panic(warp, inst, "mbar.test_wait must have one-cycle predicate latency");
     } else if (latency != 0) {
         panic(warp, inst, "fixed-latency opcode bypassed the arithmetic read pipeline");
-    } else if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
+    } else if (inst.opcode != Opcode::lds && inst.opcode != Opcode::lds_uni && inst.opcode != Opcode::sts &&
                inst.opcode != Opcode::ldg && inst.opcode != Opcode::stg &&
                inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8 &&
                inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::tma_async &&
@@ -3119,6 +3128,7 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::andi:
     case Opcode::ori:
     case Opcode::lds:
+    case Opcode::lds_uni:
     case Opcode::ldg:
     case Opcode::ldg_v8:
     case Opcode::ldg_uni:
@@ -3191,6 +3201,7 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
     case Opcode::ex2:
     case Opcode::rcp:
     case Opcode::lds:
+    case Opcode::lds_uni:
     case Opcode::ldg:
     case Opcode::ldg_v8:
     case Opcode::ldg_uni: return inst.dst;
@@ -3240,67 +3251,80 @@ uint32_t Machine::rf(const Warp& warp, uint32_t lane, uint32_t reg) const {
     return warp.rf.at(static_cast<std::size_t>(lane) * kernel_.register_count + reg);
 }
 
+// ---------------------------------------------------------------------------
+// SIMT shmem bank rounds (rfc09 pin 3: uniformity is declared, never
+// detected). Every lane of an lds/sts is one access to bank
+// (byte_address / 4) % shmem_banks, even when lanes name the same word.
+// Round r serves, in every bank, that bank's r-th lane in ascending lane
+// order, so rounds = the most lanes on any one bank. (All sixteen lanes are
+// active: only bra.uni may be predicated.) lds.uni is the declared broadcast.
+// ---------------------------------------------------------------------------
+
 std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(
     const Warp& warp, const Instruction& inst, bool load, const Wires& w) const {
-    struct Group {
-        uint32_t address = 0;
-        std::vector<LaneAccess> accesses;
-    };
-    std::vector<std::vector<Group>> groups(config_.shmem_banks);
+    std::vector<std::vector<LaneAccess>> lanes_by_bank(config_.shmem_banks);
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        const auto base = static_cast<int64_t>(rf(warp, lane, inst.src0));
-        const auto address = base + inst.imm;
-        if (address < 0 || address > std::numeric_limits<uint32_t>::max()) {
-            panic(warp, inst, "shmem address arithmetic overflow");
-        }
-        const auto byte_address = static_cast<uint32_t>(address);
-        if (byte_address % 4 != 0) panic(warp, inst, "unaligned 32-bit shmem access");
-        if (static_cast<uint64_t>(byte_address) + 4 > shmem_.size()) {
-            panic(warp, inst, "shmem access out of bounds");
-        }
+        const auto byte_address = shmem_lane_address(warp, inst, lane);
+        auto& bank_lanes = lanes_by_bank[(byte_address / 4) % config_.shmem_banks];
         if (!load) {
-            const auto& slots = mbar_wait_slots_.cur();
-            for (uint32_t index = 0; index < slots.size(); ++index) {
-                const auto& wait_slot = slots[index];
-                if (wait_slot.has_value() && !wait_slot_completed(w, index) &&
-                    byte_address >= wait_slot->byte_address &&
-                    byte_address < wait_slot->byte_address + 8) {
-                    panic(warp, inst, "repurposing an mbar with a live waiter");
-                }
-            }
+            panic_if_store_hits_live_mbar(warp, inst, byte_address, w);
+            panic_if_word_already_stored(warp, inst, bank_lanes, byte_address);
         }
-        const auto bank = (byte_address / 4) % config_.shmem_banks;
-        auto& bank_groups = groups[bank];
-        auto found = std::find_if(bank_groups.begin(), bank_groups.end(), [&](const Group& group) {
-            return group.address == byte_address;
-        });
-        if (found != bank_groups.end()) {
-            if (!load) panic(warp, inst, "multiple lanes write the same shmem word");
-            found->accesses.push_back({lane, 0, byte_address, 0});
-            continue;
-        }
-        Group group;
-        group.address = byte_address;
-        group.accesses.push_back({lane, 0, byte_address, load ? 0 : rf(warp, lane, inst.src1)});
-        bank_groups.push_back(std::move(group));
+        const auto value = load ? 0 : rf(warp, lane, inst.src1);
+        bank_lanes.push_back({.lane = lane, .byte_address = byte_address, .value = value});
     }
-
     std::size_t round_count = 0;
-    for (auto& bank_groups : groups) {
-        std::sort(bank_groups.begin(), bank_groups.end(), [](const Group& a, const Group& b) {
-            return a.address < b.address;
-        });
-        round_count = std::max(round_count, bank_groups.size());
-    }
-    if (round_count == 0) panic(warp, inst, "empty shmem request");
+    for (const auto& bank_lanes : lanes_by_bank) round_count = std::max(round_count, bank_lanes.size());
     std::vector<std::vector<LaneAccess>> rounds(round_count);
-    for (const auto& bank_groups : groups) {
-        for (std::size_t round = 0; round < bank_groups.size(); ++round) {
-            rounds[round].insert(
-                rounds[round].end(), bank_groups[round].accesses.begin(), bank_groups[round].accesses.end());
+    for (const auto& bank_lanes : lanes_by_bank) {
+        for (std::size_t round = 0; round < bank_lanes.size(); ++round) {
+            rounds[round].push_back(bank_lanes[round]);
         }
     }
     return rounds;
+}
+
+// lds.uni: hardware takes the address from lane 0 alone (as ldg.uni does) and
+// makes one access; serve_simt_round fans the word out to every lane.
+std::vector<std::vector<Machine::LaneAccess>> Machine::build_uniform_shmem_round(
+    const Warp& warp, const Instruction& inst) const {
+    sanitizer_.check_warp_uniform(site(warp, inst), lane_values(warp, inst.src0), "lds.uni base address");
+    return {{LaneAccess{.lane = 0, .byte_address = shmem_lane_address(warp, inst, 0)}}};
+}
+
+uint32_t Machine::shmem_lane_address(const Warp& warp, const Instruction& inst, uint32_t lane) const {
+    const auto address = static_cast<int64_t>(rf(warp, lane, inst.src0)) + inst.imm;
+    if (address < 0 || address > std::numeric_limits<uint32_t>::max()) {
+        panic(warp, inst, "shmem address arithmetic overflow");
+    }
+    const auto byte_address = static_cast<uint32_t>(address);
+    if (byte_address % 4 != 0) panic(warp, inst, "unaligned 32-bit shmem access");
+    if (static_cast<uint64_t>(byte_address) + 4 > shmem_.size()) {
+        panic(warp, inst, "shmem access out of bounds");
+    }
+    return byte_address;
+}
+
+void Machine::panic_if_store_hits_live_mbar(
+    const Warp& warp, const Instruction& inst, uint32_t byte_address, const Wires& w) const {
+    const auto& slots = mbar_wait_slots_.cur();
+    for (uint32_t index = 0; index < slots.size(); ++index) {
+        const auto& wait_slot = slots[index];
+        if (wait_slot.has_value() && !wait_slot_completed(w, index) &&
+            byte_address >= wait_slot->byte_address && byte_address < wait_slot->byte_address + 8) {
+            panic(warp, inst, "repurposing an mbar with a live waiter");
+        }
+    }
+}
+
+// Two lanes storing one word is UB. This is a stateless diagnostic, not
+// hardware (the bank would simply take both, in lane order); it fires in both
+// sanitizer builds, like its gmem twin in plan_lsu_command.
+void Machine::panic_if_word_already_stored(const Warp& warp, const Instruction& inst,
+    const std::vector<LaneAccess>& bank_lanes, uint32_t byte_address) const {
+    for (const auto& earlier : bank_lanes) {
+        if (earlier.byte_address == byte_address) panic(warp, inst, "multiple lanes write the same shmem word");
+    }
 }
 
 Machine::Writeback Machine::register_writeback(
@@ -3365,6 +3389,12 @@ std::vector<uint32_t> Machine::access_addresses(
         for (const auto& access : round) addresses.push_back(static_cast<uint32_t>(access.byte_address));
     }
     return addresses;
+}
+
+std::vector<uint32_t> Machine::lane_values(const Warp& warp, uint8_t reg) const {
+    std::vector<uint32_t> values(config_.lanes);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) values[lane] = rf(warp, lane, reg);
+    return values;
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(

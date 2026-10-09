@@ -450,9 +450,10 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = parse_reg(args[1], line_number);
             inst.imm = parse_value(args[2], constants, line_number);
-        } else if (op == "lds" || op == "ldg" || op == "ldg.v8" || op == "ldg.uni") {
+        } else if (op == "lds" || op == "lds.uni" || op == "ldg" || op == "ldg.v8" || op == "ldg.uni") {
             expect_count(args, 2, line_number);
             inst.opcode = op == "lds" ? Opcode::lds
+                : op == "lds.uni" ? Opcode::lds_uni
                 : op == "ldg" ? Opcode::ldg
                 : op == "ldg.uni" ? Opcode::ldg_uni
                 : Opcode::ldg_v8;
@@ -639,6 +640,7 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::andi:
     case Opcode::ori:
     case Opcode::lds:
+    case Opcode::lds_uni:
     case Opcode::ldg:
     case Opcode::ldg_v8:
     case Opcode::ldg_uni:
@@ -714,6 +716,7 @@ std::optional<uint8_t> destination(const Instruction& inst) {
     case Opcode::ex2:
     case Opcode::rcp:
     case Opcode::lds:
+    case Opcode::lds_uni:
     case Opcode::ldg: return inst.dst;
     case Opcode::ldg_v8: return inst.dst;
     case Opcode::ldg_uni: return inst.dst;
@@ -900,8 +903,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         if (const auto dst = predicate_destination(inst); latency != 0 && dst.has_value()) {
             predicate_ready[*dst] = vtime + latency;
         }
-        if (inst.opcode == Opcode::lds || inst.opcode == Opcode::ldg || inst.opcode == Opcode::ldg_v8 ||
-            inst.opcode == Opcode::ldg_uni) {
+        if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
+            inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni) {
             const auto bar = allocate();
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
@@ -1039,7 +1042,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
         if ((inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
              inst.opcode == Opcode::ldg || inst.opcode == Opcode::stg ||
              inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8 ||
-             inst.opcode == Opcode::ldg_uni ||
+             inst.opcode == Opcode::ldg_uni || inst.opcode == Opcode::lds_uni ||
              inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
              inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 ||
              inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init) && inst.control.set_depbar >= 6) {
@@ -1048,7 +1051,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
         if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
             inst.opcode != Opcode::ldg && inst.opcode != Opcode::stg &&
             inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8 &&
-            inst.opcode != Opcode::ldg_uni &&
+            inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::lds_uni &&
             inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
             inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
             inst.opcode != Opcode::mma_async && inst.opcode != Opcode::mma_async_init &&
