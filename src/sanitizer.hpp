@@ -109,7 +109,7 @@ public:
     void check_simt_mbar_rmw(const IssueSite& site, uint32_t address) const;
     void check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool complete_tx) const;
     // Panics on a conflict, else records the descriptor (and box) owners.
-    // descriptor_bytes: what the engine's later port-A read will see.
+    // descriptor_bytes: what the engine's later A-read will see.
     void record_tma_accept(
         const IssueSite& site, uint64_t command, uint32_t descriptor_address,
         const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes);
@@ -138,10 +138,6 @@ public:
     // pipeline reach the RF in launch order).
     void record_acc_transfer_final_beat(uint8_t bank, bool load);
     void record_acc_ld_final_write(uint8_t bank);
-
-    // ---- C5: port-A write vs same-cycle MMA port-B read of one word ----
-    void record_port_a_write(uint64_t byte_address, uint32_t size);
-    void check_port_b_round(const std::vector<uint32_t>& words) const;
 
     // ---- clocked registers (src/reg.hpp): at most one write per tick ----
     // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
@@ -250,7 +246,6 @@ private:
     // admission has accepted it.
     std::optional<uint32_t> attempt_warp_;
     bool attempt_accepted_ = false;
-    std::vector<uint32_t> port_a_written_words_; // this cycle
     // Registers written this tick and their first writer's tag.
     std::vector<std::pair<uint32_t, const char*>> register_writes_;
     std::vector<std::deque<OrderedRequest>> ordered_requests_; // per ordered read ID
@@ -292,8 +287,6 @@ public:
     NANOSM_SANITIZER_NOOP(record_acc_transfer_accept)
     NANOSM_SANITIZER_NOOP(record_acc_transfer_final_beat)
     NANOSM_SANITIZER_NOOP(record_acc_ld_final_write)
-    NANOSM_SANITIZER_NOOP(record_port_a_write)
-    NANOSM_SANITIZER_NOOP(check_port_b_round)
     NANOSM_SANITIZER_NOOP(record_register_write)
     NANOSM_SANITIZER_NOOP(check_register_rewrite)
     NANOSM_SANITIZER_NOOP(record_ordered_request)

@@ -66,7 +66,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
 }
 
 void Sanitizer::record_cycle_start() {
-    port_a_written_words_.clear();
     register_writes_.clear();
     attempt_warp_.reset();
     attempt_accepted_ = false;
@@ -270,8 +269,7 @@ void Sanitizer::check_simt_shmem_access(
 }
 
 void Sanitizer::check_simt_mbar_rmw(const IssueSite& site, uint32_t address) const {
-    // The RMW writes both mbar words; checked at admission like sts (its
-    // same-cycle port-B collision is the C5 record).
+    // The RMW writes both mbar words; checked at admission like sts.
     if (const auto* owner = shmem_owner_overlapping(address, address + 8ull, false)) {
         throw_issue_panic(site, shmem_race(
             opcode_name(site.inst.opcode) + " writes mbar", address, address + 8ull, *owner));
@@ -560,27 +558,6 @@ void Sanitizer::record_acc_ld_final_write(uint8_t bank) {
     if (awaiting.empty()) throw SimError("internal sanitizer: acc.ld final write without a launched transfer");
     release_tmem_owner(TmemOwnerKind::acc_ld, awaiting.front());
     awaiting.pop_front();
-}
-
-// ---------------------------------------------------------------------------
-// C5: port-A writes vs a same-cycle MMA port-B round
-// ---------------------------------------------------------------------------
-
-void Sanitizer::record_port_a_write(uint64_t byte_address, uint32_t size) {
-    const auto first = static_cast<uint32_t>(byte_address / 4);
-    const auto last = static_cast<uint32_t>((byte_address + size - 1) / 4);
-    for (uint32_t word = first; word <= last; ++word) port_a_written_words_.push_back(word);
-}
-
-void Sanitizer::check_port_b_round(const std::vector<uint32_t>& words) const {
-    for (const auto word : words) {
-        if (std::find(port_a_written_words_.begin(), port_a_written_words_.end(), word) !=
-            port_a_written_words_.end()) {
-            throw SimError(
-                "MMA port-B round and a port-A write touch shmem word " +
-                std::to_string(word) + " in the same cycle");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

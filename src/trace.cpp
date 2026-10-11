@@ -15,7 +15,7 @@ using json = nlohmann::json;
 
 constexpr uint32_t scheduler_track = 1;
 constexpr uint32_t warp_track_base = 100;
-constexpr uint32_t shmem_track = 1000;
+constexpr uint32_t shmem_a_read_track = 1000;
 constexpr uint32_t gmem_bus_track = 1001;
 constexpr uint32_t gmem_command_track = 1002;
 constexpr uint32_t gmem_queue_track = 1003;
@@ -23,6 +23,18 @@ constexpr uint32_t tma_command_track = 1010;
 constexpr uint32_t tma_command_depth_track = 1011;
 constexpr uint32_t tma_credit_depth_track = 1012;
 constexpr uint32_t tma_return_depth_track = 1013;
+constexpr uint32_t shmem_a_write_track = 1004;
+constexpr uint32_t shmem_b_write_track = 1005;
+constexpr uint32_t mbar_rmw_track = 1006;
+
+uint32_t shmem_track(ShmemService service) {
+    switch (service) {
+    case ShmemService::a_read: return shmem_a_read_track;
+    case ShmemService::a_write: return shmem_a_write_track;
+    case ShmemService::b_write: return shmem_b_write_track;
+    }
+    return shmem_a_read_track;
+}
 
 std::string category_name(TraceCategory category) {
     switch (category) {
@@ -53,6 +65,8 @@ std::string warp_state_name(WarpState state) {
     case WarpState::mbar_wait: return "mbar wait";
     case WarpState::mbar_wait_slot: return "mbar wait slot";
     case WarpState::structural: return "structural";
+    case WarpState::shmem_slot: return "no free slot";
+    case WarpState::shmem_order: return "ordered behind own access";
     case WarpState::halted: return "halted";
     case WarpState::count: break;
     }
@@ -196,32 +210,34 @@ void TraceRecorder::sfu_accept(uint32_t occupancy_cycles) {
 
 void TraceRecorder::sfu_unit_stall() { ++summary_.sfu_unit_stalls; }
 
-void TraceRecorder::shmem_begin(uint64_t cycle, uint32_t warp, std::string operation, uint32_t rounds) {
+void TraceRecorder::shmem_begin(ShmemService service, uint64_t cycle, std::string operation,
+    std::string detail, TraceCategory category, uint64_t id) {
     ++summary_.shmem_requests;
-    shmem_slice_ = OpenSlice{
-        cycle,
-        shmem_track,
-        TraceCategory::shmem,
-        std::move(operation),
-        "warp=" + std::to_string(warp) + ", rounds=" + std::to_string(rounds),
-    };
+    shmem_slices_[static_cast<std::size_t>(service)] = OpenSlice{
+        cycle, shmem_track(service), category, std::move(operation), std::move(detail), id};
 }
 
-void TraceRecorder::tma_port_begin(
-    uint64_t cycle, uint64_t command, std::string operation, uint32_t rounds) {
-    ++summary_.shmem_requests;
-    shmem_slice_ = OpenSlice{
-        cycle,
-        shmem_track,
-        TraceCategory::tma,
-        std::move(operation),
-        "command=" + std::to_string(command) + ", rounds=" + std::to_string(rounds),
-        command,
-    };
-}
-
-void TraceRecorder::shmem_round() {
-    ++summary_.shmem_rounds;
+void TraceRecorder::shmem_grant(uint64_t cycle, ShmemService service, ShmemClient client, uint32_t slot) {
+    static const char* const service_names[] = {"A-read", "A-write", "B-write"};
+    static const char* const client_names[] = {"simt", "probe", "rmw", "tma"};
+    if (client == ShmemClient::simt || client == ShmemClient::tma) ++summary_.shmem_rounds;
+    switch (service) {
+    case ShmemService::a_read:
+        ++(client == ShmemClient::simt ? summary_.shmem_a_read_simt
+            : client == ShmemClient::probe ? summary_.shmem_a_read_probe
+            : client == ShmemClient::rmw ? summary_.shmem_a_read_rmw : summary_.shmem_a_read_tma);
+        break;
+    case ShmemService::a_write:
+        ++(client == ShmemClient::rmw ? summary_.shmem_a_write_rmw : summary_.shmem_a_write_simt);
+        break;
+    case ShmemService::b_write:
+        ++summary_.shmem_b_write_tma;
+        break;
+    }
+    if (!options_.debug) return;
+    add({TraceEventKind::instant, TraceCategory::shmem,
+        std::string(service_names[static_cast<int>(service)]) + " grant",
+        client_names[static_cast<int>(client)], shmem_track(service), cycle, 0, slot});
 }
 
 void TraceRecorder::close_slice(OpenSlice slice, uint64_t end_cycle) {
@@ -239,10 +255,11 @@ void TraceRecorder::close_slice(OpenSlice slice, uint64_t end_cycle) {
     });
 }
 
-void TraceRecorder::shmem_end(uint64_t end_cycle) {
-    if (!shmem_slice_.has_value()) throw std::runtime_error("trace shmem end without begin");
-    close_slice(std::move(*shmem_slice_), end_cycle);
-    shmem_slice_.reset();
+void TraceRecorder::shmem_end(ShmemService service, uint64_t end_cycle) {
+    auto& slice = shmem_slices_[static_cast<std::size_t>(service)];
+    if (!slice.has_value()) throw std::runtime_error("trace shmem end without begin");
+    close_slice(std::move(*slice), end_cycle);
+    slice.reset();
 }
 
 void TraceRecorder::mbar_rmw_begin(
@@ -250,7 +267,7 @@ void TraceRecorder::mbar_rmw_begin(
     ++summary_.mbar_rmw_requests;
     mbar_rmw_slice_ = OpenSlice{
         cycle,
-        shmem_track,
+        mbar_rmw_track,
         TraceCategory::sync,
         "mbar RMW",
         std::move(operation) + ", address=" + std::to_string(byte_address),
@@ -483,8 +500,16 @@ std::string TraceRecorder::summary_text() const {
     }
     out << "shmem: requests=" << summary_.shmem_requests
         << " rounds=" << summary_.shmem_rounds
-        << " tma_priority_waits=" << summary_.shmem_tma_priority_waits
-        << " load_slot_full=" << summary_.shmem_load_slot_waits << '\n';
+        << " load_slot_full=" << summary_.shmem_load_slot_waits
+        << " store_slot_full=" << summary_.shmem_store_slot_waits
+        << " ordered=" << summary_.shmem_order_waits << '\n';
+    out << "shmem grants: a_read_simt=" << summary_.shmem_a_read_simt
+        << " a_read_probe=" << summary_.shmem_a_read_probe
+        << " a_read_rmw=" << summary_.shmem_a_read_rmw
+        << " a_read_tma=" << summary_.shmem_a_read_tma
+        << " a_write_simt=" << summary_.shmem_a_write_simt
+        << " a_write_rmw=" << summary_.shmem_a_write_rmw
+        << " b_write_tma=" << summary_.shmem_b_write_tma << '\n';
     out << "rf: async_writes=" << summary_.rf_async_writes
         << " async_waits=" << summary_.rf_async_waits
         << " simt_inhibited=" << summary_.rf_simt_inhibited << '\n';
@@ -574,7 +599,10 @@ std::string TraceRecorder::perfetto_json() const {
     for (uint32_t warp = 0; warp < active_warps_; ++warp) {
         metadata(warp_track_base + warp, "warp " + std::to_string(warp));
     }
-    metadata(shmem_track, "shmem port A");
+    metadata(shmem_a_read_track, "shmem A-read");
+    metadata(shmem_a_write_track, "shmem A-write");
+    metadata(shmem_b_write_track, "shmem B-write");
+    metadata(mbar_rmw_track, "mbar RMW engine");
     metadata(gmem_bus_track, "gmem bus");
     metadata(gmem_command_track, "gmem commands");
     metadata(gmem_queue_track, "gmem queue");

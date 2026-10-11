@@ -29,6 +29,9 @@ json profile_json(const DeviceProfile& p) {
             {"bytes", p.shmem_bytes},
             {"banks", p.shmem_banks},
             {"load_slots", p.shmem_load_slots},
+            {"store_slots", p.shmem_store_slots},
+            {"port_a_depth", p.shmem_port_a_depth},
+            {"read_latency_cycles", p.shmem_read_latency_cycles},
         }},
         {"tmem", {
             {"banks", p.tmem_banks},
@@ -99,8 +102,14 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.rf_arithmetic_read_cycles == 0 || p.rf_arithmetic_read_cycles > 32) {
         throw ProfileError("device profile: arithmetic RF read window must be in 1..32 cycles");
     }
-    if (p.shmem_load_slots == 0) {
-        throw ProfileError("device profile: shmem load slots must be at least 1");
+    if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
+        throw ProfileError("device profile: shmem load and store slots must be at least 1");
+    }
+    // Every latency is a nonzero number of register stages (rfc12 section 2).
+    if (p.shmem_port_a_depth == 0 || p.shmem_port_a_depth > 64 ||
+        p.shmem_read_latency_cycles == 0 || p.shmem_read_latency_cycles > 64) {
+        throw ProfileError(
+            "device profile: shmem port_a_depth and read_latency_cycles must be in 1..64 register stages");
     }
     if (p.sfu_lanes == 0 || p.sfu_lanes > p.lanes) {
         throw ProfileError("device profile: sfu lanes must be in 1..lanes");
@@ -206,13 +215,21 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& shmem = document.at("shmem");
     p.shmem_bytes = field<uint32_t>(shmem, "bytes");
     p.shmem_banks = field<uint32_t>(shmem, "banks");
-    if (shmem.contains("load_slots")) {
-        const auto& value = shmem.at("load_slots");
-        if (!value.is_number_unsigned() || value < 1 || value > 1024) {
-            throw ProfileError("device profile: shmem load_slots must be an integer in 1..1024");
+    // Optional (absent: the struct's canonical default); present: an integer
+    // in [low, high]. A 0 is rejected here and again by validation.
+    const auto optional_shmem = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
+        if (!shmem.contains(name)) return;
+        const auto& value = shmem.at(name);
+        if (!value.is_number_unsigned() || value < low || value > high) {
+            throw ProfileError(std::string("device profile: shmem ") + name + " must be an integer in " +
+                std::to_string(low) + ".." + std::to_string(high));
         }
-        p.shmem_load_slots = value.get<uint32_t>();
-    }
+        out = value.get<uint32_t>();
+    };
+    optional_shmem("load_slots", 1, 1024, p.shmem_load_slots);
+    optional_shmem("store_slots", 1, 1024, p.shmem_store_slots);
+    optional_shmem("port_a_depth", 1, 64, p.shmem_port_a_depth);
+    optional_shmem("read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
     const auto& tmem = document.at("tmem");
     p.tmem_banks = field<uint32_t>(tmem, "banks");
     p.tmem_words_per_bank = field<uint32_t>(tmem, "words_per_bank");

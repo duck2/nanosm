@@ -30,6 +30,16 @@ struct DeviceProfile {
     // Load slots (rfc12 section 3): an admitted lds / lds.uni holds one from
     // admission until the RF write path accepts its gathered vector. >= 1.
     uint32_t shmem_load_slots = 2;
+    // Store slots (rfc12 section 3): an admitted sts holds one from admission
+    // until its last write round is granted. >= 1.
+    uint32_t shmem_store_slots = 2;
+    // D (rfc12 section 2): register stages from a shmem grant to the RAM --
+    // the read's sample, the write's edge. The same for A-read, A-write and the
+    // port-B write, so accesses reach the RAM in grant order. >= 1.
+    uint32_t shmem_port_a_depth = 2;
+    // Lb: register stages from a read's RAM sample to its words at the port
+    // output. >= 1.
+    uint32_t shmem_read_latency_cycles = 2;
     uint32_t tmem_banks = 0;
     uint32_t tmem_words_per_bank = 0;
     uint32_t tmem_fine_banks = 0;

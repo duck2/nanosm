@@ -82,9 +82,8 @@ Machine::RequestChannel Machine::select_request_channel(const TmaRequests& tma, 
         channel.granted = GmemClient::tma;
         channel.walker_proceeds = true;
     }
-    if (tma.walker.has_value() &&
-        (tma.walker->sector == Sector::zero_fill || tma.walker->sector == Sector::store)) {
-        channel.walker_proceeds = true; // needs no request channel
+    if (tma.walker.has_value() && tma.walker->sector == Sector::zero_fill) {
+        channel.walker_proceeds = true; // needs no request channel (a store sector goes on its A-read grant)
     }
 
     const auto requested_now = channel.tma_write ? std::optional<uint64_t>(tma_slot->id) : std::nullopt;
@@ -650,8 +649,7 @@ Machine::GmemSectorRequest Machine::lsu_read_request(
 Machine::IngressPluck Machine::decide_ingress(const Wires& w) {
     IngressPluck pluck;
     TmaSectorRegister tma_reg = tma_sector_.cur();
-    const auto& completed = w.port_a.tma_completed;
-    if (completed.has_value() && completed->kind == TmaPortKind::load_write && completed->from_sector_register) {
+    if (w.shmem.tma_sector_released) {
         tma_reg.request.reset(); // its placement's last round read it now
         tma_reg.filled = 0;
         tma_reg.complete = false;
@@ -709,7 +707,7 @@ Machine::IngressPluck Machine::decide_ingress(const Wires& w) {
 
 // Ingress -> the TMA stream's 32 B sector register at the pluck rate. When
 // the sector is complete it becomes a placement ticket; the register stays
-// occupied until the placement's last port-A round has read it.
+// occupied until the placement's last port-B write round has read it.
 void Machine::pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t take,
     TmaSectorRegister& reg, ReadRecord& record, IngressPluck& pluck) {
     sanitizer_.check_ordered_beat(cycle_, tma_stream, beat.request, beat.offset + consumed);

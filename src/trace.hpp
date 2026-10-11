@@ -20,9 +20,16 @@ enum class WarpState : uint8_t {
     mbar_wait,
     mbar_wait_slot,
     structural,
+    shmem_slot,   // an lds / sts with no free load / store slot (rfc12 section 3)
+    shmem_order,  // a shmem access ordered behind the warp's own unserviced access (rfc12 section 4)
     halted,
     count,
 };
+
+// The shmem services that the trace attributes grants to (trash/rfc12.md
+// section 1, rfc11 section 0). The MMA's port-B reads are counted by the MMA.
+enum class ShmemService : uint8_t { a_read, a_write, b_write };
+enum class ShmemClient : uint8_t { simt, probe, rmw, tma };
 
 enum class TraceEventKind : uint8_t {
     instant,
@@ -70,13 +77,25 @@ struct TraceSummary {
     uint64_t scheduler_idle_cycles = 0;
     uint64_t scheduler_draining_cycles = 0;
     std::array<uint64_t, static_cast<std::size_t>(WarpState::count)> warp_cycles{};
+    // SIMT lds / lds.uni / sts accesses and TMA shmem transactions (data,
+    // descriptor and mbar-phase), and their bank rounds; probes and RMW steps
+    // are counted by the mbar line.
     uint64_t shmem_requests = 0;
     uint64_t shmem_rounds = 0;
-    // Warp-cycles a SIMT port-A op (lds/sts/mbar) was held off because the
-    // TMA had a port-A request waiting (TMA priority on the next free grant).
-    uint64_t shmem_tma_priority_waits = 0;
-    // Warp-cycles an lds / lds.uni was refused because every load slot was held.
+    // Warp-cycles an lds / lds.uni (sts) was refused because every load
+    // (store) slot was held, and warp-cycles a shmem access was ordered behind
+    // the warp's own unserviced access.
     uint64_t shmem_load_slot_waits = 0;
+    uint64_t shmem_store_slot_waits = 0;
+    uint64_t shmem_order_waits = 0;
+    // Rounds granted, per service and client.
+    uint64_t shmem_a_read_simt = 0;
+    uint64_t shmem_a_read_probe = 0;
+    uint64_t shmem_a_read_rmw = 0;
+    uint64_t shmem_a_read_tma = 0;
+    uint64_t shmem_a_write_simt = 0;
+    uint64_t shmem_a_write_rmw = 0;
+    uint64_t shmem_b_write_tma = 0;
     // The RF write decision (rfc10 section 3): vector beats written by async
     // holders (load slots, LSU assemblies, acc.ld pipelines); holder-cycles a
     // ready holder was not granted; warp-cycles a SIMT instruction was refused
@@ -122,9 +141,9 @@ struct TraceSummary {
     uint64_t tma_logical_bytes = 0;
     uint64_t tma_useful_bytes = 0;
     uint64_t tma_sector_bytes = 0;
-    // Data placement/readback on port A: one request per TMA load-write (incl.
-    // synthetic OOB zero fills) or store-read, and the bank rounds those
-    // requests consume. Descriptor and mbar-phase reads are excluded.
+    // Data placement (port-B write) and readback (A-read): one request per TMA
+    // load-write (incl. synthetic OOB zero fills) or store-read, and the bank
+    // rounds those requests consume. Descriptor and mbar-phase reads are excluded.
     uint64_t tma_port_requests = 0;
     uint64_t tma_port_rounds = 0;
     uint64_t tma_max_command_depth = 0;
@@ -159,11 +178,14 @@ public:
     void warp_state(uint64_t cycle, uint32_t warp, WarpState state, std::string detail = {});
 
     void depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t value);
-    void shmem_begin(uint64_t cycle, uint32_t warp, std::string operation, uint32_t rounds);
-    void tma_port_begin(
-        uint64_t cycle, uint64_t command, std::string operation, uint32_t rounds);
-    void shmem_round();
-    void shmem_end(uint64_t end_cycle);
+    // A SIMT access's or TMA transaction's slice on its service's track, from
+    // its first grant to its last; one shmem request.
+    void shmem_begin(ShmemService service, uint64_t cycle, std::string operation, std::string detail,
+        TraceCategory category, uint64_t id = 0);
+    void shmem_end(ShmemService service, uint64_t end_cycle);
+    // One bank round granted (an instant on the service's track in debug
+    // traces; its value is the requester's slot index).
+    void shmem_grant(uint64_t cycle, ShmemService service, ShmemClient client, uint32_t slot = 0);
     void mbar_rmw_begin(uint64_t cycle, uint32_t byte_address, std::string operation);
     void mbar_rmw_end(uint64_t end_cycle, bool phase_changed);
     void mbar_engine_wait_on_other() { ++summary_.mbar_engine_waits_on_other; }
@@ -173,8 +195,9 @@ public:
     void mbar_wake(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t phase);
     void mbar_timeout(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
 
-    void shmem_tma_priority_wait() { ++summary_.shmem_tma_priority_waits; }
     void shmem_load_slot_wait() { ++summary_.shmem_load_slot_waits; }
+    void shmem_store_slot_wait() { ++summary_.shmem_store_slot_waits; }
+    void shmem_order_wait() { ++summary_.shmem_order_waits; }
     void rf_async_write() { ++summary_.rf_async_writes; }
     void rf_async_wait() { ++summary_.rf_async_waits; }
     void rf_simt_inhibited() { ++summary_.rf_simt_inhibited; }
@@ -241,7 +264,7 @@ private:
     TraceSummary summary_;
     std::vector<TimelineEvent> events_;
     std::vector<WarpInterval> warp_intervals_;
-    std::optional<OpenSlice> shmem_slice_;
+    std::array<std::optional<OpenSlice>, 3> shmem_slices_; // per ShmemService
     std::optional<OpenSlice> mbar_rmw_slice_;
     std::map<uint64_t, OpenSlice> gmem_commands_;
     std::map<uint64_t, OpenSlice> gmem_bus_requests_;

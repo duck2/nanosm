@@ -11,7 +11,10 @@
   "shmem": {
     "bytes": 65536,
     "banks": 16,
-    "load_slots": 2
+    "load_slots": 2,
+    "store_slots": 2,
+    "port_a_depth": 2,
+    "read_latency_cycles": 2
   },
   "tmem": {
     "banks": 2,

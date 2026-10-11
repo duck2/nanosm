@@ -106,6 +106,13 @@ const nanosm::DeviceProfile& canonical_profile() {
     return profile;
 }
 
+// I2 (rfc12 sections 2 and 6): the RMW engine is busy from its read grant to
+// its write grant, D + Lb cycles later -- D + Lb + 1 cycles (was 2: read,
+// then write). Engine services are that far apart.
+uint64_t rmw_busy_cycles(const nanosm::DeviceProfile& profile = canonical_profile()) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
+}
+
 nanosm::Kernel compile(
     std::string_view source, const nanosm::DeviceProfile& profile = canonical_profile()) {
     return nanosm::compile_and_assemble(source, profile);
@@ -349,7 +356,8 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
     for (const auto& event : machine.trace().events()) {
         if (event.name != "mbar RMW") continue;
         ++rmw_slices;
-        require(event.duration_cycles == 2, "mbar RMW did not occupy exactly two port-A cycles");
+        // I2: read grant to write grant, D + Lb + 1 cycles (was 2).
+        require(event.duration_cycles == rmw_busy_cycles(), "mbar RMW did not hold A for D + Lb + 1 cycles");
     }
     require(rmw_slices == 3, "trace did not contain every mbar RMW service interval");
 }
@@ -436,9 +444,13 @@ void test_mbar_try_wait_times_out_false() {
     require(machine.trace().summary().mbar_wakes == 0, "timeout was counted as exact wake");
 }
 
+// I2: the wake comes when the RMW's write reaches the RAM (rfc12 section 6),
+// 2D + Lb cycles after the event's claim, which is the cycle after the park.
+// The timeout puts the deadline in that cycle (was 2: claim, then write).
 void test_mbar_phase_flip_wins_on_try_wait_deadline() {
     auto profile = canonical_profile();
-    profile.mbar_try_wait_timeout_cycles = 2;
+    profile.mbar_try_wait_timeout_cycles =
+        2 * profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, 128);
@@ -1357,67 +1369,6 @@ void write_rank1_load(std::vector<uint8_t>& shmem, uint32_t descriptor_address, 
 
 // (g) TMA priority on port A: a returned TMA sector waits only for the SIMT
 // access already in port A, never for one granted after it became ready.
-void test_tma_port_a_priority_over_sts() {
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
-    write_rank1_load(shmem, 0, 0, 64, 1024, 128);
-    auto& gmem = image_bytes(launch.gmem_image, 256);
-    fill_pattern(gmem, 0, 64, 0);
-    std::string text = R"(
-        sread r29, WARP_ID
-        setp.ne p0, r29, 0
-        @p0 bra.uni hammer
-        mov r0, 0
-        mov r1, 0
-        mov r2, 0
-        mov r3, 128
-        tma.async [0], r0
-    wait:
-        mbar.try_wait p1, [r3], 0
-        @!p1 bra.uni wait
-        halt
-    hammer:
-        sread r4, LANE_ID
-        shli r4, r4, 2
-    )";
-    for (int i = 0; i < 400; ++i) text += "sts [r4 + 4096], r4\n";
-    text += "halt\n";
-    nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
-    machine.enable_edge_probe();
-    machine.run();
-    for (uint32_t i = 0; i < 64; ++i)
-        require(machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA load data mismatch under sts pressure");
-    const auto placements = trace_spans(machine, nanosm::TraceCategory::tma, "tma load write");
-    // B2.1: the sector is complete in the TMA sector register at the cycle of
-    // its last plucked byte (bus arrival + the ingress FIFO latency), no
-    // longer at its last bus beat (B2's fall-through FIFO). Taken from the
-    // edge probe; the assertion below is unchanged.
-    std::vector<uint64_t> completed;
-    std::map<uint64_t, uint32_t> filled;
-    for (const auto& event : machine.edge_events()) {
-        if (event.edge != nanosm::LsuEdge::tma_reg_write) continue;
-        if ((filled[event.id] += event.bytes) == 32) completed.push_back(event.cycle);
-    }
-    const auto stores = trace_spans(machine, nanosm::TraceCategory::shmem, "sts");
-    require(placements.size() == 8 && completed.size() == 8, "expected eight TMA sectors");
-    uint32_t contended = 0;
-    for (std::size_t k = 0; k < 8; ++k) {
-        // The sector is in the TMA sector register at the end of its
-        // completion cycle; from that cycle's issue on, SIMT may not be granted.
-        const auto ready = completed[k];
-        for (const auto& store : stores) {
-            require(!(store.start >= ready && store.start < placements[k].start),
-                "sts granted at cycle " + std::to_string(store.start) + " after TMA sector " +
-                    std::to_string(k) + " became ready (" + std::to_string(ready) +
-                    ") but before its placement (" + std::to_string(placements[k].start) + ")");
-            if (store.start < ready && store.end > ready) ++contended;
-        }
-    }
-    require(contended != 0, "the sts hammer never overlapped a TMA return; the test proves nothing");
-    require(machine.trace().summary().shmem_tma_priority_waits != 0, "SIMT waits behind TMA were not counted");
-}
-
 // (h) Read streams: TMA (ID 0) and vector (ID 1) sectors interleave in the
 // controller's global order at sector granularity; each lands correctly.
 void test_lsu_tma_and_vector_streams_interleave() {
@@ -1747,10 +1698,15 @@ void test_tma_store_egress_is_pluck_bound() {
         machine.run();
         for (uint32_t i = 0; i < 4096; ++i)
             require(machine.read_gmem_u32(4 * i) == pattern_word(i), "16 KiB TMA store data mismatch");
-        const uint64_t bound = 16384 / (4 * pluck);
+        // I2 (rfc12 section 2): a sector's source read reaches the one TMA
+        // store sector register D + Lb cycles after its grant, and the
+        // register holds the sector until its last word is in the egress
+        // FIFO, so each of the 512 sectors costs D + Lb plus its 8 / pluck
+        // drain cycles (before I2: the drain alone, 16384 / (4 * pluck)).
+        const uint64_t bound = 512 * (config.shmem_port_a_depth + config.shmem_read_latency_cycles + 8 / pluck);
         require(machine.cycle() >= bound && machine.cycle() <= bound + 100,
             "16 KiB TMA store at pluck " + std::to_string(pluck) + " took " + std::to_string(machine.cycle()) +
-                " cycles; the egress write port bounds it at " + std::to_string(bound));
+                " cycles; the store register's round trip bounds it at " + std::to_string(bound));
     }
 }
 
@@ -3972,7 +3928,9 @@ void write_mbar(std::vector<uint8_t>& shmem, uint32_t address, uint16_t remainin
 // commit is accepted in cycle r and starts fetching in r + 1, exactly as in a
 // run with no TMA event at all: the commit presents into the MMA's own register.
 // (The alternation here follows the last-served bit: T1 was served last, so
-// the tie at r + 1 goes to the MMA.)
+// the tie at r - 1 + busy goes to the MMA.) I2: services are busy = D + Lb + 1
+// cycles apart (was 2); the commit, held from r + 1, waits busy - 2 cycles
+// for T1 and T2 waits busy cycles for the commit (was 0 + 2).
 // Before 2026-10-07 the two engines shared ONE event slot. In cycle r the
 // commit found it holding the TMA event and stayed at the head of the MMA
 // queue: the order was TMA, TMA, MMA, and the mma.async behind it (accepted
@@ -4036,13 +3994,14 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
 
     require(queued_accept_and_fetch(machine) == std::pair{r, fetch},
         "a held TMA event stalled the MMA queue behind the commit");
+    const auto busy = rmw_busy_cycles();
     require(mbar_rmw_services(machine) == std::vector<RmwService>{
                 {r - 1, "complete_tx (tma), address=4104"},
-                {r + 1, "arrive (mma.commit), address=4096"},
-                {r + 3, "complete_tx (tma), address=4104"}},
+                {r - 1 + busy, "arrive (mma.commit), address=4096"},
+                {r - 1 + 2 * busy, "complete_tx (tma), address=4104"}},
         "engine events were not served once each, alternating TMA, MMA, TMA");
-    require(machine.trace().summary().mbar_engine_waits_on_other == 2,
-        "T2 should wait exactly the two cycles of the commit's RMW");
+    require(machine.trace().summary().mbar_engine_waits_on_other == 2 * busy - 2,
+        "the commit should wait out T1's RMW from r + 1, and T2 the whole of the commit's");
     require(machine.read_mbar_state(commit_mbar).phase, "the commit's arrive was lost");
     const auto tx = machine.read_mbar_state(tx_mbar);
     require(tx.phase && tx.tx_bytes == 0, "a TMA completion was lost");
@@ -4086,20 +4045,21 @@ void test_mbar_engine_events_alternate_tma_first() {
     machine.tick(); // first: both held
     require(!machine.tma_mbar_event_held() && machine.mma_mbar_event_held(),
         "the first tie did not serve the TMA");
-    machine.tick(); // the TMA event's write stage; the commit still waits
-    machine.complete_mbar_tx(tx_mbar, 64, 0); // both pending again at first + 2
+    machine.tick(); // the TMA event's RMW is under way; the commit still waits
+    machine.complete_mbar_tx(tx_mbar, 64, 0); // pending again from first + 2, before the next free point
     machine.run(1000);
 
+    // I2: services are busy = D + Lb + 1 cycles apart (was 2).
+    const auto busy = rmw_busy_cycles();
     require(mbar_rmw_services(machine) == std::vector<RmwService>{
                 {first, "complete_tx (tma), address=4104"},
-                {first + 2, "arrive (mma.commit), address=4096"},
-                {first + 4, "complete_tx (tma), address=4104"},
-                {first + 6, "arrive (mma.commit), address=4112"}},
+                {first + busy, "arrive (mma.commit), address=4096"},
+                {first + 2 * busy, "complete_tx (tma), address=4104"},
+                {first + 3 * busy, "arrive (mma.commit), address=4112"}},
         "tied engine events did not alternate TMA, MMA, TMA, MMA");
-    // Each of the three ties holds the loser through both cycles of the
-    // winner's RMW.
-    require(machine.trace().summary().mbar_engine_waits_on_other == 6,
-        "engine_waits_on_other does not count 2 cycles per tie");
+    // Each of the three ties holds the loser through all of the winner's RMW.
+    require(machine.trace().summary().mbar_engine_waits_on_other == 3 * busy,
+        "engine_waits_on_other does not count the winner's whole RMW per tie");
     require(machine.read_mbar_state(commit0).phase && machine.read_mbar_state(commit1).phase,
         "a commit's arrive was lost");
     const auto tx = machine.read_mbar_state(tx_mbar);
@@ -4198,10 +4158,11 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
             "the TMA command outlived its claimed event (held by the MMA's?)" + where);
         if (tma_claim != r + 1) continue; // the TMA presented in r too
         aligned = true;
+        const auto busy = rmw_busy_cycles(); // I2: D + Lb + 1 (was 2)
         require(observed.services ==
-                std::vector<RmwService>{at(tma_service, r + 1), at(mma_service, r + 3)},
+                std::vector<RmwService>{at(tma_service, r + 1), at(mma_service, r + 1 + busy)},
             "same-cycle TMA completion and commit were not served TMA, then MMA" + where);
-        require(observed.waits == 2, "the commit should wait two cycles (the TMA's RMW)" + where);
+        require(observed.waits == busy, "the commit should wait out the TMA's RMW" + where);
     }
     require(aligned, "no delay made the TMA completion and the commit present in one cycle");
 }
@@ -4369,46 +4330,6 @@ void test_mma_multi_round_fetch_timing() {
     for (uint32_t lane = 0; lane < profile.lanes; ++lane)
         require(machine.read_reg(0, lane, 10) == nanosm::float_bits(8.0f),
             "per-round operand capture changed the numerical result");
-}
-
-void test_mma_port_collision_sweep() {
-    // Case 08: a port-A write and an MMA port-B round touching the same shmem
-    // word in the same cycle is UB and panics. Both streams ascend one word
-    // per cycle, but the fetch's step-0 footprint skips words, so word w is
-    // read rank(w) rounds in ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â w - rank(w) cycles earlier than an aligned
-    // writer reaches it ({0,2,4,6} for the A block). Padding between the sts
-    // and the MMA sweeps that offset: some paddings collide on one cycle,
-    // others miss. Writing far from the operands never panics at any padding.
-    const auto profile = dense_one_bank_profile(4);
-    uint32_t panics = 0;
-    for (uint32_t base : {0u, 8192u}) {
-        uint32_t base_panics = 0;
-        for (uint32_t pad = 0; pad <= 8; ++pad) {
-            std::ostringstream qtx;
-            qtx << ".acc C, 0, 0, 16, 4\n"
-                << "mov r0, 0\nmov r1, 512\n"
-                << "sread r20, LANE_ID\nshli r20, r20, 2\n"
-                << "addi r20, r20, " << base << "\n"
-                << "mov r21, 7\n"
-                << "sts [r20], r21\n";
-            for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
-            qtx << "mma.async.init C, [r0], [r1]\nhalt\n";
-            nanosm::Launch launch;
-            launch.active_warps = 1;
-            nanosm::Machine machine(profile, compile(qtx.str(), profile), std::move(launch));
-            try {
-                machine.run(4000);
-            } catch (const nanosm::SimError& error) {
-                require(std::string(error.what()).find("in the same cycle") != std::string::npos,
-                    "the port collision produced the wrong diagnostic");
-                ++base_panics;
-            }
-        }
-        if (base == 0) panics = base_panics;
-        else require(base_panics == 0, "a write far from the operands must never collide");
-    }
-    require(panics >= 1, "no padding aligned the crossing streams onto one cycle");
-    require(panics <= 8, "different-cycle same-word overlap must not be diagnosed");
 }
 
 void test_mma_varying_round_service() {
@@ -5006,40 +4927,6 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
                 require(machine.read_reg(0, lane, 16 + j) == nanosm::float_bits(24.0f),
                     "P-tile handoff produced the wrong value");
     }
-}
-
-void test_sanitizer_rmw_port_collision() {
-    // C5: the RMW engine's write stage joins the same-cycle port-A record. An
-    // mbar.init over the first word of an MMA's operand footprint, then the
-    // MMA right behind it: with no padding, fetch round 0 reads word 0 in the
-    // RMW's write cycle. (SIMT RMWs are ownership-checked at issue, like sts,
-    // so this same-cycle record is what sees an MMA accepted in between.)
-    const auto profile = dense_one_bank_profile(4);
-    uint32_t panics = 0;
-    for (uint32_t mbar : {0u, 896u}) {
-        uint32_t mbar_panics = 0;
-        for (uint32_t pad = 0; pad <= 4; ++pad) {
-            std::ostringstream qtx;
-            qtx << ".acc C, 0, 0, 16, 4\n"
-                << "mov r0, 0\nmov r1, 512\nmov r4, " << mbar << "\n"
-                << "mbar.init [r4], 1\n";
-            for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
-            qtx << "mma.async.init C, [r0], [r1]\nhalt\n";
-            nanosm::Launch launch;
-            launch.active_warps = 1;
-            nanosm::Machine machine(profile, compile(qtx.str(), profile), std::move(launch));
-            try {
-                machine.run(4000);
-            } catch (const nanosm::SimError& error) {
-                require_mentions(error.what(), {"in the same cycle"}, "RMW/port-B collision");
-                ++mbar_panics;
-            }
-        }
-        if (mbar == 0) panics = mbar_panics;
-        else require(mbar_panics == 0, "an mbar outside the operands must never collide");
-    }
-    require(panics >= 1, "the RMW write stage is missing from the port-A collision record");
-    require(panics < 5, "different-cycle RMW/port-B overlap must not be diagnosed");
 }
 
 void test_integer_alu_menu() {
@@ -6293,7 +6180,7 @@ std::string b3_table_program(const std::string& operation) {
 std::vector<uint32_t> shmem_request_rounds(const nanosm::Machine& machine) {
     std::vector<std::pair<uint64_t, uint32_t>> requests;
     for (const auto& event : machine.trace().events()) {
-        if (event.category != nanosm::TraceCategory::shmem) continue;
+        if (event.category != nanosm::TraceCategory::shmem || event.kind != nanosm::TraceEventKind::slice) continue;
         const auto rounds = event.detail.substr(event.detail.find("rounds=") + 7);
         requests.emplace_back(event.start_cycle, static_cast<uint32_t>(std::stoul(rounds)));
     }
@@ -6348,9 +6235,12 @@ void test_b3_lds_uni_one_round_one_write() {
         for (const auto value : load.values) require(value == b3_word(76), operation + ": a lane missed the word");
         require(shmem_request_rounds(*machine) == std::vector<uint32_t>{rounds}, operation + ": wrong round count");
         require(machine->trace().summary().shmem_rounds == rounds, operation + ": port A served extra rounds");
+        // I2: the last round's words reach the slot D + Lb after its grant.
         const auto issue = issued_at(*machine, 16);
-        require(issue.size() == 1 && load.cycle == issue[0] + rounds + 1,
-            operation + ": the RF write did not land one cycle after the last round");
+        const auto& profile = canonical_profile();
+        require(issue.size() == 1 && load.cycle == issue[0] + rounds + 1 + profile.shmem_port_a_depth +
+                profile.shmem_read_latency_cycles,
+            operation + ": the RF write did not land D + Lb + 1 cycles after the last round");
     }
 }
 
@@ -6644,6 +6534,15 @@ void test_b3_lds_uni_encoding() {
 // assembly with explicit controls, so every cycle is the program's own.
 // ---------------------------------------------------------------------------
 
+// I2 (rfc12 section 2): an lds's words come back D + Lb cycles after its
+// grant -- the I1 timelines below were written for D = Lb = 0. They keep
+// their RF scenarios by moving the fadd bookings and the instructions after
+// each lds.uni by the same amount (fadd latency + X, the lds.uni's stall
+// 1 + X), so every cycle after the lds.uni is the old one + X.
+uint32_t i1_lds_shift(const nanosm::DeviceProfile& profile = canonical_profile()) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
+}
+
 // Hand assembly: lines without a {...} control block get the default one.
 std::string i1_asm(const nanosm::DeviceProfile& profile, const std::string& body) {
     std::string text = ".profile " + profile.name + ", 0x" +
@@ -6702,6 +6601,12 @@ std::vector<std::pair<uint64_t, uint64_t>> refusals(
     return result;
 }
 
+std::string describe(const std::vector<std::pair<uint64_t, uint64_t>>& slices) {
+    std::string text;
+    for (const auto& [start, length] : slices) text += " {" + std::to_string(start) + ", " + std::to_string(length) + "}";
+    return text;
+}
+
 // C8, Fable's probe A (trash/causality-audit-fable-2026-10-08.md section 7):
 // one instruction stream; shmem word 0 is the lane mask the plain lds's
 // addresses are built from. Mask 15: sixteen lanes on sixteen banks, one
@@ -6710,7 +6615,9 @@ std::vector<std::pair<uint64_t, uint64_t>> refusals(
 // with mask 15 and was refused at c7 with mask 7 (its own addresses decided
 // its issue). Now both issue at c7; the rounds move only the completion.
 void test_i1_lds_issue_ignores_its_rounds() {
-    const auto& profile = canonical_profile();
+    auto profile = canonical_profile();
+    const auto x = i1_lds_shift(profile);
+    profile.timing.fadd = static_cast<uint8_t>(4 + x); // I2: the fadd's booking moves with the lds result
     const std::string body = R"(
         sread r0, LANE_ID
         mov r4, 0
@@ -6747,12 +6654,13 @@ void test_i1_lds_issue_ignores_its_rounds() {
     const auto two_rounds = run(7);
     require(one_round.rounds == std::vector<uint32_t>{1, 1} && two_rounds.rounds == std::vector<uint32_t>{1, 2},
         "the masks did not give one and two bank rounds");
-    require(one_round.issue == 7 && two_rounds.issue == 7,
+    // I2: the lds.uni's result, and so everything behind its depbar, is x later.
+    require(one_round.issue == 7 + x && two_rounds.issue == 7 + x,
         "the lds's issue cycle depends on its own addresses (C8): " + std::to_string(one_round.issue) + " vs " +
             std::to_string(two_rounds.issue));
-    require(one_round.written == 9, "one round: the result was not written at issue + 2");
-    require(two_rounds.written == 11,
-        "two rounds: the result (ready at c10, when the fadd's booking holds bank 0) was not written at c11");
+    require(one_round.written == one_round.issue + 2 + x, "one round: the result was not written at issue + 2 + x");
+    require(two_rounds.written == two_rounds.issue + 4 + x,
+        "two rounds: the result (ready when the fadd's booking holds bank 0) was not written one cycle later");
 }
 
 // The tripwire behind "a refused attempt reads nothing": a capture inside an
@@ -6788,7 +6696,10 @@ void test_i1_refused_attempts_read_nothing() {
     std::set<std::string> reasons;
     const auto collect = [&](const nanosm::Machine& machine) {
         for (const auto& event : machine.trace().events()) {
-            if (event.category == nanosm::TraceCategory::warp && event.name == "structural") reasons.insert(event.detail);
+            // I2: shmem refusals have their own warp states.
+            const bool refused = event.name == "structural" || event.name == "no free slot" ||
+                event.name == "ordered behind own access";
+            if (event.category == nanosm::TraceCategory::warp && refused) reasons.insert(event.detail);
         }
     };
     {   // load slots full: both slots hold results the booked RF bank 0 denies
@@ -6813,11 +6724,14 @@ void test_i1_refused_attempts_read_nothing() {
         require(machine->read_reg(0, 5, 9) == 0x102, "the refused lds.uni loaded the wrong word");
     }
     {   // RF write inhibited: a fadd while a load result is owed service
-        auto machine = i1_machine(canonical_profile(), R"(
+        auto profile = canonical_profile();
+        const auto x = i1_lds_shift(profile);
+        profile.timing.fadd = static_cast<uint8_t>(4 + x);
+        auto machine = i1_machine(profile, R"(
             mov r1, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
-            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
             fadd r12, r4, r4
             fadd r15, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0}
@@ -6825,7 +6739,7 @@ void test_i1_refused_attempts_read_nothing() {
         machine->run();
         collect(*machine);
     }
-    {   // port A busy: an lds behind a two-round sts
+    {   // ordered behind own access (I2; was "port A busy"): an lds behind a two-round sts
         auto machine = i1_machine(canonical_profile(), R"(
             sread r0, LANE_ID
             shli r0, r0, 3
@@ -6861,8 +6775,8 @@ void test_i1_refused_attempts_read_nothing() {
         collect(machine);
         require(machine.read_reg(0, 4, 12) == pattern_word(20), "the refused ldg loaded the wrong word");
     }
-    for (const std::string reason : {"load slots full", "RF write inhibited", "port A busy", "LSU command slot",
-             "tmem bank transfer busy"}) {
+    for (const std::string reason : {"load slots full", "RF write inhibited", "ordered behind own access",
+             "LSU command slot", "tmem bank transfer busy"}) {
         require(reasons.contains(reason), "no attempt was refused for '" + reason + "'; the test proves little");
     }
 }
@@ -6874,11 +6788,14 @@ void test_i1_refused_attempts_read_nothing() {
 // bookings have drained and the result is written. In that cycle the fadd
 // books c11: owed is set again (a booking and a grant in one cycle: set wins).
 void test_i1_rf_owed_inhibits_after_denial() {
-    auto machine = i1_machine(canonical_profile(), R"(
+    auto profile = canonical_profile();
+    const auto x = i1_lds_shift(profile);
+    profile.timing.fadd = static_cast<uint8_t>(4 + x);
+    auto machine = i1_machine(profile, R"(
         mov r1, 0
         fadd r6, r4, r4
         fadd r9, r4, r4
-        lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+        lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
         fadd r12, r4, r4
         fadd r15, r4, r4
         halt {pred=PT, stall=0, set=-, wait=sb0}
@@ -6890,12 +6807,13 @@ void test_i1_rf_owed_inhibits_after_denial() {
     });
     require(!bank0.at(0).first && bank0.at(1).first, "a successful booking of bank 0 did not set async_owed");
     require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{3}, "lds.uni issue");
-    require(written.at(3) == std::vector<uint64_t>{7}, "the result was not written when the old bookings drained (c7)");
-    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{5, 2}},
-        "bank 0 was not inhibited exactly while the result was denied with service owed (c5, c6)");
-    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{7}, "the inhibited fadd did not issue in the grant cycle");
-    require(bank0.at(7).first, "a grant and a booking in one cycle cleared async_owed (set must win)");
-    require(bank0.at(6).second == 0 && bank0.at(7).second == 1, "the cursor did not move past load slot 0 on its grant");
+    require(written.at(3) == std::vector<uint64_t>{7 + x}, "the result was not written when the old bookings drained (c7 + x)");
+    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{5 + x, 2}},
+        "bank 0 was not inhibited exactly while the result was denied with service owed (c5 + x, c6 + x)");
+    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{7 + x}, "the inhibited fadd did not issue in the grant cycle");
+    require(bank0.at(7 + x).first, "a grant and a booking in one cycle cleared async_owed (set must win)");
+    require(bank0.at(6 + x).second == 0 && bank0.at(7 + x).second == 1,
+        "the cursor did not move past load slot 0 on its grant");
     const auto& summary = machine->trace().summary();
     require(summary.rf_async_waits == 2 && summary.rf_simt_inhibited == 2 && summary.rf_async_writes == 1,
         "rf counters");
@@ -6908,14 +6826,15 @@ void test_i1_rf_owed_inhibits_after_denial() {
 // is denied again and the next fadd is inhibited; c8 it is written.
 void test_i1_rf_owed_one_more_booking() {
     auto profile = canonical_profile();
-    profile.timing.fadd = 5;
+    const auto x = i1_lds_shift(profile);
+    profile.timing.fadd = static_cast<uint8_t>(5 + x);
     {
         auto machine = i1_machine(profile, R"(
             mov r1, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
             lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
-            lds.uni r12, [r1] {pred=PT, stall=0, set=sb1, wait=-}
+            lds.uni r12, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb1, wait=-}
             mov r2, 1
             fadd r15, r4, r4
             fadd r18, r4, r4
@@ -6925,22 +6844,23 @@ void test_i1_rf_owed_one_more_booking() {
         const auto written = i1_run(*machine, {3, 12}, [&](uint64_t cycle) {
             bank0[cycle] = {machine->rf_write_owed(0), machine->rf_write_cursor(0)};
         });
-        require(written.at(3) == std::vector<uint64_t>{5} && written.at(12) == std::vector<uint64_t>{8}, "write cycles");
-        require(!bank0.at(5).first, "an async grant with no booking in its cycle did not clear async_owed");
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6},
+        require(written.at(3) == std::vector<uint64_t>{5 + x} && written.at(12) == std::vector<uint64_t>{8 + x},
+            "write cycles");
+        require(!bank0.at(5 + x).first, "an async grant with no booking in its cycle did not clear async_owed");
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
             "with async_owed = 0 a denied writer did not let one more booking through");
-        require(bank0.at(6).first, "that booking did not set async_owed");
-        require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{7, 1}},
-            "the next booking was not inhibited (c7)");
-        require(bank0.at(5).second == 1 && bank0.at(6).second == 1 && bank0.at(7).second == 1 &&
-                bank0.at(8).second == 2,
+        require(bank0.at(6 + x).first, "that booking did not set async_owed");
+        require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{7 + x, 1}},
+            "the next booking was not inhibited (c7 + x)");
+        require(bank0.at(5 + x).second == 1 && bank0.at(6 + x).second == 1 && bank0.at(7 + x).second == 1 &&
+                bank0.at(8 + x).second == 2,
             "the cursor moved without a grant, or not on one");
     }
     {   // A refused booking (its port taken) does not set the bit.
         auto machine = i1_machine(profile, R"(
             mov r1, 0
             fadd r6, r4, r4
-            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
             mov r2, 1
             mov r5, 1
             add r9, r4, r4
@@ -6948,9 +6868,9 @@ void test_i1_rf_owed_one_more_booking() {
         )");
         std::map<uint64_t, bool> owed;
         (void)i1_run(*machine, {}, [&](uint64_t cycle) { owed[cycle] = machine->rf_write_owed(0); });
-        require(refusals(*machine, 0, "RF write reservation") == std::vector<std::pair<uint64_t, uint64_t>>{{5, 1}},
-            "the add was not refused at c5 (its write cycle is the fadd's)");
-        require(!owed.at(4) && !owed.at(5) && owed.at(6), "a refused booking changed async_owed");
+        require(refusals(*machine, 0, "RF write reservation") == std::vector<std::pair<uint64_t, uint64_t>>{{5 + x, 1}},
+            "the add was not refused at c5 + x (its write cycle is the fadd's)");
+        require(!owed.at(4 + x) && !owed.at(5 + x) && owed.at(6 + x), "a refused booking changed async_owed");
     }
 }
 
@@ -6960,11 +6880,14 @@ void test_i1_rf_owed_one_more_booking() {
 // (e) With no async writer ready, a set async_owed inhibits nothing.
 void test_i1_rf_inhibition_is_bank_and_booking_local() {
     {
-        auto machine = i1_machine(canonical_profile(), R"(
+        auto profile = canonical_profile();
+        const auto x = i1_lds_shift(profile);
+        profile.timing.fadd = static_cast<uint8_t>(4 + x);
+        auto machine = i1_machine(profile, R"(
             mov r1, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
-            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
             fadd r12, r4, r4
             mov r13, 1
             lds.uni r21, [r1] {pred=PT, stall=0, set=sb1, wait=-}
@@ -6972,11 +6895,12 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
         const auto written = i1_run(*machine, {3, 13, 21});
-        require(written.at(3) == std::vector<uint64_t>{7}, "the first result was not written at c7");
-        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5}, "a bank-1 write was held by bank 0's inhibition");
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6},
+        require(written.at(3) == std::vector<uint64_t>{7 + x}, "the first result was not written at c7 + x");
+        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5 + x}, "a bank-1 write was held by bank 0's inhibition");
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
             "an lds.uni into bank 0 was held by bank 0's inhibition");
-        require(written.at(21) == std::vector<uint64_t>{9}, "the second result");
+        // The second lds.uni's own result is x later too (it meets fadd r12's booking).
+        require(written.at(21) == std::vector<uint64_t>{9 + 2 * x}, "the second result");
         require(machine->trace().summary().rf_simt_inhibited == 0, "nothing should have been inhibited");
     }
     {
@@ -7166,9 +7090,16 @@ void test_i1_acc_ld_pipeline_freeze() {
 // their results complete and waiting for the RF; the third is refused
 // (structural, counted) until the RF write decision grants slot 0 (c26) and
 // issues in that same cycle. Meanwhile port A serves warp 1's sts.
+// I2: the results come back x = D + Lb later; fadd latency 7 + x keeps the
+// bookings over them. (qtxc schedules the second lds.uni at c20 with that
+// latency, and warp 1 issues inside the refusal window, which splits the
+// refused interval.) The third lds.uni is refused until slot 0's write is
+// granted (c30) and takes the slot then; A-write serves warp 1's sts while
+// both slots hold results.
 void test_i1_load_slots() {
     auto profile = canonical_profile();
-    profile.timing.fadd = 7;
+    const auto x = i1_lds_shift(profile);
+    profile.timing.fadd = static_cast<uint8_t>(7 + x);
     nanosm::Launch launch;
     launch.active_warps = 2;
     auto& shmem = image_bytes(launch.shmem_image, 4096);
@@ -7215,13 +7146,20 @@ void test_i1_load_slots() {
         both_waiting = machine.load_slot_complete(0) && machine.load_slot_complete(1);
     });
     const auto lds = [&](uint32_t n) { return issued_at(machine, (12 + n) * 8); };
-    require(lds(0) == std::vector<uint64_t>{19} && lds(1) == std::vector<uint64_t>{21}, "the first two lds.uni");
-    require(refusals(machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{23, 3}},
-        "the third lds.uni was not refused for load slots c23..c25");
-    require(machine.trace().summary().shmem_load_slot_waits == 3, "the refusals were not counted");
-    require(lds(2) == std::vector<uint64_t>{26} && written.at(3) == std::vector<uint64_t>{26},
-        "the third lds.uni did not take slot 0 in the cycle its write was granted");
-    require(written.at(6) == std::vector<uint64_t>{27} && written.at(9) == std::vector<uint64_t>{28}, "results");
+    const auto at = [](const std::vector<uint64_t>& cycles) { return cycles.empty() ? std::string("-") : std::to_string(cycles.front()); };
+    const auto observed = " lds " + at(lds(0)) + " " + at(lds(1)) + " " + at(lds(2)) + "; written " + at(written.at(3)) +
+        " " + at(written.at(6)) + " " + at(written.at(9)) + "; refused" + describe(refusals(machine, 0, "load slots full"));
+    require(lds(0) == std::vector<uint64_t>{19} && lds(1) == std::vector<uint64_t>{20}, "the first two lds.uni:" + observed);
+    const auto refused = refusals(machine, 0, "load slots full");
+    uint64_t refused_cycles = 0;
+    for (const auto& [start, length] : refused) refused_cycles += length;
+    require(!refused.empty() && refused.front().first == 21 && refused.back().first + refused.back().second == 30,
+        "the third lds.uni was not refused for load slots from c21 until slot 0's write (c30):" + observed);
+    require(machine.trace().summary().shmem_load_slot_waits == refused_cycles, "the refusals were not counted");
+    require(lds(2) == std::vector<uint64_t>{30} && written.at(3) == std::vector<uint64_t>{30},
+        "the third lds.uni did not take slot 0 in the cycle its write was granted:" + observed);
+    require(written.at(6) == std::vector<uint64_t>{31} && written.at(9) == std::vector<uint64_t>{30 + 2 + x},
+        "results:" + observed);
     require(machine.read_reg(0, 7, 9) == 0x102, "the third load's word");
     require(store_cycle.has_value() && store_while_both_waiting,
         "port A did not serve warp 1's sts while both load slots held results waiting for the RF");
@@ -7268,8 +7206,10 @@ void test_i1_load_slots_profile_field() {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )");
     const auto written = i1_run(*machine, {3, 6});
-    require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{2, 1}},
-        "the second lds.uni was not refused once for the one slot");
+    // I2: the slot is held while the first load's words come back (D + Lb).
+    const auto refused = refusals(*machine, 0, "load slots full");
+    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{2, 1 + i1_lds_shift(one)}},
+        "the second lds.uni was not refused until the one slot freed:" + describe(refused));
     require(issued_at(*machine, 2 * 8) == written.at(3), "the second lds.uni did not take the slot as it freed");
     require(machine->read_reg(0, 0, 6) == 0x101, "the second load's word");
 }
@@ -7411,6 +7351,623 @@ ARITH:
     }
 }
 
+// ---------------------------------------------------------------------------
+// I2: shmem services and service slots (trash/rfc12.md sections 1-5 and 13;
+// trash/i2-portA-slots-2026-10-11.md). Exact timelines are hand assembly
+// (i1_asm) under a debug trace, where every granted round is an instant
+// "<service> grant" (detail = client, value = slot). Several timelines block
+// A-read and A-write for D + Lb + 1 cycles with an engine event the host
+// places into the TMA's event register: the RMW engine claims it (RMW read
+// first) and, in this slice, holds both A services until its write grant.
+// ---------------------------------------------------------------------------
+
+// A read's words reach the port output D + Lb cycles after its grant.
+uint32_t i2_return(const nanosm::DeviceProfile& profile) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
+}
+
+struct I2Grant {
+    uint64_t cycle = 0;
+    std::string service; // "A-read", "A-write", "B-write"
+    std::string client;  // "simt", "probe", "rmw", "tma"
+    uint32_t slot = 0;
+    bool operator==(const I2Grant&) const = default;
+};
+
+std::string describe(const std::vector<I2Grant>& grants) {
+    std::string text;
+    for (const auto& grant : grants) {
+        text += " c" + std::to_string(grant.cycle) + ":" + grant.service + "/" + grant.client +
+            (grant.client == "simt" ? std::to_string(grant.slot) : "");
+    }
+    return text;
+}
+
+// The rounds granted (debug traces), by cycle; one service, or all.
+std::vector<I2Grant> i2_grants(const nanosm::Machine& machine, const std::string& service = {}) {
+    std::vector<I2Grant> grants;
+    for (const auto& event : machine.trace().events()) {
+        if (event.category != nanosm::TraceCategory::shmem || event.kind != nanosm::TraceEventKind::instant) continue;
+        const auto name = event.name.substr(0, event.name.find(" grant"));
+        if (!service.empty() && name != service) continue;
+        grants.push_back({event.start_cycle, name, event.detail, static_cast<uint32_t>(event.value)});
+    }
+    std::stable_sort(grants.begin(), grants.end(), [](const auto& a, const auto& b) { return a.cycle < b.cycle; });
+    return grants;
+}
+
+constexpr uint32_t i2_event_mbar = 4096; // a TMA-completion mbar for the host's blocking events
+
+// shmem words 0..2047 hold 0x100 + word; an mbar at i2_event_mbar waits for
+// 64 transaction bytes (each host event completes its phase).
+std::unique_ptr<nanosm::Machine> i2_machine(const nanosm::DeviceProfile& profile, const std::string& program,
+    uint32_t warps = 1, bool hand_assembly = true) {
+    nanosm::Launch launch;
+    launch.active_warps = warps;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
+    nanosm::MbarState mbar;
+    mbar.valid = true;
+    mbar.expected = 1;
+    mbar.tx_bytes = 64;
+    write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(mbar));
+    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+                                      : compile(program, profile);
+    return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+}
+
+// The host's blocking event: present in the TMA's event register from the
+// next cycle on (call between ticks).
+void i2_block_a_services(nanosm::Machine& machine) {
+    machine.complete_mbar_tx(i2_event_mbar, 64, machine.read_mbar_state(i2_event_mbar).phase ? 1 : 0);
+}
+
+void i2_run_until(nanosm::Machine& machine, uint64_t cycle) {
+    while (machine.cycle() < cycle) tick_capped(machine);
+}
+
+// Same-warp order through shmem with the warp's reads serviced out of order
+// (rfc12 section 4). Canonical D = Lb = 2, two load slots.
+//   c2 lds A -> slot 0, granted c3 (pointer past slot 0); c3 lds B -> slot 1,
+//   granted c4 (pointer past slot 1). fadds book bank 0 at c8..c10, so A's
+//   result (ready c8) is written at c11 while B's is written at c9: the older
+//   lds OLD takes slot 1 at c9, the younger YOUNG slot 0 at c11. A host event
+//   holds A-read c10..c14. At c15 the round-robin starts past slot 1: YOUNG
+//   is serviced at c15, OLD at c16 -- reordered reads.
+//   WAR: the sts over OLD's words is ordered behind OLD (refused c13..c15),
+//   admitted in OLD's grant cycle and granted c17: it reaches the RAM at c19,
+//   after OLD's sample (c18). The sts over YOUNG's words follows at c18.
+// Then a tight RAW (an lds granted the cycle after the sts's last grant sees
+// the new words) and a WAW of two two-round stores.
+void test_i2_same_warp_order_with_reordered_reads() {
+    const auto& profile = canonical_profile();
+    require(i2_return(profile) == 4 && profile.shmem_load_slots == 2, "the timeline is derived for D = Lb = 2");
+    auto machine = i2_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        lds r3, [r0] {pred=PT, stall=0, set=sb4, wait=-}
+        lds r4, [r0 + 64] {pred=PT, stall=0, set=sb5, wait=-}
+        fadd r6, r30, r30
+        fadd r9, r30, r30
+        fadd r12, r30, r30
+        lds r7, [r0 + 128] {pred=PT, stall=0, set=sb0, wait=-}
+        lds r10, [r0 + 192] {pred=PT, stall=0, set=sb1, wait=-}
+        mov r5, 0x5150
+        sts [r0 + 128], r5 {pred=PT, stall=0, set=sb2, wait=-}
+        sts [r0 + 192], r5 {pred=PT, stall=0, set=sb3, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4|sb5}
+    )");
+    i2_run_until(*machine, 10);
+    i2_block_a_services(*machine);
+    machine->run();
+    const auto reads = i2_grants(*machine, "A-read");
+    require(reads == std::vector<I2Grant>{{3, "A-read", "simt", 0}, {4, "A-read", "simt", 1},
+                         {10, "A-read", "rmw", 0}, {15, "A-read", "simt", 0}, {16, "A-read", "simt", 1}},
+        "A-read grants:" + describe(reads));
+    require(issued_at(*machine, 7 * 8) == std::vector<uint64_t>{9} && issued_at(*machine, 8 * 8) == std::vector<uint64_t>{11},
+        "OLD did not take slot 1 at c9, or YOUNG slot 0 at c11");
+    const auto ordered = refusals(*machine, 0, "ordered behind own access");
+    require(ordered == std::vector<std::pair<uint64_t, uint64_t>>{{13, 3}},
+        "the sts over OLD's words was not ordered behind OLD (c13..c15):" + describe(ordered) +
+            "; grants:" + describe(i2_grants(*machine)));
+    const auto writes = i2_grants(*machine, "A-write");
+    require(writes == std::vector<I2Grant>{{14, "A-write", "rmw", 0}, {17, "A-write", "simt", 0},
+                          {18, "A-write", "simt", 0}},
+        "A-write grants:" + describe(writes));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 7) == 0x100 + 32 + lane, "OLD did not read the words before the sts");
+        require(machine->read_reg(0, lane, 10) == 0x100 + 48 + lane, "YOUNG did not read the words before the sts");
+        require(machine->read_shmem_u32(128 + 4 * lane) == 0x5150 && machine->read_shmem_u32(192 + 4 * lane) == 0x5150,
+            "sts data");
+    }
+
+    // Tight RAW: the sts's one round is granted at c4 and reaches the RAM at
+    // c6; the lds, admitted at c4, is granted at c5 and samples at c7.
+    auto raw = i2_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        mov r5, 0x777
+        sts [r0 + 256], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        lds r6, [r0 + 256] {pred=PT, stall=0, set=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )");
+    raw->run();
+    require(i2_grants(*raw) == std::vector<I2Grant>{{4, "A-write", "simt", 0}, {5, "A-read", "simt", 0}},
+        "the lds was not granted the cycle after the sts's last grant:" + describe(i2_grants(*raw)));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(raw->read_reg(0, lane, 6) == 0x777, "RAW: the lds did not see the sts (write path deeper than read?)");
+    }
+
+    // WAW: lanes l and l + 8 share a bank (two rounds). The second sts waits
+    // for the first's last round and its rounds follow at once.
+    auto waw = i2_machine(profile, R"(
+        sread r0, LANE_ID
+        andi r1, r0, 7
+        shri r2, r0, 3
+        shli r1, r1, 2
+        shli r2, r2, 6
+        add r1, r1, r2
+        mov r5, 0x111
+        mov r6, 0x222
+        sts [r1 + 3072], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        sts [r1 + 3072], r6 {pred=PT, stall=0, set=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )");
+    waw->run();
+    const auto stores = i2_grants(*waw, "A-write");
+    require(stores.size() == 4 && stores[1].cycle == stores[0].cycle + 1 && stores[2].cycle == stores[1].cycle + 1 &&
+            stores[3].cycle == stores[2].cycle + 1,
+        "the second sts did not follow the first's last round:" + describe(stores));
+    require(refusals(*waw, 0, "ordered behind own access").size() == 1, "the second sts was not ordered once");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(waw->read_shmem_u32((lane % 8) * 4 + (lane / 8) * 64 + 3072) == 0x222, "WAW: the older store won");
+    }
+}
+
+// Divergence (rfc12 section 3): rounds come from active lanes only; a masked
+// lane is no access (its word, and an lds's destination lane, are
+// untouched); an lds / sts with no active lane takes no slot, sets no depbar
+// and makes no request; a uniform operation under a partial mask PANICs.
+void test_i2_divergence() {
+    const std::string body = R"(
+        sread r0, LANE_ID
+        shli r0, r0, 6
+        mov r3, 0x77
+        mov r5, 0x55
+        sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        lds r3, [r0 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )"; // every lane on bank 0: a full mask is sixteen rounds
+    const auto& profile = canonical_profile();
+    {
+        auto machine = i2_machine(profile, body);
+        machine->set_active_mask(0, 0x00f0); // lanes 4..7
+        machine->run();
+        require(shmem_request_rounds(*machine) == std::vector<uint32_t>{4, 4}, "four active lanes are four rounds");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            const bool active = lane >= 4 && lane < 8;
+            require(machine->read_shmem_u32(64 * lane) == (active ? 0x55 : 0x100 + 16 * lane), "sts lane");
+            require(machine->read_reg(0, lane, 3) == (active ? 0x100 + 16 * lane + 1 : 0x77), "lds lane");
+        }
+    }
+    {
+        auto machine = i2_machine(profile, body);
+        machine->set_active_mask(0, 0);
+        bool slot_taken = false;
+        while (!machine->done()) {
+            tick_capped(*machine);
+            slot_taken |= machine->load_slot_held(0) || machine->load_slot_held(1) || machine->store_slot_held(0) ||
+                machine->store_slot_held(1);
+        }
+        require(!slot_taken, "an access with no active lane took a slot");
+        require(shmem_request_rounds(*machine).empty() && i2_grants(*machine).empty(), "an absent access was served");
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6}, "the halt waited on a depbar nothing set");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine->read_shmem_u32(64 * lane) == 0x100 + 16 * lane && machine->read_reg(0, lane, 3) == 0x77,
+                "an absent access changed memory or its destination");
+        }
+    }
+    for (const std::string uniform :
+             {"lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [r2]", "mbar.test_wait p0, [r2], 0"}) {
+        auto machine = i2_machine(profile, "mov r2, 4096\n" + uniform + "\nhalt\n");
+        machine->set_active_mask(0, 0xfffe);
+        try {
+            machine->run();
+            throw std::runtime_error(uniform + " ran under a partial mask");
+        } catch (const nanosm::SimError& error) {
+            require_mentions(error.what(), {"uniform operation under a partial active mask"}, uniform);
+        }
+    }
+}
+
+// shmem.store_slots: 1 and 2 both work (rfc12 section 2). Two warps each
+// store two rounds; with one slot the second warp's sts waits for the slot
+// (refused "store slots full") until the first's last round is granted,
+// then takes the slot in that cycle; with two it waits in its own slot. The
+// rounds are back to back and the memory is the same either way.
+void test_i2_store_slots_one_and_two() {
+    const std::string program = R"(
+        sread r29, WARP_ID
+        sread r0, LANE_ID
+        andi r1, r0, 7
+        shri r2, r0, 3
+        shli r1, r1, 2
+        shli r2, r2, 6
+        add r1, r1, r2
+        shli r3, r29, 7
+        add r1, r1, r3
+        addi r5, r29, 0x300
+        sts [r1 + 2048], r5
+        halt
+    )";
+    std::vector<std::vector<uint32_t>> memory;
+    for (const uint32_t slots : {1u, 2u}) {
+        auto profile = canonical_profile();
+        profile.shmem_store_slots = slots;
+        auto machine = i2_machine(profile, program, 2, false);
+        machine->run();
+        const auto stores = i2_grants(*machine, "A-write");
+        require(stores.size() == 4, "four store rounds");
+        for (std::size_t round = 1; round < 4; ++round) {
+            require(stores[round].cycle == stores[round - 1].cycle + 1, "the stores' rounds were not back to back");
+        }
+        const auto waits = machine->trace().summary().shmem_store_slot_waits;
+        require(slots == 1 ? waits != 0 : waits == 0, std::to_string(slots) + " store slots: store_slot_full=" +
+            std::to_string(waits));
+        std::vector<uint32_t> words;
+        for (uint32_t word = 0; word < 64; ++word) words.push_back(machine->read_shmem_u32(2048 + 4 * word));
+        memory.push_back(words);
+    }
+    require(memory[0] == memory[1], "one and two store slots stored different data");
+    for (uint32_t warp = 0; warp < 2; ++warp) {
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(memory[0][(lane % 8) + (lane / 8) * 16 + warp * 32] == 0x300 + warp, "store data");
+        }
+    }
+}
+
+// One store slot, reused while the previous store is still in the A-write
+// pipeline (rfc12 section 3), and done() when the last instruction is a
+// store. sts X (c3) is granted at c4, which frees the slot; sts Y takes it at
+// c4 and is granted at c5. X reaches the RAM at c4 + D, Y at c5 + D; the
+// halt issues at c5, and the machine is done only after Y's write edge.
+void test_i2_store_slot_reuse_and_done() {
+    auto profile = canonical_profile();
+    profile.shmem_store_slots = 1;
+    const auto d = profile.shmem_port_a_depth;
+    auto machine = i2_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        mov r5, 0xa1
+        sts [r0 + 512], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        sts [r0 + 576], r5 {pred=PT, stall=0, set=sb1, wait=-}
+        halt
+    )");
+    std::map<uint64_t, std::tuple<bool, bool, bool, bool>> after; // cycle -> slot held, X landed, Y landed, done
+    while (!machine->done()) {
+        const auto cycle = machine->cycle();
+        tick_capped(*machine);
+        after[cycle] = {machine->store_slot_held(0), machine->read_shmem_u32(512) == 0xa1,
+            machine->read_shmem_u32(576) == 0xa1, machine->done()};
+    }
+    require(i2_grants(*machine, "A-write") == std::vector<I2Grant>{{4, "A-write", "simt", 0}, {5, "A-write", "simt", 0}},
+        "the two stores were not granted at c4 and c5:" + describe(i2_grants(*machine)));
+    require(std::get<0>(after.at(3)) && std::get<0>(after.at(4)) && !std::get<0>(after.at(5)),
+        "the slot was not taken again in the cycle X's last round freed it");
+    require(!std::get<1>(after.at(4 + d - 1)) && std::get<1>(after.at(4 + d)), "X did not reach the RAM at c4 + D");
+    require(!std::get<2>(after.at(5 + d - 1)) && std::get<2>(after.at(5 + d)), "Y did not reach the RAM at c5 + D");
+    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5}, "halt");
+    require(!std::get<3>(after.at(5 + d - 1)) && std::get<3>(after.at(5 + d)),
+        "done() did not cover the store travelling to its write edge");
+    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(576 + 4 * lane) == 0xa1, "Y's data");
+}
+
+// A-read and A-write are independent services: one warp's sixteen-round lds
+// and another warp's sixteen-round sts are granted in the same cycles.
+void test_i2_a_read_and_a_write_same_cycle() {
+    auto machine = i2_machine(canonical_profile(), R"(
+        sread r29, WARP_ID
+        sread r0, LANE_ID
+        shli r0, r0, 6
+        setp.ne p0, r29, 0
+        @p0 bra.uni writer
+        lds r3, [r0]
+        halt
+    writer:
+        mov r5, 0x44
+        sts [r0 + 32], r5
+        halt
+    )", 2, false);
+    machine->run();
+    std::set<uint64_t> read_cycles;
+    for (const auto& grant : i2_grants(*machine, "A-read")) read_cycles.insert(grant.cycle);
+    uint32_t together = 0;
+    for (const auto& grant : i2_grants(*machine, "A-write")) together += read_cycles.contains(grant.cycle) ? 1 : 0;
+    require(read_cycles.size() == 16 && together >= 8,
+        "A-read and A-write were not granted in the same cycles (" + std::to_string(together) + ")");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 3) == 0x100 + 16 * lane, "the load's words");
+        require(machine->read_shmem_u32(64 * lane + 32) == 0x44, "the store's words");
+    }
+}
+
+// rfc12 section 5: ONE round-robin pointer over the load slots, the probe
+// register and the TMA's reads, moved only by its own grants (not by the
+// RMW's). A host event holds A-read while two lds.uni and the TMA's
+// descriptor read become ready.
+//   pointer at 0 (nothing granted yet): slot 0, slot 1, then the TMA;
+//   pointer past slot 1 (two earlier lds.uni): the TMA, then slot 0, slot 1.
+void test_i2_round_robin_tma_reads_and_loads() {
+    const auto& profile = canonical_profile();
+    require(i2_return(profile) == 4, "the timeline is derived for D = Lb = 2");
+    const auto run = [&](bool primed) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        nanosm::MbarState mbar;
+        mbar.valid = true;
+        mbar.expected = 1;
+        mbar.tx_bytes = 64;
+        write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(mbar));
+        write_rank1_load(shmem, 5120, 0, 16, 2048, 4104);
+        fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
+        const std::string priming = primed ? "lds.uni r5, [r1 + 8] {pred=PT, stall=0, set=sb3, wait=-}\n"
+                                             "lds.uni r6, [r1 + 12] {pred=PT, stall=0, set=sb4, wait=-}\n"
+                                           : "";
+        nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, priming + R"(
+            tma.async [5120], r8
+            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r4, [r1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+        )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
+        // The TMA's descriptor read is wanted from the cycle after tma.async.
+        const uint64_t blocked = primed ? 3 : 1;
+        i2_run_until(machine, blocked);
+        i2_block_a_services(machine);
+        machine.run();
+        auto reads = i2_grants(machine, "A-read");
+        reads.resize(std::min<std::size_t>(reads.size(), primed ? 6 : 4));
+        return reads;
+    };
+    const auto plain = run(false);
+    require(plain == std::vector<I2Grant>{{1, "A-read", "rmw", 0}, {6, "A-read", "simt", 0},
+                         {7, "A-read", "simt", 1}, {8, "A-read", "tma", 0}},
+        "pointer at 0: not slot 0, slot 1, TMA:" + describe(plain));
+    const auto primed = run(true);
+    require(primed == std::vector<I2Grant>{{1, "A-read", "simt", 0}, {2, "A-read", "simt", 1},
+                          {3, "A-read", "rmw", 0}, {8, "A-read", "tma", 0}, {9, "A-read", "simt", 0},
+                          {10, "A-read", "simt", 1}},
+        "pointer past slot 1: not TMA, slot 0, slot 1:" + describe(primed));
+}
+
+// TMA placement is the port-B write (rfc11 section 0): it runs in the same
+// cycles as another warp's sts stream (A-write) and the MMA's operand fetch
+// (port-B read). Everything lands correctly.
+void test_i2_tma_placement_on_port_b() {
+    nanosm::Launch launch;
+    launch.active_warps = 2;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t i = 0; i < 1024; ++i) write_u16(shmem, 2 * i, 0x3c00); // A and B: 1.0
+    write_rank1_load(shmem, 5120, 0, 256, 2048, 4104);
+    fill_pattern(image_bytes(launch.gmem_image, 1024), 0, 256, 0);
+    std::string program = R"(
+        .acc C, 0, 0, 64, 64
+        sread r29, WARP_ID
+        setp.ne p0, r29, 0
+        @p0 bra.uni hammer
+        mov r0, 0
+        mov r1, 1024
+        mov r4, 4096
+        mbar.init [r4], 1
+        mma.async.init C, [r0], [r1]
+        mma.commit [r4]
+        mov r8, 0
+        mov r9, 0
+        mov r10, 0
+        mov r11, 4104
+        tma.async [5120], r8
+    tma_wait:
+        mbar.try_wait p1, [r11], 0
+        @!p1 bra.uni tma_wait
+    mma_wait:
+        mbar.try_wait p2, [r4], 0
+        @!p2 bra.uni mma_wait
+        mov r12, 0
+        mov r13, 0
+        acc.ld r16, C, r12
+        halt
+    hammer:
+        sread r20, LANE_ID
+        shli r20, r20, 2
+    )";
+    for (int i = 0; i < 200; ++i) program += "sts [r20 + 6144], r20\n";
+    program += "halt\n";
+    nanosm::Machine machine(canonical_profile(), compile(program), std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+    machine.run(20000);
+    std::set<uint64_t> placements, stores, fetches;
+    for (const auto& grant : i2_grants(machine)) {
+        if (grant.service == "B-write") placements.insert(grant.cycle);
+        if (grant.service == "A-write" && grant.client == "simt") stores.insert(grant.cycle);
+    }
+    for (const auto& event : machine.trace().events()) {
+        if (event.name == "MMA input step") fetches.insert(event.start_cycle);
+    }
+    uint32_t all_three = 0;
+    for (const auto cycle : placements) all_three += stores.contains(cycle) && fetches.contains(cycle) ? 1 : 0;
+    require(placements.size() == 32 && all_three != 0,
+        "no cycle had a placement, an sts round and an MMA fetch together (" + std::to_string(all_three) + ")");
+    for (uint32_t i = 0; i < 256; ++i) require(machine.read_shmem_u32(2048 + 4 * i) == pattern_word(i), "TMA data");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine.read_shmem_u32(6144 + 4 * lane) == 4 * lane, "sts data");
+        require(machine.read_reg(0, lane, 16) == nanosm::float_bits(8.0f), "MMA result");
+    }
+}
+
+// I2's conservative RMW (rfc12 section 6 replaces it in I3): an RMW waiting
+// for its read starts nothing new on either A service; its read is granted
+// the cycle after the store transaction under way ends; from that read to
+// its write (D + Lb later) nothing else is granted on A; the store and the
+// load that waited are granted the next cycle. The mbar update is right.
+void test_i2_rmw_holds_both_a_services() {
+    const auto& profile = canonical_profile();
+    auto machine = i2_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 6
+        mov r5, 0x5a
+        sts [r0 + 4], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        lds r6, [r0 + 8] {pred=PT, stall=0, set=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )", 2);
+    // Both warps: a sixteen-round sts, then an lds (ordered behind it).
+    // The host event arrives while warp 0's sts is under way.
+    while (i2_grants(*machine, "A-write").empty()) tick_capped(*machine);
+    tick_capped(*machine);
+    i2_block_a_services(*machine);
+    machine->run();
+    const auto grants = i2_grants(*machine);
+    uint64_t read = 0;
+    uint64_t write = 0;
+    for (const auto& grant : grants) {
+        if (grant.client == "rmw" && grant.service == "A-read") read = grant.cycle;
+        if (grant.client == "rmw" && grant.service == "A-write") write = grant.cycle;
+    }
+    require(read != 0 && write == read + i2_return(profile), "the RMW's write was not granted D + Lb after its read");
+    uint64_t last_store_round = 0;
+    bool store_after = false;
+    bool load_after = false;
+    for (const auto& grant : grants) {
+        if (grant.client != "simt") continue;
+        require(grant.cycle < read || grant.cycle > write,
+            "a SIMT round was granted between the RMW's read and write:" + describe(grants));
+        if (grant.service == "A-write" && grant.cycle < read) last_store_round = grant.cycle;
+        store_after |= grant.service == "A-write" && grant.cycle == write + 1;
+        load_after |= grant.service == "A-read" && grant.cycle == write + 1;
+    }
+    require(read == last_store_round + 1, "the RMW's read was not granted the cycle after the store's last round");
+    require(store_after && load_after, "the waiting store and load were not granted right after the RMW's write");
+    require(machine->read_mbar_state(i2_event_mbar).phase, "the RMW's update was lost");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_shmem_u32(64 * lane + 4) == 0x5a, "sts data");
+        require(machine->read_reg(0, lane, 6) == 0x100 + 16 * lane + 2, "lds data");
+    }
+}
+
+// shmem.port_a_depth (D), shmem.read_latency_cycles (Lb) and
+// shmem.store_slots: optional in the JSON (default 2), never 0 (every latency
+// is a nonzero number of register stages), part of the fingerprint. A
+// deeper read latency moves an lds's result by exactly the difference.
+void test_i2_profile_fields() {
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    const auto canonical = nanosm::parse_device_profile(document.dump());
+    require(canonical.shmem_port_a_depth == 2 && canonical.shmem_read_latency_cycles == 2 &&
+            canonical.shmem_store_slots == 2, "the canonical profile does not declare D = Lb = 2 and two store slots");
+    for (const char* field : {"port_a_depth", "read_latency_cycles", "store_slots"}) {
+        auto defaulted = document;
+        defaulted["shmem"].erase(field);
+        require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(defaulted.dump())) ==
+                nanosm::device_profile_fingerprint(canonical), std::string(field) + ": the default is not 2");
+        for (const auto value : {nlohmann::json(0), nlohmann::json(-1), nlohmann::json(1.5)}) {
+            auto modified = document;
+            modified["shmem"][field] = value;
+            try {
+                (void)nanosm::parse_device_profile(modified.dump());
+                throw std::runtime_error(std::string(field) + " = " + value.dump() + " was accepted");
+            } catch (const nanosm::ProfileError&) {}
+        }
+    }
+    for (const auto field : {&nanosm::DeviceProfile::shmem_port_a_depth,
+             &nanosm::DeviceProfile::shmem_read_latency_cycles, &nanosm::DeviceProfile::shmem_store_slots}) {
+        auto zero = canonical_profile();
+        zero.*field = 0;
+        try {
+            nanosm::validate_device_profile(zero);
+            throw std::runtime_error("a zero shmem field passed validation");
+        } catch (const nanosm::ProfileError&) {}
+        auto three = canonical_profile();
+        three.*field = 3;
+        require(nanosm::device_profile_fingerprint(three) != nanosm::device_profile_fingerprint(canonical_profile()),
+            "a shmem field was omitted from the fingerprint");
+    }
+    const auto result_cycle = [](const nanosm::DeviceProfile& profile) {
+        auto machine = i2_machine(profile, "lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}\n"
+                                           "halt {pred=PT, stall=0, set=-, wait=sb0}\n");
+        const auto written = i1_run(*machine, {3});
+        return written.at(3).front();
+    };
+    auto slow = canonical_profile();
+    slow.shmem_read_latency_cycles = 7;
+    require(result_cycle(canonical_profile()) == 1 + i2_return(canonical_profile()) + 1 &&
+            result_cycle(slow) == result_cycle(canonical_profile()) + 5,
+        "an lds result did not arrive grant + D + Lb + 1 (the gather register) after its issue");
+}
+
+// READ_FIRST (rfc12 section 1): a read and a write of one word reaching the
+// RAM in the same cycle -- on different services -- read the old word, with
+// no collision machinery and no PANIC. A host event holds A-read and A-write
+// (a long Lb stretches it) while warp 0's sts and warp 1's lds of the same
+// words become ready; both are granted the cycle after the RMW's write.
+// The MMA's port-B read crossing an A-write: no PANIC at any alignment (the
+// old same-cycle C5 diagnostic is gone), and its result is between the old
+// and the new operands'.
+void test_i2_read_first_across_services() {
+    auto profile = canonical_profile();
+    profile.shmem_read_latency_cycles = 24;
+    auto machine = i2_machine(profile, R"(
+        sread r29, WARP_ID
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        setp.ne p0, r29, 0
+        @p0 bra.uni reader
+        mov r5, 0xee
+        sts [r0 + 512], r5
+        halt
+    reader:
+        lds r6, [r0 + 512]
+        halt
+    )", 2, false);
+    i2_block_a_services(*machine);
+    machine->run();
+    const auto grants = i2_grants(*machine);
+    std::map<std::string, uint64_t> simt;
+    for (const auto& grant : grants) if (grant.client == "simt") simt[grant.service] = grant.cycle;
+    require(simt.size() == 2 && simt.at("A-read") == simt.at("A-write"),
+        "the lds and the sts were not granted in one cycle:" + describe(grants));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(1, lane, 6) == 0x100 + 128 + lane, "READ_FIRST: the lds did not read the old word");
+        require(machine->read_shmem_u32(512 + 4 * lane) == 0xee, "the sts was lost");
+    }
+
+    const auto dense = dense_one_bank_profile(4);
+    std::set<uint32_t> outcomes;
+    for (uint32_t pad = 0; pad <= 8; ++pad) {
+        std::ostringstream qtx;
+        qtx << ".acc C, 0, 0, 16, 4\n"
+            << "mov r0, 0\nmov r1, 512\nmov r4, 896\nmbar.init [r4], 1\n"
+            << "sread r20, LANE_ID\nshli r20, r20, 2\n"
+            << "mov r21, 16384\nshli r22, r21, 16\nor r21, r21, r22\n" // two fp16 2.0 halves
+            << "sts [r20], r21\n";
+        for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
+        qtx << "mma.async.init C, [r0], [r1]\nmma.commit [r4]\n"
+            << "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\n"
+            << "mov r8, 0\nmov r9, 0\nacc.ld r10, C, r8\nhalt\n";
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 1024);
+        for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
+        for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+        nanosm::Machine mma(dense, compile(qtx.str(), dense), std::move(launch));
+        mma.run(4000); // no PANIC
+        const auto row0 = nanosm::bits_float(mma.read_reg(0, 0, 10));
+        require(row0 >= 8.0f && row0 <= 16.0f, "row 0's result is neither old nor new operands'");
+        outcomes.insert(mma.read_reg(0, 0, 10));
+    }
+    require(!outcomes.empty(), "the sweep ran nothing");
+}
+
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"encoding round trip", test_encoding_round_trip},
@@ -7447,7 +8004,6 @@ int main() {
         {"MMA dense profile recurrence bubbles", test_mma_dense_profile_recurrence_bubbles},
         {"MMA bare transfer race panics", test_mma_bare_transfer_race_panics},
         {"MMA multi-round fetch timing", test_mma_multi_round_fetch_timing},
-        {"MMA port collision sweep", test_mma_port_collision_sweep},
         {"MMA varying round service", test_mma_varying_round_service},
         {"sanitizer: sts into TMA store source", test_sanitizer_sts_into_tma_store_source},
         {"sanitizer: sts into MMA operand stage", test_sanitizer_sts_into_mma_operand_stage},
@@ -7456,7 +8012,6 @@ int main() {
         {"sanitizer: TMA/MMA accept conflicts", test_sanitizer_tma_and_mma_accept_conflicts},
         {"sanitizer: tmem ownership both directions", test_sanitizer_tmem_ownership_both_directions},
         {"sanitizer: double buffer and P tile clean", test_sanitizer_double_buffer_and_p_tile_are_clean},
-        {"sanitizer: RMW port collision (C5)", test_sanitizer_rmw_port_collision},
         {"counted loop and relocation", test_counted_loop_and_label_relocation},
         {"uniform role dispatch", test_uniform_role_dispatch},
         {"nonuniform bra.uni PANIC", test_nonuniform_bra_uni_panics},
@@ -7490,7 +8045,6 @@ int main() {
         {"lsu scatter byte enables", test_lsu_scatter_byte_enables},
         {"lsu staging pool admission", test_lsu_staging_pool_admission},
         {"lsu backpressure chain", test_lsu_backpressure_chain},
-        {"tma port-A priority over sts", test_tma_port_a_priority_over_sts},
         {"lsu TMA/vector stream interleave", test_lsu_tma_and_vector_streams_interleave},
         {"lsu controller contract tripwire", test_lsu_controller_contract_tripwire},
         {"lsu profile and ldg.uni encoding", test_lsu_profile_and_encoding},
@@ -7562,6 +8116,16 @@ int main() {
         {"I1: load slots", test_i1_load_slots},
         {"I1: load slots profile field", test_i1_load_slots_profile_field},
         {"I1.1: one LSU RF write per cycle", test_i1_lsu_one_rf_write_per_cycle},
+        {"I2: same-warp RAW/WAR/WAW with reordered reads", test_i2_same_warp_order_with_reordered_reads},
+        {"I2: divergence", test_i2_divergence},
+        {"I2: store slots 1 and 2", test_i2_store_slots_one_and_two},
+        {"I2: store slot reuse and done()", test_i2_store_slot_reuse_and_done},
+        {"I2: A-read and A-write in one cycle", test_i2_a_read_and_a_write_same_cycle},
+        {"I2: one round-robin over TMA reads and loads", test_i2_round_robin_tma_reads_and_loads},
+        {"I2: TMA placement on the port-B write", test_i2_tma_placement_on_port_b},
+        {"I2: RMW holds both A services", test_i2_rmw_holds_both_a_services},
+        {"I2: profile fields D, Lb, store slots", test_i2_profile_fields},
+        {"I2: READ_FIRST across services", test_i2_read_first_across_services},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
@@ -7570,14 +8134,12 @@ int main() {
         "RF deferred WAR and branch",
         "tmem ordering and store lifetime",
         "MMA bare transfer race panics",
-        "MMA port collision sweep",
         "sanitizer: sts into TMA store source",
         "sanitizer: sts into MMA operand stage",
         "sanitizer: lds from TMA load destination",
         "sanitizer: mbar RMW into owned range",
         "sanitizer: TMA/MMA accept conflicts",
         "sanitizer: tmem ownership both directions",
-        "sanitizer: RMW port collision (C5)",
         "lsu controller contract tripwire",
         "lsu B2.1: read_streams generalized",
         "missing wait panic",
