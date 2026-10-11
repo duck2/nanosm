@@ -483,7 +483,11 @@ std::string TraceRecorder::summary_text() const {
     }
     out << "shmem: requests=" << summary_.shmem_requests
         << " rounds=" << summary_.shmem_rounds
-        << " tma_priority_waits=" << summary_.shmem_tma_priority_waits << '\n';
+        << " tma_priority_waits=" << summary_.shmem_tma_priority_waits
+        << " load_slot_full=" << summary_.shmem_load_slot_waits << '\n';
+    out << "rf: async_writes=" << summary_.rf_async_writes
+        << " async_waits=" << summary_.rf_async_waits
+        << " simt_inhibited=" << summary_.rf_simt_inhibited << '\n';
     out << "mbar: rmw=" << summary_.mbar_rmw_requests
         << " phase_changes=" << summary_.mbar_phase_changes
         << " probes=" << summary_.mbar_initial_probes

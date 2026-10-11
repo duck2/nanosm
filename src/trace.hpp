@@ -75,6 +75,15 @@ struct TraceSummary {
     // Warp-cycles a SIMT port-A op (lds/sts/mbar) was held off because the
     // TMA had a port-A request waiting (TMA priority on the next free grant).
     uint64_t shmem_tma_priority_waits = 0;
+    // Warp-cycles an lds / lds.uni was refused because every load slot was held.
+    uint64_t shmem_load_slot_waits = 0;
+    // The RF write decision (rfc10 section 3): vector beats written by async
+    // holders (load slots, LSU assemblies, acc.ld pipelines); holder-cycles a
+    // ready holder was not granted; warp-cycles a SIMT instruction was refused
+    // because its result bank was inhibited (async service owed).
+    uint64_t rf_async_writes = 0;
+    uint64_t rf_async_waits = 0;
+    uint64_t rf_simt_inhibited = 0;
     uint64_t mbar_rmw_requests = 0;
     uint64_t mbar_phase_changes = 0;
     // Cycles an engine's held mbar event (TMA complete_tx / MMA commit arrive)
@@ -165,6 +174,10 @@ public:
     void mbar_timeout(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
 
     void shmem_tma_priority_wait() { ++summary_.shmem_tma_priority_waits; }
+    void shmem_load_slot_wait() { ++summary_.shmem_load_slot_waits; }
+    void rf_async_write() { ++summary_.rf_async_writes; }
+    void rf_async_wait() { ++summary_.rf_async_waits; }
+    void rf_simt_inhibited() { ++summary_.rf_simt_inhibited; }
     // One event per LSU command (gmem commands track): admit .. completion,
     // its phases and stall reasons in the detail. No per-word events.
     void lsu_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, std::string name);

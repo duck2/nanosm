@@ -85,9 +85,20 @@ public:
     void check_rf_raw(const IssueSite& site, const std::vector<uint8_t>& sources) const;
     void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width) const;
 
+    // ---- admission reads no operand (rfc10 section 1) ----
+    // Every issue attempt opens with record_issue_attempt; record_issue_accepted
+    // marks the moment admission has decided. Issue captures an operand only
+    // after that: a capture in an attempt not (yet) accepted is an internal
+    // PANIC (a refused attempt must consume nothing).
+    void record_issue_attempt(uint32_t warp);
+    void record_issue_accepted();
+    void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;
+
     // ---- declared uniformity (rfc09 pin 3) ----
-    // lds.uni's address register must hold one value in every lane (UB
-    // otherwise: hardware reads lane 0 only). lane_values: that register, by lane.
+    // A declared-uniform operand (lds.uni / ldg.uni / ldg.v8 / stg.v8 bases,
+    // engine and mbar operands, accumulator coordinates, the bra.uni
+    // predicate) must hold one value in every lane. Hardware reads lane 0
+    // only; anything else is UB, diagnosed here. lane_values: the operand, by lane.
     void check_warp_uniform(
         const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const;
 
@@ -121,10 +132,12 @@ public:
     void record_acc_transfer_accept(
         const IssueSite& site, uint8_t bank, bool load, uint8_t accumulator,
         uint32_t row, uint32_t col, uint32_t width, uint8_t depbar);
-    // The transfer in slot [bank][load ? 0 : 1] made its final beat. A store's
-    // ownership ends now; a load's when its final RF write commits.
-    void record_acc_transfer_final_beat(uint8_t bank, bool load, uint64_t commit_cycle);
-    void record_writebacks_committed(uint64_t cycle);
+    // The transfer in slot [bank][load ? 0 : 1] made its final tmem access. A
+    // store's ownership ends now; a load's when its final beat is written to
+    // the RF (record_acc_ld_final_write: the beats of one tmem bank's acc.ld
+    // pipeline reach the RF in launch order).
+    void record_acc_transfer_final_beat(uint8_t bank, bool load);
+    void record_acc_ld_final_write(uint8_t bank);
 
     // ---- C5: port-A write vs same-cycle MMA port-B read of one word ----
     void record_port_a_write(uint64_t byte_address, uint32_t size);
@@ -205,11 +218,6 @@ private:
         uint32_t received = 0; // bytes plucked
     };
 
-    struct PendingAccLoadRelease {
-        uint64_t id = 0;
-        uint64_t commit_cycle = 0;
-    };
-
     [[nodiscard]] const ShmemOwner* shmem_owner_overlapping(
         uint64_t begin, uint64_t end, bool writers_only) const;
     [[nodiscard]] std::string describe_shmem_owner(const ShmemOwner& owner) const;
@@ -234,8 +242,14 @@ private:
     std::vector<TmemOwner> tmem_owners_;
     uint64_t next_acc_transfer_id_ = 0;
     std::vector<std::array<std::optional<uint64_t>, 2>> acc_transfer_in_slot_; // [bank][0 load, 1 store]
-    std::vector<PendingAccLoadRelease> pending_acc_ld_releases_;
+    // Per tmem bank: acc.ld transfers whose last beat has launched, oldest
+    // first; each is released when its final beat is written to the RF.
+    std::vector<std::deque<uint64_t>> acc_ld_awaiting_final_write_;
     std::vector<WarpHazards> warps_;
+    // The issue attempt in progress (record_issue_attempt) and whether
+    // admission has accepted it.
+    std::optional<uint32_t> attempt_warp_;
+    bool attempt_accepted_ = false;
     std::vector<uint32_t> port_a_written_words_; // this cycle
     // Registers written this tick and their first writer's tag.
     std::vector<std::pair<uint32_t, const char*>> register_writes_;
@@ -259,6 +273,9 @@ public:
     NANOSM_SANITIZER_NOOP(check_pred_raw)
     NANOSM_SANITIZER_NOOP(check_rf_raw)
     NANOSM_SANITIZER_NOOP(check_rf_waw_war)
+    NANOSM_SANITIZER_NOOP(record_issue_attempt)
+    NANOSM_SANITIZER_NOOP(record_issue_accepted)
+    NANOSM_SANITIZER_NOOP(check_issue_capture)
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
@@ -274,7 +291,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_acc_transfer_overlap)
     NANOSM_SANITIZER_NOOP(record_acc_transfer_accept)
     NANOSM_SANITIZER_NOOP(record_acc_transfer_final_beat)
-    NANOSM_SANITIZER_NOOP(record_writebacks_committed)
+    NANOSM_SANITIZER_NOOP(record_acc_ld_final_write)
     NANOSM_SANITIZER_NOOP(record_port_a_write)
     NANOSM_SANITIZER_NOOP(check_port_b_round)
     NANOSM_SANITIZER_NOOP(record_register_write)

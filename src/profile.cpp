@@ -28,6 +28,7 @@ json profile_json(const DeviceProfile& p) {
         {"shmem", {
             {"bytes", p.shmem_bytes},
             {"banks", p.shmem_banks},
+            {"load_slots", p.shmem_load_slots},
         }},
         {"tmem", {
             {"banks", p.tmem_banks},
@@ -97,6 +98,9 @@ T field(const json& object, const char* name) {
 void validate_device_profile(const DeviceProfile& p) {
     if (p.rf_arithmetic_read_cycles == 0 || p.rf_arithmetic_read_cycles > 32) {
         throw ProfileError("device profile: arithmetic RF read window must be in 1..32 cycles");
+    }
+    if (p.shmem_load_slots == 0) {
+        throw ProfileError("device profile: shmem load slots must be at least 1");
     }
     if (p.sfu_lanes == 0 || p.sfu_lanes > p.lanes) {
         throw ProfileError("device profile: sfu lanes must be in 1..lanes");
@@ -202,6 +206,13 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& shmem = document.at("shmem");
     p.shmem_bytes = field<uint32_t>(shmem, "bytes");
     p.shmem_banks = field<uint32_t>(shmem, "banks");
+    if (shmem.contains("load_slots")) {
+        const auto& value = shmem.at("load_slots");
+        if (!value.is_number_unsigned() || value < 1 || value > 1024) {
+            throw ProfileError("device profile: shmem load_slots must be an integer in 1..1024");
+        }
+        p.shmem_load_slots = value.get<uint32_t>();
+    }
     const auto& tmem = document.at("tmem");
     p.tmem_banks = field<uint32_t>(tmem, "banks");
     p.tmem_words_per_bank = field<uint32_t>(tmem, "words_per_bank");

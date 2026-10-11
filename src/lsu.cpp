@@ -435,18 +435,14 @@ void Machine::deliver_write_acks(Wires& w) {
 // 2. LSU admission and request generation
 // ---------------------------------------------------------------------------
 
-bool Machine::is_lsu(Opcode opcode) {
-    return opcode == Opcode::ldg || opcode == Opcode::stg || opcode == Opcode::ldg_v8 ||
-        opcode == Opcode::stg_v8 || opcode == Opcode::ldg_uni;
-}
-
 bool Machine::is_store(LsuKind kind) {
     return kind == LsuKind::vector_store || kind == LsuKind::scalar_store;
 }
 
-// Decode and check an LSU instruction's addresses at issue. Contract
-// violations panic here: a non-uniform or misaligned vector/uniform base,
-// a misaligned or out-of-bounds lane, two lanes storing one word.
+// Capture and check an accepted LSU instruction's addresses. Contract
+// violations panic here: a misaligned vector/uniform base, a misaligned or
+// out-of-bounds lane, two lanes storing one word (and, in the sanitizer, a
+// non-uniform vector/uniform base: hardware uses lane 0's).
 Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instruction& inst) const {
     LsuCommand command;
     command.warp = warp.id;
@@ -484,8 +480,9 @@ Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instructio
         command.kind = load ? LsuKind::scalar_load : LsuKind::scalar_store;
         command.reg = load ? inst.dst : inst.src1;
         std::set<uint64_t> stored_words;
+        const auto bases = capture(warp, inst.src0);
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            const auto address = checked_address(rf(warp, lane, inst.src0));
+            const auto address = checked_address(bases[lane]);
             if (address % 4 != 0) panic(warp, inst, "unaligned 32-bit gmem access");
             if (address > gmem_.size() || gmem_.size() - address < 4) {
                 panic(warp, inst, "gmem access out of bounds");
@@ -748,7 +745,7 @@ bool Machine::pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t
     const auto* command = find_lsu_command(record.command);
     if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(record.command));
     const auto& start = staging_.at(command->assembly).cur();
-    const bool drained = w.lsu_drain.command == command->id;
+    const bool drained = w.rf_write.granted_to(AsyncWriter::assembly, command->assembly);
     const auto lane_valid = [&](uint32_t lane) {
         if (!drained && start.valid[lane] != 0) return true;
         return std::any_of(pluck.lanes.begin(), pluck.lanes.end(), [&](const IngressPluck::LaneWrite& write) {
@@ -812,8 +809,8 @@ void Machine::note_first_return(uint64_t command) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. RF read stage (vector stores). The RF write stage (assembly -> RF) is
-// the RF write port's first booking: decide_lsu_rf_drain in sim.cpp.
+// 4. RF read stage (vector stores). The RF write stage (assembly -> RF) is a
+// client of the RF write decision: decide_rf_writes in sim.cpp.
 // ---------------------------------------------------------------------------
 
 // RF -> assembly (vector stores), after issue in RF read priority: one

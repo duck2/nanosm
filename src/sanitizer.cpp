@@ -55,6 +55,7 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         accumulator_shapes_.emplace_back(acc.rows, acc.cols);
     }
     acc_transfer_in_slot_.resize(config.tmem_banks);
+    acc_ld_awaiting_final_write_.resize(config.tmem_banks);
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
     for (auto& warp : warps_) {
@@ -67,6 +68,32 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
 void Sanitizer::record_cycle_start() {
     port_a_written_words_.clear();
     register_writes_.clear();
+    attempt_warp_.reset();
+    attempt_accepted_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// Admission reads no operand (rfc10 section 1). Issue decides from metadata
+// and resource state, then captures operands; the machine's admission
+// functions cannot see the RF at all, and this tripwire catches a capture
+// placed before the decision.
+// ---------------------------------------------------------------------------
+
+void Sanitizer::record_issue_attempt(uint32_t warp) {
+    attempt_warp_ = warp;
+    attempt_accepted_ = false;
+}
+
+void Sanitizer::record_issue_accepted() {
+    if (!attempt_warp_.has_value()) throw SimError("internal sanitizer: issue accepted without an attempt");
+    attempt_accepted_ = true;
+}
+
+void Sanitizer::check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const {
+    if (attempt_warp_ == warp && attempt_accepted_) return;
+    throw SimError("internal sanitizer: cycle " + std::to_string(cycle) + ": warp " + std::to_string(warp) +
+        " read " + (predicate ? "p" : "r") + std::to_string(reg) +
+        " in an issue attempt that admission had not accepted (a refused attempt must read nothing)");
 }
 
 // ---------------------------------------------------------------------------
@@ -132,8 +159,9 @@ void Sanitizer::check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned wi
 }
 
 // ---------------------------------------------------------------------------
-// Declared uniformity (rfc09 pin 3): hardware never compares lanes'
-// addresses; an lds.uni address that differs across lanes is UB, diagnosed here.
+// Declared uniformity (rfc09 pin 3): hardware never compares lanes; it reads
+// a declared-uniform operand from lane 0. One that differs across lanes is
+// UB, diagnosed here.
 // ---------------------------------------------------------------------------
 
 void Sanitizer::check_warp_uniform(
@@ -515,24 +543,23 @@ void Sanitizer::record_acc_transfer_accept(
     acc_transfer_in_slot_.at(bank)[load ? 0 : 1] = owner.id;
 }
 
-void Sanitizer::record_acc_transfer_final_beat(uint8_t bank, bool load, uint64_t commit_cycle) {
+void Sanitizer::record_acc_transfer_final_beat(uint8_t bank, bool load) {
     auto& slot = acc_transfer_in_slot_.at(bank)[load ? 0 : 1];
     if (!slot.has_value()) throw SimError("internal sanitizer: acc transfer slot has no owner");
     const auto id = *slot;
     slot.reset();
     if (load) {
-        pending_acc_ld_releases_.push_back({id, commit_cycle}); // final RF write commits then
+        acc_ld_awaiting_final_write_.at(bank).push_back(id); // released at its final RF write
     } else {
         release_tmem_owner(TmemOwnerKind::acc_st, id); // final tmem write
     }
 }
 
-void Sanitizer::record_writebacks_committed(uint64_t cycle) {
-    std::erase_if(pending_acc_ld_releases_, [&](const PendingAccLoadRelease& pending) {
-        if (pending.commit_cycle > cycle) return false;
-        release_tmem_owner(TmemOwnerKind::acc_ld, pending.id);
-        return true;
-    });
+void Sanitizer::record_acc_ld_final_write(uint8_t bank) {
+    auto& awaiting = acc_ld_awaiting_final_write_.at(bank);
+    if (awaiting.empty()) throw SimError("internal sanitizer: acc.ld final write without a launched transfer");
+    release_tmem_owner(TmemOwnerKind::acc_ld, awaiting.front());
+    awaiting.pop_front();
 }
 
 // ---------------------------------------------------------------------------

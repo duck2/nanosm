@@ -27,6 +27,9 @@ struct DeviceProfile {
     uint32_t rf_arithmetic_read_cycles = 1;
     uint32_t shmem_bytes = 0;
     uint32_t shmem_banks = 0;
+    // Load slots (rfc12 section 3): an admitted lds / lds.uni holds one from
+    // admission until the RF write path accepts its gathered vector. >= 1.
+    uint32_t shmem_load_slots = 2;
     uint32_t tmem_banks = 0;
     uint32_t tmem_words_per_bank = 0;
     uint32_t tmem_fine_banks = 0;

@@ -10,7 +10,8 @@
   },
   "shmem": {
     "bytes": 65536,
-    "banks": 16
+    "banks": 16,
+    "load_slots": 2
   },
   "tmem": {
     "banks": 2,
