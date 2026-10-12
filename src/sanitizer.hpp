@@ -132,12 +132,12 @@ public:
     void record_acc_transfer_accept(
         const IssueSite& site, uint8_t bank, bool load, uint8_t accumulator,
         uint32_t row, uint32_t col, uint32_t width, uint8_t depbar);
-    // The transfer in slot [bank][load ? 0 : 1] made its final tmem access. A
-    // store's ownership ends now; a load's when its final beat is written to
-    // the RF (record_acc_ld_final_write: the beats of one tmem bank's acc.ld
-    // pipeline reach the RF in launch order).
+    // The transfer in slot [bank][load ? 0 : 1] made its final tmem access:
+    // its tmem ownership ends now -- a store's at its final tmem write, a
+    // load's at its final tmem READ (hardware truth: the values are in its
+    // pipeline). A load's destination registers stay not-ready until each
+    // beat's RF write (record_reg_ready), a separate lifetime.
     void record_acc_transfer_final_beat(uint8_t bank, bool load);
-    void record_acc_ld_final_write(uint8_t bank);
 
     // ---- clocked registers (src/reg.hpp): at most one write per tick ----
     // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
@@ -184,7 +184,7 @@ private:
 
     enum class TmemOwnerKind : uint8_t {
         mma,    // write-owner (read-modify-write) of the whole accumulator until its last result retires
-        acc_ld, // read-owner of its rows x columns until its final RF write commits
+        acc_ld, // read-owner of its rows x columns until its final tmem read
         acc_st, // write-owner of its rows x columns until its final tmem write
     };
 
@@ -238,9 +238,6 @@ private:
     std::vector<TmemOwner> tmem_owners_;
     uint64_t next_acc_transfer_id_ = 0;
     std::vector<std::array<std::optional<uint64_t>, 2>> acc_transfer_in_slot_; // [bank][0 load, 1 store]
-    // Per tmem bank: acc.ld transfers whose last beat has launched, oldest
-    // first; each is released when its final beat is written to the RF.
-    std::vector<std::deque<uint64_t>> acc_ld_awaiting_final_write_;
     std::vector<WarpHazards> warps_;
     // The issue attempt in progress (record_issue_attempt) and whether
     // admission has accepted it.
@@ -286,7 +283,6 @@ public:
     NANOSM_SANITIZER_NOOP(check_acc_transfer_overlap)
     NANOSM_SANITIZER_NOOP(record_acc_transfer_accept)
     NANOSM_SANITIZER_NOOP(record_acc_transfer_final_beat)
-    NANOSM_SANITIZER_NOOP(record_acc_ld_final_write)
     NANOSM_SANITIZER_NOOP(record_register_write)
     NANOSM_SANITIZER_NOOP(check_register_rewrite)
     NANOSM_SANITIZER_NOOP(record_ordered_request)

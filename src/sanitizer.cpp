@@ -55,7 +55,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         accumulator_shapes_.emplace_back(acc.rows, acc.cols);
     }
     acc_transfer_in_slot_.resize(config.tmem_banks);
-    acc_ld_awaiting_final_write_.resize(config.tmem_banks);
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
     for (auto& warp : warps_) {
@@ -459,7 +458,7 @@ std::string Sanitizer::describe_tmem_owner(const TmemOwner& owner) const {
     case TmemOwnerKind::acc_ld:
         text = "acc.ld #" + std::to_string(owner.id);
         mode = "read-owner";
-        until = "until its final RF write";
+        until = "until its final tmem read";
         break;
     case TmemOwnerKind::acc_st:
         text = "acc.st #" + std::to_string(owner.id);
@@ -546,18 +545,8 @@ void Sanitizer::record_acc_transfer_final_beat(uint8_t bank, bool load) {
     if (!slot.has_value()) throw SimError("internal sanitizer: acc transfer slot has no owner");
     const auto id = *slot;
     slot.reset();
-    if (load) {
-        acc_ld_awaiting_final_write_.at(bank).push_back(id); // released at its final RF write
-    } else {
-        release_tmem_owner(TmemOwnerKind::acc_st, id); // final tmem write
-    }
-}
-
-void Sanitizer::record_acc_ld_final_write(uint8_t bank) {
-    auto& awaiting = acc_ld_awaiting_final_write_.at(bank);
-    if (awaiting.empty()) throw SimError("internal sanitizer: acc.ld final write without a launched transfer");
-    release_tmem_owner(TmemOwnerKind::acc_ld, awaiting.front());
-    awaiting.pop_front();
+    // An acc.ld's final tmem read / an acc.st's final tmem write.
+    release_tmem_owner(load ? TmemOwnerKind::acc_ld : TmemOwnerKind::acc_st, id);
 }
 
 // ---------------------------------------------------------------------------

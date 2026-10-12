@@ -40,6 +40,10 @@ struct DeviceProfile {
     // Lb: register stages from a read's RAM sample to its words at the port
     // output. >= 1.
     uint32_t shmem_read_latency_cycles = 2;
+    // C (rfc12 section 2): register stages of the RMW engine's ALU, from a
+    // read's words at the port output to the update ready for its write. The
+    // mbar update uses it today; atomics (I5) will use the same field. >= 1.
+    uint32_t shmem_rmw_compute_cycles = 2;
     uint32_t tmem_banks = 0;
     uint32_t tmem_words_per_bank = 0;
     uint32_t tmem_fine_banks = 0;
@@ -69,6 +73,11 @@ struct DeviceProfile {
     uint32_t mbar_try_wait_timeout_cycles = 0;
     uint32_t tma_queue_commands = 0;
     uint32_t tma_sector_credits = 0;
+    // TMA store sector registers (32 B flops each): a store sector's source
+    // read reserves one at its A-read grant; it frees when its last word has
+    // gone into the egress FIFO. One register turns over every D + Lb +
+    // ceil(sector words / pluck) cycles. >= 1 (canonical 1, HUMAN).
+    uint32_t tma_store_sector_registers = 1;
     uint64_t gmem_bytes = 0;
 
     Timing timing;

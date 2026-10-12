@@ -12,7 +12,7 @@
 //      into the owning command's assembly register (vector, gather, uni)
 //   4. RF stages: assembly -> RF (loads, in sim.cpp's RF write port),
 //      RF -> assembly (vector stores)
-//   5. egress write port: assembly (stores) / TMA store sector register ->
+//   5. egress write port: assembly (stores) / TMA store sector registers ->
 //      egress FIFO, one client per cycle, TMA priority
 //
 // Every named storage element is a register (Reg<T>, read through cur()), so
@@ -854,9 +854,10 @@ Machine::LsuRfRead Machine::decide_lsu_rf_read(const Wires& w) {
 
 // One shared write port of lsu.pluck_words_per_cycle words into the egress
 // FIFO, one client per cycle, granted per 32 B slot: a started slot is
-// finished by its client (never preempted); at each new grant the TMA store
-// sector register wins over the LSU. The LSU's only candidate is its oldest
-// store with data left (egress is in command order). A slot holds one
+// finished by its client (never preempted); at each new grant the oldest TMA
+// store sector register (the ring's head), once complete, wins over the LSU.
+// The LSU's only candidate is its oldest store with data left (egress is in
+// command order). A slot holds one
 // sector: a TMA sector (8 words, its byte enables), half a vector chunk
 // (8 words), or one scatter lane (1 word, 4 byte enables, a whole slot).
 // Sources are read through Q: written in an earlier cycle.
@@ -867,9 +868,10 @@ Machine::EgressWrite Machine::decide_egress_write() {
     const uint32_t sectors_per_chunk = config_.lanes * 4 / config_.gmem_sector_bytes;
     const EgressSlot* open = nullptr;
     if (!fifo.empty() && fifo.back().words_written < fifo.back().words_total) open = &fifo.back();
+    const auto& tma_stores = tma_store_registers_.cur();
+    const auto& tma_head = tma_stores.ring.at(tma_stores.head);
     if (open == nullptr) {
-        const auto& tma_reg = tma_store_sector_.cur();
-        const bool tma_ready = tma_reg.busy && tma_reg.complete;
+        const bool tma_ready = tma_head.has_value() && tma_head->complete();
         const LsuCommand* lsu = nullptr;
         for (const auto& command : lsu_commands_.cur()) {
             if ((command.kind == LsuKind::vector_store && command.chunks_plucked < 8) ||
@@ -895,9 +897,9 @@ Machine::EgressWrite Machine::decide_egress_write() {
         slot.data.assign(config_.gmem_sector_bytes, 0);
         if (tma_ready) {
             slot.client = GmemClient::tma;
-            slot.command = tma_reg.command;
-            slot.sector_address = tma_reg.sector_address;
-            slot.byte_enable = tma_reg.byte_enable;
+            slot.command = tma_head->command;
+            slot.sector_address = tma_head->sector_address;
+            slot.byte_enable = tma_head->byte_enable;
             slot.words_total = sector_words;
         } else if (lsu->kind == LsuKind::vector_store) {
             slot.client = GmemClient::lsu;
@@ -922,17 +924,19 @@ Machine::EgressWrite Machine::decide_egress_write() {
     const uint32_t words = std::min(config_.lsu_pluck_words_per_cycle, open->words_total - open->words_written);
     write.client = open->client;
     if (open->client == GmemClient::tma) {
-        const auto& reg = tma_store_sector_.cur();
-        if (!reg.busy || !reg.complete) {
+        // The open TMA slot is the head register's: it opened with it and is
+        // never preempted, and the head moves only when its last word leaves.
+        if (!tma_head.has_value() || !tma_head->complete()) {
             throw SimError("internal: TMA store sector register drained before it was complete");
         }
+        const auto& reg = *tma_head;
         for (uint32_t word = 0; word < words; ++word) {
             const uint32_t byte = (reg.words_out + word) * 4;
             uint32_t value = 0;
             std::memcpy(&value, reg.data.data() + byte, 4);
             write.words.emplace_back(byte, value);
         }
-        write.tma_store_drained = reg.words_out + words == sector_words; // the walker may reuse it now
+        write.tma_store_drained = reg.words_out + words == sector_words; // a source read may reserve it now (d)
     } else {
         const auto* command = find_lsu_command(open->command);
         if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(open->command));

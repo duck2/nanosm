@@ -32,6 +32,7 @@ json profile_json(const DeviceProfile& p) {
             {"store_slots", p.shmem_store_slots},
             {"port_a_depth", p.shmem_port_a_depth},
             {"read_latency_cycles", p.shmem_read_latency_cycles},
+            {"rmw_compute_cycles", p.shmem_rmw_compute_cycles},
         }},
         {"tmem", {
             {"banks", p.tmem_banks},
@@ -55,6 +56,7 @@ json profile_json(const DeviceProfile& p) {
         {"tma", {
             {"queue_commands", p.tma_queue_commands},
             {"sector_credits", p.tma_sector_credits},
+            {"store_sector_registers", p.tma_store_sector_registers},
         }},
         {"core", {
             {"clock_hz", p.core_clock_hz},
@@ -107,9 +109,13 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     // Every latency is a nonzero number of register stages (rfc12 section 2).
     if (p.shmem_port_a_depth == 0 || p.shmem_port_a_depth > 64 ||
-        p.shmem_read_latency_cycles == 0 || p.shmem_read_latency_cycles > 64) {
-        throw ProfileError(
-            "device profile: shmem port_a_depth and read_latency_cycles must be in 1..64 register stages");
+        p.shmem_read_latency_cycles == 0 || p.shmem_read_latency_cycles > 64 ||
+        p.shmem_rmw_compute_cycles == 0 || p.shmem_rmw_compute_cycles > 64) {
+        throw ProfileError("device profile: shmem port_a_depth, read_latency_cycles and rmw_compute_cycles "
+            "must be in 1..64 register stages");
+    }
+    if (p.tma_store_sector_registers == 0 || p.tma_store_sector_registers > 64) {
+        throw ProfileError("device profile: tma store_sector_registers must be in 1..64");
     }
     if (p.sfu_lanes == 0 || p.sfu_lanes > p.lanes) {
         throw ProfileError("device profile: sfu lanes must be in 1..lanes");
@@ -230,6 +236,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_shmem("store_slots", 1, 1024, p.shmem_store_slots);
     optional_shmem("port_a_depth", 1, 64, p.shmem_port_a_depth);
     optional_shmem("read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
+    optional_shmem("rmw_compute_cycles", 1, 64, p.shmem_rmw_compute_cycles);
     const auto& tmem = document.at("tmem");
     p.tmem_banks = field<uint32_t>(tmem, "banks");
     p.tmem_words_per_bank = field<uint32_t>(tmem, "words_per_bank");
@@ -257,6 +264,13 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& tma = document.at("tma");
     p.tma_queue_commands = field<uint32_t>(tma, "queue_commands");
     p.tma_sector_credits = field<uint32_t>(tma, "sector_credits");
+    if (tma.contains("store_sector_registers")) { // optional (absent: 1); present: an integer in 1..64
+        const auto& value = tma.at("store_sector_registers");
+        if (!value.is_number_unsigned() || value < 1 || value > 64) {
+            throw ProfileError("device profile: tma store_sector_registers must be an integer in 1..64");
+        }
+        p.tma_store_sector_registers = value.get<uint32_t>();
+    }
     const auto& core = document.at("core");
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");
     p.timing.alu = field<uint8_t>(core, "alu_latency_cycles");

@@ -10,6 +10,7 @@
 #include "trace.hpp"
 #include "tma.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <stdint.h>
@@ -182,11 +183,17 @@ public:
         return slot.has_value() && slot->complete();
     }
     [[nodiscard]] bool store_slot_held(uint32_t index) const { return store_slots_.at(index).cur().has_value(); }
-    // Test seam (between ticks): warp `warp`'s active-lane mask. Divergence
-    // (design.md's reconvergence stack) is reserved, so nothing else narrows
-    // it; only the shmem path reads it (rfc12 section 3: lds / sts serve
-    // active lanes, uniform operations PANIC under a partial mask).
-    void set_active_mask(uint32_t warp, uint64_t mask);
+    // SHMEM-TEST-ONLY seam (between ticks): warp `warp`'s active-lane mask.
+    // It exists so the shmem tests can build divergent accesses before
+    // divergence exists. Read ONLY by the shmem path: lds / sts build their
+    // bank rounds from the active lanes (an lds writes only those lanes), and
+    // lds.uni, probes and mbar operations PANIC under a partial mask (rfc12
+    // section 3). Arithmetic, global memory, TMA, MMA, acc transfers, branches
+    // and everything else ignore it and run all lanes. It is NOT divergence:
+    // real divergence (design.md's pre-Volta reconvergence stack, reserved) is
+    // future work, and this mask is only a stand-in for that stack's top
+    // entry. Never used by launches or kernels.
+    void test_set_active_mask(uint32_t warp, uint64_t mask);
     // Test seams (Q, between ticks): the RF write decision's state per bank.
     [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
@@ -247,7 +254,7 @@ private:
         uint32_t id = 0;
         uint32_t pc = 0; // byte PC; every decoded instruction still occupies one 64-bit slot
         bool halted = false;
-        uint64_t active_mask = 0; // all lanes (see set_active_mask)
+        uint64_t active_mask = 0; // all lanes; shmem-test-only (see test_set_active_mask)
         uint64_t stall_until = 0;
         std::vector<uint32_t> rf;
         // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
@@ -403,14 +410,18 @@ private:
         complete_tx,
     };
 
+    // Field classes as in trash/sanitizer-split-2026-10-07.md: unmarked
+    // fields are hardware (routing, completion context); (S) marks a field
+    // read only for a PANIC decision or its text; (T) only for the trace.
+    // Neither is pipeline width.
     struct MbarRmwRequest {
         MbarRmwOperation operation = MbarRmwOperation::arrive;
         uint32_t byte_address = 0;
         uint32_t value = 0;
         uint8_t parity = 0;
-        std::optional<uint32_t> warp;
-        uint32_t pc = 0;
-        Instruction instruction;
+        std::optional<uint32_t> warp;   // a SIMT operation's warp (its own shmem order); none: an engine event
+        uint32_t pc = 0;                // (S) PANIC text
+        Instruction instruction;        // (S) PANIC text
     };
 
     // The two engines that present mbar events to the RMW engine.
@@ -418,8 +429,9 @@ private:
 
     // The RMW engine's one operation. A SIMT operation enters at issue and
     // waits for its A-read grant; an engine event enters at that grant. From
-    // the read grant to the write grant (when the read's words reach the port
-    // output) it holds both A services.
+    // the read grant to the write grant (D + Lb + C cycles later: the read's
+    // words reach the port output, then the update crosses the C ALU stages)
+    // it holds both A services.
     struct ActiveMbarRmw {
         MbarRmwRequest request;
         bool read_granted = false;
@@ -428,6 +440,7 @@ private:
         std::optional<MbarEngine> engine;
     };
 
+    // A probe (test_wait / try_wait): where its result goes and what it compares.
     struct MbarReadRequest {
         bool test = false;
         uint32_t warp = 0;
@@ -435,8 +448,8 @@ private:
         std::optional<uint32_t> wait_slot;
         uint32_t byte_address = 0;
         uint8_t parity = 0;
-        uint32_t pc = 0;
-        Instruction instruction;
+        uint32_t pc = 0;                // (S) PANIC text
+        Instruction instruction;        // (S) PANIC text
     };
 
     // ---- gmem controller (placeholder) + LSU: trash/rfc09.md section 3a,
@@ -529,20 +542,6 @@ private:
         std::vector<uint8_t> data;
         uint32_t filled = 0;        // bytes plucked in
         bool complete = false;      // all bytes in; its ticket is in the TMA queue's returns
-    };
-
-    // The TMA store sector register (32 B flops). Allocated when the walker
-    // starts a sector's A-read source read; written by those rounds' returns;
-    // when complete, moved into one egress slot at the pluck rate through
-    // the shared egress write port (TMA priority). Free after its last word.
-    struct TmaStoreRegister {
-        bool busy = false;
-        uint64_t command = 0;
-        uint64_t sector_address = 0;
-        std::vector<uint8_t> data;
-        uint64_t byte_enable = 0;
-        bool complete = false;
-        uint32_t words_out = 0;     // words already written into the egress FIFO
     };
 
     // A 64 B (lane-wide) assembly register from the lsu.staging_vectors pool.
@@ -701,6 +700,42 @@ private:
         bool from_sector_register = false;
     };
 
+    // A TMA store sector register (32 B flops; tma.store_sector_registers of
+    // them, a ring in reservation order). The store-sector path, one one-round
+    // sector, L = D + Lb, d = ceil(sector words / lsu.pluck_words_per_cycle):
+    //   g          the walker's source read is granted on A-read (bypass (h):
+    //              planned from Q and this cycle's egress drain). The register
+    //              at the ring's tail is reserved now; the read's rounds carry
+    //              its index (the return context). A-read is free again after
+    //              the read's last round's grant.
+    //   g + L      the words reach the port output and are written into the
+    //              register at the edge (its `source` says where each byte goes)
+    //   g + L + 1  complete in Q: the oldest complete register (the ring's
+    //              head) gets the egress write port (TMA wins a new egress
+    //              slot) and drains pluck words per cycle
+    //   g + L + d  its last word leaves: the register is free, and a source
+    //              read granted in this same cycle may reserve it (d)
+    // One register therefore turns over every L + d cycles; N registers and a
+    // free egress port sustain min(N x 32 / (L + d), 32 / d) bytes per cycle.
+    struct TmaStoreRegister {
+        uint64_t command = 0;
+        uint64_t sector_address = 0;
+        std::vector<uint8_t> data;
+        uint64_t byte_enable = 0;
+        TmaPortRequest source;      // the source read's rounds and fragments: each returned byte's place in `data`
+        uint32_t returned = 0;      // source rounds whose words are in `data`
+        uint32_t words_out = 0;     // words already written into the egress FIFO
+        [[nodiscard]] bool complete() const { return returned == source.rounds.size(); }
+    };
+    struct TmaStoreRegisters {
+        std::vector<std::optional<TmaStoreRegister>> ring;
+        uint32_t head = 0;          // the oldest held register: the one the egress drains
+        [[nodiscard]] uint32_t held() const {
+            return static_cast<uint32_t>(std::count_if(ring.begin(), ring.end(),
+                [](const auto& reg) { return reg.has_value(); }));
+        }
+    };
+
     struct IssueAttempt {
         bool issued = false;
         WarpState state = WarpState::structural;
@@ -710,16 +745,6 @@ private:
     // =======================================================================
     // Register contents that change together (one Reg each, below)
     // =======================================================================
-
-    // The RMW engine: the operation in flight and the round-robin bit between
-    // the two engines' events (they change together, at an engine claim).
-    struct RmwEngine {
-        std::optional<ActiveMbarRmw> active;
-        // The engine whose event was claimed last (set on every engine claim,
-        // contested or not). On a tie the other engine is served. Starts at
-        // mma, so the first contested free point serves the TMA.
-        MbarEngine last_served = MbarEngine::mma;
-    };
 
     // A shmem write: its bytes land at the clock edge of the cycle it reaches
     // the RAM; every read of shmem in that cycle sees the old word (READ_FIRST).
@@ -735,13 +760,15 @@ private:
 
     // One granted A-read round in the read pipeline: D stages to the RAM
     // sample, then Lb stages to the port output, where its requester takes the
-    // words. (A requester's register keeps what it needs to place them, except
-    // the probe's, which frees at its grant: the probe request rides along.)
-    enum class ReadClient : uint8_t { load_slot, probe, rmw, tma };
+    // words. Its return context says where they go: a load slot or a TMA
+    // store register (by index), the TMA frontend latch (the TMA read
+    // transaction, held until its words are back), the RMW engine's ALU, or a
+    // probe -- whose register frees at its grant, so the request rides along.
+    enum class ReadClient : uint8_t { load_slot, probe, rmw, tma_frontend, tma_store };
     struct ReadBeat {
         ReadClient client = ReadClient::load_slot;
-        uint32_t slot = 0;                    // load_slot: which
-        std::size_t round = 0;                // load_slot / tma: the transaction's round
+        uint32_t slot = 0;                    // load_slot / tma_store: which load slot / store register
+        std::size_t round = 0;                // load_slot / tma_*: the transaction's round
         std::vector<uint32_t> addresses;      // word-aligned byte addresses, at most one per bank
         std::vector<uint32_t> words;          // their contents, read at the RAM sample
         std::optional<MbarReadRequest> probe; // probe: the request
@@ -752,6 +779,13 @@ private:
         uint8_t phase = 0;
     };
 
+    // A TMA placement's last round reaches the RAM: its command's load write
+    // ends (pending count, credit release, data complete).
+    struct PlacementEnd {
+        uint64_t command = 0;
+        std::vector<GmemSectorRequest::TmaFragment> fragments; // (S) the live-mbar PANIC
+    };
+
     // One granted write round in a write pipeline (A-write, port-B write): D
     // stages to the RAM; at the last its bytes land at the clock edge and its
     // completion happens in that cycle.
@@ -759,17 +793,36 @@ private:
         std::vector<ShmemWrite> writes;
         std::optional<DepbarEvent> sts_done;   // an sts's last round: its depbar clears
         std::optional<MbarWake> wake;          // an RMW write that flips the phase wakes the waiters
-        std::optional<TmaPortRequest> placed;  // a TMA placement's last round: its load write ends
+        std::optional<PlacementEnd> placed;    // a TMA placement's last round: its load write ends
     };
     using ReadPipeline = std::vector<std::optional<ReadBeat>>;   // D + Lb stages
     using WritePipeline = std::vector<std::optional<WriteBeat>>; // D stages
 
-    // The TMA's A-read transaction (descriptor, mbar phase or store-source
-    // sector) from its first grant until its last round's words are back.
-    // The TMA starts no other read meanwhile.
+    // The RMW engine: the operation in flight, its ALU stages and the
+    // round-robin bit between the two engines' events (they change together).
+    struct RmwEngine {
+        std::optional<ActiveMbarRmw> active;
+        // The ALU (shmem.rmw_compute_cycles = C register stages, rfc12 section
+        // 2): the update computed from the read's words at the port output
+        // enters stage 0 at that cycle's edge; it is ready in the last stage C
+        // cycles after the port output, and its write is granted then.
+        std::vector<std::optional<WriteBeat>> alu;
+        // The engine whose event was claimed last (set on every engine claim,
+        // contested or not). On a tie the other engine is served. Starts at
+        // mma, so the first contested free point serves the TMA.
+        MbarEngine last_served = MbarEngine::mma;
+    };
+
+    // The TMA's A-read transaction. A descriptor or mbar-phase read (the
+    // frontend latch) holds it from its first grant until its last round's
+    // words are back; a store-source read only while it has rounds left to be
+    // granted (A-read is released at its last round's grant; each round
+    // carries its store register's index back). The TMA starts no other read
+    // while it is held.
     struct TmaReadTransaction {
-        TmaPortRequest request;  // next_round: rounds granted; descriptor / phase fragments latch the words
-        uint32_t returned = 0;   // rounds whose words are back
+        TmaPortRequest request;       // next_round: rounds granted; descriptor / phase fragments latch the words
+        uint32_t returned = 0;        // descriptor / phase: rounds whose words are back
+        uint32_t store_register = 0;  // store-source: the TMA store register its rounds land in
     };
 
     // The A-read and A-write round-robin pointers (rfc12 section 5). A-read
@@ -863,6 +916,14 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> lanes; // (lane, word)
     };
 
+    // A-read's port output -> a TMA store register (one source round's words).
+    struct TmaStoreFill {
+        uint32_t store_register = 0;
+        uint64_t command = 0;
+        std::vector<std::pair<uint32_t, uint8_t>> bytes;  // (byte offset in the sector, byte)
+        bool last = false;                                // the source read's last round: the register is complete
+    };
+
     // LSU / TMA -> egress FIFO (the shared egress write port).
     struct EgressWrite {
         std::optional<GmemClient> client;              // who writes the egress FIFO this cycle
@@ -872,7 +933,7 @@ private:
         uint64_t lsu_command = 0;
         uint32_t lsu_assembly = 0;
         bool lsu_chunk_drained = false;                // a vector store's assembly register empties
-        bool tma_store_drained = false;                // the TMA store register's last word leaves
+        bool tma_store_drained = false;                // the head TMA store register's last word leaves
     };
 
     // The TMA walker's next sector, planned from Q.
@@ -894,6 +955,7 @@ private:
         std::optional<uint64_t> frontend;          // the frontend command (selection persists)
         bool frontend_reset = false;
         std::optional<TmaWalkerPlan> walker;
+        std::optional<uint32_t> store_register;    // a store sector: the TMA store register its source read will reserve
         bool write_request = false;                // a TMA store sector waits at the egress request pointer
     };
 
@@ -926,6 +988,7 @@ private:
         uint32_t slot = 0;                // load_slot: which
         bool tma_start = false;           // tma: a new transaction, round 0 now (bypass (h))
         std::optional<MbarEngine> claim;  // rmw: a held engine event claims the idle engine now
+        std::optional<uint32_t> pointer_after; // a round-robin grant: the A-read pointer's next value
         static AReadGrant to(AReadUser user, uint32_t slot = 0) {
             AReadGrant grant;
             grant.user = user;
@@ -937,6 +1000,7 @@ private:
     struct AWriteGrant {
         AWriteUser user = AWriteUser::none;
         uint32_t slot = 0;                // store_slot: which
+        std::optional<uint32_t> pointer_after; // a round-robin grant: the A-write pointer's next value
         static AWriteGrant to(AWriteUser user, uint32_t slot = 0) {
             AWriteGrant grant;
             grant.user = user;
@@ -961,16 +1025,18 @@ private:
         ShmemArbiters arbiters;                      // the round-robin pointers after the grants
         // What the grants and returns do to their requesters.
         std::optional<LoadFill> load_fill;           // a load round's words for its gather register
+        std::optional<WriteBeat> rmw_update;         // the RMW's update, from its read's words: enters ALU stage 0
         bool tma_event_claimed = false;
         bool mma_event_claimed = false;
         bool tma_read_changed = false;               // tma_read_after is the TMA read transaction's next value
         std::optional<TmaReadTransaction> tma_read_after;
-        std::optional<TmaPortRequest> tma_read_done; // its last round's words came back now, with its data
-        std::vector<std::pair<uint32_t, uint8_t>> store_bytes; // store-source words -> the TMA store register (offset, byte)
+        std::optional<TmaPortRequest> tma_read_done; // a descriptor / phase read's last words came back now, with its data
+        std::optional<uint32_t> tma_store_reserved;  // a store-source read granted now reserves this TMA store register
+        std::optional<TmaStoreFill> tma_store_fill;  // a store-source round's words for its TMA store register
         bool tma_write_changed = false;              // tma_write_after is the placement transaction's next value
         std::optional<TmaPortRequest> tma_write_after;
         bool tma_sector_released = false;            // a placement's last round read the TMA sector register now
-        std::optional<TmaPortRequest> tma_placed;    // a placement's last write reached the RAM now
+        std::optional<PlacementEnd> tma_placed;      // a placement's last write reached the RAM now
         std::optional<std::pair<uint32_t, uint64_t>> park; // try-wait probe back incomplete: (slot, deadline)
     };
 
@@ -1045,7 +1111,6 @@ private:
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
-        bool tma_store_allocated = false;             // the walker took the TMA store register
         // Issue, then what ranks below it.
         IssueDecision issue;
         LsuRfRead lsu_rf_read;
@@ -1082,7 +1147,8 @@ private:
     //   TMA: complete_tx {address, bytes, parity} (TMA data complete, or the
     //        host's complete_mbar_tx).
     //   MMA: a commit's arrive {address}.
-    // A presented event is visible to the RMW engine from the next cycle.
+    // A presented event is visible to the RMW engine -- and to issue's
+    // admission of SIMT RMWs -- from the next cycle.
     std::deque<Reg<std::optional<LoadSlot>>> load_slots_;   // shmem.load_slots, one register each
     std::deque<Reg<std::optional<StoreSlot>>> store_slots_; // shmem.store_slots, one register each
     Reg<std::optional<MbarReadRequest>> mbar_probe_{registers_, "SIMT mbar probe"};
@@ -1102,11 +1168,12 @@ private:
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
     // tma_requests builds it (bypass (h) in tick()). The placement (port-B
     // write) register holds the rounds after the first; the A-read one holds
-    // the read until its last round's words are back.
+    // a descriptor / phase read until its last round's words are back, a
+    // store-source read until its last round's grant.
     Reg<std::optional<TmaPortRequest>> tma_write_txn_{registers_, "TMA placement transaction"};
     Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, "TMA read transaction"};
     Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
-    Reg<TmaStoreRegister> tma_store_sector_{registers_, "TMA store sector register"};
+    Reg<TmaStoreRegisters> tma_store_registers_{registers_, "TMA store sector registers"};
     // LSU.
     Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
     std::deque<Reg<AssemblyRegister>> staging_;   // the lsu.staging_vectors pool, one register each
@@ -1247,7 +1314,7 @@ private:
     void drive_tma_queue(const Wires& w);
     void drive_tma_transactions(const Wires& w);
     void drive_tma_sector(const Wires& w);
-    void drive_tma_store_sector(const Wires& w);
+    void drive_tma_store_registers(const Wires& w);
     void drive_lsu_commands(const Wires& w);
     void drive_assembly_pool(const Wires& w);
     void drive_ingress(const Wires& w);
@@ -1315,11 +1382,13 @@ private:
     [[nodiscard]] AReadGrant grant_rmw_read() const;
     [[nodiscard]] AReadGrant a_read_round_robin(const Wires& w) const;
     ReadBeat load_round(uint32_t slot);
-    ReadBeat tma_read_round(const TmaPortRequest& request, bool start);
+    ReadBeat tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register);
     WriteBeat store_round(uint32_t slot);
-    WriteBeat rmw_write(const ReadBeat& read);
+    WriteBeat rmw_update(const ReadBeat& read);
     WriteBeat placement_round(const TmaPortRequest& request, bool start);
     void advance_tma_read(Wires& w);
+    void fill_tma_store_register(const ReadBeat& beat, Wires& w);
+    [[nodiscard]] std::optional<uint32_t> tma_store_register_free(const EgressWrite& egress) const;
     void deliver_probe(const ReadBeat& beat, Wires& w);
     void count_engine_wait_on_other(const Wires& w);
     [[nodiscard]] MbarEngine engine_to_claim(bool tma_held, bool mma_held) const;
@@ -1340,7 +1409,9 @@ private:
     // TMA.
     void apply_tma_requests(TmaQueue& tma, Wires& w);
     void apply_tma_walker(TmaQueue& tma, Wires& w);
-    void complete_tma_port_request(TmaQueue& tma, const TmaPortRequest& request);
+    void complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& request);
+    void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
+    void complete_tma_store_capture(TmaQueue& tma, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
     void release_tma_credit(TmaQueue& tma);
     void trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle);

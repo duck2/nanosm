@@ -14,7 +14,8 @@
     "load_slots": 2,
     "store_slots": 2,
     "port_a_depth": 2,
-    "read_latency_cycles": 2
+    "read_latency_cycles": 2,
+    "rmw_compute_cycles": 2
   },
   "tmem": {
     "banks": 2,
@@ -41,7 +42,8 @@
   },
   "tma": {
     "queue_commands": 4,
-    "sector_credits": 16
+    "sector_credits": 16,
+    "store_sector_registers": 1
   },
   "core": {
     "clock_hz": 1000000000,
