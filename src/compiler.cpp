@@ -585,6 +585,11 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
             }
             inst.opcode = op == "bra" ? Opcode::bra : Opcode::bra_uni;
             pending_branches.push_back({program.instructions.size(), args[0], line_number});
+        } else if (op == "fence.sh") {
+            // rfc12 section 10: explicit only. qtxc schedules it like any
+            // instruction and never inserts one.
+            expect_count(args, 0, line_number);
+            inst.opcode = Opcode::fence_sh;
         } else if (op == "halt") {
             expect_count(args, 0, line_number);
             inst.opcode = Opcode::halt;

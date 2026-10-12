@@ -8019,6 +8019,14 @@ void test_i2_profile_fields() {
 // their first two rounds. A word is new iff its sts round reached the RAM in
 // an earlier cycle than the fetch round reading it (the same cycle is
 // READ_FIRST: old). The sweep must cross that boundary, a tie included.
+// I4 (rfc12 sections 10 and 11): the MMA sweep issues the sts and then the
+// mma.async.init reading its words with NO fence.sh -- a deliberate missing
+// fence, kept to measure READ_FIRST. The hardware is unchanged, so with the
+// sanitizer compiled out the sweep asserts exactly what it did. With the
+// sanitizer, the missing-fence check PANICs at the MMA's accept exactly when
+// a store round has not reached the RAM by that cycle (every old-word
+// outcome and the tie are among those); the other pads run and read only
+// new words. The sweep must have both outcomes.
 void test_i2_read_first_across_services() {
     auto profile = canonical_profile();
     profile.shmem_read_latency_cycles = 24;
@@ -8059,7 +8067,11 @@ void test_i2_read_first_across_services() {
     const uint64_t depth = dense.shmem_port_a_depth;
     std::set<uint32_t> outcomes;
     bool tie = false;
-    for (uint32_t pad = 0; pad <= 8; ++pad) {
+    uint32_t panicked = 0;
+    uint32_t clean = 0;
+    // I4: up to 20 pads (was 8): the sixteen-round sts reaches the RAM in full
+    // only around pad 17, so the sanitizer build sees both outcomes.
+    for (uint32_t pad = 0; pad <= 20; ++pad) {
         std::ostringstream qtx;
         qtx << ".acc C, 0, 0, 16, 4\n"
             << "mov r0, 0\nmov r1, 512\nmov r4, 896\nmbar.init [r4], 1\n"
@@ -8077,7 +8089,39 @@ void test_i2_read_first_across_services() {
         for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
         nanosm::Machine mma(dense, compile(qtx.str(), dense), std::move(launch),
             nanosm::TraceOptions{.timeline = true, .debug = true});
-        mma.run(4000); // no PANIC
+        std::optional<std::string> panic;
+        try {
+            mma.run(4000);
+        } catch (const nanosm::SimError& error) {
+            panic = error.what();
+        }
+#if NANOSM_SANITIZER
+        {
+            // The MMA's accept: its issue (pc = 8 * (10 + pad)), or the PANIC it raised there.
+            std::vector<I2Grant> stores;
+            for (const auto& grant : i2_grants(mma, "A-write")) {
+                if (grant.client == "simt") stores.push_back(grant);
+            }
+            const auto what = "pad " + std::to_string(pad) + ":" + describe(stores);
+            const uint64_t accept = panic.has_value()
+                ? std::stoull(panic->substr(panic->find("cycle=") + 6))
+                : issued_at(mma, 8 * (10 + pad)).at(0);
+            const bool in_flight = stores.size() < 16 || stores.back().cycle + depth > accept;
+            require(panic.has_value() == in_flight, what + ": accepted at c" + std::to_string(accept) +
+                (panic.has_value() ? " with every store round at the RAM, yet: " + *panic
+                                   : " with a store round still travelling, and no missing-fence PANIC"));
+            if (panic.has_value()) {
+                require_mentions(*panic, {"missing fence.sh: mma.async #1 A operand bytes",
+                    "overlap this warp's earlier sts [r20], r21", "whose write has not reached the RAM"}, what);
+                ++panicked;
+                continue;
+            }
+            require(nanosm::bits_float(mma.read_reg(0, 0, 10)) == 16.0f, what + ": not every word was new");
+            ++clean;
+            continue;
+        }
+#endif
+        require(!panic.has_value(), "pad " + std::to_string(pad) + ": " + panic.value_or(""));
         std::map<int64_t, uint64_t> step_start;
         for (const auto& event : mma.trace().events()) {
             if (event.name == "MMA input step") step_start[event.value] = event.start_cycle;
@@ -8099,7 +8143,13 @@ void test_i2_read_first_across_services() {
             ", but the words the fetch sampled sum to " + std::to_string(expected));
         outcomes.insert(mma.read_reg(0, 0, 10));
     }
-    require(outcomes.size() >= 2 && tie, "the sweep did not cross the READ_FIRST boundary (a tie included)");
+#if NANOSM_SANITIZER
+    require(panicked != 0 && clean != 0, "the sweep did not cross the missing-fence boundary (" +
+        std::to_string(panicked) + " PANICs, " + std::to_string(clean) + " clean)");
+#else
+    require(outcomes.size() >= 2 && tie && panicked == 0 && clean == 0,
+        "the sweep did not cross the READ_FIRST boundary (a tie included)");
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -9170,6 +9220,525 @@ void test_i3_sanitizer_nonzero_tx_at_kernel_end() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// I4: fence.sh, the missing-fence / race sanitizer and C10 live-mbar opacity
+// (trash/rfc12.md sections 10 and 11; trash/i4-fence-sanitizer-c10-2026-10-11.md).
+// Timelines are hand assembly under a debug trace, as in the I2 section; the
+// sanitizer cases are qtxc where the exact cycles do not matter.
+// ---------------------------------------------------------------------------
+
+// An I2-style machine (shmem words 0..2047 hold 0x100 + word; gmem words
+// 0..1023 hold 5 * word + 2) whose shmem image `setup` adds to.
+std::unique_ptr<nanosm::Machine> i4_machine(const nanosm::DeviceProfile& profile, const std::string& program,
+    const std::function<void(std::vector<uint8_t>&)>& setup = {}, uint32_t warps = 1, bool hand_assembly = true) {
+    nanosm::Launch launch;
+    launch.active_warps = warps;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
+    if (setup) setup(shmem);
+    auto& gmem = image_bytes(launch.gmem_image, 4096);
+    for (uint32_t word = 0; word < 1024; ++word) write_u32(gmem, 4 * word, 5 * word + 2);
+    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+                                      : compile(program, profile);
+    return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+}
+
+// A rank-1 TMA descriptor at 5120 moving `bytes` between shmem `shmem_base`
+// and gmem 0, completing into the mbar at 4104 (which expects those bytes).
+std::function<void(std::vector<uint8_t>&)> i4_tma(bool store, uint32_t shmem_base, uint32_t bytes) {
+    return [=](std::vector<uint8_t>& shmem) {
+        write_tma_descriptor(shmem, 5120, linear_tma(store, shmem_base, bytes, 4104));
+        write_tx_mbar(shmem, 4104, bytes);
+    };
+}
+
+// The machine's PANIC text (a clean run is a test failure).
+std::string i4_panic(nanosm::Machine& machine, const std::string& what) {
+    try {
+        machine.run();
+    } catch (const nanosm::SimError& error) {
+        return error.what();
+    }
+    throw std::runtime_error(what + " did not panic");
+}
+
+const std::string i4_fence_wait = "fence.sh: own accesses not at the RAM";
+
+// The ISA side: fence.sh is opcode 0x27 with no operands; qtxc and the hand
+// assembler parse it (and refuse operands or a depbar); hex round-trips it;
+// qtxc never inserts one (rfc12 section 10: explicit only).
+void test_i4_fence_encoding_qtxc_and_assembly() {
+    nanosm::Instruction fence;
+    fence.opcode = nanosm::Opcode::fence_sh;
+    fence.control.stall = 3;
+    const auto word = nanosm::encode(fence);
+    require(word >> 56 == 0x27 && (word & ((1ull << 38) - 1)) == 0, "fence.sh is not opcode 0x27 with an empty payload");
+    const auto decoded = nanosm::decode(word);
+    require(decoded.opcode == nanosm::Opcode::fence_sh && decoded.control.stall == 3 &&
+            nanosm::format_instruction(decoded, false) == "fence.sh",
+        "fence.sh did not round-trip: " + nanosm::format_instruction(decoded));
+    require(nanosm::fixed_latency(decoded, canonical_profile().timing) == 0, "fence.sh has a fixed latency");
+
+    const auto& profile = canonical_profile();
+    const auto program = nanosm::compile_qtx("mov r0, 0\nsts [r0], r0\nfence.sh\nhalt\n", profile);
+    require(program.instructions.size() == 4 && program.instructions[2].opcode == nanosm::Opcode::fence_sh &&
+            program.instructions[2].control.set_depbar == 7,
+        "qtxc did not schedule the written fence.sh in place");
+    const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(program), profile);
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "fence.sh did not survive hex");
+    for (const auto* bad : {"fence.sh r1\nhalt\n", "fence.sh [r0]\nhalt\n"}) {
+        try {
+            (void)nanosm::compile_qtx(bad, profile);
+            throw std::runtime_error(std::string("qtxc accepted '") + bad + "'");
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("expected 0 operands") != std::string::npos,
+                std::string("fence.sh with an operand: wrong error: ") + error.what());
+        }
+    }
+    try {
+        (void)nanosm::assemble_asm(i1_asm(profile, "fence.sh {pred=PT, stall=0, set=sb0, wait=-}\nhalt\n"), profile);
+        throw std::runtime_error("the hand assembler let fence.sh set a depbar");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("this opcode cannot set a depbar") != std::string::npos,
+            std::string("fence.sh with a depbar: wrong error: ") + error.what());
+    }
+    // No auto-insertion: an sts the TMA then stores, with no fence written, gets none.
+    const auto unfenced = nanosm::compile_qtx(
+        "mov r8, 0\nmov r9, 0\nmov r10, 0\nsts [r8], r8\ntma.async [5120], r8\nhalt\n", profile);
+    require(std::none_of(unfenced.instructions.begin(), unfenced.instructions.end(),
+                [](const auto& inst) { return inst.opcode == nanosm::Opcode::fence_sh; }) &&
+            unfenced.instructions.size() == 6,
+        "qtxc inserted a fence.sh");
+}
+
+// rfc12 section 10: fence.sh is admitted in the cycle its warp's LAST earlier
+// shmem access reaches the RAM -- a store round's write edge, a load round's
+// sample: its grant + D -- so the instruction after it issues once that edge
+// has passed. At D = 2 and 3, hand assembly, one instruction per cycle:
+//   one-round sts: issued c3, granted c4; fence.sh refused c4 .. c3 + D,
+//     admitted at c4 + D; the next instruction at c5 + D;
+//   two-round sts (lanes l and l + 8 share a bank): rounds at c8 and c9;
+//     fence.sh admitted at c9 + D (the last round);
+//   lds: granted c3, samples at c3 + D: fence.sh is admitted then, while the
+//     words are still on their way to the RF (its write comes later);
+//   a TMA store of the sts's words right after the fence: accepted with the
+//     store at the RAM, so the missing-fence check passes (sanitizer build)
+//     and gmem gets the new words.
+// (Mutation: admitting fence.sh at "no unserviced slot" alone -- without the
+// + D -- puts it at the last grant, c4 / c9 / c3, and fails every case.)
+void test_i4_fence_waits_until_own_accesses_reach_ram() {
+    for (const uint32_t d : {2u, 3u}) {
+        auto profile = canonical_profile();
+        profile.shmem_port_a_depth = d;
+        const auto what = "D=" + std::to_string(d) + ": ";
+        using Slices = std::vector<std::pair<uint64_t, uint64_t>>;
+
+        auto one = i4_machine(profile, R"(
+            sread r0, LANE_ID
+            shli r0, r0, 2
+            mov r5, 0x777
+            sts [r0 + 256], r5 {pred=PT, stall=0, set=sb0, wait=-}
+            fence.sh
+            mov r9, 1
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )");
+        one->run();
+        require(i2_grants(*one) == std::vector<I2Grant>{{4, "A-write", "simt", 0}},
+            what + "one-round sts:" + describe(i2_grants(*one)));
+        require(issued_at(*one, 4 * 8) == std::vector<uint64_t>{4 + d} &&
+                issued_at(*one, 5 * 8) == std::vector<uint64_t>{5 + d} &&
+                refusals(*one, 0, i4_fence_wait) == Slices{{4, d}},
+            what + "one-round sts: fence.sh not admitted exactly at its grant + D (c" + std::to_string(4 + d) +
+                "); waits:" + describe(refusals(*one, 0, i4_fence_wait)));
+
+        auto two = i4_machine(profile, R"(
+            sread r0, LANE_ID
+            andi r1, r0, 7
+            shri r2, r0, 3
+            shli r1, r1, 2
+            shli r2, r2, 6
+            add r1, r1, r2
+            mov r5, 0x222
+            sts [r1 + 3072], r5 {pred=PT, stall=0, set=sb0, wait=-}
+            fence.sh
+            mov r9, 1
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )");
+        two->run();
+        require(i2_grants(*two) == std::vector<I2Grant>{{8, "A-write", "simt", 0}, {9, "A-write", "simt", 0}},
+            what + "two-round sts:" + describe(i2_grants(*two)));
+        require(issued_at(*two, 8 * 8) == std::vector<uint64_t>{9 + d} && refusals(*two, 0, i4_fence_wait) == Slices{{8, 1 + d}},
+            what + "two-round sts: fence.sh not admitted at its LAST round's grant + D (c" + std::to_string(9 + d) +
+                "); waits:" + describe(refusals(*two, 0, i4_fence_wait)));
+
+        auto load = i4_machine(profile, R"(
+            sread r0, LANE_ID
+            shli r0, r0, 2
+            lds r6, [r0 + 256] {pred=PT, stall=0, set=sb0, wait=-}
+            fence.sh
+            mov r9, 1
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )");
+        const auto written = i1_run(*load, {6});
+        require(i2_grants(*load) == std::vector<I2Grant>{{3, "A-read", "simt", 0}}, what + "lds:" + describe(i2_grants(*load)));
+        require(issued_at(*load, 3 * 8) == std::vector<uint64_t>{3 + d} && refusals(*load, 0, i4_fence_wait) == Slices{{3, d}},
+            what + "lds: fence.sh not admitted at its sample (grant + D = c" + std::to_string(3 + d) + ")");
+        require(written.at(6).size() == 1 && written.at(6).front() > 3 + d && load->read_reg(0, 5, 6) == 0x100 + 64 + 5,
+            what + "lds: the fence waited for the RF write, or the lds read the wrong word");
+
+        auto engine = i4_machine(profile, R"(
+            sread r0, LANE_ID
+            shli r0, r0, 2
+            mov r5, 0x777
+            mov r8, 0
+            mov r9, 0
+            mov r10, 0
+            mov r12, 4104
+            sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
+            fence.sh
+            tma.async [5120], r8
+        wait: mbar.try_wait p0, [r12], 0
+            bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )", i4_tma(true, 0, 1024));
+        engine->run(); // the sanitizer build: no missing-fence PANIC
+        require(i2_grants(*engine, "A-write").front().cycle == 8 && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{8 + d} &&
+                issued_at(*engine, 9 * 8) == std::vector<uint64_t>{9 + d},
+            what + "the TMA store did not follow the fence at the sts's grant + D + 1");
+        for (uint32_t i = 0; i < 256; ++i) {
+            require(engine->read_gmem_u32(4 * i) == (i < 16 ? 0x777u : 0x100 + i), what + "TMA store word " + std::to_string(i));
+        }
+    }
+}
+
+// SANITIZER (rfc12 sections 10 and 11): each case a warp's own access that
+// has NOT reached the RAM when an engine command over the same bytes is
+// accepted -- one write involved -- PANICs "missing fence.sh"; the same
+// program with fence.sh between them runs and computes the fenced result:
+//   sts -> TMA store of those words (its source reads);
+//   sts -> tma.async whose DESCRIPTOR the sts just wrote (copied in through
+//     lds / sts; before I4 the descriptor peek overlaid in-flight stores);
+//   sts -> mma.async reading that tile (port B), one bank: sixteen rounds;
+//   lds -> TMA load overwriting the words the lds reads (it has not sampled).
+// The PANIC is deliberate: the conflicting access is still outstanding (the
+// command issues the cycle after it).
+void test_i4_missing_fence_panics() {
+    const auto& profile = canonical_profile();
+    const auto program = [](const std::string& before, bool fenced, const std::string& command) {
+        return before + (fenced ? "fence.sh\n" : "") + command + R"(
+        wait:
+            mbar.try_wait p0, [r4], 0
+            @!p0 bra.uni wait
+            halt
+        )";
+    };
+    const std::string prologue = R"(
+        mov r8, 0
+        mov r9, 0
+        mov r10, 0
+        mov r4, 4104
+        sread r20, LANE_ID
+        shli r20, r20, 2
+    )";
+
+    // sts -> TMA store source.
+    const auto store_source = prologue + "mov r21, 7\nsts [r20], r21\n";
+    auto message = i4_panic(*i4_machine(profile, program(store_source, false, "tma.async [5120], r8\n"),
+        i4_tma(true, 0, 1024), 1, false), "sts -> TMA store source");
+    require_mentions(message, {"reason=missing fence.sh: tma store #0 source bytes [0, 64) overlap this warp's earlier "
+        "sts [r20], r21 (pc 56, issued cycle", "whose write has not reached the RAM; issue fence.sh between them",
+        "inst='tma.async [5120], r8"}, "sts -> TMA store source");
+    auto fenced = i4_machine(profile, program(store_source, true, "tma.async [5120], r8\n"), i4_tma(true, 0, 1024), 1, false);
+    fenced->run();
+    for (uint32_t i = 0; i < 256; ++i) {
+        require(fenced->read_gmem_u32(4 * i) == (i < 16 ? 7u : 0x100 + i), "fenced TMA store word " + std::to_string(i));
+    }
+
+    // sts -> the descriptor: copied from 6144 into 5120 (zeros: invalid).
+    const auto descriptor_copy = [](std::vector<uint8_t>& shmem) {
+        write_tma_descriptor(shmem, 6144, linear_tma(false, 1024, 64, 4104));
+        for (uint32_t i = 0; i < 16; ++i) write_u32(shmem, 5120 + 4 * i, 0);
+        write_tx_mbar(shmem, 4104, 64);
+    };
+    const auto copy = prologue + "lds r21, [r20 + 6144]\nsts [r20 + 5120], r21\n";
+    message = i4_panic(*i4_machine(profile, program(copy, false, "tma.async [5120], r8\n"), descriptor_copy, 1, false),
+        "sts -> TMA descriptor");
+    require_mentions(message, {"reason=missing fence.sh: tma #0 descriptor bytes [5120, 5184) overlap this warp's earlier "
+        "sts [r20 + 5120], r21", "whose write has not reached the RAM"}, "sts -> TMA descriptor");
+    fenced = i4_machine(profile, program(copy, true, "tma.async [5120], r8\n"), descriptor_copy, 1, false);
+    fenced->run();
+    for (uint32_t i = 0; i < 16; ++i) {
+        require(fenced->read_shmem_u32(1024 + 4 * i) == 5 * i + 2, "the TMA with the copied descriptor, word " + std::to_string(i));
+    }
+
+    // sts -> mma.async on that tile (one bank: the sts is sixteen rounds).
+    const auto dense = dense_one_bank_profile(4);
+    const auto mma_machine = [&](bool fence) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 1024);
+        for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
+        for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+        write_count_mbar(shmem, 896, 1);
+        return std::make_unique<nanosm::Machine>(dense, compile(std::string(R"(
+            .acc C, 0, 0, 16, 4
+            mov r0, 0
+            mov r1, 512
+            mov r4, 896
+            sread r20, LANE_ID
+            shli r20, r20, 2
+            mov r21, 16384
+            shli r22, r21, 16
+            or r21, r21, r22
+            sts [r20], r21
+        )") + (fence ? "fence.sh\n" : "") + R"(
+            mma.async.init C, [r0], [r1]
+            mma.commit [r4]
+        wait:
+            mbar.try_wait p0, [r4], 0
+            @!p0 bra.uni wait
+            mov r8, 0
+            mov r9, 0
+            acc.ld r10, C, r8
+            halt
+        )", dense), std::move(launch));
+    };
+    message = i4_panic(*mma_machine(false), "sts -> mma.async");
+    require_mentions(message, {"reason=missing fence.sh: mma.async #1 A operand bytes [0, 64) overlap this warp's earlier "
+        "sts [r20], r21", "inst='mma.async.init ACC0, [r0], [r1]"}, "sts -> mma.async");
+    auto mma = mma_machine(true);
+    mma->run(4000);
+    require(nanosm::bits_float(mma->read_reg(0, 0, 10)) == 16.0f, "the fenced MMA did not read the stored 2.0 halves");
+
+    // lds -> TMA load over the words it reads.
+    const auto read_then_load = prologue + "lds r21, [r20]\n";
+    message = i4_panic(*i4_machine(profile, program(read_then_load, false, "tma.async [5120], r8\n"),
+        i4_tma(false, 0, 1024), 1, false), "lds -> TMA load");
+    require_mentions(message, {"reason=missing fence.sh: tma load #0 destination bytes [0, 64) overlap this warp's earlier "
+        "lds r21, [r20] (pc 48, issued cycle", "whose read has not sampled the RAM; issue fence.sh between them"},
+        "lds -> TMA load");
+    fenced = i4_machine(profile, program(read_then_load, true, "tma.async [5120], r8\n"), i4_tma(false, 0, 1024), 1, false);
+    fenced->run();
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(fenced->read_reg(0, lane, 21) == 0x100 + lane, "the fenced lds did not read the old word");
+    }
+    for (uint32_t i = 0; i < 256; ++i) require(fenced->read_shmem_u32(4 * i) == 5 * i + 2, "the fenced TMA load");
+}
+
+// SANITIZER (rfc12 section 11): another warp's access still travelling to
+// the RAM is a RACE, not a missing fence (cross-warp ordering is by mbar).
+// Warp 1 runs a sixteen-round access (all lanes on bank 0: 6144 + 64 * lane);
+// warp 0, after a stall, accepts a TMA over those words while it is under way:
+//   warp 1 sts, warp 0 TMA store (the engine reads, the access writes);
+//   warp 1 lds, warp 0 TMA load (the engine writes, the access reads).
+// Control, the FA handoff: warp 1's sts, then mbar.arrive (admitted once the
+// sts is serviced; no depbar wait), warp 0 waits on the mbar and stores the
+// words: the arrive's RMW commits after the store's last round reached the
+// RAM, so the TMA's accept finds nothing in flight.
+void test_i4_cross_warp_race() {
+    const auto& profile = canonical_profile();
+    const auto two_warps = [](const std::string& access) {
+        return R"(
+            sread r29, WARP_ID
+            setp.ne p6, r29, 0
+            bra.uni other {pred=p6, stall=0, set=-, wait=-}
+            mov r8, 0
+            mov r9, 0
+            mov r10, 0 {pred=PT, stall=8, set=-, wait=-}
+            tma.async [5120], r8
+            mov r4, 4104
+        wait: mbar.try_wait p0, [r4], 0
+            bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
+            halt
+        other: sread r20, LANE_ID
+            shli r20, r20, 6
+            mov r21, 0x66
+        )" + access + R"(
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )";
+    };
+    // The TMA's accept lies inside the sixteen rounds' travel (first grant .. last grant + D).
+    const auto under_way = [&](nanosm::Machine& machine, const std::string& message, const std::string& service) {
+        const auto rounds = i2_grants(machine, service);
+        const auto accept = std::stoull(message.substr(message.find("cycle=") + 6));
+        require(!rounds.empty() && rounds.front().cycle <= accept &&
+                accept < rounds.back().cycle + profile.shmem_port_a_depth,
+            "the TMA was not accepted while warp 1's access was under way (c" + std::to_string(accept) + "):" +
+                describe(rounds));
+    };
+    auto machine = i4_machine(profile, two_warps("sts [r20 + 6144], r21 {pred=PT, stall=0, set=sb0, wait=-}"),
+        i4_tma(true, 6144, 1024), 2);
+    auto message = i4_panic(*machine, "warp 1 sts vs warp 0 TMA store");
+    require_mentions(message, {"warp=0", "reason=shmem race: tma store #0 source bytes [",
+        "overlap warp 1's sts [r20 + 6144], r21 (pc", "whose write has not reached the RAM; order them with an mbar"},
+        "cross-warp sts vs TMA store");
+    under_way(*machine, message, "A-write");
+    machine = i4_machine(profile, two_warps("lds r22, [r20 + 6144] {pred=PT, stall=0, set=sb0, wait=-}"),
+        i4_tma(false, 6144, 1024), 2);
+    message = i4_panic(*machine, "warp 1 lds vs warp 0 TMA load");
+    require_mentions(message, {"warp=0", "reason=shmem race: tma load #0 destination bytes [",
+        "overlap warp 1's lds r22, [r20 + 6144] (pc", "whose read has not sampled the RAM; order them with an mbar"},
+        "cross-warp lds vs TMA load");
+    under_way(*machine, message, "A-read");
+
+    auto handoff = i4_machine(profile, R"(
+            sread r29, WARP_ID
+            setp.ne p6, r29, 0
+            bra.uni producer {pred=p6, stall=0, set=-, wait=-}
+            mov r8, 0
+            mov r9, 0
+            mov r10, 0
+            mov r4, 4104
+            mov r5, 4112
+        ready: mbar.try_wait p0, [r5], 0
+            bra.uni ready {pred=!p0, stall=0, set=-, wait=-}
+            tma.async [5120], r8
+        stored: mbar.try_wait p0, [r4], 0
+            bra.uni stored {pred=!p0, stall=0, set=-, wait=-}
+            halt
+        producer: sread r20, LANE_ID
+            shli r20, r20, 6
+            mov r21, 0x66
+            mov r5, 4112
+            sts [r20 + 6144], r21 {pred=PT, stall=0, set=sb0, wait=-}
+            mbar.arrive [r5]
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )", [](std::vector<uint8_t>& shmem) {
+            i4_tma(true, 6144, 1024)(shmem);
+            write_count_mbar(shmem, 4112, 1);
+        }, 2);
+    handoff->run();
+    for (uint32_t i = 0; i < 256; ++i) {
+        require(handoff->read_gmem_u32(4 * i) == (i % 16 == 0 ? 0x66u : 0x100 + 1536 + i), "handoff word " + std::to_string(i));
+    }
+}
+
+// rfc12 section 11: read / read overlap never PANICs. An lds still under way
+// (one bank: sixteen rounds) when an mma.async.init reading the same words is
+// accepted; an lds that has not sampled when a TMA store of its words is
+// accepted. Both run, and the asserted timing shows the lds really was in
+// flight at the accept.
+void test_i4_read_read_overlap_is_clean() {
+    const auto dense = dense_one_bank_profile(4);
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 1024);
+    for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
+    for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+    write_count_mbar(shmem, 896, 1);
+    nanosm::Machine mma(dense, compile(R"(
+        .acc C, 0, 0, 16, 4
+        mov r0, 0
+        mov r1, 512
+        mov r4, 896
+        sread r20, LANE_ID
+        shli r20, r20, 2
+        lds r21, [r20]
+        mma.async.init C, [r0], [r1]
+        mma.commit [r4]
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        mov r8, 0
+        mov r9, 0
+        acc.ld r10, C, r8
+        halt
+    )", dense), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
+    mma.run(4000);
+    const auto reads = i2_grants(mma, "A-read");
+    const auto accept = issued_at(mma, 6 * 8);
+    require(reads.size() >= 16 && accept.size() == 1 && reads[15].cycle + dense.shmem_port_a_depth > accept.front(),
+        "the lds was not still in flight when the MMA was accepted:" + describe(reads));
+    require(nanosm::bits_float(mma.read_reg(0, 0, 10)) == 8.0f && mma.read_reg(0, 3, 21) == 0x3c003c00u,
+        "lds + MMA read/read results");
+
+    const auto& profile = canonical_profile();
+    auto store = i4_machine(profile, R"(
+        mov r8, 0
+        mov r9, 0
+        mov r10, 0
+        mov r4, 4104
+        sread r20, LANE_ID
+        shli r20, r20, 2
+        lds r21, [r20] {pred=PT, stall=0, set=sb0, wait=-}
+        tma.async [5120], r8
+    wait: mbar.try_wait p0, [r4], 0
+        bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    )", i4_tma(true, 0, 1024));
+    store->run();
+    const auto lds = i2_grants(*store, "A-read");
+    require(!lds.empty() && lds.front().client == "simt" &&
+            lds.front().cycle + profile.shmem_port_a_depth > issued_at(*store, 7 * 8).at(0),
+        "the lds had sampled before the TMA store's accept:" + describe(lds));
+    for (uint32_t i = 0; i < 256; ++i) require(store->read_gmem_u32(4 * i) == 0x100 + i, "lds + TMA store word");
+    require(store->read_reg(0, 7, 21) == 0x100 + 7, "lds + TMA store: the lds");
+}
+
+// SANITIZER, C10 live-mbar opacity (rfc12 section 11): an mbar.init makes its
+// 8 bytes a live mbar until kernel end; only mbar operations may touch it.
+//   sts onto it after the init PANICs (at the sts round's grant) naming the
+//   mbar; the same sts BEFORE the init is legal (the init repurposes it);
+//   a TMA load whose placement writes it PANICs at that placement round. The
+//   init must reach the RAM before the TMA's accept (fence.sh); without the
+//   fence the in-flight init itself is the missing-fence PANIC;
+//   mbar.init of a live mbar PANICs (implementer choice: no mbar.inval in
+//   v0, so an mbar is initialized once per kernel).
+// mbar operations on a live mbar stay legal (e.g. "mbar sleep and wake":
+// init, arrive.expect_tx, try_wait, engine complete_tx); the machine's
+// live-waiter PANICs are unchanged ("mbar reinit with waiter", "mbar store
+// repurpose").
+void test_i4_live_mbar_opacity() {
+    const auto& profile = canonical_profile();
+    const std::string lanes = R"(
+        sread r20, LANE_ID
+        shli r20, r20, 2
+        add r20, r20, r4
+        mov r21, 9
+    )";
+    auto message = i4_panic(*i4_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\n" + lanes + "sts [r20], r21\nhalt\n",
+        {}, 1, false), "sts onto a live mbar");
+    require_mentions(message, {"reason=live mbar opacity: sts writes bytes [4160, 4168) of the live mbar [4160, 4168) "
+        "(mbar.init by warp 0 pc 8 at cycle ", "until kernel end only mbar operations may touch it",
+        "inst='sts [r20], r21"}, "sts onto a live mbar");
+    auto repurpose = i4_machine(profile, "mov r4, 4160\n" + lanes + "sts [r20], r21\nmbar.init [r4], 1\nhalt\n", {}, 1, false);
+    repurpose->run();
+    const auto state = repurpose->read_mbar_state(4160);
+    require(state.valid && state.expected == 1 && repurpose->read_shmem_u32(4168) == 9,
+        "an sts before the mbar.init was refused, or the init did not land after it");
+
+    const std::string placement = R"(
+        mov r8, 0
+        mov r9, 0
+        mov r10, 0
+        mov r4, 4104
+        mov r5, 1032
+        mbar.init [r5], 1
+    )";
+    const std::string load = R"(
+        tma.async [5120], r8
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        halt
+    )";
+    message = i4_panic(*i4_machine(profile, placement + "fence.sh\n" + load, i4_tma(false, 1024, 64), 1, false),
+        "TMA placement over a live mbar");
+    require_mentions(message, {"mbar address=1032 reason=live mbar opacity: tma load #0 placement writes bytes "
+        "[1032, 1040) of the live mbar [1032, 1040) (mbar.init by warp 0 pc 40 at cycle "}, "TMA placement over a live mbar");
+    message = i4_panic(*i4_machine(profile, placement + load, i4_tma(false, 1024, 64), 1, false),
+        "TMA load over an mbar.init in flight");
+    require_mentions(message, {"reason=missing fence.sh: tma load #0 destination bytes [1032, 1040) overlap this warp's "
+        "earlier mbar.init [r5], 1 (pc 40"}, "TMA load over an mbar.init in flight");
+
+    message = i4_panic(*i4_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\nmbar.init [r4], 2\nhalt\n", {}, 1, false),
+        "mbar.init over a live mbar");
+    require_mentions(message, {"reason=mbar.init over the live mbar [4160, 4168) (mbar.init by warp 0 pc 8 at cycle ",
+        "(v0 has no mbar.inval: an mbar is initialized once per kernel)", "inst='mbar.init [r4], 2"},
+        "mbar.init over a live mbar");
+}
+
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"encoding round trip", test_encoding_round_trip},
@@ -9347,6 +9916,12 @@ int main() {
         {"I3: tx range PANICs", test_i3_tx_range_panics},
         {"I3: sanitizer wrong-phase complete_tx", test_i3_sanitizer_wrong_phase_complete_tx},
         {"I3: sanitizer nonzero tx at kernel end", test_i3_sanitizer_nonzero_tx_at_kernel_end},
+        {"I4: fence.sh encoding, qtxc and hand assembly", test_i4_fence_encoding_qtxc_and_assembly},
+        {"I4: fence.sh waits until its warp's accesses reach the RAM", test_i4_fence_waits_until_own_accesses_reach_ram},
+        {"I4: missing fence.sh PANICs; fence.sh passes", test_i4_missing_fence_panics},
+        {"I4: cross-warp race; the mbar handoff is clean", test_i4_cross_warp_race},
+        {"I4: read/read overlap never PANICs", test_i4_read_read_overlap_is_clean},
+        {"I4: C10 live-mbar opacity", test_i4_live_mbar_opacity},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
@@ -9378,6 +9953,10 @@ int main() {
         "mbar wrong-phase completion",
         "I3: sanitizer wrong-phase complete_tx",
         "I3: sanitizer nonzero tx at kernel end",
+        // I4 (rfc12 section 11): missing fence.sh / race and C10 are sanitizer checks.
+        "I4: missing fence.sh PANICs; fence.sh passes",
+        "I4: cross-warp race; the mbar handoff is clean",
+        "I4: C10 live-mbar opacity",
     };
     for (const auto& name : expects_sanitizer_panic) {
         if (std::none_of(tests.begin(), tests.end(), [&](const auto& test) { return test.first == name; })) {

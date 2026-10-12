@@ -157,6 +157,7 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::bra_uni:
         word |= immediate;
         break;
+    case Opcode::fence_sh:
     case Opcode::halt:
         break;
     }
@@ -293,6 +294,7 @@ Instruction decode(uint64_t word) {
     case Opcode::bra_uni:
         inst.imm = static_cast<int32_t>(immediate);
         break;
+    case Opcode::fence_sh:
     case Opcode::halt:
         break;
     }
@@ -360,6 +362,7 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::stg_v8: return "stg.v8";
     case Opcode::ldg_uni: return "ldg.uni";
     case Opcode::lds_uni: return "lds.uni";
+    case Opcode::fence_sh: return "fence.sh";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
     case Opcode::halt: return "halt";
@@ -514,6 +517,7 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
     case Opcode::bra_uni:
         out << ' ' << (inst.imm >= 0 ? "+" : "") << inst.imm;
         break;
+    case Opcode::fence_sh:
     case Opcode::halt:
         break;
     }
@@ -593,6 +597,7 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::mma_async:
     case Opcode::mma_async_init:
     case Opcode::mma_commit:
+    case Opcode::fence_sh:
     case Opcode::halt:
         return 0;
     }

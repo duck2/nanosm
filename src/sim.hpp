@@ -101,6 +101,7 @@ struct ResourceView {
     bool no_active_lanes = false;    // the warp's active mask is empty: its lds / sts is absent (no slot)
     bool unserviced_read = false;    // the warp holds a load slot with rounds not yet granted
     bool unserviced_write = false;   // ... a store slot, or a SIMT RMW whose final write is not yet granted
+    bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM by now
     bool load_slot_free = false;
     bool store_slot_free = false;
     bool probe_register_free = false;
@@ -119,6 +120,7 @@ enum class Refusal : uint8_t {
     mma_queue_full,
     tmem_bank_busy,
     shmem_ordered,
+    shmem_fence,
     load_slots_full,
     store_slots_full,
     probe_register_busy,
@@ -1044,6 +1046,11 @@ private:
         std::optional<WriteBeat> a_write_beat;
         std::optional<WriteBeat> b_write_beat;
         ShmemArbiters arbiters;                      // the round-robin pointers after the grants
+        // The warp whose own access A-read / A-write grants a round of now: an
+        // lds / sts round, a probe, its SIMT RMW's read / write (none: idle, a
+        // TMA read, an engine event's RMW). It reaches the RAM D cycles later.
+        std::optional<uint32_t> a_read_warp;
+        std::optional<uint32_t> a_write_warp;
         // What the grants and returns do to their requesters.
         std::optional<LoadFill> load_fill;           // a load round's words for its gather register
         std::optional<WriteBeat> rmw_update;         // the RMW's update, from its read's words: enters ALU stage 0
@@ -1181,6 +1188,12 @@ private:
     Reg<WritePipeline> a_write_pipe_{registers_, "A-write pipeline"};
     Reg<WritePipeline> b_write_pipe_{registers_, "port-B write pipeline"};
     Reg<ShmemArbiters> shmem_arbiters_{registers_, "shmem A-read / A-write arbiters"};
+    // fence.sh (rfc12 section 10), per warp: how many cycles from now until
+    // the warp's latest granted shmem round reaches the RAM (a write's edge,
+    // a read's sample: grant + D). A grant at g sets it to D - 1 at g + 1; it
+    // counts down to 0, the cycle that round is at the RAM. 0..D-1:
+    // ceil(log2(D)) bits per warp.
+    Reg<std::vector<uint32_t>> shmem_to_ram_{registers_, "per-warp shmem cycles to the RAM"};
     Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{registers_, "TMA mbar event register"};
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
     // MMA and accumulator transfers.
@@ -1334,6 +1347,7 @@ private:
     void drive_a_read_pipe(const Wires& w);
     void drive_write_pipes(const Wires& w);
     void drive_shmem_arbiters(const Wires& w);
+    void drive_shmem_to_ram(const Wires& w);
     void drive_tma_event(const Wires& w);
     void drive_mma_event(const Wires& w);
     void drive_mma(const Wires& w);
@@ -1360,11 +1374,13 @@ private:
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] static std::vector<uint32_t> access_addresses(
         const std::vector<std::vector<LaneAccess>>& rounds);
+    [[nodiscard]] static std::vector<std::vector<uint32_t>> round_addresses(
+        const std::vector<std::vector<LaneAccess>>& rounds);
     [[nodiscard]] std::vector<uint32_t> lane_values(const Warp& warp, uint8_t reg) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, bool a_operand) const;
-    [[nodiscard]] std::vector<uint8_t> pending_shmem_bytes(uint32_t address, uint32_t size, const Wires& w) const;
-    [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> pending_tma_descriptor_bytes(
+    [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
+    [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> tma_descriptor_at_accept(
         uint32_t address, const Wires& w) const;
     [[nodiscard]] std::optional<uint64_t> pending_tma_completion_mbar(
         const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, const Wires& w) const;
@@ -1399,6 +1415,7 @@ private:
     [[nodiscard]] bool store_slot_released(const Wires& w, uint32_t slot) const;
     [[nodiscard]] bool warp_unserviced_read(const Wires& w, uint32_t warp) const;
     [[nodiscard]] bool warp_unserviced_write(const Wires& w, uint32_t warp) const;
+    [[nodiscard]] bool own_shmem_at_ram(const Wires& w, uint32_t warp) const;
     [[nodiscard]] bool probe_in_flight(uint32_t warp) const;
     [[nodiscard]] uint64_t full_mask() const;
 

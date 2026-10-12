@@ -287,6 +287,136 @@ void Sanitizer::check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool com
     }
 }
 
+// ---------------------------------------------------------------------------
+// Missing fence.sh / race (trash/rfc12.md sections 10 and 11). The shadow of
+// the SIMT shmem accesses that may still be travelling to the RAM, and the
+// check an engine command's footprint makes against it at accept.
+// ---------------------------------------------------------------------------
+
+void Sanitizer::record_simt_shmem_issue(const IssueSite& site, SimtShmemHolder holder, uint32_t index,
+    const std::vector<std::vector<uint32_t>>& rounds, uint32_t access_bytes, bool write) {
+    // Accesses whose every round has reached the RAM are done.
+    std::erase_if(simt_shmem_, [&](const SimtShmemAccess& access) {
+        return access.granted == access.rounds.size() && std::all_of(access.rounds.begin(), access.rounds.end(),
+            [&](const SimtShmemRound& round) { return *round.ram_cycle <= site.cycle; });
+    });
+    SimtShmemAccess access;
+    access.holder = holder;
+    access.index = index;
+    access.warp = site.warp;
+    access.pc = site.pc;
+    access.issue_cycle = site.cycle;
+    access.inst = site.inst;
+    access.write = write;
+    access.access_bytes = access_bytes;
+    for (const auto& addresses : rounds) access.rounds.push_back({addresses, std::nullopt});
+    simt_shmem_.push_back(std::move(access));
+}
+
+void Sanitizer::record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, uint32_t index, uint64_t ram_cycle) {
+    // The holder serves one access at a time: the one with rounds left.
+    const auto access = std::find_if(simt_shmem_.begin(), simt_shmem_.end(), [&](const SimtShmemAccess& candidate) {
+        return candidate.holder == holder && candidate.index == index && candidate.granted < candidate.rounds.size();
+    });
+    if (access == simt_shmem_.end()) throw SimError("internal sanitizer: a SIMT shmem grant has no recorded access");
+    auto& round = access->rounds.at(access->granted++);
+    round.ram_cycle = ram_cycle;
+    if (holder != SimtShmemHolder::store_slot) return;
+    // C10: an sts round writing a live mbar, at its grant.
+    std::vector<std::pair<uint32_t, uint32_t>> written;
+    for (const auto address : round.addresses) written.emplace_back(address, address + 4);
+    if (const auto hit = live_mbar_hit(written); hit.has_value()) {
+        throw_issue_panic(IssueSite{cycle, access->warp, access->pc, access->inst},
+            "live mbar opacity: sts writes bytes " + half_open(hit->first_byte, hit->last_byte) + " of the live mbar " +
+                describe_live_mbar(*hit->mbar));
+    }
+}
+
+void Sanitizer::check_engine_footprint(
+    const IssueSite& site, const std::string& label, uint64_t begin, uint64_t end, bool write) const {
+    // The issuing warp's own accesses first ("missing fence.sh"), then the
+    // other warps' ("shmem race"); the first conflicting access is reported.
+    for (const bool own : {true, false}) {
+        for (const auto& access : simt_shmem_) {
+            if ((access.warp == site.warp) != own) continue;
+            if (!write && !access.write) continue; // read / read never conflicts
+            uint64_t first = std::numeric_limits<uint64_t>::max();
+            uint64_t last = 0;
+            for (const auto& round : access.rounds) {
+                if (round.ram_cycle.has_value() && *round.ram_cycle <= site.cycle) continue; // reached the RAM
+                for (const auto address : round.addresses) {
+                    const uint64_t a = address;
+                    const uint64_t b = a + access.access_bytes;
+                    if (b <= begin || a >= end) continue;
+                    first = std::min(first, std::max(a, begin));
+                    last = std::max(last, std::min(b, end));
+                }
+            }
+            if (last <= first) continue;
+            const auto what = format_instruction(access.inst, false) + " (pc " + std::to_string(access.pc) +
+                ", issued cycle " + std::to_string(access.issue_cycle) + "), whose " +
+                (access.write ? "write has not reached the RAM" : "read has not sampled the RAM");
+            if (own) {
+                throw_issue_panic(site, "missing fence.sh: " + label + " bytes " + half_open(first, last) +
+                    " overlap this warp's earlier " + what + "; issue fence.sh between them");
+            }
+            throw_issue_panic(site, "shmem race: " + label + " bytes " + half_open(first, last) + " overlap warp " +
+                std::to_string(access.warp) + "'s " + what + "; order them with an mbar");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C10 live-mbar opacity (trash/rfc12.md section 11).
+// ---------------------------------------------------------------------------
+
+const Sanitizer::LiveMbar* Sanitizer::live_mbar_overlapping(uint64_t begin, uint64_t end) const {
+    for (const auto& mbar : live_mbars_) {
+        if (begin < mbar.address + 8ull && mbar.address < end) return &mbar;
+    }
+    return nullptr;
+}
+
+// The first live mbar one write round touches, and the bytes of it the round writes.
+std::optional<Sanitizer::LiveMbarHit> Sanitizer::live_mbar_hit(
+    const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) const {
+    for (const auto& [begin, end] : byte_ranges) {
+        const auto* mbar = live_mbar_overlapping(begin, end);
+        if (mbar == nullptr) continue;
+        LiveMbarHit hit{mbar, std::numeric_limits<uint64_t>::max(), 0};
+        for (const auto& [b, e] : byte_ranges) {
+            if (e <= mbar->address || b >= mbar->address + 8ull) continue;
+            hit.first_byte = std::min<uint64_t>(hit.first_byte, std::max<uint64_t>(b, mbar->address));
+            hit.last_byte = std::max<uint64_t>(hit.last_byte, std::min<uint64_t>(e, mbar->address + 8ull));
+        }
+        return hit;
+    }
+    return std::nullopt;
+}
+
+std::string Sanitizer::describe_live_mbar(const LiveMbar& mbar) {
+    return half_open(mbar.address, mbar.address + 8ull) + " (mbar.init by warp " + std::to_string(mbar.warp) +
+        " pc " + std::to_string(mbar.pc) + " at cycle " + std::to_string(mbar.init_cycle) +
+        "); until kernel end only mbar operations may touch it";
+}
+
+void Sanitizer::record_mbar_init(const IssueSite& site, uint32_t address) {
+    if (const auto* mbar = live_mbar_overlapping(address, address + 8ull)) {
+        throw_issue_panic(site, "mbar.init over the live mbar " + describe_live_mbar(*mbar) +
+            " (v0 has no mbar.inval: an mbar is initialized once per kernel)");
+    }
+    live_mbars_.push_back({address, site.warp, site.pc, site.cycle});
+}
+
+void Sanitizer::check_live_mbar_write(uint64_t cycle, const std::string& writer,
+    const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) const {
+    const auto hit = live_mbar_hit(byte_ranges);
+    if (!hit.has_value()) return;
+    throw SimError("PANIC cycle=" + std::to_string(cycle) + " mbar address=" + std::to_string(hit->mbar->address) +
+        " reason=live mbar opacity: " + writer + " writes bytes " + half_open(hit->first_byte, hit->last_byte) +
+        " of the live mbar " + describe_live_mbar(*hit->mbar));
+}
+
 void Sanitizer::check_complete_tx_phase(uint64_t cycle, uint32_t address, std::optional<uint64_t> tma_command,
     uint8_t stated_parity, bool phase) {
     std::optional<bool> meant = stated_parity != 0;
@@ -336,6 +466,12 @@ void Sanitizer::record_tma_accept(
     descriptor_owner.pc = site.pc;
     descriptor_owner.issue_cycle = site.cycle;
 
+    // rfc12 section 11: nothing the engine will read may still be travelling
+    // to the RAM -- first the descriptor itself (an sts that wrote it needs a
+    // fence.sh), so the bytes decoded below are the ones the engine reads.
+    check_engine_footprint(site, "tma #" + std::to_string(command) + " descriptor", descriptor_owner.begin,
+        descriptor_owner.end, false);
+
     // The descriptor the engine will read later. An invalid one has no box
     // owner: the engine's own descriptor read will panic.
     std::optional<TmaDescriptor> descriptor;
@@ -353,6 +489,9 @@ void Sanitizer::record_tma_accept(
         descriptor_owner.completion_mbar = descriptor->completion_mbar;
         const auto label = std::string(load ? "tma load #" : "tma store #") +
             std::to_string(command) + (load ? " destination" : " source");
+        // The box against SIMT accesses still travelling to the RAM: a load's
+        // placements write it, a store's source reads read it.
+        check_engine_footprint(site, label, begin, end, load);
         // A load writes its box: any owner conflicts. A store reads it: only
         // a pending writer conflicts.
         if (const auto* owner = shmem_owner_overlapping(begin, end, !load))
@@ -380,8 +519,10 @@ void Sanitizer::record_tma_accept(
 }
 
 void Sanitizer::record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded) {
-    // The descriptor was read-owned since accept, so the engine must decode
-    // exactly what the sanitizer peeked. A mismatch is a sanitizer bug.
+    // Nothing was travelling to the descriptor at accept (else the missing-
+    // fence / race check panicked) and it was read-owned since, so the engine
+    // must decode exactly what the sanitizer peeked. A mismatch is a
+    // sanitizer bug.
     std::erase_if(shmem_owners_, [&](const ShmemOwner& owner) {
         return owner.kind == ShmemOwnerKind::tma_descriptor && owner.command == command;
     });
@@ -396,8 +537,8 @@ void Sanitizer::record_tma_descriptor_read(uint64_t command, const TmaDescriptor
     if (owner == shmem_owners_.end() || owner->begin != begin || owner->end != end ||
         owner->write != load) {
         throw SimError("internal sanitizer: tma #" + std::to_string(command) +
-            " decoded a descriptor different from the one peeked at accept (a write still in "
-            "flight at accept changed it; the owner record cannot be trusted)");
+            " decoded a descriptor different from the one peeked at accept (a write in flight "
+            "at accept escaped the missing-fence / race check; the owner record cannot be trusted)");
     }
 }
 
@@ -417,6 +558,9 @@ void Sanitizer::record_mma_accept(
         if (!span.has_value()) continue; // the machine's footprint check already panicked
         const auto label = "mma.async #" + std::to_string(command) +
             (a_operand ? " A operand" : " B operand");
+        // rfc12 section 11: the port-B reads against SIMT writes still
+        // travelling to the RAM (an sts into the tile needs a fence.sh).
+        check_engine_footprint(site, label, span->first, span->second, false);
         if (const auto* owner = shmem_owner_overlapping(span->first, span->second, true))
             throw_issue_panic(site, shmem_race(label, span->first, span->second, *owner));
         ShmemOwner owner;

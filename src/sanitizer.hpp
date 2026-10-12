@@ -5,8 +5,9 @@
 //
 // The Sanitizer holds every piece of shadow state the simulator keeps only to
 // decide whether to PANIC (ownership tables, hazard horizons, fall-through
-// and port-collision tripwires, the ordered-ID tripwire). None of it is
-// hardware. The machine's behavior -- every cycle, counter, result byte and
+// and port-collision tripwires, the ordered-ID tripwire, the shadow of SIMT
+// shmem accesses still travelling to the RAM, the live-mbar list). None of
+// it is hardware. The machine's behavior -- every cycle, counter, result byte and
 // trace event -- must never depend on it.
 //
 //   - The machine talks to it in one direction only. record_*() tells it what
@@ -65,6 +66,12 @@ struct IssueSite {
 // Which async reader of a register finished (selects the internal-underflow text).
 enum class AsyncReader : uint8_t { acc_st, stg_v8 };
 
+// Where a SIMT shmem access waits for its grants (rfc12 sections 3, 6, 9):
+// a load slot, a store slot (by slot index), the probe register or the SIMT
+// RMW register / engine (by warp: a warp has at most one probe and one SIMT
+// RMW outstanding).
+enum class SimtShmemHolder : uint8_t { load_slot, store_slot, probe, rmw };
+
 #if NANOSM_SANITIZER
 
 class Sanitizer {
@@ -109,8 +116,50 @@ public:
         const IssueSite& site, const std::vector<uint32_t>& word_addresses, bool load) const;
     void check_simt_mbar_rmw(const IssueSite& site, uint32_t address) const;
     void check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool complete_tx) const;
+
+    // ---- missing fence.sh / race (trash/rfc12.md sections 10 and 11) ----
+    // A shadow of every SIMT shmem access until it REACHES THE RAM (a write's
+    // edge, a read's sample: its round's grant + D). An access is recorded
+    // when issue accepts it -- an lds / lds.uni / sts with its bank rounds'
+    // word addresses (access_bytes 4), a probe or a SIMT mbar RMW as one
+    // 8-byte round -- and each round's grant then records when it reaches the
+    // RAM (ram_cycle). A SIMT RMW counts at its FINAL write grant. The
+    // engine-command accepts (record_tma_accept, record_mma_accept) intersect
+    // their footprint with the rounds that have not reached the RAM by the
+    // accept cycle (ungranted, or ram_cycle later than it): an overlap where
+    // at least one side writes PANICs -- with the issuing warp's own access
+    // "missing fence.sh", with another warp's "shmem race". Read/read overlap
+    // never PANICs. This diagnoses the PHYSICAL hazard present at accept; it
+    // does not track whether a fence.sh was issued (backlog D10), so an
+    // unfenced command whose warp's accesses already reached the RAM passes.
+    void record_simt_shmem_issue(const IssueSite& site, SimtShmemHolder holder, uint32_t index,
+        const std::vector<std::vector<uint32_t>>& rounds, uint32_t access_bytes, bool write);
+    // The next round of the access in (holder, index) is granted now (cycle);
+    // it reaches the RAM at ram_cycle. An sts round is also checked against
+    // the live mbars (C10, below).
+    void record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, uint32_t index, uint64_t ram_cycle);
+
+    // ---- C10 live-mbar opacity (trash/rfc12.md section 11) ----
+    // An accepted SIMT mbar.init makes [address, address + 8) a LIVE mbar
+    // until kernel end (v0 retirement). From then on only mbar operations
+    // (init, arrive, expect_tx, the probes, the engines' complete_tx and
+    // commit arrive) may touch it: an sts round (checked at its grant),
+    // a TMA placement round (port-B write, check_live_mbar_write) or I5's
+    // ordinary atomics writing any of its bytes PANIC naming the mbar.
+    // Implementer choice: an mbar.init of an already-live mbar PANICs too
+    // (no mbar.inval in v0: an mbar is initialized once per kernel). mbars
+    // the launch image presets are not recorded.
+    void record_mbar_init(const IssueSite& site, uint32_t address);
+    // A non-mbar write granted now (a TMA placement round; I5: an ordinary
+    // atomic's write): `writer` names it, byte_ranges are its [begin, end).
+    void check_live_mbar_write(uint64_t cycle, const std::string& writer,
+        const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) const;
+
     // Panics on a conflict, else records the descriptor (and box) owners.
-    // descriptor_bytes: what the engine's later A-read will see.
+    // First the missing-fence / race check: the descriptor's 64 bytes, then
+    // the box (a load's destination is written, a store's source read).
+    // descriptor_bytes: what the engine's later A-read will see -- memory as
+    // of this cycle's clock edge (anything still in flight PANICked above).
     // completion_mbar_word: the descriptor's completion mbar as it stands at
     // accept (none: invalid descriptor). Its phase is recorded for the
     // command's complete_tx (rfc12 section 8: the hardware reads no mbar at
@@ -132,7 +181,9 @@ public:
     void check_kernel_end(uint64_t cycle) const;
     void record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded);
     void record_tma_data_complete(uint64_t command);
-    // Panics on a conflict, else records the A/B operand and accumulator owners.
+    // Panics on a conflict (first the missing-fence / race check of both
+    // operand spans, port-B reads), else records the A/B operand and
+    // accumulator owners.
     void record_mma_accept(
         const IssueSite& site, uint64_t command, uint8_t accumulator, uint8_t depbar,
         std::optional<std::pair<uint32_t, uint32_t>> a_span,
@@ -231,6 +282,45 @@ private:
         uint32_t received = 0; // bytes plucked
     };
 
+    // One SIMT shmem access until all its rounds have reached the RAM.
+    struct SimtShmemRound {
+        std::vector<uint32_t> addresses;   // byte address of each access in the round
+        std::optional<uint64_t> ram_cycle; // granted: the cycle it reaches the RAM (grant + D)
+    };
+    struct SimtShmemAccess {
+        SimtShmemHolder holder = SimtShmemHolder::load_slot;
+        uint32_t index = 0;                // slot index, or the warp (probe, RMW)
+        uint32_t warp = 0;
+        uint32_t pc = 0;
+        uint64_t issue_cycle = 0;
+        Instruction inst;
+        bool write = false;
+        uint32_t access_bytes = 4;         // 4 (lds / sts word) or 8 (mbar)
+        std::vector<SimtShmemRound> rounds;
+        std::size_t granted = 0;
+    };
+
+    struct LiveMbar {
+        uint32_t address = 0;
+        uint32_t warp = 0;
+        uint32_t pc = 0;
+        uint64_t init_cycle = 0;
+    };
+    struct LiveMbarHit {
+        const LiveMbar* mbar = nullptr;
+        uint64_t first_byte = 0; // the mbar bytes the write round writes: [first_byte, last_byte)
+        uint64_t last_byte = 0;
+    };
+
+    // The missing-fence / race check of one footprint range of an engine
+    // command accepted at site (label: e.g. "tma load #3 destination").
+    void check_engine_footprint(
+        const IssueSite& site, const std::string& label, uint64_t begin, uint64_t end, bool write) const;
+    [[nodiscard]] const LiveMbar* live_mbar_overlapping(uint64_t begin, uint64_t end) const;
+    [[nodiscard]] std::optional<LiveMbarHit> live_mbar_hit(
+        const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) const;
+    [[nodiscard]] static std::string describe_live_mbar(const LiveMbar& mbar);
+
     [[nodiscard]] const ShmemOwner* shmem_owner_overlapping(
         uint64_t begin, uint64_t end, bool writers_only) const;
     [[nodiscard]] std::string describe_shmem_owner(const ShmemOwner& owner) const;
@@ -252,6 +342,11 @@ private:
 
     // n is tiny (a few outstanding commands); checks are linear scans.
     std::vector<ShmemOwner> shmem_owners_;
+    // SIMT shmem accesses that may not have reached the RAM yet (pruned at
+    // each issue: bounded by the slots, the probe / RMW registers and D).
+    std::vector<SimtShmemAccess> simt_shmem_;
+    // C10: mbars a SIMT mbar.init made live, until kernel end.
+    std::vector<LiveMbar> live_mbars_;
     // TMA command -> its completion mbar's phase at accept, until its complete_tx.
     std::vector<std::pair<uint64_t, bool>> tma_completion_phases_;
     // mbar address -> its tx count as the last RMW left it.
@@ -293,6 +388,10 @@ public:
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
     NANOSM_SANITIZER_NOOP(check_engine_mbar_rmw)
+    NANOSM_SANITIZER_NOOP(record_simt_shmem_issue)
+    NANOSM_SANITIZER_NOOP(record_simt_shmem_grant)
+    NANOSM_SANITIZER_NOOP(record_mbar_init)
+    NANOSM_SANITIZER_NOOP(check_live_mbar_write)
     NANOSM_SANITIZER_NOOP(record_tma_accept)
     NANOSM_SANITIZER_NOOP(check_complete_tx_phase)
     NANOSM_SANITIZER_NOOP(record_mbar_tx)
