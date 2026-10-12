@@ -440,8 +440,12 @@ bool Machine::is_store(LsuKind kind) {
 
 // Capture and check an accepted LSU instruction's addresses. Contract
 // violations panic here: a misaligned vector/uniform base, a misaligned or
-// out-of-bounds lane, two lanes storing one word (and, in the sanitizer, a
-// non-uniform vector/uniform base: hardware uses lane 0's).
+// out-of-bounds lane (and, in the sanitizer, a non-uniform vector/uniform
+// base: hardware uses lane 0's; two lanes of a scalar store naming one word,
+// backlog D12: UB, as on NVIDIA -- the machine sends every lane's write, one
+// request per lane in lane order, and with the placeholder controller's
+// queue-front order the highest lane's lands last; a reordering controller
+// may land another, which is why no program may rely on it).
 Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instruction& inst) const {
     LsuCommand command;
     command.warp = warp.id;
@@ -478,7 +482,7 @@ Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instructio
         const bool load = inst.opcode == Opcode::ldg;
         command.kind = load ? LsuKind::scalar_load : LsuKind::scalar_store;
         command.reg = load ? inst.dst : inst.src1;
-        std::set<uint64_t> stored_words;
+        std::vector<uint64_t> words;
         const auto bases = capture(warp, inst.src0);
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             const auto address = checked_address(bases[lane]);
@@ -486,12 +490,11 @@ Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instructio
             if (address > gmem_.size() || gmem_.size() - address < 4) {
                 panic(warp, inst, "gmem access out of bounds");
             }
-            if (!load && !stored_words.insert(address).second) {
-                panic(warp, inst, "multiple lanes write the same gmem word");
-            }
+            words.push_back(address);
             const uint64_t sector = address / config_.gmem_sector_bytes * config_.gmem_sector_bytes;
             command.sectors.push_back({sector, lane, static_cast<uint32_t>(address - sector)});
         }
+        if (!load) sanitizer_.check_store_word_collision(site(warp, inst), words, "gmem");
         command.requests_total = config_.lanes;
         break;
     }

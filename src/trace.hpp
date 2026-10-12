@@ -191,6 +191,11 @@ public:
     void shmem_grant(uint64_t cycle, ShmemService service, ShmemClient client, uint32_t slot = 0);
     void mbar_rmw_begin(uint64_t cycle, uint32_t byte_address, std::string operation);
     void mbar_rmw_end(uint64_t end_cycle, bool phase_changed);
+    // A uniform atomic's "atomic RMW" slice on the RMW engine's track, from
+    // its start to its write grant + 1 (not an mbar RMW: not counted in the
+    // mbar line; its read and write are a_read_rmw / a_write_rmw grants).
+    void atomic_rmw_begin(uint64_t cycle, std::string detail);
+    void atomic_rmw_end(uint64_t end_cycle);
     void mbar_engine_wait_on_other() { ++summary_.mbar_engine_waits_on_other; }
     void mbar_probe(
         uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity, bool complete);

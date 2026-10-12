@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <limits>
 #include <new>
+#include <optional>
 #include <sstream>
 
 namespace nanosm {
@@ -105,16 +106,55 @@ std::vector<ImageSegment> load_segments(const json& value, const std::string& na
     return result;
 }
 
+// An unsigned 32-bit integer field, checked BEFORE it is narrowed (nlohmann's
+// get<uint32_t> is a bare cast: 4294967296 would become 0, 4160.9 4160 and
+// -8 0xfffffff8). Backlog C11 (mbars) and C2 (active_warps).
+std::optional<uint32_t> unsigned_32(const json& value) {
+    if (!value.is_number_unsigned()) return std::nullopt;
+    const auto wide = value.get<uint64_t>();
+    if (wide > std::numeric_limits<uint32_t>::max()) return std::nullopt;
+    return static_cast<uint32_t>(wide);
+}
+
+uint32_t load_active_warps(const json& document, const std::string& format) {
+    const auto warps = unsigned_32(document.at("active_warps"));
+    if (!warps.has_value()) throw SimError(format + ": active warp count is not an unsigned 32-bit integer");
+    if (*warps == 0) throw SimError(format + ": active warp count is zero");
+    return *warps;
+}
+
+// The optional declared-mbar list (Launch::mbars): emitted only when there is
+// one, so launches without declared mbars keep their exact text.
+void emit_mbars(json& document, const std::vector<uint32_t>& mbars) {
+    if (!mbars.empty()) document["mbars"] = mbars;
+}
+
+std::vector<uint32_t> load_mbars(const json& document) {
+    if (!document.contains("mbars")) return {};
+    const auto& value = document.at("mbars");
+    if (!value.is_array()) throw SimError("launch: mbars is not an array of shmem addresses");
+    std::vector<uint32_t> mbars;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const auto address = unsigned_32(value.at(index));
+        if (!address.has_value()) {
+            throw SimError("launch: mbars[" + std::to_string(index) + "] is not a shmem address");
+        }
+        mbars.push_back(*address);
+    }
+    return mbars;
+}
+
 } // namespace
 
 std::string emit_launch_state(const Launch& launch) {
     if (launch.active_warps == 0) throw SimError("launch state: active warp count is zero");
-    const json document = {
+    json document = {
         {"format", "nanosm-launch-state-v0"},
         {"active_warps", launch.active_warps},
         {"shmem", emit_segments(launch.shmem_image)},
         {"gmem", emit_segments(launch.gmem_image)},
     };
+    emit_mbars(document, launch.mbars);
     return document.dump(2) + '\n';
 }
 
@@ -125,10 +165,10 @@ Launch load_launch_state(std::string_view source) {
             throw SimError("launch state: unsupported format");
         }
         Launch launch;
-        launch.active_warps = document.at("active_warps").get<uint32_t>();
-        if (launch.active_warps == 0) throw SimError("launch state: active warp count is zero");
+        launch.active_warps = load_active_warps(document, "launch state");
         launch.shmem_image = load_segments(document.at("shmem"), "shmem");
         launch.gmem_image = load_segments(document.at("gmem"), "gmem");
+        launch.mbars = load_mbars(document);
         return launch;
     } catch (const SimError&) {
         throw;
@@ -151,7 +191,7 @@ std::string emit_launch_image(const LaunchImage& image) {
         accumulators.push_back({{"name", acc.name}, {"bank", acc.bank},
             {"base_word", acc.base_word}, {"rows", acc.rows}, {"cols", acc.cols}});
     }
-    const json document = {
+    json document = {
         {"format", "nanosm-launch-v0"},
         {"profile", {
             {"name", image.kernel.profile_name},
@@ -166,6 +206,7 @@ std::string emit_launch_image(const LaunchImage& image) {
         {"shmem", emit_segments(image.launch.shmem_image)},
         {"gmem", emit_segments(image.launch.gmem_image)},
     };
+    emit_mbars(document, image.launch.mbars);
     return document.dump(2) + '\n';
 }
 
@@ -206,12 +247,10 @@ LaunchImage load_launch_image(std::string_view source) {
                 words.at(index).get<std::string>(),
                 "kernel.words[" + std::to_string(index) + "]"));
         }
-        image.launch.active_warps = document.at("active_warps").get<uint32_t>();
-        if (image.launch.active_warps == 0) {
-            throw SimError("launch image: active warp count is zero");
-        }
+        image.launch.active_warps = load_active_warps(document, "launch image");
         image.launch.shmem_image = load_segments(document.at("shmem"), "shmem");
         image.launch.gmem_image = load_segments(document.at("gmem"), "gmem");
+        image.launch.mbars = load_mbars(document);
         validate_kernel(image.kernel);
         return image;
     } catch (const SimError&) {

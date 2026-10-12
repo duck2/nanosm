@@ -67,6 +67,17 @@ enum class Opcode : uint8_t {
     mbar_test_wait_r = 0x36,
     mbar_try_wait_i = 0x37,
     mbar_try_wait_r = 0x38,
+    // Uniform shared-memory atomics on signed int32 (trash/rfc13.md):
+    // atom.op.uni rD, [rA + imm], rB. ONE 32-bit word per warp instruction:
+    // the address (rA + imm) and the operand (rB) come from lane 0, the update
+    // is applied once, and every active lane's rD receives the word's old
+    // value. add wraps (32-bit two's complement); exch writes the operand. An
+    // mbar-engine operation: the global store pause covers its one read, the
+    // ALU's C stages and its one write (D + Lb + C + 1 cycles canonical: 7).
+    atom_add_uni = 0x39,
+    atom_and_uni = 0x3a,
+    atom_xor_uni = 0x3b,
+    atom_exch_uni = 0x3c,
     tma_async = 0x40,
     acc_ld = 0x50,
     acc_ld_v8 = 0x51,
@@ -140,6 +151,8 @@ namespace encoding {
 // RRI payload: dst[8], src0[8], simm[22]
 // store payload: base[8], value[8], simm[22]
 // RI payload: dst[8], reserved[8], simm[22]
+// atomic payload: dst[8], base[8], operand[8], simm[14] (the offset is 14 bits:
+// the third register takes the immediate's high bits)
 // setp uses dst as p0..p6; immediate and register RHS forms have distinct opcodes.
 // Branch immediates are signed byte displacements relative to the following PC.
 // mbar addresses are held in a register; mbar immediates and register operands
@@ -163,6 +176,9 @@ inline constexpr uint64_t register_mask = 0xff;
 inline constexpr uint64_t immediate_mask = 0x3fffff;
 inline constexpr int32_t immediate_min = -(1 << 21);
 inline constexpr int32_t immediate_max = (1 << 21) - 1;
+inline constexpr uint64_t atomic_immediate_mask = 0x3fff;
+inline constexpr int32_t atomic_immediate_min = -(1 << 13);
+inline constexpr int32_t atomic_immediate_max = (1 << 13) - 1;
 
 inline constexpr unsigned reg0_shift = 30;
 inline constexpr unsigned reg1_shift = 22;
@@ -170,6 +186,12 @@ inline constexpr unsigned reg2_shift = 14;
 inline constexpr unsigned reg3_shift = 6; // fma's rc, in RRR reserved bits
 
 } // namespace encoding
+
+// The uniform shared atomics (trash/rfc13.md): atom.add/and/xor/exch.uni.
+inline bool is_atomic(Opcode opcode) {
+    return opcode == Opcode::atom_add_uni || opcode == Opcode::atom_and_uni ||
+        opcode == Opcode::atom_xor_uni || opcode == Opcode::atom_exch_uni;
+}
 
 uint64_t encode(const Instruction& instruction);
 Instruction decode(uint64_t word);

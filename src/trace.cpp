@@ -281,6 +281,18 @@ void TraceRecorder::mbar_rmw_end(uint64_t end_cycle, bool phase_changed) {
     mbar_rmw_slice_.reset();
 }
 
+// The engine runs one operation at a time, so an atomic's slice shares the
+// mbar RMW's track and open-slice slot.
+void TraceRecorder::atomic_rmw_begin(uint64_t cycle, std::string detail) {
+    mbar_rmw_slice_ = OpenSlice{cycle, mbar_rmw_track, TraceCategory::sync, "atomic RMW", std::move(detail)};
+}
+
+void TraceRecorder::atomic_rmw_end(uint64_t end_cycle) {
+    if (!mbar_rmw_slice_.has_value()) throw std::runtime_error("trace atomic RMW end without begin");
+    close_slice(std::move(*mbar_rmw_slice_), end_cycle);
+    mbar_rmw_slice_.reset();
+}
+
 void TraceRecorder::mbar_probe(
     uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity, bool complete) {
     ++summary_.mbar_initial_probes;

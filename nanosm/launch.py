@@ -11,6 +11,10 @@ from ._native import Session, TRACE_DEBUG, TRACE_TIMELINE, encode_mbar, encode_t
 class SparseMemory:
     def __init__(self) -> None:
         self._segments: list[dict[str, object]] = []
+        # Addresses written by mbar(): in shmem, the launch DECLARES them as
+        # mbars (live from launch for the sanitizer's C10 opacity, rfc12
+        # section 11), like a kernel's mbar.init.
+        self.mbars: list[int] = []
 
     def write(self, address: int, data: bytes | bytearray | memoryview) -> None:
         payload = bytes(data)
@@ -52,6 +56,7 @@ class SparseMemory:
             raise ValueError("mbar tx_bytes is outside -(2^20 - 1)..2^20 - 1")
         word = encode_mbar(phase, expected, remaining, tx_bytes)
         self.write(address, struct.pack("<Q", word))
+        self.mbars.append(address)
 
     def tma_desc(
         self,
@@ -182,6 +187,7 @@ class Launch:
             "active_warps": self.warps,
             "shmem": self.shmem._json(),
             "gmem": self.gmem._json(),
+            "mbars": self.shmem.mbars,
         }
         return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 

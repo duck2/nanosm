@@ -42,7 +42,7 @@ struct DeviceProfile {
     uint32_t shmem_read_latency_cycles = 2;
     // C (rfc12 section 2): register stages of the RMW engine's ALU, from a
     // read's words at the port output to the update ready for its write. The
-    // mbar update uses it today; atomics (I5) will use the same field. >= 1.
+    // mbar update and the uniform atomics (trash/rfc13.md) use it. >= 1.
     uint32_t shmem_rmw_compute_cycles = 2;
     uint32_t tmem_banks = 0;
     uint32_t tmem_words_per_bank = 0;

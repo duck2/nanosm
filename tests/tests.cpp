@@ -711,37 +711,6 @@ void test_mbar_arrival_underflow_panics() {
     }
 }
 
-void test_mbar_reinit_with_waiter_panics() {
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r1, 64
-        sread r0, WARP_ID
-        setp.eq p0, r0, 0
-        @p0 bra.uni waiter
-        mbar.init [r1], 1
-        halt
-    waiter:
-        mbar.try_wait p1, [r1], 0
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("mbar reinit with a live waiter was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("reinitializing an mbar with a live waiter") !=
-                std::string::npos,
-            "mbar reinit with a waiter produced the wrong PANIC");
-    }
-}
-
 // I3 (rfc12 section 8): complete_tx carries no phase in hardware; the phase
 // a sender meant (here the host's stated parity) is sanitizer metadata, so
 // this is now a sanitizer PANIC (listed in expects_sanitizer_panic).
@@ -765,38 +734,6 @@ void test_mbar_complete_wrong_phase_panics() {
         require(
             std::string(error.what()).find("wrong phase") != std::string::npos,
             "wrong-phase complete_tx produced the wrong PANIC");
-    }
-}
-
-void test_store_cannot_repurpose_mbar_with_waiter() {
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r1, 64
-        sread r0, WARP_ID
-        setp.eq p0, r0, 0
-        @p0 bra.uni waiter
-        mov r2, 5
-        sts [r1], r2
-        halt
-    waiter:
-        mbar.try_wait p1, [r1], 0
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("ordinary store repurposed an mbar with a live waiter");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("repurposing an mbar with a live waiter") !=
-                std::string::npos,
-            "ordinary mbar repurpose produced the wrong PANIC");
     }
 }
 
@@ -3130,48 +3067,6 @@ void test_bank_conflict_serializes() {
     require(
         machine.trace().summary().shmem_rounds == 16,
         "sixteen-way bank conflict did not serialize to sixteen rounds");
-}
-
-void test_write_collision_panics() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 4);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 0
-        mov r1, 7
-        sts [r0], r1
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("same-word write collision did not panic");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("multiple lanes write the same shmem word") != std::string::npos,
-            "write collision produced the wrong panic");
-    }
-}
-
-void test_gmem_write_collision_panics_without_writing() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 4);
-    write_u32(gmem, 0, 0x12345678);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov   r0, 0
-        sread r1, LANE_ID
-        stg   [r0], r1
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("same-word gmem write collision did not panic");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("multiple lanes write the same gmem word") != std::string::npos,
-            "gmem write collision produced the wrong panic");
-    }
-    require(machine.read_gmem_u32(0) == 0x12345678, "colliding gmem store changed memory");
 }
 
 void test_profile_defaults_are_invalid() {
@@ -7600,7 +7495,9 @@ void test_i2_same_warp_order_with_reordered_reads() {
 // Divergence (rfc12 section 3): rounds come from active lanes only; a masked
 // lane is no access (its word, and an lds's destination lane, are
 // untouched); an lds / sts with no active lane takes no slot, sets no depbar
-// and makes no request; a uniform operation under a partial mask PANICs.
+// and makes no request; a uniform operation under a partial mask is the
+// sanitizer's PANIC (backlog D12; the machine's quiet lane-0 behavior:
+// "D12: uniform ops under a partial mask").
 void test_i2_divergence() {
     const std::string body = R"(
         sread r0, LANE_ID
@@ -7640,6 +7537,7 @@ void test_i2_divergence() {
                 "an absent access changed memory or its destination");
         }
     }
+#if NANOSM_SANITIZER
     for (const std::string uniform :
              {"lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [r2]", "mbar.test_wait p0, [r2], 0"}) {
         auto machine = i2_machine(profile, "mov r2, 4096\n" + uniform + "\nhalt\n");
@@ -7651,6 +7549,7 @@ void test_i2_divergence() {
             require_mentions(error.what(), {"uniform operation under a partial active mask"}, uniform);
         }
     }
+#endif
 }
 
 // shmem.store_slots: 1 and 2 both work (rfc12 section 2). Two warps each
@@ -9686,9 +9585,8 @@ void test_i4_read_read_overlap_is_clean() {
 //   mbar.init of a live mbar PANICs (implementer choice: no mbar.inval in
 //   v0, so an mbar is initialized once per kernel).
 // mbar operations on a live mbar stay legal (e.g. "mbar sleep and wake":
-// init, arrive.expect_tx, try_wait, engine complete_tx); the machine's
-// live-waiter PANICs are unchanged ("mbar reinit with waiter", "mbar store
-// repurpose").
+// init, arrive.expect_tx, try_wait, engine complete_tx). The machine's
+// live-waiter PANICs are gone (backlog D12 / D12.1): C10 is the only check.
 void test_i4_live_mbar_opacity() {
     const auto& profile = canonical_profile();
     const std::string lanes = R"(
@@ -9737,6 +9635,989 @@ void test_i4_live_mbar_opacity() {
     require_mentions(message, {"reason=mbar.init over the live mbar [4160, 4168) (mbar.init by warp 0 pc 8 at cycle ",
         "(v0 has no mbar.inval: an mbar is initialized once per kernel)", "inst='mbar.init [r4], 2"},
         "mbar.init over a live mbar");
+}
+
+// ---------------------------------------------------------------------------
+// I5: uniform shared atomics (trash/rfc13.md; trash/i5r-uniform-atomics-
+// 2026-10-12.md), backlog D12 (machine quiet, sanitizer PANIC) and the C10
+// follow-up (launch-declared mbars are live; C11: their addresses are checked
+// before narrowing). Hand assembly under a debug trace, as in the I2 - I4
+// sections. An atomic is an RMW-engine operation: its "atomic RMW" slice runs
+// from its START (the store pause begins) to its write grant + 1; inside it,
+// its read and its write are the "rmw" grants on A-read and A-write.
+// ---------------------------------------------------------------------------
+
+struct I5Atomic {
+    uint64_t start = 0;
+    uint64_t end = 0;             // the write grant + 1
+    std::vector<uint64_t> reads;  // its read grant
+    std::vector<uint64_t> writes; // its write grant
+    std::string detail;
+};
+
+std::string describe(const I5Atomic& atomic) {
+    std::string text = " {" + atomic.detail + ": start c" + std::to_string(atomic.start) + ", end c" +
+        std::to_string(atomic.end) + ", reads";
+    for (const auto cycle : atomic.reads) text += " " + std::to_string(cycle);
+    text += ", writes";
+    for (const auto cycle : atomic.writes) text += " " + std::to_string(cycle);
+    return text + "}";
+}
+
+std::vector<I5Atomic> i5_atomics(const nanosm::Machine& machine) {
+    std::vector<I5Atomic> atomics;
+    for (const auto& event : machine.trace().events()) {
+        if (event.name != "atomic RMW") continue;
+        atomics.push_back({event.start_cycle, event.start_cycle + event.duration_cycles, {}, {}, event.detail});
+    }
+    std::sort(atomics.begin(), atomics.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+    for (const auto& grant : i2_grants(machine)) {
+        if (grant.client != "rmw") continue;
+        for (auto& atomic : atomics) {
+            if (grant.cycle < atomic.start || grant.cycle >= atomic.end) continue;
+            (grant.service == "A-read" ? atomic.reads : atomic.writes).push_back(grant.cycle);
+        }
+    }
+    return atomics;
+}
+
+// The one atomic a run made.
+I5Atomic i5_atomic(const nanosm::Machine& machine, const std::string& what) {
+    const auto atomics = i5_atomics(machine);
+    require(atomics.size() == 1, what + ": expected one atomic, found " + std::to_string(atomics.size()));
+    return atomics.front();
+}
+
+// rfc13 section 6: one read at g, the old word at the port output at
+// a = g + D + Lb, the write granted at w = a + C, the slice ending at w + 1.
+// `read` is the expected g.
+void i5_require_timeline(const I5Atomic& atomic, const nanosm::DeviceProfile& profile, uint64_t read,
+    const std::string& what) {
+    const uint64_t w = read + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
+        profile.shmem_rmw_compute_cycles;
+    require(atomic.reads == std::vector<uint64_t>{read} && atomic.writes == std::vector<uint64_t>{w} &&
+            atomic.end == w + 1,
+        what + ": not read c" + std::to_string(read) + ", write c" + std::to_string(w) + ":" + describe(atomic));
+}
+
+// The atomic ALU, written independently of the machine's: 32-bit wrap through
+// 64-bit arithmetic.
+uint32_t i5_expected(nanosm::Opcode opcode, uint32_t old_word, uint32_t operand) {
+    switch (opcode) {
+    case nanosm::Opcode::atom_add_uni: return static_cast<uint32_t>((uint64_t{old_word} + operand) & 0xffffffffull);
+    case nanosm::Opcode::atom_and_uni: return old_word & operand;
+    case nanosm::Opcode::atom_xor_uni: return old_word ^ operand;
+    default: return operand; // exch
+    }
+}
+
+// An I2-style machine (shmem words 0..2047 hold 0x100 + word; gmem words
+// 0..1023 hold 5 * word + 2); `setup` may change the launch (its image's
+// shmem bytes are launch.shmem_image[0].bytes; its declared mbars).
+std::unique_ptr<nanosm::Machine> i5_machine(const nanosm::DeviceProfile& profile, const std::string& program,
+    uint32_t warps = 1, const std::function<void(nanosm::Launch&)>& setup = {}, bool hand_assembly = true) {
+    nanosm::Launch launch;
+    launch.active_warps = warps;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
+    auto& gmem = image_bytes(launch.gmem_image, 4096);
+    for (uint32_t word = 0; word < 1024; ++word) write_u32(gmem, 4 * word, 5 * word + 2);
+    if (setup) setup(launch);
+    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+                                      : compile(program, profile);
+    return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+}
+
+const std::array<std::pair<nanosm::Opcode, const char*>, 4> i5_ops = {{
+    {nanosm::Opcode::atom_add_uni, "atom.add.uni"},
+    {nanosm::Opcode::atom_and_uni, "atom.and.uni"},
+    {nanosm::Opcode::atom_xor_uni, "atom.xor.uni"},
+    {nanosm::Opcode::atom_exch_uni, "atom.exch.uni"},
+}};
+
+// The ISA side: four opcodes 0x39..0x3c, payload dst[8] base[8] operand[8]
+// simm[14]; qtxc and the hand assembler parse "atom.op.uni rD, [rA + imm],
+// rB"; the offset is a signed 14-bit field; an atomic returns its old value
+// through a depbar (qtxc allocates one, a consumer of rD waits on it; the hand
+// assembler requires one); latency 0 (an async RF writer); hex round trip.
+// The per-lane spelling "atom.add" is gone.
+void test_i5_atomic_encoding_and_assembly() {
+    const auto& profile = canonical_profile();
+    uint32_t code = 0x39;
+    for (const auto& [opcode, name] : i5_ops) {
+        for (const int32_t offset : {-8192, 8191, 0, -4}) {
+            nanosm::Instruction inst;
+            inst.opcode = opcode;
+            inst.dst = 200;
+            inst.src0 = 129;
+            inst.src1 = 255;
+            inst.imm = offset;
+            inst.control.set_depbar = 3;
+            const auto word = nanosm::encode(inst);
+            const auto decoded = nanosm::decode(word);
+            require(word >> 56 == code && decoded.opcode == opcode && decoded.dst == 200 && decoded.src0 == 129 &&
+                    decoded.src1 == 255 && decoded.imm == offset && decoded.control.set_depbar == 3,
+                std::string(name) + " did not round-trip with offset " + std::to_string(offset));
+            require(nanosm::fixed_latency(decoded, profile.timing) == 0, std::string(name) + " has a fixed latency");
+        }
+        nanosm::Instruction text;
+        text.opcode = opcode;
+        text.dst = 7;
+        text.src0 = 1;
+        text.src1 = 5;
+        text.imm = 64;
+        require(nanosm::format_instruction(text, false) == std::string(name) + " r7, [r1 + 64], r5",
+            "format: " + nanosm::format_instruction(text, false));
+        text.imm = 8192;
+        try {
+            (void)nanosm::encode(text);
+            throw std::runtime_error(std::string(name) + " encoded a 15-bit offset");
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("signed 14-bit") != std::string::npos, error.what());
+        }
+        ++code;
+    }
+    const auto program = nanosm::compile_qtx(
+        "mov r1, 0\nmov r2, 5\natom.xor.uni r3, [r1 - 64], r2\nadd r4, r3, r3\nhalt\n", profile);
+    const auto& atom = program.instructions.at(2);
+    const auto& consumer = program.instructions.at(3);
+    require(atom.opcode == nanosm::Opcode::atom_xor_uni && atom.imm == -64 && atom.control.set_depbar < 6 &&
+            (consumer.control.wait_mask >> atom.control.set_depbar & 1) != 0,
+        "qtxc did not give the atomic a depbar its rD consumer waits on");
+    const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(program), profile);
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "atom did not survive hex");
+    const auto rejects = [&](const std::string& source, bool hand, const std::string& needle) {
+        try {
+            if (hand) (void)nanosm::assemble_asm(i1_asm(profile, source), profile);
+            else (void)nanosm::compile_qtx(source, profile);
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find(needle) != std::string::npos,
+                "'" + source + "': wrong error: " + error.what());
+            return;
+        }
+        throw std::runtime_error("'" + source + "' was accepted");
+    };
+    rejects("atom.add.uni r3, [r1 + 8192], r2\nhalt\n", false, "atom offset must fit a signed 14-bit immediate");
+    rejects("atom.add.uni r3, [r1 - 8193], r2\nhalt\n", false, "atom offset must fit a signed 14-bit immediate");
+    rejects("atom.add.uni r3, [r1]\nhalt\n", false, "expected 3 operands");
+    rejects("atom.min.uni r3, [r1], r2\nhalt\n", false, "unknown opcode 'atom.min.uni'");
+    rejects("atom.add r3, [r1], r2\nhalt\n", false, "unknown opcode 'atom.add'");
+    rejects("atom.exch.uni r3, [r1], r2\nhalt\n", true, "memory operation requires set=sb0..sb5");
+}
+
+// rfc13 sections 1 and 6: ONE word per warp instruction, the update applied
+// ONCE (all sixteen lanes hold the operand 0x5a5: add adds it once), every
+// lane's rD gets the old word. One read, granted when the engine starts it
+// (the cycle after the atomic's issue: nothing else holds A-read); its write
+// D + Lb + C later; the slice ends at that write + 1. The old word reaches rD
+// through the return slot at a + 1 (a = the read + D + Lb), BEFORE the write
+// grant a + C; the warp's next shmem access (an lds.uni of the word) is
+// admitted only at the write grant and reads the new word. Each op at the
+// canonical D = Lb = C = 2 (7 cycles from start to the end of the pause);
+// add also at D = 3, C = 3.
+void test_i5_one_word_timeline() {
+    const std::string program_tail = R"( r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        lds.uni r8, [r1 + 2048] {pred=PT, stall=0, set=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )";
+    const std::string program_head = R"(
+        mov r1, 0
+        mov r5, 0x5a5
+        )";
+    struct Case {
+        nanosm::Opcode opcode;
+        const char* name;
+        uint32_t d;
+        uint32_t c;
+    };
+    std::vector<Case> cases;
+    for (const auto& [opcode, name] : i5_ops) cases.push_back({opcode, name, 2, 2});
+    cases.push_back({nanosm::Opcode::atom_add_uni, "atom.add.uni", 3, 3});
+    for (const auto& test : cases) {
+        auto profile = canonical_profile();
+        profile.shmem_port_a_depth = test.d;
+        profile.shmem_rmw_compute_cycles = test.c;
+        const auto what = std::string(test.name) + " D=" + std::to_string(test.d) + " C=" + std::to_string(test.c);
+        auto machine = i5_machine(profile, program_head + test.name + program_tail);
+        const auto written = i1_run(*machine, {7});
+        const auto atomic = i5_atomic(*machine, what);
+        const auto issue = issued_at(*machine, 16).at(0);
+        require(atomic.start == issue + 1, what + ": did not start the cycle after its issue");
+        i5_require_timeline(atomic, profile, atomic.start, what);
+        const auto a = atomic.reads.at(0) + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
+        const auto w = atomic.writes.at(0);
+        require(written.at(7) == std::vector<uint64_t>{a + 1} && a + 1 < w,
+            what + ": rD was not written at a + 1 (c" + std::to_string(a + 1) + "), before the write grant c" +
+                std::to_string(w));
+        require(issued_at(*machine, 24) == std::vector<uint64_t>{w}, what + ": the lds.uni was not admitted at the write grant");
+        const auto lds = i2_grants(*machine, "A-read");
+        require(lds.size() == 2 && lds[1] == I2Grant{w + 1, "A-read", "simt", lds[1].slot},
+            what + ": the lds.uni's read was not granted at w + 1:" + describe(lds));
+        const uint32_t updated = i5_expected(test.opcode, 0x300, 0x5a5);
+        require(machine->read_shmem_u32(2048) == updated, what + ": the word was not updated once");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine->read_reg(0, lane, 7) == 0x300 && machine->read_reg(0, lane, 8) == updated,
+                what + ": lane " + std::to_string(lane) + " rD or the lds.uni");
+        }
+        require(atomic.detail == std::string(test.name) + ", warp=0", what + ": slice detail " + atomic.detail);
+        if (test.d == 2 && test.c == 2) require(atomic.end - atomic.start == 7, what + ": not 7 cycles canonical");
+    }
+}
+
+// int32 add WRAPS (rfc13 section 1: defined 32-bit two's-complement wrap,
+// unlike the checked mbar tx count): one atomic each,
+//   0x7fffffff + 1 = 0x80000000      0x80000000 + (-1) = 0x7fffffff
+//   0xffffffff + 1 = 0               0x80000000 + 0x80000000 = 0
+//   0x7fffffff + 0x7fffffff = 0xfffffffe
+// and a chain across the boundary on one word: 0x7ffffffe + 1 + 1 + 1 + 1,
+// each atomic reading the previous sum. Operands come from a table (lds.uni),
+// in registers whose RF bank differs from the base's (r1: bank 1), so each
+// atomic's two RF reads fit the fixed read window.
+void test_i5_add_wraps_at_the_int32_boundary() {
+    const auto& profile = canonical_profile();
+    const std::array<std::pair<uint32_t, uint32_t>, 5> cases = {{
+        {0x7fffffffu, 1u}, {0x80000000u, 0xffffffffu}, {0xffffffffu, 1u}, {0x80000000u, 0x80000000u},
+        {0x7fffffffu, 0x7fffffffu},
+    }};
+    auto machine = i5_machine(profile, R"(
+        mov r1, 0
+        mov r20, 1
+        lds.uni r12, [r1 + 7232] {pred=PT, stall=0, set=sb1, wait=-}
+        lds.uni r14, [r1 + 7236] {pred=PT, stall=0, set=sb1, wait=-}
+        lds.uni r15, [r1 + 7240] {pred=PT, stall=0, set=sb1, wait=-}
+        lds.uni r17, [r1 + 7244] {pred=PT, stall=0, set=sb1, wait=-}
+        lds.uni r18, [r1 + 7248] {pred=PT, stall=0, set=sb1, wait=-}
+        atom.add.uni r7, [r1 + 2048], r12 {pred=PT, stall=0, set=sb0, wait=sb1}
+        atom.add.uni r8, [r1 + 2052], r14 {pred=PT, stall=0, set=sb0, wait=-}
+        atom.add.uni r9, [r1 + 2056], r15 {pred=PT, stall=0, set=sb0, wait=-}
+        atom.add.uni r10, [r1 + 2060], r17 {pred=PT, stall=0, set=sb0, wait=-}
+        atom.add.uni r11, [r1 + 2064], r18 {pred=PT, stall=0, set=sb0, wait=-}
+        atom.add.uni r21, [r1 + 2092], r20 {pred=PT, stall=0, set=sb2, wait=-}
+        atom.add.uni r22, [r1 + 2092], r20 {pred=PT, stall=0, set=sb2, wait=-}
+        atom.add.uni r23, [r1 + 2092], r20 {pred=PT, stall=0, set=sb2, wait=-}
+        atom.add.uni r24, [r1 + 2092], r20 {pred=PT, stall=0, set=sb2, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb2}
+    )", 1, [&](nanosm::Launch& launch) {
+        auto& shmem = launch.shmem_image.at(0).bytes;
+        for (uint32_t k = 0; k < 5; ++k) {
+            write_u32(shmem, 2048 + 4 * k, cases[k].first);
+            write_u32(shmem, 7232 + 4 * k, cases[k].second);
+        }
+        write_u32(shmem, 2092, 0x7ffffffeu);
+    });
+    machine->run();
+    for (uint32_t k = 0; k < 5; ++k) {
+        const auto [old_word, operand] = cases[k];
+        require(machine->read_shmem_u32(2048 + 4 * k) == static_cast<uint32_t>(uint64_t{old_word} + operand) &&
+                machine->read_reg(0, 5, 7 + k) == old_word,
+            "case " + std::to_string(k) + ": " + std::to_string(old_word) + " + " + std::to_string(operand));
+    }
+    for (uint32_t k = 0; k < 4; ++k) {
+        require(machine->read_reg(0, 9, 21 + k) == 0x7ffffffeu + k, "chain: atomic " + std::to_string(k));
+    }
+    require(machine->read_shmem_u32(2092) == 0x80000002u, "chain: the sum did not wrap to 0x80000002");
+}
+
+// rfc13 section 4: an atomic reserves its RETURN load slot at admission; with
+// none free it is not admitted (structural, counted as a load-slot wait), so
+// it never takes the store pause with nowhere to put its old value. One load
+// slot: the lds holds it from its grant G until its RF write at G + D + Lb +
+// 1; the atomic (not ordered: the lds is serviced at its grant) is refused
+// "load slots full" G .. G + D + Lb and admitted in the cycle the lds's RF
+// write frees the slot (same-cycle reuse), then runs.
+void test_i5_return_slot_admission() {
+    auto profile = canonical_profile();
+    profile.shmem_load_slots = 1;
+    const uint64_t back = profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
+    auto machine = i5_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r1, r0, 2
+        mov r2, 0
+        mov r3, 5
+        lds r6, [r1 + 256] {pred=PT, stall=0, set=sb1, wait=-}
+        atom.add.uni r7, [r2 + 1024], r3 {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )");
+    machine->run();
+    const auto g = i2_grants(*machine, "A-read").at(0);
+    require(g.client == "simt" && issued_at(*machine, 32) == std::vector<uint64_t>{g.cycle - 1},
+        "the lds was not granted the cycle after its issue");
+    require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{g.cycle, back + 1}} &&
+            issued_at(*machine, 40) == std::vector<uint64_t>{g.cycle + back + 1},
+        "the atomic was not refused for its return slot c" + std::to_string(g.cycle) + " .. c" +
+            std::to_string(g.cycle + back) + " and admitted at c" + std::to_string(g.cycle + back + 1) + ":" +
+            describe(refusals(*machine, 0, "load slots full")));
+    require(machine->trace().summary().shmem_load_slot_waits == back + 1, "the return-slot refusals were not counted");
+    const auto atomic = i5_atomic(*machine, "after the refusal");
+    i5_require_timeline(atomic, profile, atomic.start, "after the refusal");
+    require(machine->read_shmem_u32(1024) == 0x205, "the atomic's word");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 6) == 0x100 + 64 + lane && machine->read_reg(0, lane, 7) == 0x200,
+            "lane " + std::to_string(lane) + ": the lds or the atomic returned the wrong word");
+    }
+}
+
+// rfc13 section 4: the SIMT RMW register holds ONE operation machine-wide.
+// Three warps, one atomic each on one word (operand 1): the first runs in the
+// engine, the second waits in the register, the third is refused "SIMT RMW
+// register busy" until the register empties. All three apply, one after
+// another (each reads the previous sum), and the engine runs them back to
+// back with no overlap.
+void test_i5_simt_rmw_register_busy() {
+    auto profile = canonical_profile();
+    profile.shmem_load_slots = 3; // a return slot for each: the third waits only for the register
+    auto machine = i5_machine(profile, R"(
+        mov r1, 0
+        mov r5, 1
+        atom.add.uni r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    )", 3);
+    machine->run();
+    const auto atomics = i5_atomics(*machine);
+    require(atomics.size() == 3, "expected three atomics");
+    for (std::size_t k = 1; k < atomics.size(); ++k) {
+        require(atomics[k].start >= atomics[k - 1].end, "two atomics overlapped in the engine:" + describe(atomics[k]));
+    }
+    uint32_t busy = 0;
+    for (uint32_t warp = 0; warp < 3; ++warp) busy += static_cast<uint32_t>(refusals(*machine, warp, "SIMT RMW register busy").size());
+    require(busy != 0, "no warp was refused for the busy SIMT RMW register");
+    std::set<uint32_t> old_values;
+    for (uint32_t warp = 0; warp < 3; ++warp) old_values.insert(machine->read_reg(warp, 0, 7));
+    require(old_values == std::set<uint32_t>{0x300, 0x301, 0x302} && machine->read_shmem_u32(2048) == 0x303,
+        "the three atomics did not apply one after another");
+}
+
+// rfc13 section 6 with rfc12 section 6: the global store pause covers the
+// atomic from its start to its write grant w; stores start again at w + 1;
+// reads continue. Warp 0: one atomic. Warp 1: an lds (granted while the
+// atomic runs) and an sts on other words, admitted before w and granted
+// exactly at w + 1; store_paused counts its wait.
+// (Mutation: the pause ends at the atomic's read grant -> the sts goes in
+// before w + 1 and this test fails.)
+void test_i5_store_pause_and_resume() {
+    const auto& profile = canonical_profile();
+    auto machine = i5_machine(profile, R"(
+        sread r29, WARP_ID
+        setp.ne p6, r29, 0
+        bra.uni other {pred=p6, stall=0, set=-, wait=-}
+        mov r1, 0
+        mov r5, 1
+        atom.add.uni r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    other: sread r20, LANE_ID
+        shli r20, r20, 2
+        mov r21, 0x77
+        lds r23, [r20 + 256] {pred=PT, stall=0, set=sb1, wait=-}
+        sts [r20 + 3072], r21 {pred=PT, stall=0, set=sb2, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb1|sb2}
+    )", 2);
+    machine->run();
+    const auto atomic = i5_atomic(*machine, "store pause");
+    i5_require_timeline(atomic, profile, atomic.start, "store pause");
+    std::vector<uint64_t> loads;
+    std::vector<uint64_t> stores;
+    for (const auto& grant : i2_grants(*machine)) {
+        if (grant.client != "simt") continue;
+        (grant.service == "A-read" ? loads : stores).push_back(grant.cycle);
+    }
+    const auto w = atomic.writes.at(0);
+    const auto sts_issue = issued_at(*machine, 11 * 8);
+    require(loads.size() == 1 && loads[0] > atomic.start && loads[0] < w,
+        "warp 1's lds was not granted while the atomic ran (reads continue):" + describe(i2_grants(*machine)) +
+            describe(atomic));
+    require(sts_issue.size() == 1 && sts_issue[0] < w, "warp 1's sts was not admitted before the atomic's write");
+    require(stores == std::vector<uint64_t>{w + 1},
+        "the sts was not granted at the atomic's write + 1 (c" + std::to_string(w + 1) + "):" +
+            describe(i2_grants(*machine, "A-write")) + describe(atomic));
+    require(machine->trace().summary().shmem_store_paused == w - sts_issue[0],
+        "store_paused should count the sts's wait, its admission + 1 .. the atomic's write");
+    require(machine->read_shmem_u32(2048) == 0x301, "the atomic's word");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 7) == 0x300 && machine->read_reg(1, lane, 23) == 0x100 + 64 + lane &&
+                machine->read_shmem_u32(3072 + 4 * lane) == 0x77,
+            "lane " + std::to_string(lane) + ": wrong atomic, lds or sts data");
+    }
+}
+
+// rfc12 section 6 step 2: an atomic that STARTS while another warp's store
+// transaction is under way reads strictly after that store's last round
+// (matched D then lands the store before the atomic's sample). Warp 1: one
+// sts of sixteen rounds (every lane on bank 0); its LAST round writes the
+// atomic's word. Warp 0's atomic starts during those rounds; its read is
+// granted the cycle after the last round, and it reads the stored word.
+// (Mutation: the read granted while the store is under way -> it is early
+// and returns the old word.)
+void test_i5_read_after_the_store_under_way() {
+    const auto& profile = canonical_profile();
+    auto machine = i5_machine(profile, R"(
+        sread r29, WARP_ID
+        setp.ne p6, r29, 0
+        bra.uni other {pred=p6, stall=0, set=-, wait=-}
+        mov r1, 0
+        mov r5, 1
+        mov r6, 0
+        mov r6, 1
+        mov r6, 2
+        atom.add.uni r7, [r1 + 960], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    other: sread r20, LANE_ID
+        shli r20, r20, 6
+        mov r21, 0x77
+        sts [r20], r21 {pred=PT, stall=0, set=sb2, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb2}
+    )", 2);
+    machine->run();
+    const auto atomic = i5_atomic(*machine, "read after the store");
+    std::vector<uint64_t> rounds;
+    for (const auto& grant : i2_grants(*machine, "A-write")) {
+        if (grant.client == "simt") rounds.push_back(grant.cycle);
+    }
+    require(rounds.size() == 16, "the sts was not sixteen rounds");
+    require(atomic.start > rounds.front() && atomic.start <= rounds.back(),
+        "the atomic did not start while the sts was under way (the test needs that):" + describe(atomic) +
+            " sts rounds c" + std::to_string(rounds.front()) + "..c" + std::to_string(rounds.back()));
+    i5_require_timeline(atomic, profile, rounds.back() + 1, "read after the store");
+    require(machine->read_reg(0, 0, 7) == 0x77 && machine->read_shmem_u32(960) == 0x78,
+        "the atomic did not read the store's word (rD " + std::to_string(machine->read_reg(0, 0, 7)) + ")");
+}
+
+// rfc13 section 4 with rfc12 section 4: an atomic is a WRITE for its warp's
+// order and counts as unserviced until its write grant.
+//   sts B; atom B: the atomic waits for the sts's grant and reads its word;
+//   atom B; lds B: the lds waits until the atomic's write grant w (admitted
+//     at w) and reads the result in lane 0's word;
+//   lds A; atom A: the atomic waits for the lds's grant; the lds reads the
+//     old word (and so does the atomic: it applies after);
+//   atom A; fence.sh: admitted at the atomic's write grant + D.
+// Words B: 384 + l (sixteen banks, one round each); A: 256 + l. Three load
+// slots, so atom A's return slot is free while both lds hold theirs: only
+// the warp's order decides.
+void test_i5_same_warp_order() {
+    auto profile = canonical_profile();
+    profile.shmem_load_slots = 3;
+    auto machine = i5_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r1, r0, 2
+        mov r2, 0
+        mov r3, 3
+        mov r12, 0x1010
+        sts [r1 + 1536], r12 {pred=PT, stall=0, set=sb1, wait=-}
+        atom.add.uni r11, [r2 + 1536], r3 {pred=PT, stall=0, set=sb2, wait=-}
+        lds r8, [r1 + 1536] {pred=PT, stall=0, set=sb3, wait=-}
+        lds r6, [r1 + 1024] {pred=PT, stall=0, set=sb4, wait=-}
+        atom.add.uni r7, [r2 + 1024], r3 {pred=PT, stall=0, set=sb0, wait=-}
+        fence.sh
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4}
+    )");
+    machine->run();
+    const auto atomics = i5_atomics(*machine);
+    require(atomics.size() == 2, "expected two atomics");
+    std::vector<I2Grant> simt;
+    for (const auto& grant : i2_grants(*machine)) {
+        if (grant.client == "simt") simt.push_back(grant);
+    }
+    // sts B, lds B, lds A, in that order.
+    require(simt.size() == 3 && simt[0].service == "A-write" && simt[1].service == "A-read" &&
+            simt[2].service == "A-read",
+        "the SIMT rounds:" + describe(simt));
+    require(issued_at(*machine, 48) == std::vector<uint64_t>{simt[0].cycle} && atomics[0].reads.at(0) > simt[0].cycle,
+        "atom B was not admitted at the sts's grant, reading after it");
+    const auto w_b = atomics[0].writes.at(0);
+    require(issued_at(*machine, 56) == std::vector<uint64_t>{w_b} && simt[1].cycle > w_b,
+        "lds B was not admitted at atom B's write grant c" + std::to_string(w_b) + ":" + describe(atomics[0]));
+    require(issued_at(*machine, 72) == std::vector<uint64_t>{simt[2].cycle} && atomics[1].reads.at(0) > simt[2].cycle,
+        "atom A was not admitted at lds A's grant");
+    require(issued_at(*machine, 80) == std::vector<uint64_t>{atomics[1].writes.at(0) + profile.shmem_port_a_depth},
+        "fence.sh was not admitted at atom A's write grant + D");
+    require(machine->read_shmem_u32(1536) == 0x1013 && machine->read_shmem_u32(1024) == 0x203,
+        "the atomics' words");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 11) == 0x1010 && machine->read_reg(0, lane, 7) == 0x200,
+            "lane " + std::to_string(lane) + ": an atomic's old value");
+        require(machine->read_reg(0, lane, 8) == (lane == 0 ? 0x1013u : 0x1010u) &&
+                machine->read_reg(0, lane, 6) == 0x200 + lane,
+            "lane " + std::to_string(lane) + ": an lds around the atomics");
+    }
+}
+
+// Backlog D12 (HUMAN 2026-10-12): a uniform operation takes lane 0's
+// operands whatever the active mask -- the mask gates only its destination's
+// lane write enables -- and a partial (or empty) mask is UB: the SANITIZER
+// PANICs; the machine runs quietly, and what it does then is no contract
+// (rfc13 section 2: the asserts below pin today's behavior so that it stays
+// deterministic, nothing more). Lane 0 is inactive here (0xfffe), and
+// lane l's registers hold l-dependent values, so lane 0's are visible:
+//   atom.add.uni [lane 0's r1 + 2048] += lane 0's r5 (1): word 512 becomes
+//     0x301; rD lanes 1..15 get 0x300, lane 0 keeps 0xdead;
+//   lds.uni r3 from lane 0's address: lanes 1..15 get 0x300;
+//   mbar.arrive and mbar.test_wait on a count-1 mbar: the phase completes.
+// An EMPTY mask still performs the atomic (word 512 = 0x301) and writes no
+// lane of rD.
+void test_d12_uniform_ops_under_a_partial_mask() {
+    const auto& profile = canonical_profile();
+    const std::string program = R"(
+        sread r0, LANE_ID
+        shli r1, r0, 2
+        addi r5, r0, 1
+        mov r7, 0xdead
+        mov r3, 0xbeef
+        mov r4, 4160
+        atom.add.uni r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
+        lds.uni r3, [r1 + 2048] {pred=PT, stall=0, set=sb1, wait=sb0}
+        mbar.arrive [r4]
+        mbar.test_wait p0, [r4], 0
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )";
+    const auto mbar = [](nanosm::Launch& launch) { write_count_mbar(launch.shmem_image.at(0).bytes, 4160, 1); };
+    for (const uint64_t mask : {uint64_t{0xfffe}, uint64_t{0}}) {
+        const auto what = "mask " + std::to_string(mask);
+        auto machine = i5_machine(profile, program, 1, mbar);
+        machine->test_set_active_mask(0, mask);
+#if NANOSM_SANITIZER
+        const auto message = i4_panic(*machine, what);
+        require_mentions(message, {"atom.add.uni is a uniform operation under a partial active mask"}, what);
+#else
+        while (!machine->done()) tick_capped(*machine);
+        require(machine->read_shmem_u32(2048) == 0x301, what + ": the atomic did not use lane 0's address and operand");
+        require(machine->read_mbar_state(4160).phase, what + ": the arrive did not complete the phase");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            const bool active = (mask >> lane & 1) != 0;
+            require(machine->read_reg(0, lane, 7) == (active ? 0x300u : 0xdeadu) &&
+                    machine->read_reg(0, lane, 3) == (active ? 0x301u : 0xbeefu),
+                what + ": lane " + std::to_string(lane) + " rD (the mask gates only the write enables)");
+        }
+#endif
+    }
+#if NANOSM_SANITIZER
+    for (const std::string uniform :
+             {"lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [r2]", "mbar.test_wait p0, [r2], 0"}) {
+        auto machine = i5_machine(profile, "mov r1, 0\nmov r2, 4160\n" + uniform + "\nhalt\n", 1, mbar);
+        machine->test_set_active_mask(0, 0xfffe);
+        require_mentions(i4_panic(*machine, uniform), {"uniform operation under a partial active mask"}, uniform);
+    }
+#endif
+}
+
+// Backlog D12 (HUMAN 2026-10-12, as on NVIDIA): two lanes of one sts naming
+// one word is UB -- the SANITIZER PANICs at issue; the machine just writes
+// every lane, in round order (each lane on the word is its own bank round),
+// so the highest ACTIVE lane's word lands. Lane l stores l + 1 to word 0.
+void test_d12_sts_two_lanes_on_one_word() {
+    for (const uint64_t mask : {uint64_t{0xffff}, uint64_t{0x00f6}}) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        image_bytes(launch.shmem_image, 4);
+        nanosm::Machine machine(canonical_profile(), compile(R"(
+            sread r1, LANE_ID
+            addi r2, r1, 1
+            mov r0, 0
+            sts [r0], r2
+            halt
+        )"), std::move(launch));
+        machine.test_set_active_mask(0, mask);
+#if NANOSM_SANITIZER
+        require_mentions(i4_panic(machine, "same-word sts"), {"multiple lanes write the same shmem word"},
+            "same-word sts");
+#else
+        while (!machine.done()) tick_capped(machine);
+        const uint32_t highest = mask == 0xffff ? 15 : 7;
+        require(machine.read_shmem_u32(0) == highest + 1,
+            "the highest active lane's word did not land (" + std::to_string(machine.read_shmem_u32(0)) + ")");
+#endif
+    }
+}
+
+// Backlog D12, gmem: two lanes of one stg naming one word is UB -- the
+// SANITIZER PANICs at issue, before anything is written; the machine sends
+// every lane's write, one request per lane in lane order, and with the
+// placeholder controller's queue-front order the highest lane's lands last.
+void test_d12_stg_two_lanes_on_one_word() {
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& gmem = image_bytes(launch.gmem_image, 4);
+    write_u32(gmem, 0, 0x12345678);
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        mov   r0, 0
+        sread r1, LANE_ID
+        stg   [r0], r1
+        halt
+    )"), std::move(launch));
+#if NANOSM_SANITIZER
+    require_mentions(i4_panic(machine, "same-word stg"), {"multiple lanes write the same gmem word"}, "same-word stg");
+    require(machine.read_gmem_u32(0) == 0x12345678, "the PANIC came after a write");
+#else
+    while (!machine.done()) tick_capped(machine);
+    require(machine.read_gmem_u32(0) == 15, "lane 15's word did not land last (" +
+        std::to_string(machine.read_gmem_u32(0)) + ")");
+#endif
+}
+
+// Backlog D12: an sts over an mbar with a live waiter is UB (as on NVIDIA:
+// an mbarrier's memory is used for nothing else until mbarrier.inval). The
+// machine no longer checks it: the sts just writes the word. The SANITIZER's
+// C10 PANICs (the mbar is declared by the launch, so it is live from launch).
+// Warp 0 waits on the mbar (one try_wait, then halt); warp 1's sts writes 5
+// into words 16 + l (lanes 0 and 1: the mbar's two words). Without the
+// sanitizer the waiter's try_wait simply times out (no wake); the run is
+// capped.
+void test_d12_sts_over_an_mbar_with_a_live_waiter() {
+    nanosm::Launch launch;
+    launch.active_warps = 2;
+    auto& shmem = image_bytes(launch.shmem_image, 128);
+    write_count_mbar(shmem, 64, 1);
+    launch.mbars = {64};
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        mov r1, 64
+        sread r0, WARP_ID
+        setp.eq p0, r0, 0
+        @p0 bra.uni waiter
+        sread r3, LANE_ID
+        shli r3, r3, 2
+        add r3, r3, r1
+        mov r2, 5
+        sts [r3], r2
+        halt
+    waiter:
+        mbar.try_wait p1, [r1], 0
+        halt
+    )"), std::move(launch));
+#if NANOSM_SANITIZER
+    require_mentions(i4_panic(machine, "sts over a live mbar"), {"reason=live mbar opacity: sts writes bytes [64, 72) "
+        "of the live mbar [64, 72) (declared by the launch image)"}, "sts over a live mbar");
+#else
+    while (!machine.done()) tick_capped(machine);
+    require(machine.read_shmem_u32(64) == 5 && machine.read_shmem_u32(68) == 5, "the sts did not write the mbar's words");
+#endif
+}
+
+// Backlog D12.1 (HUMAN 2026-10-12): EVERY uniform operation -- each
+// instruction with a lane-0-sourced operand, and bra.uni in every form -- is
+// UB under a partial (or empty) active mask: the SANITIZER PANICs naming it;
+// the machine reads lane 0 and runs quietly (what it does then is no
+// contract; a program with a partial mask uses the per-lane instruction).
+// One program per uniform opcode family, each of which runs to completion
+// under a full mask, run under 0xfffe (lane 0 inactive): the named opcode is
+// the program's first uniform operation.
+void test_d12_1_every_uniform_op_under_a_partial_mask() {
+    const auto& profile = canonical_profile();
+    const auto setup = [](nanosm::Launch& launch) {
+        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        write_count_mbar(shmem, 4096, 1);
+        write_tma_descriptor(shmem, 5120, linear_tma(false, 1024, 64, 4104));
+        write_tx_mbar(shmem, 4104, 64);
+        image_bytes(launch.gmem_image, 4096);
+    };
+    const std::string mma_tail = "mov r4, 4160\nmbar.init [r4], 1\nmma.commit [r4]\n"
+                                 "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n";
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"lds.uni", "mov r0, 0\nlds.uni r1, [r0]\nhalt\n"},
+        {"ldg.uni", "mov r0, 0\nldg.uni r1, [r0]\nhalt\n"},
+        {"ldg.v8", "mov r0, 0\nldg.v8 r8, [r0]\nhalt\n"},
+        {"stg.v8", "mov r0, 0\nstg.v8 [r0], r8\nhalt\n"},
+        {"mbar.init", "mov r4, 4160\nmbar.init [r4], 1\nhalt\n"},
+        {"mbar.arrive", "mov r4, 4096\nmbar.arrive [r4]\nhalt\n"},
+        {"mbar.arrive.expect_tx", "mov r4, 4096\nmbar.arrive.expect_tx [r4], 0\nhalt\n"},
+        {"mbar.test_wait", "mov r4, 4096\nmbar.test_wait p0, [r4], 0\nhalt\n"},
+        {"mbar.try_wait", "mov r4, 4096\nmbar.try_wait p0, [r4], 0\nhalt\n"},
+        {"atom.add.uni", "mov r0, 0\nmov r1, 1\natom.add.uni r2, [r0], r1\nhalt\n"},
+        {"tma.async", "mov r8, 0\nmov r9, 0\nmov r10, 0\nmov r4, 4104\ntma.async [5120], r8\n"
+                      "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n"},
+        {"mma.async.init", ".acc C, 0, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async.init C, [r0], [r1]\n" + mma_tail},
+        {"mma.async", ".acc C, 0, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async C, [r0], [r1]\n" + mma_tail},
+        {"mma.commit", "mov r4, 4096\nmma.commit [r4]\nhalt\n"},
+        {"acc.ld", ".acc C, 0, 0, 64, 64\nmov r8, 0\nmov r9, 0\nacc.ld r10, C, r8\nhalt\n"},
+        {"acc.st.v8", ".acc C, 0, 0, 64, 64\nmov r8, 0\nmov r9, 0\nmov r0, 1\nacc.st.v8 C, r8, r0\nhalt\n"},
+        {"bra.uni", "sread r0, WARP_ID\nsetp.eq p0, r0, 0\n@p0 bra.uni out\nmov r1, 1\nout:\nhalt\n"},
+        {"bra.uni", "bra.uni out\nmov r1, 1\nout:\nhalt\n"}, // @PT: no operand, still uniform
+    };
+    for (const auto& [name, program] : cases) {
+        for (const uint64_t mask : {uint64_t{0xffff}, uint64_t{0xfffe}}) {
+            const auto what = name + " under mask " + std::to_string(mask) + ": " + program;
+            nanosm::Launch launch;
+            launch.active_warps = 1;
+            setup(launch);
+            nanosm::Machine machine(profile, compile(program, profile), std::move(launch));
+            machine.test_set_active_mask(0, mask);
+#if NANOSM_SANITIZER
+            if (mask != 0xffff) {
+                require_mentions(i4_panic(machine, what), {name + " is a uniform operation under a partial active mask"},
+                    what);
+                continue;
+            }
+#endif
+            try {
+                while (!machine.done()) tick_capped(machine);
+            } catch (const nanosm::SimError& error) {
+                throw std::runtime_error(what + ": the machine panicked: " + error.what());
+            }
+        }
+    }
+}
+
+// Backlog D12.1: an mbar.init over an mbar with a live waiter is UB (as on
+// NVIDIA: an mbarrier is reinitialized only after mbarrier.inval). The
+// machine no longer checks it: the init just writes the new state and wakes
+// nobody. The SANITIZER's C10 PANICs (the mbar is declared by the launch, so
+// it is live from launch). Warp 0 parks in one try_wait on the count-1 mbar
+// (nobody arrives); warp 1 re-initializes it with count 3 while warp 0 is
+// parked. Without the sanitizer warp 0's try_wait times out (false: r9 stays
+// 0) and both halt; the run is capped.
+void test_d12_1_mbar_init_over_a_live_waiter() {
+    nanosm::Launch launch;
+    launch.active_warps = 2;
+    auto& shmem = image_bytes(launch.shmem_image, 128);
+    write_count_mbar(shmem, 64, 1);
+    launch.mbars = {64};
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        mov r1, 64
+        sread r0, WARP_ID
+        setp.eq p0, r0, 0
+        @p0 bra.uni waiter
+        mbar.init [r1], 3
+        halt
+    waiter:
+        mov r9, 0
+        mbar.try_wait p1, [r1], 0
+        @p1 bra.uni woken
+        halt
+    woken:
+        mov r9, 7
+        halt
+    )"), std::move(launch));
+#if NANOSM_SANITIZER
+    require_mentions(i4_panic(machine, "mbar.init over a live waiter"),
+        {"reason=mbar.init over the live mbar [64, 72) (declared by the launch image)", "inst='mbar.init [r1], 3"},
+        "mbar.init over a live waiter");
+#else
+    while (!machine.done()) tick_capped(machine);
+    const auto state = machine.read_mbar_state(64);
+    require(state.valid && state.expected == 3 && state.remaining == 3 && !state.phase,
+        "the mbar.init did not write its state over the waited-on mbar");
+    require(machine.read_reg(0, 0, 9) == 0, "the waiter was woken; a re-initialization wakes nobody");
+#endif
+}
+
+// Backlog D12.1: a TMA load placing data over an mbar with a live waiter is
+// UB (as on NVIDIA: an mbarrier's memory serves nothing else until
+// mbarrier.inval). The machine no longer checks it: the placement just writes
+// the bytes. The SANITIZER's C10 PANICs at the placement write (the mbar at
+// 1032 is declared by the launch). Warp 0 spins in try_wait on that count-1
+// mbar (nobody arrives); warp 1, after a delay that lets warp 0's first probe
+// return and park, loads 64 bytes from gmem 0 over shmem [1024, 1088). The
+// gmem bytes that land on the mbar are the same mbar with its phase flipped
+// (only bit 0 differs, so any probe sees a valid mbar): without the
+// sanitizer warp 0's next probe sees phase 1 and leaves, and warp 1 waits
+// for the TMA's own mbar at 4104.
+void test_d12_1_tma_load_over_a_live_waiter() {
+    nanosm::Launch launch;
+    launch.active_warps = 2;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    write_count_mbar(shmem, 1032, 1);
+    write_tma_descriptor(shmem, 5120, linear_tma(false, 1024, 64, 4104));
+    write_tx_mbar(shmem, 4104, 64);
+    launch.mbars = {1032};
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    for (uint32_t word = 0; word < 16; ++word) write_u32(gmem, 4 * word, 0x500 + word);
+    nanosm::MbarState flipped;
+    flipped.phase = true;
+    flipped.valid = true;
+    flipped.expected = 1;
+    flipped.remaining = 1;
+    write_u64(gmem, 8, nanosm::encode_mbar_state(flipped));
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        sread r0, WARP_ID
+        setp.eq p0, r0, 0
+        @p0 bra.uni waiter
+        mov r20, 0
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        addi r20, r20, 1
+        mov r8, 0
+        mov r9, 0
+        mov r10, 0
+        mov r4, 4104
+        tma.async [5120], r8
+    loaded:
+        mbar.try_wait p1, [r4], 0
+        @!p1 bra.uni loaded
+        halt
+    waiter:
+        mov r1, 1032
+    spin:
+        mbar.try_wait p2, [r1], 0
+        @!p2 bra.uni spin
+        halt
+    )"), std::move(launch));
+#if NANOSM_SANITIZER
+    require_mentions(i4_panic(machine, "TMA load over a live waiter"),
+        {"reason=live mbar opacity: tma load #0 placement writes bytes [1032, 1040) of the live mbar [1032, 1040) "
+         "(declared by the launch image)"},
+        "TMA load over a live waiter");
+#else
+    while (!machine.done()) tick_capped(machine);
+    const auto state = machine.read_mbar_state(1032);
+    require(state.valid && state.phase && state.expected == 1 && state.remaining == 1,
+        "the TMA did not write its bytes over the waited-on mbar");
+    require(machine.read_shmem_u32(1024) == 0x500 && machine.read_shmem_u32(1084) == 0x50f,
+        "the TMA's other bytes did not land");
+#endif
+}
+
+// SANITIZER (rfc09 pin 3, rfc13 section 2): an atomic's address and operand
+// are lane 0's in hardware; one that differs across lanes PANICs.
+void test_i5_atomic_nonuniform_operands() {
+    const auto& profile = canonical_profile();
+    for (const auto& [program, needle] : {
+             std::pair<std::string, std::string>{"sread r0, LANE_ID\nshli r1, r0, 2\nmov r5, 1\n"
+                 "atom.add.uni r7, [r1], r5\nhalt\n", "atom base address is not warp-uniform"},
+             {"sread r0, LANE_ID\nmov r1, 0\natom.add.uni r7, [r1], r0\nhalt\n", "atom operand is not warp-uniform"},
+         }) {
+        require_mentions(i4_panic(*i5_machine(profile, program, 1, {}, false), needle), {needle}, needle);
+    }
+}
+
+// SANITIZER (rfc13 section 7, C10): an atomic writing a LIVE mbar PANICs at
+// its write grant (using the RMW engine does not authorize it) -- an mbar
+// made live by a SIMT mbar.init, and one the launch declared (live from
+// launch). The launch-declared mbar is opaque to an sts and to an mbar.init
+// as well, and stays usable by mbar operations. The atomic's other sanitizer
+// checks: issued over a TMA load's destination it is a race; its word still
+// travelling under a TMA store of it, without a fence.sh, a missing fence
+// (with one: clean, and gmem gets its result).
+void test_i5_atomic_sanitizer() {
+    const auto& profile = canonical_profile();
+    auto message = i4_panic(*i5_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\nmov r21, 9\n"
+        "atom.add.uni r7, [r4], r21\nhalt\n", 1, {}, false), "an atomic on a SIMT-initialized mbar");
+    require_mentions(message, {"mbar address=4160 reason=live mbar opacity: atom.add.uni r7, [r4], r21 (warp 0 pc ",
+        "writes bytes [4160, 4164) of the live mbar [4160, 4168) (mbar.init by warp 0 pc 8 at cycle ",
+        "until kernel end only mbar operations may touch it"}, "an atomic on a SIMT-initialized mbar");
+
+    const auto declared = [](nanosm::Launch& launch) {
+        write_count_mbar(launch.shmem_image.at(0).bytes, 4160, 1);
+        launch.mbars = {4160};
+    };
+    message = i4_panic(*i5_machine(profile, "mov r4, 4164\nmov r21, 9\natom.exch.uni r7, [r4], r21\nhalt\n", 1,
+        declared, false), "an atomic on a launch-declared mbar");
+    require_mentions(message, {"mbar address=4160 reason=live mbar opacity: atom.exch.uni r7, [r4], r21 (warp 0 pc ",
+        "writes bytes [4164, 4168) of the live mbar [4160, 4168) (declared by the launch image)"},
+        "an atomic on a launch-declared mbar");
+    message = i4_panic(*i5_machine(profile, "mov r4, 4160\nsread r20, LANE_ID\nshli r20, r20, 2\nadd r20, r20, r4\n"
+        "mov r21, 9\nsts [r20], r21\nhalt\n", 1, declared, false), "an sts on a launch-declared mbar");
+    require_mentions(message, {"reason=live mbar opacity: sts writes bytes [4160, 4168) of the live mbar [4160, 4168) "
+        "(declared by the launch image)"}, "an sts on a launch-declared mbar");
+    message = i4_panic(*i5_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\nhalt\n", 1, declared, false),
+        "an mbar.init over a launch-declared mbar");
+    require_mentions(message, {"reason=mbar.init over the live mbar [4160, 4168) (declared by the launch image)"},
+        "an mbar.init over a launch-declared mbar");
+    auto legal = i5_machine(profile, "mov r4, 4160\nmbar.arrive [r4]\nwait:\nmbar.try_wait p0, [r4], 0\n"
+        "@!p0 bra.uni wait\nhalt\n", 1, declared, false);
+    legal->run();
+    require(legal->read_mbar_state(4160).phase, "an arrive on a launch-declared mbar did not complete its phase");
+
+    const auto tma = [](bool store) {
+        return [store](nanosm::Launch& launch) {
+            auto& shmem = launch.shmem_image.at(0).bytes;
+            write_tma_descriptor(shmem, 5120, linear_tma(store, store ? 0 : 1024, 64, 4104));
+            write_tx_mbar(shmem, 4104, 64);
+        };
+    };
+    const std::string tail = R"(
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        halt
+    )";
+    const std::string prologue = "mov r8, 0\nmov r9, 0\nmov r10, 0\nmov r4, 4104\n";
+    message = i4_panic(*i5_machine(profile, prologue + "tma.async [5120], r8\nmov r20, 1032\nmov r21, 1\n"
+        "atom.add.uni r7, [r20], r21\n" + tail, 1, tma(false), false), "an atomic over a TMA load's destination");
+    require_mentions(message, {"reason=shmem race: atom.add.uni writes 1 word, bytes [1032, 1036) owned by tma load #0"},
+        "an atomic over a TMA load's destination");
+    const std::string atomic = "mov r20, 8\nmov r21, 0x1000\natom.add.uni r7, [r20], r21\n";
+    message = i4_panic(*i5_machine(profile, prologue + atomic + "tma.async [5120], r8\n" + tail, 1, tma(true), false),
+        "a TMA store of an atomic's word without fence.sh");
+    require_mentions(message, {"reason=missing fence.sh: tma store #0 source bytes [", "overlap this warp's earlier "
+        "atom.add.uni r7, [r20], r21 (pc ", "whose write has not reached the RAM; issue fence.sh between them"},
+        "a TMA store of an atomic's word without fence.sh");
+    auto fenced = i5_machine(profile, prologue + atomic + "fence.sh\ntma.async [5120], r8\n" + tail, 1, tma(true), false);
+    fenced->run();
+    for (uint32_t i = 0; i < 16; ++i) {
+        require(fenced->read_gmem_u32(4 * i) == (i == 2 ? 0x1102u : 0x100u + i),
+            "the fenced TMA store did not carry the atomic's result");
+    }
+}
+
+// C10 follow-up (both builds): a launch DECLARES the mbars the host
+// initialized in its shmem image (Launch::mbars; the Python harness's
+// shmem.mbar() declares, so FA's are declared). The launch formats carry the
+// list ("mbars", absent: none, emitted only when there is one); the machine
+// rejects a declaration that is not an 8-byte aligned shmem slot. C11 / C2:
+// an "mbars" entry or "active_warps" that is not an unsigned 32-bit integer
+// is rejected before it is narrowed (4294967296 is not address 0, 4160.9 is
+// not 4160, -8 is not 0xfffffff8).
+void test_i5_launch_declared_mbars_format() {
+    nanosm::LaunchImage input;
+    input.kernel = compile("halt");
+    input.launch.active_warps = 1;
+    input.launch.shmem_image.push_back({4160, std::vector<uint8_t>(8, 0)});
+    const auto plain = nanosm::emit_launch_image(input);
+    require(plain.find("mbars") == std::string::npos, "a launch with no declared mbar emitted an mbars field");
+    input.launch.mbars = {4160, 4168};
+    const auto declared = nanosm::emit_launch_image(input);
+    const auto loaded = nanosm::load_launch_image(declared);
+    require(loaded.launch.mbars == std::vector<uint32_t>{4160, 4168} && nanosm::emit_launch_image(loaded) == declared,
+        "the launch image lost its declared mbars");
+    const auto state_text = nanosm::emit_launch_state(input.launch);
+    const auto state = nanosm::load_launch_state(state_text);
+    require(state.mbars == input.launch.mbars, "the launch state lost its declared mbars");
+    require(nanosm::load_launch_state(nanosm::emit_launch_state(nanosm::Launch{1, {}, {}, {}})).mbars.empty(),
+        "an absent mbars field is not an empty list");
+    for (const uint32_t bad : {4161u, 65536u}) {
+        auto launch = input.launch;
+        launch.mbars = {bad};
+        try {
+            nanosm::Machine machine(canonical_profile(), compile("halt"), std::move(launch));
+            throw std::runtime_error("a declared mbar at " + std::to_string(bad) + " was accepted");
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("launch declares an mbar at " + std::to_string(bad)) != std::string::npos,
+                error.what());
+        }
+    }
+    const auto rejected = [](const std::function<std::string()>& load, const std::string& needle, const std::string& what) {
+        try {
+            (void)load();
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find(needle) != std::string::npos, what + ": " + error.what());
+            return;
+        }
+        throw std::runtime_error(what + " was accepted");
+    };
+    for (const auto& bad : {nlohmann::json(4294967296ull), nlohmann::json(4160.9), nlohmann::json(-8), nlohmann::json("64")}) {
+        for (const bool image : {false, true}) {
+            auto document = nlohmann::json::parse(image ? declared : state_text);
+            document["mbars"] = {4160, bad};
+            const auto text = document.dump();
+            rejected([&] { return image ? nanosm::emit_launch_image(nanosm::load_launch_image(text))
+                                        : nanosm::emit_launch_state(nanosm::load_launch_state(text)); },
+                "launch: mbars[1] is not a shmem address", "mbars entry " + bad.dump());
+        }
+    }
+    for (const auto& bad : {nlohmann::json(4294967297ull), nlohmann::json(1.5), nlohmann::json(-1)}) {
+        for (const bool image : {false, true}) {
+            auto document = nlohmann::json::parse(image ? declared : state_text);
+            document["active_warps"] = bad;
+            const auto text = document.dump();
+            rejected([&] { return image ? nanosm::emit_launch_image(nanosm::load_launch_image(text))
+                                        : nanosm::emit_launch_state(nanosm::load_launch_state(text)); },
+                std::string(image ? "launch image" : "launch state") + ": active warp count is not an unsigned 32-bit integer",
+                "active_warps " + bad.dump());
+        }
+    }
 }
 
 int main() {
@@ -9799,9 +10680,7 @@ int main() {
         {"mbar warp handoff", test_warp_handoff_through_mbar},
         {"mbar uniform address", test_mbar_requires_uniform_address},
         {"mbar arrival underflow", test_mbar_arrival_underflow_panics},
-        {"mbar reinit with waiter", test_mbar_reinit_with_waiter_panics},
         {"mbar wrong-phase completion", test_mbar_complete_wrong_phase_panics},
-        {"mbar store repurpose", test_store_cannot_repurpose_mbar_with_waiter},
         {"vadd", test_vadd},
         {"sparse launch images", test_sparse_launch_images},
         {"lsu scalar ldg: one request per lane", test_lsu_scalar_ldg_is_one_request_per_lane},
@@ -9843,8 +10722,6 @@ int main() {
         {"missing wait panic", test_missing_wait_panics_instead_of_scoreboarding},
         {"plain lds of one word: 16 rounds", test_plain_lds_of_one_word_is_sixteen_rounds},
         {"bank conflict", test_bank_conflict_serializes},
-        {"write collision", test_write_collision_panics},
-        {"gmem write collision", test_gmem_write_collision_panics_without_writing},
         {"invalid profile defaults", test_profile_defaults_are_invalid},
         {"validate before allocation", test_profile_is_validated_before_machine_allocation},
         {"allocation failure PANIC", test_host_allocation_failure_is_a_panic},
@@ -9922,6 +10799,24 @@ int main() {
         {"I4: cross-warp race; the mbar handoff is clean", test_i4_cross_warp_race},
         {"I4: read/read overlap never PANICs", test_i4_read_read_overlap_is_clean},
         {"I4: C10 live-mbar opacity", test_i4_live_mbar_opacity},
+        {"I5: atom.*.uni encoding, qtxc and hand assembly", test_i5_atomic_encoding_and_assembly},
+        {"I5: one word, applied once; the timeline (D, C = 2, 3)", test_i5_one_word_timeline},
+        {"I5: int32 add wraps at the boundary", test_i5_add_wraps_at_the_int32_boundary},
+        {"I5: return slot admission", test_i5_return_slot_admission},
+        {"I5: SIMT RMW register busy", test_i5_simt_rmw_register_busy},
+        {"I5: store pause and resume", test_i5_store_pause_and_resume},
+        {"I5: read after the store under way", test_i5_read_after_the_store_under_way},
+        {"I5: same-warp order around an atomic", test_i5_same_warp_order},
+        {"I5: launch-declared mbars (format; C11, C2)", test_i5_launch_declared_mbars_format},
+        {"I5: atom.*.uni non-uniform address or operand PANIC", test_i5_atomic_nonuniform_operands},
+        {"I5: atomic sanitizer: C10, race, missing fence", test_i5_atomic_sanitizer},
+        {"D12: uniform ops under a partial mask", test_d12_uniform_ops_under_a_partial_mask},
+        {"D12: sts with two lanes on one word", test_d12_sts_two_lanes_on_one_word},
+        {"D12: stg with two lanes on one word", test_d12_stg_two_lanes_on_one_word},
+        {"D12: sts over an mbar with a live waiter", test_d12_sts_over_an_mbar_with_a_live_waiter},
+        {"D12.1: every uniform op under a partial mask", test_d12_1_every_uniform_op_under_a_partial_mask},
+        {"D12.1: mbar.init over an mbar with a live waiter", test_d12_1_mbar_init_over_a_live_waiter},
+        {"D12.1: TMA load over an mbar with a live waiter", test_d12_1_tma_load_over_a_live_waiter},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
@@ -9957,6 +10852,12 @@ int main() {
         "I4: missing fence.sh PANICs; fence.sh passes",
         "I4: cross-warp race; the mbar handoff is clean",
         "I4: C10 live-mbar opacity",
+        // I5: uniformity, C10 (live mbars, now also launch-declared ones),
+        // the race and the missing fence are sanitizer checks. (The D12 tests
+        // run in both builds: quiet machine without the sanitizer, its PANIC
+        // with it.)
+        "I5: atom.*.uni non-uniform address or operand PANIC",
+        "I5: atomic sanitizer: C10, race, missing fence",
     };
     for (const auto& name : expects_sanitizer_panic) {
         if (std::none_of(tests.begin(), tests.end(), [&](const auto& test) { return test.first == name; })) {

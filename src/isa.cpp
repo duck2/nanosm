@@ -38,6 +38,10 @@ uint64_t encode(const Instruction& inst) {
         inst.imm < encoding::immediate_min || inst.imm > encoding::immediate_max) {
         throw SimError("instruction field does not fit 64-bit encoding: " + format_instruction(inst));
     }
+    if (is_atomic(inst.opcode) &&
+        (inst.imm < encoding::atomic_immediate_min || inst.imm > encoding::atomic_immediate_max)) {
+        throw SimError("atomic offset does not fit its signed 14-bit immediate: " + format_instruction(inst));
+    }
     const auto predicate = static_cast<uint64_t>(
         inst.control.predicate | (inst.control.predicate_invert ? 8 : 0));
     uint64_t word =
@@ -152,6 +156,15 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
         word |= immediate;
+        break;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        word |= static_cast<uint32_t>(inst.imm) & encoding::atomic_immediate_mask;
         break;
     case Opcode::bra:
     case Opcode::bra_uni:
@@ -290,6 +303,18 @@ Instruction decode(uint64_t word) {
         inst.src1 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
         break;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni: {
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        auto offset = static_cast<uint32_t>(word & encoding::atomic_immediate_mask);
+        if ((offset & (1u << 13)) != 0) offset |= ~static_cast<uint32_t>(encoding::atomic_immediate_mask);
+        inst.imm = static_cast<int32_t>(offset);
+        break;
+    }
     case Opcode::bra:
     case Opcode::bra_uni:
         inst.imm = static_cast<int32_t>(immediate);
@@ -363,6 +388,10 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::ldg_uni: return "ldg.uni";
     case Opcode::lds_uni: return "lds.uni";
     case Opcode::fence_sh: return "fence.sh";
+    case Opcode::atom_add_uni: return "atom.add.uni";
+    case Opcode::atom_and_uni: return "atom.and.uni";
+    case Opcode::atom_xor_uni: return "atom.xor.uni";
+    case Opcode::atom_exch_uni: return "atom.exch.uni";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
     case Opcode::halt: return "halt";
@@ -513,6 +542,12 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
     case Opcode::stg_v8:
         out << ' ' << address(inst.src0, inst.imm) << ", " << reg(inst.src1);
         break;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni:
+        out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm) << ", " << reg(inst.src1);
+        break;
     case Opcode::bra:
     case Opcode::bra_uni:
         out << ' ' << (inst.imm >= 0 ? "+" : "") << inst.imm;
@@ -598,6 +633,10 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::mma_async_init:
     case Opcode::mma_commit:
     case Opcode::fence_sh:
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni:
     case Opcode::halt:
         return 0;
     }

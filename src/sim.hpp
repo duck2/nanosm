@@ -100,9 +100,9 @@ struct ResourceView {
     // shmem (trash/rfc12.md sections 3, 4 and 6), as this cycle's grants leave it:
     bool no_active_lanes = false;    // the warp's active mask is empty: its lds / sts is absent (no slot)
     bool unserviced_read = false;    // the warp holds a load slot with rounds not yet granted
-    bool unserviced_write = false;   // ... a store slot, or a SIMT RMW whose final write is not yet granted
+    bool unserviced_write = false;   // ... a store slot, or a SIMT RMW (mbar op or atomic) whose write is not yet granted
     bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM by now
-    bool load_slot_free = false;
+    bool load_slot_free = false;     // an lds's slot, or an atomic's return slot
     bool store_slot_free = false;
     bool probe_register_free = false;
     bool simt_rmw_register_free = false; // the SIMT RMW register is empty after this cycle
@@ -188,10 +188,12 @@ public:
     // SHMEM-TEST-ONLY seam (between ticks): warp `warp`'s active-lane mask.
     // It exists so the shmem tests can build divergent accesses before
     // divergence exists. Read ONLY by the shmem path: lds / sts build their
-    // bank rounds from the active lanes (an lds writes only those lanes), and
-    // lds.uni, probes and mbar operations PANIC under a partial mask (rfc12
-    // section 3). Arithmetic, global memory, TMA, MMA, acc transfers, branches
-    // and everything else ignore it and run all lanes. It is NOT divergence:
+    // bank rounds from the active lanes (an lds writes only those lanes),
+    // and lds.uni / atom.*.uni write only their active destination lanes.
+    // Every uniform operation under a partial mask is the SANITIZER's PANIC
+    // (backlog D12.1). Arithmetic, global memory, TMA, MMA, acc transfers,
+    // branches and everything else ignore it and run all lanes (backlog S10:
+    // making every instruction honor it is divergence work). It is NOT divergence:
     // real divergence (design.md's pre-Volta reconvergence stack, reserved) is
     // future work, and this mask is only a stand-in for that stack's top
     // entry. Never used by launches or kernels.
@@ -311,16 +313,22 @@ private:
     // Serviced when its last round is granted; complete when every round's
     // words are back in `words`, the 64 B gather register -- then it is a
     // ready async RF writer.
+    // Or a uniform atomic's RETURN slot (trash/rfc13.md section 5), reserved
+    // at the atomic's admission: no rounds of its own (never an A-read
+    // requester, never an unserviced read); the RMW engine fills it once, with
+    // the word's old value for every lane, and then it waits for the RF like
+    // any lds.uni.
     struct LoadSlot {
         uint32_t warp = 0;
-        bool uniform = false;      // lds.uni: its one word goes to every lane
+        bool uniform = false;      // lds.uni / an atomic: its one word goes to every lane
         uint64_t mask = 0;         // the active lanes: its RF write's lane enables
         SlotRounds access;
         uint8_t dst = 0;
         uint8_t depbar = 0;
         std::vector<uint32_t> words;
         std::size_t returned = 0;  // rounds whose words are in `words`
-        [[nodiscard]] bool complete() const { return returned == access.rounds.size(); }
+        bool engine_filled = false; // an atomic's return slot: one fill from the RMW engine
+        [[nodiscard]] bool complete() const { return returned == (engine_filled ? 1 : access.rounds.size()); }
     };
 
     // A store slot (rfc12 section 3): one sts from admission until its last
@@ -405,11 +413,18 @@ private:
         std::map<uint32_t, uint16_t> captured;
     };
 
+    // What the RMW engine does with the word(s) it reads: an mbar operation
+    // (both mbar words), or a uniform atomic (trash/rfc13.md section 3: one
+    // 4-byte word, old value back through its return slot).
     enum class MbarRmwOperation : uint8_t {
         init,
         arrive,
         arrive_expect_tx,
         complete_tx,
+        atom_add,
+        atom_and,
+        atom_xor,
+        atom_exch,
     };
 
     // Field classes as in trash/sanitizer-split-2026-10-07.md: unmarked
@@ -420,11 +435,15 @@ private:
     // the mbar's CURRENT phase. Which phase the sender meant is sanitizer
     // metadata only: the TMA command id (its completion mbar's phase was
     // peeked at accept) or the host's stated parity.
+    // A uniform atomic is a SIMT request like an mbar operation: its address,
+    // its 32-bit operand in `value`, and the load slot its old value returns
+    // through.
     struct MbarRmwRequest {
         MbarRmwOperation operation = MbarRmwOperation::arrive;
         uint32_t byte_address = 0;
         uint32_t value = 0;
         std::optional<uint32_t> warp;   // a SIMT operation's warp (its own shmem order); none: an engine event
+        std::optional<uint32_t> return_slot; // an atomic: its return load slot
         uint8_t parity = 0;             // (S) the host's complete_tx (complete_mbar_tx): the phase it says it completes
         std::optional<uint64_t> tma_command; // (S) a TMA's complete_tx: its command (the accept-time phase peek)
         uint32_t pc = 0;                // (S) PANIC text
@@ -1173,8 +1192,9 @@ private:
     // engine and its three requester registers, the services' pipelines and
     // arbiters. Each requester holds at most one pending RMW in its own
     // one-entry register:
-    //   SIMT: one mbar.init / arrive / arrive.expect_tx, accepted at issue
-    //         (machine-wide; a warp waits at issue while it is held).
+    //   SIMT: one mbar.init / arrive / arrive.expect_tx or one uniform
+    //         atomic, accepted at issue (machine-wide; a warp waits at issue
+    //         while it is held).
     //   TMA:  complete_tx {address, bytes} (TMA data complete, or the host's
     //         complete_mbar_tx). An engine stalls only on its own register.
     //   MMA:  a commit's arrive {address}.
@@ -1327,6 +1347,7 @@ private:
     void issue_lsu(const Warp& warp, const Instruction& inst, Wires& w);
     void issue_tma(const Warp& warp, const Instruction& inst, Wires& w);
     void issue_mbar_rmw(const Warp& warp, const Instruction& inst, Wires& w);
+    void issue_atomic(const Warp& warp, const Instruction& inst, Wires& w);
     void issue_mbar_wait(const Warp& warp, const Instruction& inst, Wires& w);
     [[nodiscard]] uint32_t branch_target(const Warp& warp, const Instruction& inst) const;
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
@@ -1432,6 +1453,8 @@ private:
     ReadBeat tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register);
     WriteBeat store_round(uint32_t slot);
     WriteBeat rmw_update(const ReadBeat& read);
+    [[nodiscard]] static bool is_atomic_operation(MbarRmwOperation operation);
+    [[nodiscard]] WriteBeat atomic_update(const MbarRmwRequest& request, uint32_t old_word) const;
     WriteBeat placement_round(const TmaPortRequest& request, bool start);
     void advance_tma_read(Wires& w);
     void fill_tma_store_register(const ReadBeat& beat, Wires& w);
@@ -1487,21 +1510,16 @@ private:
     [[nodiscard]] uint32_t uniform_reg(
         const Warp& warp, const Instruction& inst, uint8_t reg, const std::string& name) const;
     [[nodiscard]] uint32_t mbar_address_operand(const Warp& warp, const Instruction& inst) const;
-    void panic_if_partial_mask(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
     [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);
     [[nodiscard]] uint32_t rf(const Warp& warp, uint32_t lane, uint32_t reg) const;
     // SIMT shmem bank rounds (lds/sts by bank decode; lds.uni: one access),
     // from the captured operands.
     [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(
-        const Warp& warp, const Instruction& inst, bool load, const Wires& w) const;
+        const Warp& warp, const Instruction& inst, bool load) const;
     [[nodiscard]] std::vector<std::vector<LaneAccess>> build_uniform_shmem_round(
         const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] uint32_t shmem_address(const Warp& warp, const Instruction& inst, uint32_t base) const;
-    void panic_if_store_hits_live_mbar(
-        const Warp& warp, const Instruction& inst, uint32_t byte_address, const Wires& w) const;
-    void panic_if_word_already_stored(const Warp& warp, const Instruction& inst,
-        const std::vector<LaneAccess>& bank_lanes, uint32_t byte_address) const;
     void apply_image(
         std::vector<uint8_t>& memory,
         const std::vector<ImageSegment>& image,

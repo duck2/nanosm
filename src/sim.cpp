@@ -127,27 +127,34 @@ bool is_acc_transfer(Opcode opcode) {
 }
 
 // The SIMT shmem users: accesses (load / store slots), mbar probes (the probe
-// register) and mbar RMWs (the RMW engine).
+// register), mbar RMWs and uniform atomics (the RMW engine; an atomic also
+// holds a load slot for its old value).
 bool uses_shmem(Opcode opcode) {
     return is_shared_load(opcode) || opcode == Opcode::sts || is_mbar_rmw(opcode) ||
-        is_mbar_predicate_writer(opcode);
+        is_mbar_predicate_writer(opcode) || is_atomic(opcode);
 }
 
 // trash/rfc12.md sections 3, 4 and 6: first the warp's own order -- a read
-// waits for the warp's unserviced writes, a write (sts, an RMW) for its
-// unserviced reads and writes; reads may pass reads -- then the resource that
-// holds the operation. So a SIMT RMW enters the SIMT RMW register (and later
-// the engine, whose store pause would block them) only once its warp's own
-// lds / sts are serviced. An lds / sts with no active lane is absent: no
-// slot, no order.
+// waits for the warp's unserviced writes, a write (sts, an RMW, an atomic)
+// for its unserviced reads and writes; reads may pass reads -- then the
+// resources that hold the operation. So a SIMT RMW enters the SIMT RMW
+// register (and later the engine, whose store pause would block them) only
+// once its warp's own lds / sts are serviced. A uniform atomic (rfc13
+// section 4) needs its RETURN load slot as well as the SIMT RMW register: it
+// is admitted with both or not at all, so it never takes the store pause with
+// nowhere to put its old value. An lds / sts with no active lane is absent:
+// no slot, no order. (A uniform operation ignores the mask: it is never
+// absent.)
 std::optional<Refusal> shmem_refusal(Opcode opcode, const ResourceView& view) {
     if ((opcode == Opcode::lds || opcode == Opcode::sts) && view.no_active_lanes) return std::nullopt;
-    const bool write = opcode == Opcode::sts || is_mbar_rmw(opcode);
+    const bool write = opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
     if (view.unserviced_write || (write && view.unserviced_read)) return Refusal::shmem_ordered;
-    if (is_shared_load(opcode) && !view.load_slot_free) return Refusal::load_slots_full;
+    if ((is_shared_load(opcode) || is_atomic(opcode)) && !view.load_slot_free) return Refusal::load_slots_full;
     if (opcode == Opcode::sts && !view.store_slot_free) return Refusal::store_slots_full;
     if (is_mbar_predicate_writer(opcode) && !view.probe_register_free) return Refusal::probe_register_busy;
-    if (is_mbar_rmw(opcode) && !view.simt_rmw_register_free) return Refusal::simt_rmw_register_busy;
+    if ((is_mbar_rmw(opcode) || is_atomic(opcode)) && !view.simt_rmw_register_free) {
+        return Refusal::simt_rmw_register_busy;
+    }
     return std::nullopt;
 }
 
@@ -378,6 +385,17 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         launch.active_warps, config_.core_clock_hz, config_.dram_clock_hz, trace_options);
     apply_image(shmem_, launch.shmem_image, "shmem");
     apply_image(gmem_, launch.gmem_image, "gmem");
+    // The mbars the launch declares (initialized by the host in the shmem
+    // image, e.g. FA's): live from launch for the sanitizer's C10 opacity,
+    // like a SIMT mbar.init's (rfc12 section 11). A declaration is metadata;
+    // the machine only checks that it names an mbar slot.
+    for (const auto address : launch.mbars) {
+        if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_.size()) {
+            throw SimError("launch declares an mbar at " + std::to_string(address) +
+                ", which is not 8-byte aligned in shmem");
+        }
+    }
+    sanitizer_.record_launch_mbars(launch.mbars);
 }
 
 void Machine::set_driver_shuffle_seed(uint64_t seed) {
@@ -770,7 +788,7 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         writeback.values = slot.words;
         writeback.lane_enables = slot.mask;
         writeback.clear_depbar = slot.depbar;
-        writeback.reason = "lds";
+        writeback.reason = slot.engine_filled ? "atom" : "lds"; // an atomic's old value, or an lds
         sanitizer_.record_reg_ready(write.warp, write.reg, cycle_);
         return writeback;
     }
@@ -926,9 +944,10 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 // port-B read is not pipelined: it reads the RAM in its fetch cycle.
 //
 // The RMW engine (rfc12 section 6): one operation at a time, each one
-// coherent 8-byte mbar RMW (both words in one read round, one write round).
-// Its requester waits in a register (the SIMT RMW register, the TMA's or the
-// MMA's event register). One RMW, with D, Lb and C as above:
+// coherent 8-byte mbar RMW (both words in one read round, one write round)
+// or one uniform atomic (trash/rfc13.md: one 4-byte word, read and written
+// the same way). Its requester waits in a register (the SIMT RMW register,
+// the TMA's or the MMA's event register). One RMW, with D, Lb and C as above:
 //   s          START. A-write's alternation lets an RMW begin
 //              (select_a_write step 4) and the engine takes a requester
 //              (select_rmw_admission). The global store PAUSE -- the engine's
@@ -939,7 +958,8 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 //              after that store transaction's last round (r = s when no store
 //              and no A-read transaction is under way)
 //   r + D      the RAM sample
-//   r + D + Lb the words at the port output; the ALU computes the update
+//   r + D + Lb the words at the port output; the ALU computes the update (an
+//              atomic's old word also goes to its return load slot now)
 //   w = r + D + Lb + C
 //              WRITE (the final write) granted on A-write; the PAUSE ends at
 //              this cycle's edge
@@ -948,7 +968,9 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 //   w + D      the write reaches the RAM; a phase flip wakes the waiters now
 // Reads are never paused: between r and w A-read serves loads, probes and
 // TMA reads, and a read of the mbar sampling at w + D sees the old word
-// (READ_FIRST).
+// (READ_FIRST). An atomic's old value waits in its return slot for the RF
+// write decision, so rD may be written before w; the warp's next shmem
+// access still waits for w (its unserviced write), fence.sh for w + D.
 //
 // fence.sh (rfc12 section 10) is admitted in the cycle its warp's last
 // earlier shmem access REACHES THE RAM (a store's write edge, a load's
@@ -1023,8 +1045,9 @@ void Machine::commit_shmem_writes(Wires& w) {
 
 // The read round at the port output goes to its requester: a load round to
 // its slot's gather register, a probe to its warp, an RMW's words through its
-// update into the ALU, a store-source round to its TMA store register. (A
-// descriptor round: the frontend latch, advance_tma_read.)
+// update into the ALU (an atomic's old word also to every lane of its return
+// slot), a store-source round to its TMA store register. (A descriptor round:
+// the frontend latch, advance_tma_read.)
 void Machine::deliver_shmem_read(Wires& w) {
     const auto& beat = w.shmem.delivered;
     if (!beat.has_value()) return;
@@ -1034,6 +1057,11 @@ void Machine::deliver_shmem_read(Wires& w) {
         return;
     case ReadClient::rmw:
         w.shmem.rmw_update = rmw_update(*beat);
+        if (const auto slot = rmw_.cur().active->request.return_slot; slot.has_value()) {
+            LoadFill fill{*slot, {}};
+            for (uint32_t lane = 0; lane < config_.lanes; ++lane) fill.lanes.emplace_back(lane, beat->words.at(0));
+            w.shmem.load_fill = std::move(fill);
+        }
         return;
     case ReadClient::tma_store:
         fill_tma_store_register(*beat, w);
@@ -1225,8 +1253,9 @@ std::optional<Machine::RmwStart> Machine::select_rmw_admission(const Wires& w) c
 //      nothing new starts on A-read (implementer choice: with no preemption a
 //      new multi-round read could only delay the RMW's read and so lengthen
 //      the store pause);
-//   3. ONE round-robin over the new requesters: load slots not yet started,
-//      the probe register, the TMA's new read.
+//   3. ONE round-robin over the new requesters: load slots not yet started
+//      (an atomic's return slot is not a requester: the engine reads for
+//      it), the probe register, the TMA's new read.
 // Reads are never paused: between an RMW's read and its write, step 3 serves
 // loads, probes and TMA reads as usual.
 Machine::AReadGrant Machine::select_a_read(const Wires& w) const {
@@ -1241,7 +1270,7 @@ Machine::AReadGrant Machine::a_read_round_robin(const Wires& w) const {
     std::vector<uint8_t> ready(slots + 2, 0);
     for (uint32_t index = 0; index < slots; ++index) {
         const auto& slot = load_slots_[index].cur();
-        ready[index] = slot.has_value() && !slot->access.started() ? 1 : 0;
+        ready[index] = slot.has_value() && !slot->engine_filled && !slot->access.started() ? 1 : 0;
     }
     ready[slots] = mbar_probe_.cur().has_value() ? 1 : 0;
     ready[slots + 1] = w.tma.a_read.has_value() ? 1 : 0;
@@ -1272,7 +1301,8 @@ Machine::BWriteUser Machine::select_b_write(const Wires& w) const {
 // An RMW starts: the engine takes the request out of its register (an
 // engine's event: its command ends now, step_tma; the sanitizer admits an
 // engine's RMW here, a SIMT one at issue). The PAUSE is set from the next
-// cycle; the trace's "mbar RMW" slice runs from now to the write grant.
+// cycle; the trace's "mbar RMW" (an atomic: "atomic RMW") slice runs from
+// now to the write grant.
 void Machine::serve_rmw_start(Wires& w) {
     auto& shmem = w.shmem;
     if (!shmem.rmw_start.has_value()) return;
@@ -1288,7 +1318,11 @@ void Machine::serve_rmw_start(Wires& w) {
         sanitizer_.check_engine_mbar_rmw(cycle_, active.request.byte_address,
             active.request.operation == MbarRmwOperation::complete_tx);
     }
-    trace_->mbar_rmw_begin(cycle_, active.request.byte_address, rmw_label(active));
+    if (is_atomic_operation(active.request.operation)) {
+        trace_->atomic_rmw_begin(cycle_, rmw_label(active) + ", warp=" + std::to_string(*active.request.warp));
+    } else {
+        trace_->mbar_rmw_begin(cycle_, active.request.byte_address, rmw_label(active));
+    }
     shmem.rmw_started = std::move(active);
 }
 
@@ -1319,12 +1353,15 @@ void Machine::serve_a_read(Wires& w) {
         shmem.a_read_beat = std::move(beat);
         return;
     }
-    case AReadUser::rmw: { // the engine's operation, or the one starting now: both mbar words, one round
+    case AReadUser::rmw: { // the engine's operation, or the one starting now: one round
         const auto& active = rmw_.cur().active.has_value() ? *rmw_.cur().active : *shmem.rmw_started;
         trace_->shmem_grant(cycle_, ShmemService::a_read, ShmemClient::rmw);
         ReadBeat beat;
         beat.client = ReadClient::rmw;
-        beat.addresses = {active.request.byte_address, active.request.byte_address + 4};
+        const auto address = active.request.byte_address;
+        // An mbar operation reads both mbar words; an atomic its one word.
+        beat.addresses = is_atomic_operation(active.request.operation) ? std::vector<uint32_t>{address}
+                                                                       : std::vector<uint32_t>{address, address + 4};
         shmem.a_read_warp = active.request.warp; // none: an engine event's RMW
         shmem.a_read_beat = std::move(beat);
         return;
@@ -1500,10 +1537,20 @@ void Machine::serve_a_write(Wires& w) {
         return;
     case AWriteUser::rmw: {
         const auto& update = *rmw_.cur().alu.back();
+        const auto& request = rmw_.cur().active->request;
         trace_->shmem_grant(cycle_, ShmemService::a_write, ShmemClient::rmw);
-        trace_->mbar_rmw_end(cycle_ + 1, update.wake.has_value());
+        if (is_atomic_operation(request.operation)) {
+            trace_->atomic_rmw_end(cycle_ + 1);
+            // C10 (sanitizer): an ordinary atomic may not write a live mbar --
+            // using the RMW engine does not authorize it.
+            sanitizer_.check_live_mbar_write(cycle_, format_instruction(request.instruction, false) + " (warp " +
+                std::to_string(*request.warp) + " pc " + std::to_string(request.pc) + ")",
+                std::vector<std::pair<uint32_t, uint32_t>>{{request.byte_address, request.byte_address + 4}});
+        } else {
+            trace_->mbar_rmw_end(cycle_ + 1, update.wake.has_value());
+        }
         // A SIMT RMW's final write: its warp's access reaches the RAM D cycles from now.
-        if (const auto warp = rmw_.cur().active->request.warp; warp.has_value()) {
+        if (const auto warp = request.warp; warp.has_value()) {
             sanitizer_.record_simt_shmem_grant(cycle_, SimtShmemHolder::rmw, *warp, cycle_ + config_.shmem_port_a_depth);
             shmem.a_write_warp = warp;
         }
@@ -1554,8 +1601,11 @@ Machine::WriteBeat Machine::store_round(uint32_t index) {
 // atomic add wraps; this does not). complete_tx carries no phase: it changes
 // the current one. Whether that is the phase its sender meant is the
 // sanitizer's question (the TMA's accept-time peek; the host's parity).
+// An atomic's word is ordinary data, not an mbar: it goes to atomic_update
+// before any mbar decode (no live-phase validation, no tx check).
 Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
     const auto& request = rmw_.cur().active->request;
+    if (is_atomic_operation(request.operation)) return atomic_update(request, read.words.at(0));
     auto state = decode_mbar_state(static_cast<uint64_t>(read.words.at(0)) | static_cast<uint64_t>(read.words.at(1)) << 32);
 
     const auto validate_live = [&] {
@@ -1579,11 +1629,11 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
 
     switch (request.operation) {
     case MbarRmwOperation::init:
-        for (const auto& wait_slot : mbar_wait_slots_.cur()) {
-            if (wait_slot.has_value() && wait_slot->byte_address == request.byte_address) {
-                mbar_rmw_panic(request, "reinitializing an mbar with a live waiter");
-            }
-        }
+        // An init over an mbar with a live waiter is UB (as on NVIDIA: an
+        // mbarrier is reinitialized only after mbarrier.inval); the
+        // sanitizer's C10 PANICs (mbar.init over a live mbar). The machine
+        // just writes the new state: a waiter is not woken by it (backlog
+        // D12.1).
         if (request.value == 0 || request.value > mbar_encoding::max_count) {
             mbar_rmw_panic(request, "expected arrival count is outside 1..32767");
         }
@@ -1609,6 +1659,11 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
             state.phase);
         add_tx(-tx_operand());
         break;
+    case MbarRmwOperation::atom_add:
+    case MbarRmwOperation::atom_and:
+    case MbarRmwOperation::atom_xor:
+    case MbarRmwOperation::atom_exch:
+        throw SimError("internal: an atomic reached the mbar update");
     }
 
     WriteBeat beat;
@@ -1620,6 +1675,33 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
     sanitizer_.record_mbar_tx(request.byte_address, state.tx_bytes);
     const auto word = encode_mbar_state(state);
     std::vector<uint8_t> bytes(8);
+    std::memcpy(bytes.data(), &word, sizeof(word));
+    beat.writes.push_back({request.byte_address, std::move(bytes)});
+    return beat;
+}
+
+bool Machine::is_atomic_operation(MbarRmwOperation operation) {
+    return operation == MbarRmwOperation::atom_add || operation == MbarRmwOperation::atom_and ||
+        operation == MbarRmwOperation::atom_xor || operation == MbarRmwOperation::atom_exch;
+}
+
+// A uniform atomic's update (trash/rfc13.md section 3), on signed int32: the
+// new word from the old one and the operand, written back as one 4-byte
+// word. add wraps: the sum is taken in unsigned 32-bit arithmetic, i.e.
+// modulo 2^32 -- defined 32-bit two's-complement wrap, never host signed
+// overflow. (For add, and, xor and exchange the signed and unsigned bit
+// results agree.) No wake: an atomic is not an mbar operation.
+Machine::WriteBeat Machine::atomic_update(const MbarRmwRequest& request, uint32_t old_word) const {
+    uint32_t word = 0;
+    switch (request.operation) {
+    case MbarRmwOperation::atom_add: word = old_word + request.value; break;
+    case MbarRmwOperation::atom_and: word = old_word & request.value; break;
+    case MbarRmwOperation::atom_xor: word = old_word ^ request.value; break;
+    case MbarRmwOperation::atom_exch: word = request.value; break;
+    default: throw SimError("internal: an mbar operation in the atomic ALU");
+    }
+    WriteBeat beat;
+    std::vector<uint8_t> bytes(4);
     std::memcpy(bytes.data(), &word, sizeof(word));
     beat.writes.push_back({request.byte_address, std::move(bytes)});
     return beat;
@@ -1719,6 +1801,10 @@ std::string Machine::rmw_label(const ActiveMbarRmw& active) {
     case MbarRmwOperation::arrive: operation = "arrive"; break;
     case MbarRmwOperation::arrive_expect_tx: operation = "arrive.expect_tx"; break;
     case MbarRmwOperation::complete_tx: operation = "complete_tx"; break;
+    case MbarRmwOperation::atom_add: operation = "atom.add.uni"; break;
+    case MbarRmwOperation::atom_and: operation = "atom.and.uni"; break;
+    case MbarRmwOperation::atom_xor: operation = "atom.xor.uni"; break;
+    case MbarRmwOperation::atom_exch: operation = "atom.exch.uni"; break;
     }
     if (active.engine.has_value()) {
         operation += *active.engine == MbarEngine::tma ? " (tma)" : " (mma.commit)";
@@ -2517,6 +2603,10 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& re
 }
 
 // A placement's last write reached the RAM: its command's load write ends.
+// A placement over an mbar with a live waiter is UB (as on NVIDIA: an
+// mbarrier's memory serves nothing else until mbarrier.inval); the
+// sanitizer's C10 PANICs at the placement write. The machine just wrote the
+// bytes (backlog D12.1).
 void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed) {
     auto command_it = tma.commands.find(placed.command);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
@@ -2527,14 +2617,6 @@ void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed)
     for (const auto& fragment : placed.fragments) {
         if (static_cast<uint64_t>(fragment.shmem_address) + fragment.size > shmem_.size()) {
             throw SimError("tma load return is outside shmem");
-        }
-        for (const auto& wait_slot : mbar_wait_slots_.cur()) {
-            if (!wait_slot.has_value()) continue;
-            const auto fragment_end = static_cast<uint64_t>(fragment.shmem_address) + fragment.size;
-            const auto mbar_end = static_cast<uint64_t>(wait_slot->byte_address) + 8;
-            if (fragment.shmem_address < mbar_end && wait_slot->byte_address < fragment_end) {
-                throw SimError("tma load repurposes an mbar with a live waiter");
-            }
         }
     }
     --command.pending_load_writes;
@@ -3080,6 +3162,12 @@ uint32_t Machine::hand_over(Warp& warp, const Instruction& inst, Wires& w) {
     case Opcode::mbar_try_wait_r:
         issue_mbar_wait(warp, inst, w);
         break;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni:
+        issue_atomic(warp, inst, w);
+        break;
     case Opcode::bra:
     case Opcode::bra_uni:
         return branch_target(warp, inst);
@@ -3176,13 +3264,15 @@ void Machine::issue_acc_transfer(const Warp& warp, const Instruction& inst, Wire
 // load takes its load slot now; A-read serves it from the next cycle; its
 // gathered vector waits in the slot for the RF write decision. No RF booking:
 // the depbar completes it. With no active lane a plain lds is absent: no
-// slot, no depbar, no RF write.
+// slot, no depbar, no RF write. lds.uni ignores the mask (lane 0's address,
+// even if lane 0 is inactive; the mask gates only its RF write's lanes): a
+// partial or empty mask is the sanitizer's PANIC (backlog D12, in
+// uniform_reg).
 void Machine::issue_shared_load(const Warp& warp, const Instruction& inst, Wires& w) {
     if (inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(inst.opcode) + " has no depbar");
     const bool uniform = inst.opcode == Opcode::lds_uni;
-    if (uniform) panic_if_partial_mask(warp, inst);
-    if (warp.active_mask == 0) return;
-    auto rounds = uniform ? build_uniform_shmem_round(warp, inst) : build_shmem_rounds(warp, inst, true, w);
+    if (!uniform && warp.active_mask == 0) return;
+    auto rounds = uniform ? build_uniform_shmem_round(warp, inst) : build_shmem_rounds(warp, inst, true);
     const auto index = *free_load_slot(w);
     sanitizer_.check_simt_shmem_access(site(warp, inst), access_addresses(rounds), true);
     sanitizer_.record_simt_shmem_issue(site(warp, inst), SimtShmemHolder::load_slot, index, round_addresses(rounds),
@@ -3202,13 +3292,17 @@ void Machine::issue_shared_load(const Warp& warp, const Instruction& inst, Wires
 
 // sts (rfc12 section 3): address and data captured now (its RF reads were
 // booked with the issue), into a store slot that A-write serves from the
-// next cycle. With no active lane it is absent.
+// next cycle. With no active lane it is absent. Two lanes on one word is UB
+// (the sanitizer's PANIC, backlog D12); the machine just writes both, in
+// round order, so the highest active lane's word lands.
 void Machine::issue_shared_store(const Warp& warp, const Instruction& inst, Wires& w) {
     if (inst.control.set_depbar >= 6) panic(warp, inst, "sts has no depbar");
     if (warp.active_mask == 0) return;
-    auto rounds = build_shmem_rounds(warp, inst, false, w);
+    auto rounds = build_shmem_rounds(warp, inst, false);
     const auto index = *free_store_slot(w);
-    sanitizer_.check_simt_shmem_access(site(warp, inst), access_addresses(rounds), false);
+    const auto words = access_addresses(rounds);
+    sanitizer_.check_store_word_collision(site(warp, inst), std::vector<uint64_t>(words.begin(), words.end()), "shmem");
+    sanitizer_.check_simt_shmem_access(site(warp, inst), words, false);
     sanitizer_.record_simt_shmem_issue(site(warp, inst), SimtShmemHolder::store_slot, index, round_addresses(rounds),
         4, true);
     admit_depbar(w, warp.id, inst.control.set_depbar);
@@ -3305,8 +3399,10 @@ void Machine::issue_tma(const Warp& warp, const Instruction& inst, Wires& w) {
     w.issue.tma = std::move(command);
 }
 
+// mbar.init / arrive / arrive.expect_tx: a uniform operation, lane 0's
+// operands whatever the active mask (a partial mask is the sanitizer's
+// PANIC, backlog D12, in uniform_reg).
 void Machine::issue_mbar_rmw(const Warp& warp, const Instruction& inst, Wires& w) {
-    panic_if_partial_mask(warp, inst);
     MbarRmwRequest request;
     request.byte_address = mbar_address_operand(warp, inst);
     request.warp = warp.id;
@@ -3342,12 +3438,60 @@ void Machine::issue_mbar_rmw(const Warp& warp, const Instruction& inst, Wires& w
     w.issue.rmw = std::move(request);
 }
 
+// atom.op.uni rD, [rA + imm], rB (trash/rfc13.md). Admission found the warp
+// with no unserviced read or write, a free load slot and the SIMT RMW
+// register empty after this cycle. Now lane 0's address (4-byte aligned, in
+// bounds: PANIC otherwise) and operand are captured -- whatever the active
+// mask; a partial mask, and an address or operand that differs across
+// lanes, are the sanitizer's PANICs -- the RETURN load slot is reserved (rD's
+// lanes, the depbar, the old word), and the atomic enters the SIMT RMW
+// register like an mbar operation: the RMW engine reads the word, the ALU
+// computes the new one, and its write is granted D + Lb + C after the read.
+// The warp's younger shmem accesses wait for that write grant
+// (warp_unserviced_write); rD waits for the depbar, cleared by the return
+// slot's RF write -- possibly before the write grant.
+void Machine::issue_atomic(const Warp& warp, const Instruction& inst, Wires& w) {
+    if (inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(inst.opcode) + " has no depbar");
+    const auto address = shmem_address(warp, inst, uniform_reg(warp, inst, inst.src0, "atom base address"));
+    const auto operand = uniform_reg(warp, inst, inst.src1, "atom operand");
+    const auto slot_index = *free_load_slot(w);
+    sanitizer_.check_simt_shmem_access(site(warp, inst), std::vector<uint32_t>{address}, false);
+    // The shadow of the warp's access: one 4-byte write round, reaching the
+    // RAM at its write grant + D.
+    sanitizer_.record_simt_shmem_issue(site(warp, inst), SimtShmemHolder::rmw, warp.id,
+        std::vector<std::vector<uint32_t>>{{address}}, 4, true);
+    sanitizer_.record_reg_ready(warp.id, inst.dst, std::numeric_limits<uint64_t>::max()); // until its RF write
+    admit_depbar(w, warp.id, inst.control.set_depbar);
+    LoadSlot slot;
+    slot.warp = warp.id;
+    slot.uniform = true;
+    slot.mask = warp.active_mask;
+    slot.dst = inst.dst;
+    slot.depbar = inst.control.set_depbar;
+    slot.words.assign(config_.lanes, 0);
+    slot.engine_filled = true;
+    w.issue.load_slot = std::make_pair(slot_index, std::move(slot));
+    MbarRmwRequest request;
+    switch (inst.opcode) {
+    case Opcode::atom_add_uni: request.operation = MbarRmwOperation::atom_add; break;
+    case Opcode::atom_and_uni: request.operation = MbarRmwOperation::atom_and; break;
+    case Opcode::atom_xor_uni: request.operation = MbarRmwOperation::atom_xor; break;
+    default: request.operation = MbarRmwOperation::atom_exch; break;
+    }
+    request.byte_address = address;
+    request.value = operand;
+    request.warp = warp.id;
+    request.return_slot = slot_index;
+    request.pc = warp.pc;
+    request.instruction = inst;
+    w.issue.rmw = std::move(request);
+}
+
 // mbar.test_wait / try_wait: the probe goes into the probe register; A-read
 // serves it from the next cycle and its warp waits until it comes back
 // (rfc12 section 9). try_wait installs its wait slot first, so a wake that
 // comes while the probe travels finds it.
 void Machine::issue_mbar_wait(const Warp& warp, const Instruction& inst, Wires& w) {
-    panic_if_partial_mask(warp, inst);
     const bool test = is_mbar_test_wait(inst.opcode);
     const bool immediate = inst.opcode == Opcode::mbar_test_wait_i ||
         inst.opcode == Opcode::mbar_try_wait_i;
@@ -3385,8 +3529,13 @@ void Machine::issue_mbar_wait(const Warp& warp, const Instruction& inst, Wires& 
 }
 
 // bra / bra.uni. bra.uni's predicate is a declared-uniform operand: hardware
-// reads lane 0 (the sanitizer checks the other lanes).
+// reads lane 0 (the sanitizer checks the other lanes). bra.uni is a uniform
+// operation in every form, @PT included: under a partial or empty mask it is
+// the sanitizer's PANIC (backlog D12.1).
 uint32_t Machine::branch_target(const Warp& warp, const Instruction& inst) const {
+    if (inst.opcode == Opcode::bra_uni) {
+        sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
+    }
     bool take = true;
     if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
         const auto lanes = capture_predicate(warp, inst.control.predicate);
@@ -3417,7 +3566,8 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
     } else if (!is_shared_load(opcode) && opcode != Opcode::sts && !is_lsu_opcode(opcode) &&
                !is_tma(opcode) && !is_acc_transfer(opcode) && !is_mma_command(opcode) &&
                opcode != Opcode::bra && opcode != Opcode::bra_uni && opcode != Opcode::fence_sh &&
-               !is_mbar_rmw(opcode) && !is_mbar_try_wait(opcode) && opcode != Opcode::halt) {
+               !is_mbar_rmw(opcode) && !is_mbar_try_wait(opcode) && !is_atomic(opcode) &&
+               opcode != Opcode::halt) {
         panic(warp, inst, "zero-latency RF writer is unsupported");
     }
 }
@@ -4257,7 +4407,11 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
         static_cast<uint8_t>(inst.src0 + 2),
     };
     case Opcode::sts:
-    case Opcode::stg: return {inst.src0, inst.src1};
+    case Opcode::stg:
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
         std::vector<uint8_t> result{inst.src0};
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
@@ -4309,6 +4463,10 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
     case Opcode::ldg_uni: return inst.dst;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8: return inst.dst;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni: return inst.dst;
     default: return std::nullopt;
     }
 }
@@ -4336,22 +4494,20 @@ std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predi
     return std::vector<uint32_t>(bits.begin(), bits.end());
 }
 
-// A declared-uniform operand (rfc09 pin 3): hardware reads lane 0. A value
-// that differs across lanes is UB; the sanitizer panics on it with the
-// operand's name ("... is not warp-uniform").
+// A declared-uniform operand (rfc09 pin 3): hardware reads lane 0, whatever
+// the active mask (even when lane 0 is inactive). Two things are UB and the
+// sanitizer panics on them: a value that differs across lanes (named by the
+// operand: "... is not warp-uniform"), and any uniform operation under a
+// partial or empty mask (backlog D12.1, rfc13 section 2: a program with a
+// partial mask uses the per-lane instruction). Every lane-0-sourced operand
+// is read here, so every uniform operation with a register operand gets the
+// mask check; bra.uni checks it in branch_target.
 uint32_t Machine::uniform_reg(
     const Warp& warp, const Instruction& inst, uint8_t reg, const std::string& name) const {
+    sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
     const auto lanes = capture(warp, reg);
     sanitizer_.check_warp_uniform(site(warp, inst), lanes, name);
     return lanes[0];
-}
-
-// rfc12 section 3: lds.uni, probes and mbar operations are uniform operations;
-// a partial active mask is a PANIC.
-void Machine::panic_if_partial_mask(const Warp& warp, const Instruction& inst) const {
-    if (warp.active_mask != full_mask()) {
-        panic(warp, inst, opcode_name(inst.opcode) + " is a uniform operation under a partial active mask");
-    }
 }
 
 uint32_t Machine::mbar_address_operand(const Warp& warp, const Instruction& inst) const {
@@ -4386,10 +4542,13 @@ uint32_t Machine::rf(const Warp& warp, uint32_t lane, uint32_t reg) const {
 // inactive lane is no access at all (rfc12 section 3). Round r serves, in
 // every bank, that bank's r-th active lane in ascending lane order, so rounds
 // = the most active lanes on any one bank. lds.uni is the declared broadcast.
+// An sts with two lanes on one word (UB: the sanitizer's PANIC) writes both,
+// in round order, so the higher lane's word lands last; one over a live mbar
+// (UB: the sanitizer's C10) simply writes it.
 // ---------------------------------------------------------------------------
 
 std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(
-    const Warp& warp, const Instruction& inst, bool load, const Wires& w) const {
+    const Warp& warp, const Instruction& inst, bool load) const {
     const auto bases = capture(warp, inst.src0);
     const auto data = load ? std::vector<uint32_t>(config_.lanes, 0) : capture(warp, inst.src1);
     std::vector<std::vector<LaneAccess>> lanes_by_bank(config_.shmem_banks);
@@ -4397,10 +4556,6 @@ std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(
         if ((warp.active_mask >> lane & 1) == 0) continue;
         const auto byte_address = shmem_address(warp, inst, bases[lane]);
         auto& bank_lanes = lanes_by_bank[(byte_address / 4) % config_.shmem_banks];
-        if (!load) {
-            panic_if_store_hits_live_mbar(warp, inst, byte_address, w);
-            panic_if_word_already_stored(warp, inst, bank_lanes, byte_address);
-        }
         bank_lanes.push_back({.lane = lane, .byte_address = byte_address, .value = data[lane]});
     }
     std::size_t round_count = 0;
@@ -4436,27 +4591,6 @@ uint32_t Machine::shmem_address(const Warp& warp, const Instruction& inst, uint3
     return byte_address;
 }
 
-void Machine::panic_if_store_hits_live_mbar(
-    const Warp& warp, const Instruction& inst, uint32_t byte_address, const Wires& w) const {
-    const auto& slots = mbar_wait_slots_.cur();
-    for (uint32_t index = 0; index < slots.size(); ++index) {
-        const auto& wait_slot = slots[index];
-        if (wait_slot.has_value() && !wait_slot_completed(w, index) &&
-            byte_address >= wait_slot->byte_address && byte_address < wait_slot->byte_address + 8) {
-            panic(warp, inst, "repurposing an mbar with a live waiter");
-        }
-    }
-}
-
-// Two lanes storing one word is UB. This is a stateless diagnostic, not
-// hardware (the bank would simply take both, in lane order); it fires in both
-// sanitizer builds, like its gmem twin in plan_lsu_command.
-void Machine::panic_if_word_already_stored(const Warp& warp, const Instruction& inst,
-    const std::vector<LaneAccess>& bank_lanes, uint32_t byte_address) const {
-    for (const auto& earlier : bank_lanes) {
-        if (earlier.byte_address == byte_address) panic(warp, inst, "multiple lanes write the same shmem word");
-    }
-}
 
 Machine::Writeback Machine::register_writeback(
     Warp& warp,

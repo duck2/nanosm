@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 
 namespace nanosm {
 
@@ -171,6 +172,25 @@ void Sanitizer::check_warp_uniform(
     }
 }
 
+void Sanitizer::check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const {
+    if (active_mask != full_mask) {
+        throw_issue_panic(site, opcode_name(site.inst.opcode) + " is a uniform operation under a partial active mask");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Same-word stores (backlog D12): which lane's word lands is not part of the
+// contract, so two lanes of one store naming one word is UB, diagnosed here.
+// ---------------------------------------------------------------------------
+
+void Sanitizer::check_store_word_collision(
+    const IssueSite& site, const std::vector<uint64_t>& word_addresses, const std::string& space) const {
+    std::set<uint64_t> seen;
+    for (const auto address : word_addresses) {
+        if (!seen.insert(address).second) throw_issue_panic(site, "multiple lanes write the same " + space + " word");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shmem ownership. An outstanding engine command is modeled as owning shmem
 // byte ranges from its accepted issue until an existing completion event; a
@@ -262,10 +282,10 @@ void Sanitizer::check_simt_shmem_access(
             ++words;
         }
         if (words == 0) continue;
+        const auto access = is_atomic(site.inst.opcode) ? opcode_name(site.inst.opcode) + " writes "
+            : load ? std::string("lds reads ") : std::string("sts writes ");
         throw_issue_panic(site, shmem_race(
-            std::string(load ? "lds reads " : "sts writes ") + std::to_string(words) +
-                (words == 1 ? " word," : " words,"),
-            first, last, owner));
+            access + std::to_string(words) + (words == 1 ? " word," : " words,"), first, last, owner));
     }
 }
 
@@ -395,9 +415,23 @@ std::optional<Sanitizer::LiveMbarHit> Sanitizer::live_mbar_hit(
 }
 
 std::string Sanitizer::describe_live_mbar(const LiveMbar& mbar) {
-    return half_open(mbar.address, mbar.address + 8ull) + " (mbar.init by warp " + std::to_string(mbar.warp) +
-        " pc " + std::to_string(mbar.pc) + " at cycle " + std::to_string(mbar.init_cycle) +
+    const auto origin = mbar.declared_by_launch ? std::string("declared by the launch image")
+        : "mbar.init by warp " + std::to_string(mbar.warp) + " pc " + std::to_string(mbar.pc) + " at cycle " +
+            std::to_string(mbar.init_cycle);
+    return half_open(mbar.address, mbar.address + 8ull) + " (" + origin +
         "); until kernel end only mbar operations may touch it";
+}
+
+// The launch's declared mbars (host-initialized in the shmem image): live
+// from launch. A repeated declaration is one mbar.
+void Sanitizer::record_launch_mbars(const std::vector<uint32_t>& addresses) {
+    for (const auto address : addresses) {
+        if (live_mbar_overlapping(address, address + 8ull) != nullptr) continue;
+        LiveMbar mbar;
+        mbar.address = address;
+        mbar.declared_by_launch = true;
+        live_mbars_.push_back(mbar);
+    }
 }
 
 void Sanitizer::record_mbar_init(const IssueSite& site, uint32_t address) {
@@ -405,7 +439,12 @@ void Sanitizer::record_mbar_init(const IssueSite& site, uint32_t address) {
         throw_issue_panic(site, "mbar.init over the live mbar " + describe_live_mbar(*mbar) +
             " (v0 has no mbar.inval: an mbar is initialized once per kernel)");
     }
-    live_mbars_.push_back({address, site.warp, site.pc, site.cycle});
+    LiveMbar mbar;
+    mbar.address = address;
+    mbar.warp = site.warp;
+    mbar.pc = site.pc;
+    mbar.init_cycle = site.cycle;
+    live_mbars_.push_back(mbar);
 }
 
 void Sanitizer::check_live_mbar_write(uint64_t cycle, const std::string& writer,

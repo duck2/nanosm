@@ -109,6 +109,22 @@ public:
     // only; anything else is UB, diagnosed here. lane_values: the operand, by lane.
     void check_warp_uniform(
         const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const;
+    // A uniform operation -- every instruction with a declared-uniform
+    // operand (the list above; the machine calls this from uniform_reg) and
+    // bra.uni -- under a partial or empty active mask. Hardware reads lane 0
+    // whatever the mask, so this is UB, diagnosed here (HUMAN 2026-10-12,
+    // backlog D12 / D12.1, rfc13 section 2); what the machine does then is
+    // no contract.
+    void check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const;
+
+    // ---- same-word stores (HUMAN 2026-10-12, backlog D12) ----
+    // Two active lanes of one sts / stg naming one 4-byte word: UB, as on
+    // NVIDIA (one write lands; which is undefined). The machine lets one
+    // land quietly (the highest active lane); no program may rely on which.
+    // word_addresses: the active lanes' word byte addresses, in lane order;
+    // space: "shmem" or "gmem" (the PANIC text).
+    void check_store_word_collision(
+        const IssueSite& site, const std::vector<uint64_t>& word_addresses, const std::string& space) const;
 
     // ---- shmem ownership (trash/shmem-ownership-sanitizer-2026-10-03.md) ----
     // word_addresses: every lane access of every round, duplicates included.
@@ -122,8 +138,10 @@ public:
     // edge, a read's sample: its round's grant + D). An access is recorded
     // when issue accepts it -- an lds / lds.uni / sts with its bank rounds'
     // word addresses (access_bytes 4), a probe or a SIMT mbar RMW as one
-    // 8-byte round -- and each round's grant then records when it reaches the
-    // RAM (ram_cycle). A SIMT RMW counts at its FINAL write grant. The
+    // 8-byte round, a uniform atomic as one 4-byte round (a write: it reads
+    // and writes the word) -- and each round's grant then records when it
+    // reaches the RAM (ram_cycle). A SIMT RMW (an mbar operation or an atomic)
+    // counts at its write grant. The
     // engine-command accepts (record_tma_accept, record_mma_accept) intersect
     // their footprint with the rounds that have not reached the RAM by the
     // accept cycle (ungranted, or ram_cycle later than it): an overlap where
@@ -141,16 +159,19 @@ public:
 
     // ---- C10 live-mbar opacity (trash/rfc12.md section 11) ----
     // An accepted SIMT mbar.init makes [address, address + 8) a LIVE mbar
-    // until kernel end (v0 retirement). From then on only mbar operations
-    // (init, arrive, expect_tx, the probes, the engines' complete_tx and
-    // commit arrive) may touch it: an sts round (checked at its grant),
-    // a TMA placement round (port-B write, check_live_mbar_write) or I5's
-    // ordinary atomics writing any of its bytes PANIC naming the mbar.
-    // Implementer choice: an mbar.init of an already-live mbar PANICs too
-    // (no mbar.inval in v0: an mbar is initialized once per kernel). mbars
-    // the launch image presets are not recorded.
+    // until kernel end (v0 retirement); so does the launch's declaration of an
+    // mbar the host initialized in the shmem image (Launch::mbars, live from
+    // launch; I5). From then on only mbar operations (init, arrive,
+    // expect_tx, the probes, the engines' complete_tx and commit arrive) may
+    // touch it: an sts round (checked at its grant), a TMA placement round
+    // (port-B write, check_live_mbar_write) or a uniform atomic's write
+    // (check_live_mbar_write) writing any of its bytes PANIC naming the
+    // mbar. Implementer choice: an mbar.init of an already-live mbar PANICs
+    // too (no mbar.inval in v0: an mbar is initialized once per kernel, and a
+    // declared one already was, by the host).
+    void record_launch_mbars(const std::vector<uint32_t>& addresses);
     void record_mbar_init(const IssueSite& site, uint32_t address);
-    // A non-mbar write granted now (a TMA placement round; I5: an ordinary
+    // A non-mbar write granted now (a TMA placement round, a uniform
     // atomic's write): `writer` names it, byte_ranges are its [begin, end).
     void check_live_mbar_write(uint64_t cycle, const std::string& writer,
         const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) const;
@@ -302,6 +323,7 @@ private:
 
     struct LiveMbar {
         uint32_t address = 0;
+        bool declared_by_launch = false; // live from launch (else: a SIMT mbar.init, below)
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t init_cycle = 0;
@@ -345,7 +367,7 @@ private:
     // SIMT shmem accesses that may not have reached the RAM yet (pruned at
     // each issue: bounded by the slots, the probe / RMW registers and D).
     std::vector<SimtShmemAccess> simt_shmem_;
-    // C10: mbars a SIMT mbar.init made live, until kernel end.
+    // C10: mbars the launch declared or a SIMT mbar.init made live, until kernel end.
     std::vector<LiveMbar> live_mbars_;
     // TMA command -> its completion mbar's phase at accept, until its complete_tx.
     std::vector<std::pair<uint64_t, bool>> tma_completion_phases_;
@@ -385,11 +407,14 @@ public:
     NANOSM_SANITIZER_NOOP(record_issue_accepted)
     NANOSM_SANITIZER_NOOP(check_issue_capture)
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
+    NANOSM_SANITIZER_NOOP(check_uniform_mask)
+    NANOSM_SANITIZER_NOOP(check_store_word_collision)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
     NANOSM_SANITIZER_NOOP(check_engine_mbar_rmw)
     NANOSM_SANITIZER_NOOP(record_simt_shmem_issue)
     NANOSM_SANITIZER_NOOP(record_simt_shmem_grant)
+    NANOSM_SANITIZER_NOOP(record_launch_mbars)
     NANOSM_SANITIZER_NOOP(record_mbar_init)
     NANOSM_SANITIZER_NOOP(check_live_mbar_write)
     NANOSM_SANITIZER_NOOP(record_tma_accept)

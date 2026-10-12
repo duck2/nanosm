@@ -472,6 +472,24 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
             inst.src1 = parse_reg(args[1], line_number);
             if (op == "stg.v8" && static_cast<unsigned>(inst.src1) + 8 > 256)
                 throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
+        } else if (op == "atom.add.uni" || op == "atom.and.uni" || op == "atom.xor.uni" || op == "atom.exch.uni") {
+            // trash/rfc13.md: uniform shared atomics on signed int32. One word
+            // per warp instruction (lane 0's address and operand); its old
+            // value comes back to every lane's rD (async, through a load slot:
+            // a depbar like lds.uni). The offset is a signed 14-bit field.
+            expect_count(args, 3, line_number);
+            inst.opcode = op == "atom.add.uni" ? Opcode::atom_add_uni
+                : op == "atom.and.uni" ? Opcode::atom_and_uni
+                : op == "atom.xor.uni" ? Opcode::atom_xor_uni
+                : Opcode::atom_exch_uni;
+            inst.dst = parse_reg(args[0], line_number);
+            const auto addr = parse_address(args[1], constants, line_number);
+            inst.src0 = addr.base;
+            inst.imm = addr.offset;
+            inst.src1 = parse_reg(args[2], line_number);
+            if (inst.imm < encoding::atomic_immediate_min || inst.imm > encoding::atomic_immediate_max) {
+                throw SimError("line " + std::to_string(line_number) + ": atom offset must fit a signed 14-bit immediate");
+            }
         } else if (op == "mbar.init") {
             expect_count(args, 2, line_number);
             inst.src0 = parse_mbar_address(args[0], line_number);
@@ -670,7 +688,11 @@ std::vector<uint8_t> sources(const Instruction& inst) {
         return {inst.src0, static_cast<uint8_t>(inst.src0 + 1),
             static_cast<uint8_t>(inst.src0 + 2)};
     case Opcode::sts:
-    case Opcode::stg: return {inst.src0, inst.src1};
+    case Opcode::stg:
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
         std::vector<uint8_t> result{inst.src0};
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
@@ -727,6 +749,10 @@ std::optional<uint8_t> destination(const Instruction& inst) {
     case Opcode::ldg_uni: return inst.dst;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8: return inst.dst;
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni: return inst.dst;
     default: return std::nullopt;
     }
 }
@@ -909,7 +935,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             predicate_ready[*dst] = vtime + latency;
         }
         if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
-            inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni) {
+            inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
             const auto bar = allocate();
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
@@ -1050,7 +1076,8 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
              inst.opcode == Opcode::ldg_uni || inst.opcode == Opcode::lds_uni ||
              inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
              inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 ||
-             inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init) && inst.control.set_depbar >= 6) {
+             inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init ||
+             is_atomic(inst.opcode)) && inst.control.set_depbar >= 6) {
             throw SimError("line " + std::to_string(inst.line) + ": memory operation requires set=sb0..sb5");
         }
         if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
@@ -1060,7 +1087,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
             inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
             inst.opcode != Opcode::mma_async && inst.opcode != Opcode::mma_async_init &&
-            inst.control.set_depbar != 7) {
+            !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
             throw SimError("line " + std::to_string(inst.line) + ": this opcode cannot set a depbar");
         }
         if (is_setp(inst.opcode) && inst.dst >= 7) {
