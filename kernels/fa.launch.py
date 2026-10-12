@@ -266,8 +266,10 @@ def run_case(case: str, trace: Path | None) -> None:
             "gmem": {"commands": 0, "sectors": 1792, "beats": 7168, "bytes": 57344},
             # Was 1586 requests / 3122 rounds. +256 staging sts at two rounds
             # each (rows r and r+8 share a bank) = +512; +512 TMA store reads at
-            # two rounds = +1024; + the store's descriptor and mbar-phase reads.
-            "shmem": {"requests": 2356, "rounds": 4660},
+            # two rounds = +1024; + the store's descriptor read. I3 (rfc12
+            # section 8): the TMA reads no mbar at its start any more, -6
+            # one-round mbar-phase reads (one per command): 2356 / 4660 before.
+            "shmem": {"requests": 2350, "rounds": 4654},
             "mma": {"commands": 32, "input_steps": 16384, "result_steps": 16384,
                     "shmem_rounds": 16384, "recurrence_stalls": 0},
             "tmem": {"load_beats": 1536, "store_beats": 256},

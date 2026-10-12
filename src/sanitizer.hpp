@@ -34,6 +34,7 @@
 #include <array>
 #include <cstddef>
 #include <deque>
+#include <map>
 #include <optional>
 #include <stdint.h>
 #include <string>
@@ -110,9 +111,25 @@ public:
     void check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool complete_tx) const;
     // Panics on a conflict, else records the descriptor (and box) owners.
     // descriptor_bytes: what the engine's later A-read will see.
+    // completion_mbar_word: the descriptor's completion mbar as it stands at
+    // accept (none: invalid descriptor). Its phase is recorded for the
+    // command's complete_tx (rfc12 section 8: the hardware reads no mbar at
+    // TMA start; this peek is sanitizer-only metadata).
     void record_tma_accept(
         const IssueSite& site, uint64_t command, uint32_t descriptor_address,
-        const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes);
+        const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes,
+        std::optional<uint64_t> completion_mbar_word);
+    // A complete_tx reaches its mbar, whose current phase is `phase`: it must
+    // be the phase its sender meant -- a TMA command's accept-time peek
+    // (tma_command), else the host's stated parity. A mismatch PANICs ("wrong
+    // phase"): the transaction bytes landed in a later phase (e.g. a plain
+    // final arrive completed the phase before the TMA's bytes came back).
+    void check_complete_tx_phase(uint64_t cycle, uint32_t address, std::optional<uint64_t> tma_command,
+        uint8_t stated_parity, bool phase);
+    // Every mbar RMW's resulting tx count; at kernel end each touched mbar's
+    // count must be zero (a missing expect_tx or complete_tx hangs a waiter).
+    void record_mbar_tx(uint32_t address, int32_t tx);
+    void check_kernel_end(uint64_t cycle) const;
     void record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded);
     void record_tma_data_complete(uint64_t command);
     // Panics on a conflict, else records the A/B operand and accumulator owners.
@@ -235,6 +252,10 @@ private:
 
     // n is tiny (a few outstanding commands); checks are linear scans.
     std::vector<ShmemOwner> shmem_owners_;
+    // TMA command -> its completion mbar's phase at accept, until its complete_tx.
+    std::vector<std::pair<uint64_t, bool>> tma_completion_phases_;
+    // mbar address -> its tx count as the last RMW left it.
+    std::map<uint32_t, int32_t> mbar_tx_;
     std::vector<TmemOwner> tmem_owners_;
     uint64_t next_acc_transfer_id_ = 0;
     std::vector<std::array<std::optional<uint64_t>, 2>> acc_transfer_in_slot_; // [bank][0 load, 1 store]
@@ -273,6 +294,9 @@ public:
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
     NANOSM_SANITIZER_NOOP(check_engine_mbar_rmw)
     NANOSM_SANITIZER_NOOP(record_tma_accept)
+    NANOSM_SANITIZER_NOOP(check_complete_tx_phase)
+    NANOSM_SANITIZER_NOOP(record_mbar_tx)
+    NANOSM_SANITIZER_NOOP(check_kernel_end)
     NANOSM_SANITIZER_NOOP(record_tma_descriptor_read)
     NANOSM_SANITIZER_NOOP(record_tma_data_complete)
     NANOSM_SANITIZER_NOOP(record_mma_accept)

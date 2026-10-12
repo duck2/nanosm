@@ -3,6 +3,8 @@
 
 #include "sanitizer.hpp"
 
+#include "mbar.hpp"
+
 #include <algorithm>
 #include <limits>
 
@@ -285,9 +287,46 @@ void Sanitizer::check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool com
     }
 }
 
+void Sanitizer::check_complete_tx_phase(uint64_t cycle, uint32_t address, std::optional<uint64_t> tma_command,
+    uint8_t stated_parity, bool phase) {
+    std::optional<bool> meant = stated_parity != 0;
+    std::string who = "the host completes phase " + std::to_string(stated_parity);
+    if (tma_command.has_value()) {
+        // A TMA's: the phase its accept-time peek recorded (none: the
+        // descriptor was invalid at accept, and its own read panicked).
+        meant.reset();
+        const auto record = std::find_if(tma_completion_phases_.begin(), tma_completion_phases_.end(),
+            [&](const auto& entry) { return entry.first == *tma_command; });
+        if (record != tma_completion_phases_.end()) {
+            meant = record->second;
+            who = "tma #" + std::to_string(*tma_command) + " was accepted in phase " +
+                std::to_string(record->second ? 1 : 0);
+            tma_completion_phases_.erase(record);
+        }
+    }
+    if (meant.has_value() && *meant != phase) {
+        throw_mbar_rmw_panic(cycle, address, "completing transaction bytes against the wrong phase (" + who +
+            "; the mbar is in phase " + std::to_string(phase ? 1 : 0) + ")", nullptr);
+    }
+}
+
+void Sanitizer::record_mbar_tx(uint32_t address, int32_t tx) {
+    mbar_tx_[address] = tx;
+}
+
+void Sanitizer::check_kernel_end(uint64_t cycle) const {
+    for (const auto& [address, tx] : mbar_tx_) {
+        if (tx == 0) continue;
+        throw SimError("PANIC cycle=" + std::to_string(cycle) + " mbar address=" + std::to_string(address) +
+            " reason=transaction count is nonzero at kernel end (tx=" + std::to_string(tx) +
+            "; a missing expect_tx or complete_tx would hang its waiters)");
+    }
+}
+
 void Sanitizer::record_tma_accept(
     const IssueSite& site, uint64_t command, uint32_t descriptor_address,
-    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes) {
+    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes,
+    std::optional<uint64_t> completion_mbar_word) {
     ShmemOwner descriptor_owner;
     descriptor_owner.kind = ShmemOwnerKind::tma_descriptor;
     descriptor_owner.command = command;
@@ -335,6 +374,9 @@ void Sanitizer::record_tma_accept(
     }
     shmem_owners_.push_back(descriptor_owner);
     if (data_owner.has_value()) shmem_owners_.push_back(*data_owner);
+    if (descriptor.has_value() && completion_mbar_word.has_value()) {
+        tma_completion_phases_.emplace_back(command, decode_mbar_state(*completion_mbar_word).phase);
+    }
 }
 
 void Sanitizer::record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded) {

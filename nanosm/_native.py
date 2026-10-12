@@ -51,7 +51,7 @@ lib.nanosm_mbar_encode.argtypes = [
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
-    ctypes.c_uint32,
+    ctypes.c_int32,  # tx_bytes: the signed transaction count
     ctypes.POINTER(ctypes.c_uint64),
 ]
 lib.nanosm_mbar_encode.restype = ctypes.c_int32

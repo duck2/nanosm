@@ -116,7 +116,7 @@ int32_t nanosm_mbar_encode(
     uint32_t phase,
     uint32_t expected,
     uint32_t remaining,
-    uint32_t tx_bytes,
+    int32_t tx_bytes,
     uint64_t* output) {
     try {
         last_error.clear();
@@ -127,6 +127,9 @@ int32_t nanosm_mbar_encode(
         }
         if (remaining > expected) {
             throw nanosm::SimError("mbar remaining count exceeds expected count");
+        }
+        if (tx_bytes > nanosm::mbar_encoding::tx_limit || tx_bytes < -nanosm::mbar_encoding::tx_limit) {
+            throw nanosm::SimError("mbar transaction count is outside -(2^20 - 1)..2^20 - 1");
         }
         nanosm::MbarState state;
         state.phase = phase != 0;

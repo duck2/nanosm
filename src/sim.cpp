@@ -136,8 +136,10 @@ bool uses_shmem(Opcode opcode) {
 // trash/rfc12.md sections 3, 4 and 6: first the warp's own order -- a read
 // waits for the warp's unserviced writes, a write (sts, an RMW) for its
 // unserviced reads and writes; reads may pass reads -- then the resource that
-// holds the operation. An lds / sts with no active lane is absent: no slot,
-// no order.
+// holds the operation. So a SIMT RMW enters the SIMT RMW register (and later
+// the engine, whose store pause would block them) only once its warp's own
+// lds / sts are serviced. An lds / sts with no active lane is absent: no
+// slot, no order.
 std::optional<Refusal> shmem_refusal(Opcode opcode, const ResourceView& view) {
     if ((opcode == Opcode::lds || opcode == Opcode::sts) && view.no_active_lanes) return std::nullopt;
     const bool write = opcode == Opcode::sts || is_mbar_rmw(opcode);
@@ -145,7 +147,7 @@ std::optional<Refusal> shmem_refusal(Opcode opcode, const ResourceView& view) {
     if (is_shared_load(opcode) && !view.load_slot_free) return Refusal::load_slots_full;
     if (opcode == Opcode::sts && !view.store_slot_free) return Refusal::store_slots_full;
     if (is_mbar_predicate_writer(opcode) && !view.probe_register_free) return Refusal::probe_register_busy;
-    if (is_mbar_rmw(opcode) && !view.rmw_engine_free) return Refusal::rmw_engine_busy;
+    if (is_mbar_rmw(opcode) && !view.simt_rmw_register_free) return Refusal::simt_rmw_register_busy;
     return std::nullopt;
 }
 
@@ -396,9 +398,10 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          wait slots completed (wake, immediate success, timeout).
 //      (c) Issue looks ahead: an instruction accepted at t occupies its
 //          resources from t+1, so issue sees the space this cycle frees
-//          (queue entries, slots freed by this cycle's grants, the RMW engine,
-//          assembly registers) and the warp's shmem accesses as this cycle's
-//          grants leave them (rfc12 section 4).
+//          (queue entries, slots freed by this cycle's grants, the SIMT RMW
+//          register emptied by an RMW start, assembly registers) and the
+//          warp's shmem accesses as this cycle's grants leave them (rfc12
+//          section 4).
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
 //          t (the assembly register, a load slot whose RF write is granted
 //          at t, the TMA sector / store registers, the MMA event register,
@@ -415,11 +418,13 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          this cycle's egress drain of a store register (d)) ->
 //          tma_requests builds the request -> select_a_read / select_b_write
 //          grants it -> round 0 enters its pipeline, all in one cycle. No
-//          register holds the transaction before round 0. A held engine
-//          event's claim of the RMW engine is likewise its read grant. A SIMT
-//          access accepted at issue sits in its slot (a register) and is
-//          granted from the next cycle. A new MMA fetch serves its first
-//          port-B round in the cycle it starts.
+//          register holds the transaction before round 0. Likewise an RMW's
+//          start (A-write's alternation lets it begin, the engine takes the
+//          request from its register) and its read grant may share a cycle:
+//          select_a_read sees the start (shmem wire order: A-write, RMW
+//          admission, A-read). A SIMT access or RMW accepted at issue sits in
+//          its slot / register and is served from the next cycle. A new MMA
+//          fetch serves its first port-B round in the cycle it starts.
 // 2. DRIVERS. Each register's next value, from Q and the wires. They run in
 //    any order (set_driver_shuffle_seed() permutes them every cycle).
 // 3. CLOCK EDGE. Every register takes D; shmem takes the write rounds that
@@ -483,6 +488,8 @@ void Machine::tick() {
         std::memcpy(shmem_.data() + write.address, write.bytes.data(), write.bytes.size());
     }
     ++cycle_;
+    // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
+    if (done()) sanitizer_.check_kernel_end(cycle_);
 }
 
 void Machine::run(uint64_t cycle_limit) {
@@ -506,10 +513,11 @@ bool Machine::done() const {
         return std::all_of(pipe.begin(), pipe.end(), [](const auto& stage) { return !stage.has_value(); });
     };
     // rfc12 section 13: the slots in every state, the probe register, the RMW
-    // engine (its operation and ALU stages) and the services' pipelines (a
-    // store whose slot is free may still be travelling to its write edge).
+    // engine (its SIMT RMW register, operation and ALU stages) and the
+    // services' pipelines (a store whose slot is free may still be travelling
+    // to its write edge).
     const bool shmem_idle = std::all_of(load_slots_.begin(), load_slots_.end(), empty) &&
-        std::all_of(store_slots_.begin(), store_slots_.end(), empty) && empty(mbar_probe_) &&
+        std::all_of(store_slots_.begin(), store_slots_.end(), empty) && empty(mbar_probe_) && empty(simt_rmw_) &&
         !rmw_.cur().active.has_value() && drained(rmw_.cur().alu) && drained(a_read_pipe_.cur()) &&
         drained(a_write_pipe_.cur()) && drained(b_write_pipe_.cur()) && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
@@ -557,7 +565,9 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
         throw SimError("invalid engine mbar address");
     }
     if (parity > 1) throw SimError("invalid engine mbar parity");
-    // A DMA complete_tx: it belongs in the TMA's event register.
+    // A DMA complete_tx: it belongs in the TMA's event register. It changes the
+    // mbar's current phase; `parity` (the phase the host means) is sanitizer
+    // metadata only (rfc12 section 8).
     if (tma_mbar_event_.cur().has_value()) {
         throw SimError("TMA mbar event register is occupied; an engine holds one event at a time");
     }
@@ -912,6 +922,31 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 // stages before its write is granted. A read and a write of one word at the
 // RAM in one cycle: READ_FIRST (the write lands at the clock edge). The MMA's
 // port-B read is not pipelined: it reads the RAM in its fetch cycle.
+//
+// The RMW engine (rfc12 section 6): one operation at a time, each one
+// coherent 8-byte mbar RMW (both words in one read round, one write round).
+// Its requester waits in a register (the SIMT RMW register, the TMA's or the
+// MMA's event register). One RMW, with D, Lb and C as above:
+//   s          START. A-write's alternation lets an RMW begin
+//              (select_a_write step 4) and the engine takes a requester
+//              (select_rmw_admission). The global store PAUSE -- the engine's
+//              operation register -- is set from s + 1: no new store
+//              transaction starts. A store transaction under way keeps its
+//              rounds.
+//   r >= s     READ, granted on A-read before any new requester, strictly
+//              after that store transaction's last round (r = s when no store
+//              and no A-read transaction is under way)
+//   r + D      the RAM sample
+//   r + D + Lb the words at the port output; the ALU computes the update
+//   w = r + D + Lb + C
+//              WRITE (the final write) granted on A-write; the PAUSE ends at
+//              this cycle's edge
+//   w + 1      stores may start again: one granted now reaches the RAM at
+//              w + 1 + D, after the RMW's write (matched D, no drain)
+//   w + D      the write reaches the RAM; a phase flip wakes the waiters now
+// Reads are never paused: between r and w A-read serves loads, probes and
+// TMA reads, and a read of the mbar sampling at w + D sees the old word
+// (READ_FIRST).
 // ===========================================================================
 
 // shmem this cycle, in wire order:
@@ -919,18 +954,23 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 //      now and the completions they carry (an sts's depbar, an RMW's wake, a
 //      placement's end); the read round sampled now; the read round at the
 //      port output, whose requester takes its words now;
-//   2. one select per service: A-read, A-write (an RMW's write is granted
-//      when its update is in the ALU's last stage), B-write;
-//   3. their data paths: the granted rounds enter the pipelines, the
-//      requesters advance.
+//   2. the selects, one per shared resource, in this order: A-write (an RMW's
+//      write, a store round, and which transaction STARTS next: an RMW or a
+//      store), the RMW engine's admission (which requester an RMW start
+//      takes), A-read (sees that start: an RMW's read may be granted in its
+//      start cycle), B-write;
+//   3. their data paths: the RMW start, the granted rounds enter the
+//      pipelines, the requesters advance.
 void Machine::step_shmem(Wires& w) {
     w.shmem.arbiters = shmem_arbiters_.cur();
     shmem_ram_stage(w.shmem);
     commit_shmem_writes(w);
     deliver_shmem_read(w);
-    w.shmem.a_read = select_a_read(w);
     w.shmem.a_write = select_a_write(w);
+    w.shmem.rmw_start = select_rmw_admission(w);
+    w.shmem.a_read = select_a_read(w);
     w.shmem.b_write = select_b_write(w);
+    serve_rmw_start(w);
     serve_a_read(w);
     serve_a_write(w);
     serve_b_write(w);
@@ -973,7 +1013,7 @@ void Machine::commit_shmem_writes(Wires& w) {
 // The read round at the port output goes to its requester: a load round to
 // its slot's gather register, a probe to its warp, an RMW's words through its
 // update into the ALU, a store-source round to its TMA store register. (A
-// descriptor / phase round: the frontend latch, advance_tma_read.)
+// descriptor round: the frontend latch, advance_tma_read.)
 void Machine::deliver_shmem_read(Wires& w) {
     const auto& beat = w.shmem.delivered;
     if (!beat.has_value()) return;
@@ -1051,20 +1091,26 @@ void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
 
 // ---- The requesters, from Q ----
 
-// The RMW engine between its read grant and its write grant: in I2's
-// conservative rule it holds both A services (rfc12 section 6 replaces this
-// with the global store pause in I3).
-bool Machine::rmw_holds_a_services() const {
-    const auto& active = rmw_.cur().active;
-    return active.has_value() && active->read_granted;
+// The global store PAUSE (rfc12 section 6) is a register: the RMW engine's
+// operation register, held from the RMW's start to its final write grant.
+// While it is set no new store transaction starts on A-write. It clears at
+// the edge of the final write grant w, so stores may start at w + 1 (matched
+// D still lands them after the RMW's write; nothing waits for its commit).
+bool Machine::store_pause() const {
+    return rmw_.cur().active.has_value();
 }
 
-// An RMW waits for its read: a SIMT operation in the engine, or a held engine
-// event while the engine is idle.
-bool Machine::rmw_wants_read() const {
+// An RMW waits to start in one of the engine's three requester registers.
+bool Machine::rmw_requester_held() const {
+    return simt_rmw_.cur().has_value() || tma_mbar_event_.cur().has_value() || mma_mbar_event_.cur().has_value();
+}
+
+// A started RMW waits for its read: the engine's operation (Q) whose read is
+// not granted yet, or the RMW starting now (A-write's alternation and the
+// engine's admission, earlier in wire order).
+bool Machine::rmw_awaits_read(const Wires& w) const {
     const auto& active = rmw_.cur().active;
-    if (active.has_value()) return !active->read_granted;
-    return tma_mbar_event_.cur().has_value() || mma_mbar_event_.cur().has_value();
+    return (active.has_value() && !active->read_granted) || w.shmem.rmw_start.has_value();
 }
 
 // The load slot whose transaction is under way on A-read (started, rounds left).
@@ -1076,12 +1122,21 @@ std::optional<uint32_t> Machine::load_slot_in_service() const {
     return std::nullopt;
 }
 
+// The store slot whose transaction is under way on A-write (started; a
+// serviced store slot is already free).
 std::optional<uint32_t> Machine::store_slot_in_service() const {
     for (uint32_t index = 0; index < store_slots_.size(); ++index) {
         const auto& slot = store_slots_[index].cur();
-        if (slot.has_value() && slot->access.started()) return index; // a serviced store slot is free
+        if (slot.has_value() && slot->access.started()) return index;
     }
     return std::nullopt;
+}
+
+// A store transaction waits to start: a store slot held and not started.
+bool Machine::store_slot_waiting() const {
+    return std::any_of(store_slots_.begin(), store_slots_.end(), [](const auto& slot) {
+        return slot.cur().has_value() && !slot.cur()->access.started();
+    });
 }
 
 bool Machine::tma_read_in_service() const {
@@ -1089,32 +1144,85 @@ bool Machine::tma_read_in_service() const {
     return transaction.has_value() && transaction->request.next_round < transaction->request.rounds.size();
 }
 
-// ---- The selects: one per service (rfc12 section 5) ----
+// ---- The selects: one per shared resource (rfc12 sections 5 and 6) ----
 
-// A-read, in order:
-//   1. an RMW between its read and its write holds A-read: no grant;
-//   2. a transaction under way takes its next round (no preemption);
-//   3. an RMW waiting for its read wins, once A-write has no transaction
-//      under way either (it holds both services from its read grant). Until
-//      then nothing new starts on A-read (nor on A-write: select_a_write);
-//   4. ONE round-robin over the new requesters: load slots not yet started,
-//      the probe register, the TMA's new read.
-Machine::AReadGrant Machine::select_a_read(const Wires& w) const {
-    if (rmw_holds_a_services()) return {};
-    if (tma_read_in_service()) return AReadGrant::to(AReadUser::tma);
-    if (const auto slot = load_slot_in_service(); slot.has_value()) return AReadGrant::to(AReadUser::load_slot, *slot);
-    if (rmw_wants_read()) return store_slot_in_service().has_value() ? AReadGrant{} : grant_rmw_read();
-    return a_read_round_robin(w);
+// A-write, in order:
+//   1. the RMW's write, when its update is in the ALU's last stage (Q):
+//      granted now, D + Lb + C after its read. It is the RMW's final write:
+//      the PAUSE ends at this cycle's edge;
+//   2. a store transaction under way takes its next round -- also once an
+//      RMW has started: that RMW's read waits for this store's last round
+//      (select_a_read);
+//   3. PAUSE: no new store transaction starts;
+//   4. which transaction STARTS next. An RMW waiting to start (the engine
+//      idle, a requester held) and a store waiting to start (a store slot
+//      not started) alternate: when both wait, the one that did not start
+//      last goes (the alternation bit, ShmemArbiters::rmw_started_last), so
+//      one store transaction goes between consecutive RMWs; when one waits,
+//      it goes. An RMW start (rmw_start) begins the PAUSE; the engine's
+//      admission picks the requester. It may share its cycle with step 2's
+//      round. A store start is round 0 of the store slot the round-robin
+//      pointer picks.
+// The alternation bit is read only here, to choose a START: from an RMW's
+// start to its final write grant the PAUSE holds every new store, so no store
+// is ever granted between an RMW's read and its write.
+Machine::AWriteGrant Machine::select_a_write(const Wires&) const {
+    AWriteGrant grant;
+    const bool rmw_waiting = !store_pause() && rmw_requester_held();
+    const bool stores_turn = store_slot_waiting() && (!rmw_waiting || shmem_arbiters_.cur().rmw_started_last);
+    grant.rmw_start = rmw_waiting && !stores_turn;
+    if (rmw_.cur().alu.back().has_value()) { // (the PAUSE is set: no RMW starts)
+        grant.user = AWriteUser::rmw;
+        return grant;
+    }
+    if (const auto slot = store_slot_in_service(); slot.has_value()) {
+        grant.user = AWriteUser::store_slot;
+        grant.slot = *slot;
+        return grant;
+    }
+    if (store_pause() || !stores_turn) return grant;
+    std::vector<uint8_t> ready(store_slots_.size(), 0);
+    for (std::size_t index = 0; index < ready.size(); ++index) ready[index] = store_slots_[index].cur().has_value() ? 1 : 0;
+    const auto choice = round_robin_grant(ready, shmem_arbiters_.cur().a_write, 1);
+    grant.user = AWriteUser::store_slot;
+    grant.slot = choice.granted.front();
+    grant.pointer_after = choice.cursor_after;
+    return grant;
 }
 
-// The RMW read: the SIMT operation in the engine, or a held engine event that
-// claims the idle engine now (both held: the engine not served last).
-Machine::AReadGrant Machine::grant_rmw_read() const {
-    auto grant = AReadGrant::to(AReadUser::rmw);
-    if (!rmw_.cur().active.has_value()) {
-        grant.claim = engine_to_claim(tma_mbar_event_.cur().has_value(), mma_mbar_event_.cur().has_value());
-    }
-    return grant;
+// The RMW engine's admission (rfc12 section 6): when A-write lets an RMW
+// start, which requester the idle engine takes. Implementer choice (I3), one
+// simple fairness rule: the SIMT RMW register and the engines' event
+// registers alternate BY CLASS -- when both classes hold a request, the class
+// that did not start last goes (RmwEngine::simt_started_last); within the
+// engines the existing TMA / MMA alternation decides (engine_to_claim).
+std::optional<Machine::RmwStart> Machine::select_rmw_admission(const Wires& w) const {
+    if (!w.shmem.a_write.rmw_start) return std::nullopt;
+    const bool tma = tma_mbar_event_.cur().has_value();
+    const bool mma = mma_mbar_event_.cur().has_value();
+    const bool simt = simt_rmw_.cur().has_value();
+    if (simt && (!(tma || mma) || !rmw_.cur().simt_started_last)) return RmwStart{};
+    return RmwStart{engine_to_claim(tma, mma)};
+}
+
+// A-read, in order:
+//   1. a transaction under way takes its next round (no preemption);
+//   2. a started RMW waiting for its read (started earlier, or starting now)
+//      goes before every new requester. It is granted strictly after the
+//      last round of the store transaction under way on A-write, if any:
+//      matched D then lands that store before the RMW's sample. Until then
+//      nothing new starts on A-read (implementer choice: with no preemption a
+//      new multi-round read could only delay the RMW's read and so lengthen
+//      the store pause);
+//   3. ONE round-robin over the new requesters: load slots not yet started,
+//      the probe register, the TMA's new read.
+// Reads are never paused: between an RMW's read and its write, step 3 serves
+// loads, probes and TMA reads as usual.
+Machine::AReadGrant Machine::select_a_read(const Wires& w) const {
+    if (tma_read_in_service()) return AReadGrant::to(AReadUser::tma);
+    if (const auto slot = load_slot_in_service(); slot.has_value()) return AReadGrant::to(AReadUser::load_slot, *slot);
+    if (rmw_awaits_read(w)) return store_slot_in_service().has_value() ? AReadGrant{} : AReadGrant::to(AReadUser::rmw);
+    return a_read_round_robin(w);
 }
 
 Machine::AReadGrant Machine::a_read_round_robin(const Wires& w) const {
@@ -1142,27 +1250,6 @@ Machine::AReadGrant Machine::a_read_round_robin(const Wires& w) const {
     return grant;
 }
 
-// A-write, in order:
-//   1. an RMW whose update is in the ALU's last stage (Q): its write is
-//      granted now, D + Lb + C after its read;
-//   2. otherwise an RMW between its read and its write holds A-write;
-//   3. a store transaction under way takes its next round;
-//   4. an RMW waiting for its read: no new store starts;
-//   5. one round-robin over the store slots not yet started.
-Machine::AWriteGrant Machine::select_a_write(const Wires&) const {
-    if (rmw_.cur().alu.back().has_value()) return AWriteGrant::to(AWriteUser::rmw);
-    if (rmw_holds_a_services()) return {};
-    if (const auto slot = store_slot_in_service(); slot.has_value()) return AWriteGrant::to(AWriteUser::store_slot, *slot);
-    if (rmw_wants_read()) return {};
-    std::vector<uint8_t> ready(store_slots_.size(), 0);
-    for (std::size_t index = 0; index < ready.size(); ++index) ready[index] = store_slots_[index].cur().has_value() ? 1 : 0;
-    const auto choice = round_robin_grant(ready, shmem_arbiters_.cur().a_write, 1);
-    if (choice.granted.empty()) return {};
-    auto grant = AWriteGrant::to(AWriteUser::store_slot, choice.granted.front());
-    grant.pointer_after = choice.cursor_after;
-    return grant;
-}
-
 // B-write has one client: the TMA's placement under way, else a new one.
 Machine::BWriteUser Machine::select_b_write(const Wires& w) const {
     if (tma_write_txn_.cur().has_value()) return BWriteUser::tma_continue;
@@ -1170,6 +1257,29 @@ Machine::BWriteUser Machine::select_b_write(const Wires& w) const {
 }
 
 // ---- The data paths ----
+
+// An RMW starts: the engine takes the request out of its register (an
+// engine's event: its command ends now, step_tma; the sanitizer admits an
+// engine's RMW here, a SIMT one at issue). The PAUSE is set from the next
+// cycle; the trace's "mbar RMW" slice runs from now to the write grant.
+void Machine::serve_rmw_start(Wires& w) {
+    auto& shmem = w.shmem;
+    if (!shmem.rmw_start.has_value()) return;
+    ActiveMbarRmw active;
+    active.engine = shmem.rmw_start->engine;
+    if (!active.engine.has_value()) {
+        shmem.simt_rmw_started = true;
+        active.request = *simt_rmw_.cur();
+    } else {
+        const bool tma = *active.engine == MbarEngine::tma;
+        (tma ? shmem.tma_event_claimed : shmem.mma_event_claimed) = true;
+        active.request = *(tma ? tma_mbar_event_ : mma_mbar_event_).cur();
+        sanitizer_.check_engine_mbar_rmw(cycle_, active.request.byte_address,
+            active.request.operation == MbarRmwOperation::complete_tx);
+    }
+    trace_->mbar_rmw_begin(cycle_, active.request.byte_address, rmw_label(active));
+    shmem.rmw_started = std::move(active);
+}
 
 // The granted A-read round enters the read pipeline. A round-robin grant
 // moves the pointer past its requester (pointer_after, from the select). A
@@ -1193,18 +1303,8 @@ void Machine::serve_a_read(Wires& w) {
         shmem.a_read_beat = std::move(beat);
         return;
     }
-    case AReadUser::rmw: {
-        auto active = rmw_.cur().active.value_or(ActiveMbarRmw{});
-        if (grant.claim.has_value()) {
-            const bool tma_event = *grant.claim == MbarEngine::tma;
-            (tma_event ? shmem.tma_event_claimed : shmem.mma_event_claimed) = true;
-            active.request = tma_event ? *tma_mbar_event_.cur() : *mma_mbar_event_.cur();
-            active.engine = grant.claim;
-            // Sanitizer: an engine's RMW is admitted here (SIMT ones at issue).
-            sanitizer_.check_engine_mbar_rmw(cycle_, active.request.byte_address,
-                active.request.operation == MbarRmwOperation::complete_tx);
-        }
-        trace_->mbar_rmw_begin(cycle_, active.request.byte_address, rmw_label(active));
+    case AReadUser::rmw: { // the engine's operation, or the one starting now: both mbar words, one round
+        const auto& active = rmw_.cur().active.has_value() ? *rmw_.cur().active : *shmem.rmw_started;
         trace_->shmem_grant(cycle_, ShmemService::a_read, ShmemClient::rmw);
         ReadBeat beat;
         beat.client = ReadClient::rmw;
@@ -1246,15 +1346,14 @@ Machine::ReadBeat Machine::load_round(uint32_t index) {
 
 namespace {
 const char* tma_port_label(int kind) {
-    static const char* const labels[] = {
-        "tma descriptor read", "tma mbar phase read", "tma load write", "tma store read"};
+    static const char* const labels[] = {"tma descriptor read", "tma load write", "tma store read"};
     return labels[kind];
 }
 } // namespace
 
 // A TMA read's next round (round 0 when it starts now). A store-source round
-// carries its store register's index; descriptor / phase rounds return to
-// the frontend latch.
+// carries its store register's index; descriptor rounds return to the
+// frontend latch.
 Machine::ReadBeat Machine::tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register) {
     const auto rounds = static_cast<uint32_t>(request.rounds.size());
     if (start) {
@@ -1290,11 +1389,11 @@ std::vector<uint32_t> Machine::tma_round_addresses(const TmaPortRequest& request
 }
 
 // The TMA read transaction after this cycle: a round granted (a new
-// transaction starts with round 0), a descriptor / phase round's words back
-// into the frontend latch. A descriptor / phase read ends when its last
-// round's words are back, and the TMA takes its data (step_tma); a
-// store-source read ends at its last round's grant (its words go to its
-// store register: fill_tma_store_register).
+// transaction starts with round 0), a descriptor round's words back into the
+// frontend latch. A descriptor read ends when its last round's words are
+// back, and the TMA takes its data (step_tma); a store-source read ends at
+// its last round's grant (its words go to its store register:
+// fill_tma_store_register).
 void Machine::advance_tma_read(Wires& w) {
     auto& shmem = w.shmem;
     const bool granted = shmem.a_read.user == AReadUser::tma;
@@ -1359,13 +1458,21 @@ void Machine::fill_tma_store_register(const ReadBeat& beat, Wires& w) {
     w.shmem.tma_store_fill = std::move(fill);
 }
 
-// The granted A-write round enters the A-write pipeline. A round-robin grant
-// moves the pointer past its store slot (pointer_after, from the select). An
-// RMW's write takes its update from the ALU's last stage; a phase flip wakes
-// the waiters when the write reaches the RAM.
+// The granted A-write round enters the A-write pipeline. A new store
+// transaction moves the round-robin pointer past its slot (pointer_after,
+// from the select); every start sets the alternation bit (an RMW start: true;
+// a store start: false). An RMW's write takes its update from the ALU's last
+// stage; a phase flip wakes the waiters when the write reaches the RAM.
 void Machine::serve_a_write(Wires& w) {
     auto& shmem = w.shmem;
-    if (shmem.a_write.pointer_after.has_value()) shmem.arbiters.a_write = *shmem.a_write.pointer_after;
+    const auto& grant = shmem.a_write;
+    if (grant.pointer_after.has_value()) shmem.arbiters.a_write = *grant.pointer_after;
+    if (grant.rmw_start) {
+        shmem.arbiters.rmw_started_last = true;
+    } else if (grant.pointer_after.has_value()) {
+        shmem.arbiters.rmw_started_last = false;
+    }
+    if (store_pause() && store_slot_waiting()) trace_->shmem_store_pause_wait();
     switch (shmem.a_write.user) {
     case AWriteUser::none:
         return;
@@ -1410,6 +1517,17 @@ Machine::WriteBeat Machine::store_round(uint32_t index) {
 // computes the new mbar word (and whether the phase flips) from them; the
 // result enters ALU stage 0 at this cycle's edge and its write is granted C
 // cycles from now (select_a_write).
+//
+// The tx count is signed (rfc12 section 8, as in PTX): arrive.expect_tx adds,
+// complete_tx subtracts, in either order --
+//     completion first:  (1, 0) -complete_tx 128-> (1, -128) -arrive.expect_tx 128-> (0, 0) done
+//     expectation first: (1, 0) -arrive.expect_tx 128-> (0, 128) -complete_tx 128-> (0, 0) done
+// (pending arrivals, tx). arrive.expect_tx changes both, THEN completion is
+// tested; the phase completes when both are zero. tx arithmetic is checked: an
+// operand above 2^20 - 1 or a count leaving -(2^20 - 1)..2^20 - 1 PANICs (an
+// atomic add wraps; this does not). complete_tx carries no phase: it changes
+// the current one. Whether that is the phase its sender meant is the
+// sanitizer's question (the TMA's accept-time peek; the host's parity).
 Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
     const auto& request = rmw_.cur().active->request;
     auto state = decode_mbar_state(static_cast<uint64_t>(read.words.at(0)) | static_cast<uint64_t>(read.words.at(1)) << 32);
@@ -1419,6 +1537,18 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
         if (state.expected == 0 || state.remaining > state.expected) {
             mbar_rmw_panic(request, "corrupt mbar state");
         }
+    };
+    const auto tx_operand = [&]() -> int64_t {
+        if (request.value > static_cast<uint32_t>(mbar_encoding::tx_limit)) {
+            mbar_rmw_panic(request, "transaction byte count operand exceeds 2^20 - 1");
+        }
+        return request.value;
+    };
+    const auto add_tx = [&](int64_t delta) {
+        const int64_t count = static_cast<int64_t>(state.tx_bytes) + delta;
+        if (count > mbar_encoding::tx_limit) mbar_rmw_panic(request, "transaction byte count overflow (above 2^20 - 1)");
+        if (count < -mbar_encoding::tx_limit) mbar_rmw_panic(request, "transaction byte count underflow (below -(2^20 - 1))");
+        state.tx_bytes = static_cast<int32_t>(count);
     };
 
     switch (request.operation) {
@@ -1444,21 +1574,14 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
     case MbarRmwOperation::arrive_expect_tx:
         validate_live();
         if (state.remaining == 0) mbar_rmw_panic(request, "arrival count underflow");
-        if (request.value > std::numeric_limits<uint32_t>::max() - state.tx_bytes) {
-            mbar_rmw_panic(request, "transaction byte count overflow");
-        }
         --state.remaining;
-        state.tx_bytes += request.value;
+        add_tx(tx_operand());
         break;
     case MbarRmwOperation::complete_tx:
         validate_live();
-        if (state.phase != (request.parity != 0)) {
-            mbar_rmw_panic(request, "completing transaction bytes against the wrong phase");
-        }
-        if (request.value > state.tx_bytes) {
-            mbar_rmw_panic(request, "transaction byte count underflow");
-        }
-        state.tx_bytes -= request.value;
+        sanitizer_.check_complete_tx_phase(cycle_, request.byte_address, request.tma_command, request.parity,
+            state.phase);
+        add_tx(-tx_operand());
         break;
     }
 
@@ -1468,6 +1591,7 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
         state.remaining = state.expected;
         beat.wake = MbarWake{request.byte_address, static_cast<uint8_t>(state.phase)};
     }
+    sanitizer_.record_mbar_tx(request.byte_address, state.tx_bytes);
     const auto word = encode_mbar_state(state);
     std::vector<uint8_t> bytes(8);
     std::memcpy(bytes.data(), &word, sizeof(word));
@@ -1536,11 +1660,12 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
 }
 
 // (T) An engine's held event waits while the RMW engine works on the OTHER
-// engine's event (from its claim to its write grant). An event presented this
+// engine's event (from its start to its write grant). An event presented this
 // cycle is held from the next one.
 void Machine::count_engine_wait_on_other(const Wires& w) {
-    auto serving = w.shmem.a_read.claim;
-    if (!serving.has_value() && rmw_.cur().active.has_value()) serving = rmw_.cur().active->engine;
+    std::optional<MbarEngine> serving;
+    if (w.shmem.rmw_start.has_value()) serving = w.shmem.rmw_start->engine;
+    else if (rmw_.cur().active.has_value()) serving = rmw_.cur().active->engine;
     if (!serving.has_value()) return;
     if ((*serving == MbarEngine::tma ? mma_mbar_event_ : tma_mbar_event_).cur().has_value()) {
         trace_->mbar_engine_wait_on_other();
@@ -1548,7 +1673,7 @@ void Machine::count_engine_wait_on_other(const Wires& w) {
 }
 
 // The RMW engine's choice between the two engines' held events: one holder
-// is served; when both hold one, the engine not served last.
+// is started; when both hold one, the engine not started last.
 Machine::MbarEngine Machine::engine_to_claim(bool tma_held, bool mma_held) const {
     if (!mma_held) return MbarEngine::tma;
     if (!tma_held) return MbarEngine::mma;
@@ -1610,30 +1735,18 @@ bool Machine::warp_unserviced_read(const Wires& w, uint32_t warp) const {
     return false;
 }
 
-// An unserviced write: the warp holds a store slot, or its SIMT RMW's write
-// is not granted (rfc12 section 6: an RMW counts until its write grant).
+// An unserviced write: the warp holds a store slot, or its SIMT RMW waits in
+// the SIMT RMW register or runs in the engine with its final write not
+// granted by the end of this cycle (rfc12 section 6: a SIMT RMW counts as
+// unserviced until its FINAL write grant).
 bool Machine::warp_unserviced_write(const Wires& w, uint32_t warp) const {
     for (uint32_t index = 0; index < store_slots_.size(); ++index) {
         const auto& slot = store_slots_[index].cur();
         if (slot.has_value() && slot->warp == warp && !store_slot_released(w, index)) return true;
     }
+    if (simt_rmw_.cur().has_value() && simt_rmw_.cur()->warp == warp) return true;
     const auto& active = rmw_.cur().active;
     return active.has_value() && active->request.warp == warp && w.shmem.a_write.user != AWriteUser::rmw;
-}
-
-// The RMW engine can take a SIMT operation accepted now: it is idle after
-// this cycle (idle and not claimed now, or its write granted now), and no
-// engine event is held in its register and unclaimed. Registered state and
-// this cycle's grants only (look-ahead (c)): an event an engine presents
-// into its register this cycle reaches the RMW engine -- and admission --
-// from the next cycle, like any register's content.
-bool Machine::rmw_engine_free_next_cycle(const Wires& w) const {
-    const bool idle_next = rmw_.cur().active.has_value()
-        ? w.shmem.a_write.user == AWriteUser::rmw
-        : !w.shmem.a_read.claim.has_value();
-    const bool tma_event = tma_mbar_event_.cur().has_value() && !w.shmem.tma_event_claimed;
-    const bool mma_event = mma_mbar_event_.cur().has_value() && !w.shmem.mma_event_claimed;
-    return idle_next && !tma_event && !mma_event;
 }
 
 // The warp's probe has not come back: it waits in the probe register or
@@ -2070,12 +2183,13 @@ void Machine::step_acc_st(uint32_t bank, std::optional<AccTransfer>& slot, Wires
 //      request pointer wants the request channel.
 //   3. Port-B write: the front ticket's placement, when no placement is
 //      under way.
-//   4. The frontend command: its descriptor or mbar-phase read (A-read), or
-//      the walker's next sector -- a load sector wants the request channel, a
-//      store sector the A-read of its source (and a free TMA store register
-//      for its words). One TMA read in service at a time: none while a
-//      descriptor / phase read's words are still coming back, or while a
-//      store-source read has rounds left to be granted.
+//   4. The frontend command: its descriptor read (A-read), or the walker's
+//      next sector -- a load sector wants the request channel, a store sector
+//      the A-read of its source (and a free TMA store register for its
+//      words). One TMA read in service at a time: none while a descriptor
+//      read's words are still coming back, or while a store-source read has
+//      rounds left to be granted. There is no mbar read at the start (rfc12
+//      section 8): the walk begins once the descriptor is decoded.
 Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     TmaRequests want;
     const auto& tma = tma_.cur();
@@ -2090,7 +2204,7 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
             event.operation = MbarRmwOperation::complete_tx;
             event.byte_address = command.descriptor.completion_mbar;
             event.value = static_cast<uint32_t>(command.logical_bytes);
-            event.parity = command.mbar_phase;
+            event.tma_command = command.id; // (S) the sanitizer's accept-time phase peek
             want.present_event = std::move(event);
         }
     }
@@ -2113,17 +2227,14 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     if (!want.frontend.has_value()) return want;
     const auto& command = tma.commands.at(*want.frontend);
     const bool read_free = !tma_read_txn_.cur().has_value();
-    if (command.state == TmaCommandState::descriptor || command.state == TmaCommandState::phase) {
+    if (command.state == TmaCommandState::descriptor) {
         if (!read_free) return want;
-        const bool descriptor = command.state == TmaCommandState::descriptor;
         TmaPortRequest request;
-        request.kind = descriptor ? TmaPortKind::descriptor : TmaPortKind::phase;
+        request.kind = TmaPortKind::descriptor;
         request.command = command.id;
-        const uint32_t base = descriptor ? command.descriptor_address : command.descriptor.completion_mbar;
-        const uint32_t size = descriptor ? static_cast<uint32_t>(tma_descriptor_bytes) : 8u;
-        for (uint32_t offset = 0; offset < size; offset += 4) {
+        for (uint32_t offset = 0; offset < tma_descriptor_bytes; offset += 4) {
             GmemSectorRequest::TmaFragment fragment;
-            fragment.shmem_address = base + offset;
+            fragment.shmem_address = command.descriptor_address + offset;
             fragment.size = 4;
             request.fragments.push_back(fragment);
         }
@@ -2239,7 +2350,8 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(
 void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
     // The command whose event the register holds ends in the cycle the RMW
-    // engine claims that event. (Today the TMA never presents in that cycle:
+    // engine claims that event (the event's RMW starts: serve_rmw_start).
+    // (Today the TMA never presents in that cycle:
     // it presents only when event_command is empty in Q.)
     if (tma.event_command.has_value() && w.shmem.tma_event_claimed) {
         const auto& command = tma.commands.at(*tma.event_command);
@@ -2324,8 +2436,9 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
     tma.frontend.reset();
 }
 
-// A descriptor or mbar-phase read's last round is back: its data is in
-// `request` (the frontend latch).
+// A descriptor read's last round is back: its data is in `request` (the
+// frontend latch). The command walks next (I3: no mbar phase read and no
+// "enough transaction bytes" check -- the tx count is signed, rfc12 section 8).
 void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& request) {
     auto command_it = tma.commands.find(request.command);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
@@ -2349,30 +2462,6 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& re
         validate_tma_runtime_descriptor(command);
         // releases the descriptor read-ownership; verifies the accept-time peek
         sanitizer_.record_tma_descriptor_read(command.id, command.descriptor);
-        command.state = TmaCommandState::phase;
-        return;
-    }
-    case TmaPortKind::phase: {
-        if (command.state != TmaCommandState::phase) {
-            throw SimError("tma mbar phase read completed in the wrong command state");
-        }
-        uint64_t word = 0;
-        for (const auto& fragment : request.fragments) {
-            const uint32_t offset = fragment.shmem_address - command.descriptor.completion_mbar;
-            if (offset + fragment.size > sizeof(word)) {
-                throw SimError("tma mbar fragment is outside the mbar");
-            }
-            std::memcpy(reinterpret_cast<uint8_t*>(&word) + offset,
-                fragment.data.data(), fragment.size);
-        }
-        const auto state = decode_mbar_state(word);
-        if (!state.valid || state.expected == 0 || state.remaining > state.expected) {
-            throw SimError("tma completion mbar is uninitialized or corrupt");
-        }
-        if (state.tx_bytes < command.logical_bytes) {
-            throw SimError("tma completion mbar does not expect enough transaction bytes");
-        }
-        command.mbar_phase = static_cast<uint8_t>(state.phase);
         command.state = TmaCommandState::walking;
         return;
     }
@@ -2429,7 +2518,6 @@ void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
 std::optional<uint64_t> Machine::next_tma_frontend_command(const TmaQueue& tma) const {
     for (const auto& [id, command] : tma.commands) {
         if (command.state == TmaCommandState::descriptor ||
-            command.state == TmaCommandState::phase ||
             (command.state == TmaCommandState::walking && !command.walker_done)) {
             return id;
         }
@@ -2800,7 +2888,7 @@ ResourceView Machine::resource_view(
     view.load_slot_free = free_load_slot(w).has_value();
     view.store_slot_free = free_store_slot(w).has_value();
     view.probe_register_free = !mbar_probe_.cur().has_value() || w.shmem.a_read.user == AReadUser::probe;
-    view.rmw_engine_free = rmw_engine_free_next_cycle(w);
+    view.simt_rmw_register_free = !simt_rmw_.cur().has_value() || w.shmem.simt_rmw_started;
     view.lsu_slot_free =
         lsu_commands_.cur().size() - w.released_lsu_commands.size() < config_.lsu_active_commands;
     view.assembly_free = free_assembly_register(w).has_value();
@@ -2832,7 +2920,7 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
         trace_->shmem_store_slot_wait();
         return {false, WarpState::shmem_slot, "store slots full"};
     case Refusal::probe_register_busy: return {false, WarpState::structural, "mbar probe register busy"};
-    case Refusal::rmw_engine_busy: return {false, WarpState::structural, "RMW engine busy"};
+    case Refusal::simt_rmw_register_busy: return {false, WarpState::structural, "SIMT RMW register busy"};
     case Refusal::lsu_slot:
         ++trace_->lsu_counters().lsu_no_slot_cycles;
         return {false, WarpState::structural, "LSU command slot"};
@@ -3146,8 +3234,12 @@ void Machine::issue_tma(const Warp& warp, const Instruction& inst, Wires& w) {
         static_cast<int32_t>(uniform_reg(warp, inst, inst.src0 + 1, "tma y coordinate")),
         static_cast<int32_t>(uniform_reg(warp, inst, inst.src0 + 2, "tma z coordinate")),
     };
-    sanitizer_.record_tma_accept(site(warp, inst), command_id, command.descriptor_address,
-        pending_tma_descriptor_bytes(command.descriptor_address, w));
+    // Sanitizer: the descriptor the engine will read, and the phase of its
+    // completion mbar now -- the accept-time peek a TMA's complete_tx is
+    // checked against (rfc12 section 8; the hardware reads no mbar).
+    const auto descriptor_bytes = pending_tma_descriptor_bytes(command.descriptor_address, w);
+    sanitizer_.record_tma_accept(site(warp, inst), command_id, command.descriptor_address, descriptor_bytes,
+        pending_tma_completion_mbar(descriptor_bytes, w));
     trace_->tma_command_begin(cycle_, command_id, warp.id, static_cast<uint32_t>(inst.imm),
         w.tma_next.commands.size() + 1);
     w.issue.tma = std::move(command);
@@ -3180,11 +3272,11 @@ void Machine::issue_mbar_rmw(const Warp& warp, const Instruction& inst, Wires& w
             : uniform_reg(warp, inst, inst.src1, "mbar tx byte count");
     }
     sanitizer_.check_simt_mbar_rmw(site(warp, inst), request.byte_address);
-    // The engine is free next cycle (admission), so the accepted operation
-    // takes it now and asks A-read for its read from the next cycle.
-    ActiveMbarRmw active;
-    active.request = std::move(request);
-    w.issue.rmw = std::move(active);
+    // The SIMT RMW register is empty after this cycle (admission). The
+    // operation waits there until the RMW engine starts it (A-write's
+    // alternation, then the engine's admission); its warp's younger shmem
+    // accesses wait until its final write grant (warp_unserviced_write).
+    w.issue.rmw = std::move(request);
 }
 
 // mbar.test_wait / try_wait: the probe goes into the probe register; A-read
@@ -3481,12 +3573,13 @@ void Machine::step_arithmetic_reads(Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 26> canonical = {
+    static constexpr std::array<Driver, 27> canonical = {
         &Machine::drive_depbar,
         &Machine::drive_wait_slots,
         &Machine::drive_load_slots,
         &Machine::drive_store_slots,
         &Machine::drive_mbar_probe,
+        &Machine::drive_simt_rmw,
         &Machine::drive_rmw_engine,
         &Machine::drive_a_read_pipe,
         &Machine::drive_write_pipes,
@@ -3602,35 +3695,44 @@ void Machine::drive_mbar_probe(const Wires& w) {
     }
 }
 
-// The RMW engine: its ALU moves one stage (the update computed from the
-// words at the port output now enters stage 0; the last stage's leaves with
-// the write granted now), its write granted (it is done; the A-write
-// pipeline carries the write and the wake), its read granted (an engine
-// event's claim installs the event now), a SIMT operation accepted by issue.
+// The SIMT RMW register: emptied by its RMW's start, refilled by issue in the
+// same cycle (d).
+void Machine::drive_simt_rmw(const Wires& w) {
+    const bool started = w.shmem.simt_rmw_started;
+    if (w.issue.rmw.has_value()) {
+        if (simt_rmw_.cur().has_value() && !started) throw SimError("internal SIMT RMW accepted over another");
+        simt_rmw_.set_next(w.issue.rmw, "issue: SIMT RMW");
+    } else if (started) {
+        simt_rmw_.set_next(std::nullopt, "RMW engine: SIMT RMW started");
+    }
+}
+
+// The RMW engine, in one calculation: its ALU moves one stage (the update
+// computed from the words at the port output now enters stage 0; the last
+// stage's leaves with the write granted now); the write granted now ends the
+// operation and the PAUSE; an RMW starting now installs its operation (and
+// the admission state: which class, which engine started last); the read
+// granted now marks it.
 void Machine::drive_rmw_engine(const Wires& w) {
     const auto& cur = rmw_.cur();
-    const auto& read = w.shmem.a_read;
-    const bool read_granted = read.user == AReadUser::rmw;
+    const bool started = w.shmem.rmw_start.has_value();
+    const bool read_granted = w.shmem.a_read.user == AReadUser::rmw;
     const bool write_granted = w.shmem.a_write.user == AWriteUser::rmw;
     const bool computing = w.shmem.rmw_update.has_value() ||
         std::any_of(cur.alu.begin(), cur.alu.end(), [](const auto& stage) { return stage.has_value(); });
-    if (!read_granted && !write_granted && !w.issue.rmw.has_value() && !computing) return;
+    if (!started && !read_granted && !write_granted && !computing) return;
     auto next = cur;
     for (std::size_t stage = next.alu.size() - 1; stage > 0; --stage) next.alu[stage] = cur.alu[stage - 1];
     next.alu.front() = w.shmem.rmw_update;
     if (write_granted) next.active.reset();
-    if (read_granted && read.claim.has_value()) {
-        ActiveMbarRmw claimed;
-        claimed.request = *(*read.claim == MbarEngine::tma ? tma_mbar_event_ : mma_mbar_event_).cur();
-        claimed.engine = read.claim;
-        next.active = std::move(claimed);
-        next.last_served = *read.claim;
+    if (started) {
+        if (next.active.has_value()) throw SimError("internal RMW started over a busy RMW engine");
+        next.active = w.shmem.rmw_started;
+        const auto engine = w.shmem.rmw_start->engine;
+        next.simt_started_last = !engine.has_value();
+        if (engine.has_value()) next.last_served = *engine;
     }
     if (read_granted) next.active->read_granted = true;
-    if (w.issue.rmw.has_value()) {
-        if (next.active.has_value()) throw SimError("internal SIMT RMW accepted over a busy RMW engine");
-        next.active = w.issue.rmw;
-    }
     rmw_.set_next(std::move(next), "drive_rmw_engine");
 }
 
@@ -4367,21 +4469,21 @@ std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
     return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
 }
 
-std::array<uint8_t, tma_descriptor_bytes> Machine::pending_tma_descriptor_bytes(
-    uint32_t address, const Wires& w) const {
-    // The descriptor the engine will read later: shmem now, then every write
-    // already granted, in the order it reaches the RAM (the write pipelines'
-    // stages, oldest first, then this cycle's grants: all before the engine's
-    // read, which is granted after accept and has the same depth), then the
-    // store slots' rounds not yet granted. Those may now reach the RAM after
-    // the engine's read (A-read and A-write are separate services); then the
-    // descriptor-read check reports the race. (I4 replaces this overlay with
-    // rfc12 section 11's missing-fence check.)
-    std::array<uint8_t, tma_descriptor_bytes> bytes{};
-    std::memcpy(bytes.data(), shmem_.data() + address, bytes.size());
-    const auto overlay = [&](uint64_t at, const uint8_t* data, std::size_t size) {
-        for (std::size_t byte = 0; byte < size; ++byte) {
-            if (at + byte >= address && at + byte < address + tma_descriptor_bytes) {
+// shmem bytes [address, address + size) as the engines will see them later:
+// shmem now, then every write already granted, in the order it reaches the
+// RAM (the write pipelines' stages, oldest first, then this cycle's grants:
+// all before an engine read granted after accept, which has the same depth),
+// then the RMW's computed update (its ALU stages and this cycle's update: its
+// write is granted later, while the store pause holds new stores), then the
+// store slots' rounds not yet granted. Those may reach the RAM after the
+// engine's read (A-read and A-write are separate services); then the
+// descriptor-read check reports the race. (I4 replaces this overlay with
+// rfc12 section 11's missing-fence check.)
+std::vector<uint8_t> Machine::pending_shmem_bytes(uint32_t address, uint32_t size, const Wires& w) const {
+    std::vector<uint8_t> bytes(shmem_.begin() + address, shmem_.begin() + address + size);
+    const auto overlay = [&](uint64_t at, const uint8_t* data, std::size_t length) {
+        for (std::size_t byte = 0; byte < length; ++byte) {
+            if (at + byte >= address && at + byte < static_cast<uint64_t>(address) + size) {
                 bytes[at + byte - address] = data[byte];
             }
         }
@@ -4398,6 +4500,9 @@ std::array<uint8_t, tma_descriptor_bytes> Machine::pending_tma_descriptor_bytes(
     }
     overlay_beat(w.shmem.a_write_beat);
     overlay_beat(w.shmem.b_write_beat);
+    const auto& alu = rmw_.cur().alu;
+    for (std::size_t stage = alu.size(); stage-- > 0;) overlay_beat(alu[stage]);
+    overlay_beat(w.shmem.rmw_update);
     for (const auto& slot : store_slots_) {
         if (!slot.cur().has_value()) continue;
         const auto& access = slot.cur()->access;
@@ -4408,6 +4513,34 @@ std::array<uint8_t, tma_descriptor_bytes> Machine::pending_tma_descriptor_bytes(
         }
     }
     return bytes;
+}
+
+// The descriptor the engine will read later (pending_shmem_bytes).
+std::array<uint8_t, tma_descriptor_bytes> Machine::pending_tma_descriptor_bytes(
+    uint32_t address, const Wires& w) const {
+    const auto pending = pending_shmem_bytes(address, static_cast<uint32_t>(tma_descriptor_bytes), w);
+    std::array<uint8_t, tma_descriptor_bytes> bytes{};
+    std::copy(pending.begin(), pending.end(), bytes.begin());
+    return bytes;
+}
+
+// The accept-time peek of a TMA's completion mbar (rfc12 section 8): its
+// word as pending_shmem_bytes sees it, or none when the peeked descriptor is
+// invalid or its mbar is outside shmem (the engine's own descriptor read
+// panics then). Sanitizer-only: the hardware reads no mbar at TMA start.
+std::optional<uint64_t> Machine::pending_tma_completion_mbar(
+    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, const Wires& w) const {
+    uint32_t mbar = 0;
+    try {
+        mbar = decode_tma_descriptor(descriptor_bytes.data(), descriptor_bytes.size()).completion_mbar;
+    } catch (const SimError&) {
+        return std::nullopt;
+    }
+    if (mbar % 8 != 0 || static_cast<uint64_t>(mbar) + 8 > shmem_.size()) return std::nullopt;
+    const auto bytes = pending_shmem_bytes(mbar, 8, w);
+    uint64_t word = 0;
+    std::memcpy(&word, bytes.data(), sizeof(word));
+    return word;
 }
 
 [[noreturn]] void Machine::panic(

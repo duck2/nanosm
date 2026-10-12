@@ -77,9 +77,9 @@ struct TraceSummary {
     uint64_t scheduler_idle_cycles = 0;
     uint64_t scheduler_draining_cycles = 0;
     std::array<uint64_t, static_cast<std::size_t>(WarpState::count)> warp_cycles{};
-    // SIMT lds / lds.uni / sts accesses and TMA shmem transactions (data,
-    // descriptor and mbar-phase), and their bank rounds; probes and RMW steps
-    // are counted by the mbar line.
+    // SIMT lds / lds.uni / sts accesses and TMA shmem transactions (data and
+    // descriptor), and their bank rounds; probes and RMW steps are counted by
+    // the mbar line.
     uint64_t shmem_requests = 0;
     uint64_t shmem_rounds = 0;
     // Warp-cycles an lds / lds.uni (sts) was refused because every load
@@ -88,6 +88,9 @@ struct TraceSummary {
     uint64_t shmem_load_slot_waits = 0;
     uint64_t shmem_store_slot_waits = 0;
     uint64_t shmem_order_waits = 0;
+    // Cycles a store waited to start (a store slot held, not started) while
+    // an RMW's store pause held A-write (rfc12 section 6).
+    uint64_t shmem_store_paused = 0;
     // Rounds granted, per service and client.
     uint64_t shmem_a_read_simt = 0;
     uint64_t shmem_a_read_probe = 0;
@@ -143,7 +146,7 @@ struct TraceSummary {
     uint64_t tma_sector_bytes = 0;
     // Data placement (port-B write) and readback (A-read): one request per TMA
     // load-write (incl. synthetic OOB zero fills) or store-read, and the bank
-    // rounds those requests consume. Descriptor and mbar-phase reads are excluded.
+    // rounds those requests consume. Descriptor reads are excluded.
     uint64_t tma_port_requests = 0;
     uint64_t tma_port_rounds = 0;
     uint64_t tma_max_command_depth = 0;
@@ -198,6 +201,7 @@ public:
     void shmem_load_slot_wait() { ++summary_.shmem_load_slot_waits; }
     void shmem_store_slot_wait() { ++summary_.shmem_store_slot_waits; }
     void shmem_order_wait() { ++summary_.shmem_order_waits; }
+    void shmem_store_pause_wait() { ++summary_.shmem_store_paused; }
     void rf_async_write() { ++summary_.rf_async_writes; }
     void rf_async_wait() { ++summary_.rf_async_waits; }
     void rf_simt_inhibited() { ++summary_.rf_simt_inhibited; }

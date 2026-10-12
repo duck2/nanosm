@@ -31,12 +31,14 @@ enum {
 #define NANOSM_SIZE_ERROR UINT64_MAX
 
 // Encode an initialized mbar without duplicating its implementation-defined
-// bit layout in language bindings or launch-image authors.
+// bit layout in language bindings or launch-image authors. tx_bytes is the
+// signed transaction count, -(2^20 - 1)..2^20 - 1 (negative: complete_tx ran
+// ahead of expect_tx).
 NANOSM_CAPI int32_t nanosm_mbar_encode(
     uint32_t phase,
     uint32_t expected,
     uint32_t remaining,
-    uint32_t tx_bytes,
+    int32_t tx_bytes,
     uint64_t* output);
 
 #define NANOSM_TMA_DESCRIPTOR_BYTES UINT32_C(64)

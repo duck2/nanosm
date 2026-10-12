@@ -43,10 +43,13 @@ class SparseMemory:
             "phase": phase,
             "expected": expected,
             "remaining": remaining,
-            "tx_bytes": tx_bytes,
         }.items():
             if not 0 <= value <= 0xFFFFFFFF:
                 raise ValueError(f"mbar {name} is outside the C ABI's uint32_t range")
+        # The signed transaction count (rfc12 section 8): negative when
+        # complete_tx ran ahead of expect_tx.
+        if not -(2**20 - 1) <= tx_bytes <= 2**20 - 1:
+            raise ValueError("mbar tx_bytes is outside -(2^20 - 1)..2^20 - 1")
         word = encode_mbar(phase, expected, remaining, tx_bytes)
         self.write(address, struct.pack("<Q", word))
 

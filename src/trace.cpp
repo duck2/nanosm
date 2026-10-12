@@ -502,7 +502,8 @@ std::string TraceRecorder::summary_text() const {
         << " rounds=" << summary_.shmem_rounds
         << " load_slot_full=" << summary_.shmem_load_slot_waits
         << " store_slot_full=" << summary_.shmem_store_slot_waits
-        << " ordered=" << summary_.shmem_order_waits << '\n';
+        << " ordered=" << summary_.shmem_order_waits
+        << " store_paused=" << summary_.shmem_store_paused << '\n';
     out << "shmem grants: a_read_simt=" << summary_.shmem_a_read_simt
         << " a_read_probe=" << summary_.shmem_a_read_probe
         << " a_read_rmw=" << summary_.shmem_a_read_rmw
