@@ -122,6 +122,30 @@ nanosm::Kernel compile(
     return nanosm::compile_and_assemble(source, profile);
 }
 
+// Hand assembly: lines without a {...} control block get the default one.
+std::string i1_asm(const nanosm::DeviceProfile& profile, const std::string& body) {
+    std::string text = ".profile " + profile.name + ", 0x" +
+        nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + "\n";
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        text += line;
+        if (line[first] != '.' && line.find('{') == std::string::npos) text += " {pred=PT, stall=0, set=-, wait=-}";
+        text += "\n";
+    }
+    return text;
+}
+
+// Hand assembly with the fixed-latency stalls its register and predicate
+// dependencies need under `profile` (src/rf.hpp, the distances qtxc
+// schedules with): every authored stall is kept when it is at least that,
+// raised when not; depbars and waits stay as written (I6a).
+nanosm::Kernel hand_assemble(const std::string& text, const nanosm::DeviceProfile& profile) {
+    return nanosm::schedule_fixed_stalls(nanosm::assemble_asm(text, profile), profile);
+}
+
 void test_encoding_round_trip() {
     nanosm::Instruction inst;
     inst.opcode = nanosm::Opcode::add;
@@ -210,18 +234,31 @@ void test_compiler_controls() {
         sts  [r0 + 128], r4
         halt
     )", canonical_profile());
-    require(program.instructions[0].control.stall == 0, "mov stalled without a close consumer");
+    // I6a (src/rf.hpp): a fixed result is visible issue_to_visible after its
+    // issue; its consumer samples issue_to_sample (1, the issue register)
+    // after its own. The mov's result feeds the very next lds (7 - 1 = 6 at
+    // canonical); the fadd's the sts after it (10 - 1 = 9).
+    const auto& profile = canonical_profile();
+    const auto distance = [&](const nanosm::Instruction& producer) {
+        return nanosm::issue_to_visible(producer, profile) - nanosm::issue_register_stages;
+    };
+    require(program.instructions[0].control.stall == distance(program.instructions[0]),
+        "mov did not cover the lds right after it");
     require(program.instructions[1].control.set_depbar == 0, "first load did not allocate sb0");
     require(program.instructions[2].control.set_depbar == 1, "second load did not allocate sb1");
     require(program.instructions[3].control.wait_mask == 0b000011, "fadd did not wait for both loads");
-    require(program.instructions[3].control.stall == 4, "fadd did not cover its one-away consumer");
+    require(program.instructions[3].control.stall == distance(program.instructions[3]),
+        "fadd did not cover its one-away consumer");
     require(program.instructions[4].control.set_depbar == 0, "store did not reuse a released depbar");
     require(program.instructions[5].control.wait_mask == 0b000001, "halt did not wait for store completion");
 }
 
 void test_stalls_track_consumer_distance() {
-    // fadd's result is consumed three instructions later, so of its 4-cycle latency
-    // only one cycle must be bought with a stall, and it lands just before the consumer.
+    // fadd's result is consumed three instructions later, so only what its
+    // distance (src/rf.hpp: issue_to_visible - the consumer's issue_to_sample)
+    // exceeds those three issues is bought with a stall, and it lands just
+    // before the consumer. The mov feeding the fadd stalls the full distance.
+    const auto& profile = canonical_profile();
     const auto program = nanosm::compile_qtx(R"(
         mov  r0, 1
         fadd r1, r0, r0
@@ -229,10 +266,15 @@ void test_stalls_track_consumer_distance() {
         mov  r3, 6
         add  r4, r1, r2
         halt
-    )", canonical_profile());
-    require(program.instructions[1].control.stall == 0, "fadd stalled its own latency");
+    )", profile);
+    const auto& fadd = program.instructions[1];
+    const auto fadd_distance = nanosm::issue_to_visible(fadd, profile) - nanosm::issue_register_stages;
+    require(program.instructions[0].control.stall ==
+            nanosm::issue_to_visible(program.instructions[0], profile) - nanosm::issue_register_stages,
+        "mov did not cover the fadd right after it");
+    require(fadd.control.stall == 0, "fadd stalled its own latency");
     require(program.instructions[2].control.stall == 0, "independent mov stalled");
-    require(program.instructions[3].control.stall == 2, "pre-consumer stall wrong");
+    require(program.instructions[3].control.stall == fadd_distance - 2, "pre-consumer stall wrong");
     nanosm::Launch launch;
     launch.active_warps = 1;
     image_bytes(launch.shmem_image, 4);
@@ -329,7 +371,14 @@ void test_branch_boundary_drains_async_work() {
     done:
         halt
     )", canonical_profile());
-    require(fixed.instructions[2].control.stall == 3, "branch did not drain a live fadd writeback");
+    // The fadd issued one cycle before the branch; the block after it must
+    // issue no earlier than one cycle before the fadd's result is visible (its
+    // first sample is after the issue register): issue_to_visible - 1 cycles
+    // after the fadd, issue_to_visible - 2 after the branch (src/rf.hpp).
+    require(fixed.instructions[2].control.stall ==
+            nanosm::issue_to_visible(fixed.instructions[1], canonical_profile()) -
+                nanosm::issue_register_stages - 1,
+        "branch did not drain a live fadd writeback");
 }
 
 void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
@@ -347,7 +396,9 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
         halt
     )"), std::move(launch), {.timeline = true});
 
-    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 32) machine.tick();
+    // A guard only: the warp parks once its init, arrive and probe have
+    // crossed issue, dispatch (I6a) and the RMW engine.
+    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 200) machine.tick();
     require(machine.trace().summary().mbar_sleeps == 1, "mbar.try_wait never parked the warp");
     machine.complete_mbar_tx(64, 8, 0);
     machine.run();
@@ -1200,10 +1251,14 @@ void test_lsu_staging_pool_admission() {
         return std::make_tuple(spans[0], spans[1], machine.trace().summary().lsu_no_staging_cycles,
             machine.trace().summary().lsu_no_slot_cycles);
     };
+    // I6a: the second ldg.v8 issues in the cycle the first command's eighth RF
+    // write releases the register (its grant: first.end) and reaches the LSU
+    // issue_to_dispatch later (the command slice starts at dispatch).
+    const auto dispatch = nanosm::issue_to_dispatch(canonical_profile());
     const auto [first, second, no_staging, no_slot] = run(1);
-    require(second.start == first.end,
+    require(second.start == first.end + dispatch,
         "with one assembly register the second ldg.v8 was admitted at cycle " + std::to_string(second.start) +
-            ", not at the first command's eighth write (" + std::to_string(first.end) + ")");
+            ", not at the first command's eighth write (" + std::to_string(first.end) + ") + dispatch");
     // Warp 1 is tried every cycle from its ldg.v8 until admission.
     require(no_staging + 4 >= second.start - first.start,
         "no_staging did not count the ineligible cycles");
@@ -1218,13 +1273,17 @@ void test_lsu_staging_pool_admission() {
 // it indefinitely. Since I1 (trash/rfc10.md section 3) one denial with service
 // owed inhibits new bookings to the bank, so a ready async writer waits at
 // most for the bookings already made. To hold one for a while, the stream
-// books `latency` cycles ahead: fadds with that latency (set in the profile
-// by with_long_bookings), one per cycle, rotating over `latency` destination
-// registers of `bank` so no WAW stall separates them.
-constexpr uint32_t booking_horizon = 30;
+// books booking_horizon cycles ahead: fadds whose result reaches the write
+// port that far after their issue (I6a: the issue register, Lr and the fadd
+// latency set by with_long_bookings, src/rf.hpp), one per cycle, rotating
+// over booking_horizon destination registers of `bank`. booking_latency is
+// as long as the five-bit stall field allows at canonical RF depths (window
+// 1, Lr 2, Wd 2: 31 - 2 - 2 - 1 = 26), less a margin.
+constexpr uint32_t booking_latency = 24;
+constexpr uint32_t booking_horizon = 1 + 2 + booking_latency; // issue register + canonical Lr + latency
 
 void with_long_bookings(nanosm::DeviceProfile& config) {
-    config.timing.fadd = booking_horizon;
+    config.timing.fadd = booking_latency;
 }
 
 std::string booking_stream(uint32_t bank, uint32_t count) {
@@ -1850,7 +1909,10 @@ void test_lsu_no_fall_through_timelines() {
     require(t.uni_bus_to_assembly == 1 && t.uni_assembly_to_rf == 1, "ldg.uni: bus -> assembly -> RF is not 1 + 1");
     require(all_equal(t.gather_bus_to_read, 1) && t.gather_assembly_to_rf == 1,
         "gather: bus -> FIFO read -> RF is not 1 + 1");
-    require(all_equal(t.store_rf_to_egress, 1), "stg.v8: RF read beat -> first egress word is not 1 cycle");
+    // I6a: the beat sampled at t is at the RF output, filling the assembly
+    // register, at t + Lr; the egress port reads it (Q) one cycle later.
+    require(all_equal(t.store_rf_to_egress, canonical_profile().rf_read_latency_cycles + 1),
+        "stg.v8: RF read beat -> first egress word is not Lr + 1 cycles");
     // The assembly register is refilled in the cycle its last word drained
     // (its consumer runs first in the tick): a handoff, not a read-through.
     require(all_equal(t.store_drain_to_next_rf, 0), "stg.v8: drained assembly register not refilled at once");
@@ -3186,13 +3248,31 @@ void test_perfetto_overlapping_commands_are_async() {
     require(begins >= 2 && begins == ends, "concurrent gmem commands did not emit async pairs");
 }
 
+// An issue event (the instruction category also carries the debug trace's
+// "RF read" samples and "RF write" port presentations).
+bool is_issue_event(const nanosm::TimelineEvent& event) {
+    return event.category == nanosm::TraceCategory::instruction && event.name != "RF read" &&
+        event.name != "RF write";
+}
+
 std::vector<uint64_t> issued_at(const nanosm::Machine& machine, uint32_t pc) {
     std::vector<uint64_t> result;
     for (const auto& event : machine.trace().events()) {
-        if (event.category == nanosm::TraceCategory::instruction &&
-            event.name != "RF read" && event.id == pc) result.push_back(event.start_cycle);
+        if (is_issue_event(event) && event.id == pc) result.push_back(event.start_cycle);
     }
     return result;
+}
+
+// Every issue, in order: " c<cycle>:w<warp>:<pc>:<opcode>" (a debugging aid
+// for failure messages).
+std::string issue_log(const nanosm::Machine& machine) {
+    std::string text;
+    for (const auto& event : machine.trace().events()) {
+        if (!is_issue_event(event)) continue;
+        const auto warp = event.detail.substr(5, event.detail.find(',') - 5);
+        text += " c" + std::to_string(event.start_cycle) + ":w" + warp + ":" + std::to_string(event.id) + ":" + event.name;
+    }
+    return text;
 }
 
 void check_read_capacity(const nanosm::Machine& machine, const nanosm::DeviceProfile& profile) {
@@ -3269,15 +3349,23 @@ void test_rf_deferred_fadd_and_halt() {
         if (machine.read_reg(0, 0, 4) != 0 && changed == 0) changed = tick;
     }
     require(machine.done(), "deferred FADD pipeline did not drain");
+    // r0 and r3 share bank 0: two rounds, right-aligned in the window of 3
+    // (offsets 1, 2), sampled after the issue register at issue + 2 and
+    // issue + 3; the operands are at the RF output Lr later, the result at
+    // the write port fadd later, and it lands at the edge Wd after that
+    // (src/rf.hpp) -- read_reg sees it after that cycle's tick.
     const auto issue = issued_at(machine, 16).at(0);
-    require(changed == issue + 2 + profile.timing.fadd, "accepted FADD latency varied");
+    const uint64_t window = 3;
+    require(changed == issue + nanosm::issue_register_stages + (window - 1) + profile.rf_read_latency_cycles +
+                profile.timing.fadd + profile.rf_write_depth_cycles,
+        "accepted FADD latency varied");
     require(machine.read_reg(0, 0, 4) == nanosm::float_bits(3.75f), "deferred FADD lost its operands");
     std::vector<std::pair<uint64_t, uint64_t>> captures;
     for (const auto& event : machine.trace().events()) {
         if (event.name == "RF read" && (event.id == 0 || event.id == 3))
             captures.emplace_back(event.start_cycle, event.id);
     }
-    require(captures == std::vector<std::pair<uint64_t, uint64_t>>{{issue + 1, 0}, {issue + 2, 3}},
+    require(captures == std::vector<std::pair<uint64_t, uint64_t>>{{issue + 2, 0}, {issue + 3, 3}},
         "FADD sources were not captured in their reserved cycles");
     const auto mov_issue = issued_at(machine, 24).at(0);
     require(mov_issue == issue + 1, "zero-source MOV could not follow pipelined FADD");
@@ -3288,11 +3376,17 @@ void test_rf_deferred_fadd_and_halt() {
     nanosm::Machine predicate(profile, compile("setp.eq.u32 p0, r0, r0\nhalt", profile),
         std::move(predicate_launch), {.timeline = true, .debug = true});
     predicate.run();
-    require(predicate.cycle() == 4, "HALT dropped a pending predicate-only read pipeline");
+    // setp at c0: one round at offset 2, sampled at c3; its predicate reaches
+    // the file at its port cycle 1 + 2 + Lr + alu (c6), at that edge; done()
+    // waits for it, so the run ends at c7.
+    require(predicate.cycle() == nanosm::issue_register_stages + (window - 1) + profile.rf_read_latency_cycles +
+                profile.timing.alu + 1,
+        "HALT dropped a pending predicate-only read pipeline");
     uint32_t duplicate_reads = 0;
     for (const auto& event : predicate.trace().events()) {
         if (event.name == "RF read") {
-            require(event.start_cycle == 2, "duplicate operand captured before its fixed slot");
+            require(event.start_cycle == nanosm::issue_register_stages + window - 1,
+                "duplicate operand captured before its fixed slot");
             ++duplicate_reads;
         }
     }
@@ -3300,31 +3394,42 @@ void test_rf_deferred_fadd_and_halt() {
 }
 
 void test_rf_deferred_war_and_branch() {
+    // I6a (src/rf.hpp): a younger FIXED write can never land before an older
+    // fixed sample (every fixed writer has the whole window, Lr, E and Wd
+    // ahead of it), so qtxc buys no WAR stall there. A younger ASYNC write
+    // is judged on the floor every RF write obeys (earliest_rf_visible, 7 at
+    // canonical): with a window of 8, add's samples of r0 / r3 (one bank, two
+    // rounds, offsets 6 and 7) end at issue + 8, so an lds overwriting r3 must
+    // issue at least read_until - floor = 9 - 7 = 2 cycles later.
     auto profile = canonical_profile();
-    profile.rf_arithmetic_read_cycles = 4;
-    const auto source = "add r2, r0, r3\nmov r3, 7\nhalt";
+    profile.rf_arithmetic_read_cycles = 8;
+    const auto fixed_writer = nanosm::compile_qtx("add r2, r0, r3\nmov r3, 7\nhalt", profile);
+    require(fixed_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall a fixed writer cannot need");
+    const auto source = "add r2, r0, r3\nlds r3, [r5]\nhalt";
     auto program = nanosm::compile_qtx(source, profile);
-    require(program.instructions[0].control.stall == 4, "qtxc did not protect deferred WAR");
-    for (const uint8_t bad_stall : {uint8_t{0}, uint8_t{3}}) {
-        auto invalid = program;
-        invalid.instructions[0].control.stall = bad_stall;
+    const auto war_distance = 1 + profile.rf_arithmetic_read_cycles - nanosm::earliest_rf_visible(profile);
+    require(program.instructions[0].control.stall == war_distance, "qtxc did not protect deferred WAR");
+    const auto run = [&](const nanosm::Kernel& kernel) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        nanosm::Machine machine(profile, nanosm::assemble_asm(nanosm::emit_asm(invalid), profile),
-            std::move(launch));
+        write_u32(image_bytes(launch.shmem_image, 64), 0, 7);
+        auto machine = std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch));
+        machine->run();
+        return machine;
+    };
+    for (const uint8_t bad_stall : {uint8_t{0}, static_cast<uint8_t>(war_distance - 1)}) {
+        auto invalid = program;
+        invalid.instructions[0].control.stall = bad_stall;
         try {
-            machine.run();
+            (void)run(nanosm::assemble_asm(nanosm::emit_asm(invalid), profile));
             throw std::runtime_error("missing WAR stall was silently repaired");
         } catch (const nanosm::SimError& error) {
             require(std::string(error.what()).find("RF WAR hazard") != std::string::npos,
                 "invalid WAR assembly produced the wrong diagnostic");
         }
     }
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine valid(profile, compile(source, profile), std::move(launch));
-    valid.run();
-    require(valid.read_reg(0, 0, 2) == 0 && valid.read_reg(0, 0, 3) == 7,
+    const auto valid = run(compile(source, profile));
+    require(valid->read_reg(0, 0, 2) == 0 && valid->read_reg(0, 0, 3) == 7,
         "WAR-correct schedule changed the captured value");
 
     nanosm::Launch loop_launch;
@@ -3883,11 +3988,14 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
     };
 
     // Reference, no TMA event: the commit presents in cycle r, the cycle its
-    // predecessor retires, and frees the queue slot the mma.async waits for.
+    // predecessor retires, and frees the queue slot the mma.async waits for:
+    // the mma.async issues in r and reaches the MMA queue at its dispatch,
+    // accept = r + issue_to_dispatch (I6a), fetching from the next cycle.
     nanosm::Machine reference(canonical_profile(), kernel, make_launch(), {.timeline = true});
     reference.run(5000);
-    const auto [r, fetch] = queued_accept_and_fetch(reference);
-    require(r > 2 && fetch == r + 1, "reference MMA queue timing changed; re-derive the test");
+    const auto [accept, fetch] = queued_accept_and_fetch(reference);
+    const auto r = accept - nanosm::issue_to_dispatch(canonical_profile());
+    require(r > 2 && fetch == accept + 1, "reference MMA queue timing changed; re-derive the test");
     require(mbar_rmw_services(reference) ==
             std::vector<RmwService>{{r + 1, "arrive (mma.commit), address=4096"}},
         "reference commit was not served at r + 1");
@@ -3904,7 +4012,7 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
         "the TMA event and the commit were not pending together in cycle r");
     machine.run(5000);
 
-    require(queued_accept_and_fetch(machine) == std::pair{r, fetch},
+    require(queued_accept_and_fetch(machine) == std::pair{accept, fetch},
         "a held TMA event stalled the MMA queue behind the commit");
     const auto busy = rmw_busy_cycles();
     require(mbar_rmw_services(machine) == std::vector<RmwService>{
@@ -4050,7 +4158,9 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     const auto at = [](RmwService service, uint64_t cycle) { service.first = cycle; return service; };
 
     const auto reference = run(std::nullopt); // no TMA
-    const auto r = reference.accept;
+    // The commit presents in r; the mma.async behind it issues then and
+    // reaches the queue at its dispatch (I6a).
+    const auto r = reference.accept - nanosm::issue_to_dispatch(canonical_profile());
     require(reference.services == std::vector<RmwService>{at(mma_service, r + 1)},
         "reference commit was not served at r + 1");
     const auto early = run(0u); // the TMA completes long before r
@@ -4062,7 +4172,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     for (uint32_t delay = estimate - 6; delay <= estimate + 6; ++delay) {
         const auto observed = run(delay);
         const auto where = " (delay " + std::to_string(delay) + ")";
-        require(observed.accept == r, "the TMA's completion delayed the MMA queue" + where);
+        require(observed.accept == reference.accept, "the TMA's completion delayed the MMA queue" + where);
         require(observed.services.size() == 2, "an engine event was lost" + where);
         const auto tma_claim = observed.services[0].second == tma_service.second
             ? observed.services[0].first : observed.services[1].first;
@@ -5142,7 +5252,10 @@ void test_sfu_unit_timing() {
         fadd r4, r2, r2
         halt
     )", profile);
-    require(scheduled.instructions[1].control.stall == 11,
+    // The ex2's result feeds the very next fadd: its whole distance (src/rf.hpp),
+    // the effective SFU latency inside it.
+    require(scheduled.instructions[1].control.stall ==
+            nanosm::issue_to_visible(scheduled.instructions[1], profile) - nanosm::issue_register_stages,
         "qtxc did not schedule the effective SFU latency");
 
     nanosm::Launch launch;
@@ -5593,9 +5706,12 @@ void test_assembly_contract_final_chunk() {
     const auto first = vector_load_timeline(machine, 0);
     const auto final_drain = first.drain[7];
     require(life[0].second == final_drain, "the first command did not end at its final RF write");
-    require(life[1].first == final_drain,
-        "the second ldg.v8 was not admitted in the cycle the first released its slot (" +
-            std::to_string(life[1].first) + " vs " + std::to_string(final_drain) + ")");
+    // I6a: the second ldg.v8 issues in the cycle the first releases its slot
+    // (look-ahead (c)) and the LSU admits it issue_to_dispatch later.
+    const auto admitted = final_drain + nanosm::issue_to_dispatch(config);
+    require(life[1].first == admitted,
+        "the second ldg.v8 was not admitted issue_to_dispatch after the first released its slot (" +
+            std::to_string(life[1].first) + " vs " + std::to_string(admitted) + ")");
     const auto second = vector_load_timeline(machine, 1);
     require(second.first_word[0] > final_drain, "the new command's words entered in the reallocation cycle");
     require_vector_data(machine, 0, 8, 0, "final chunk (old command)");
@@ -5613,13 +5729,18 @@ struct AssemblyAfter {
 
 struct ReuseRun {
     std::unique_ptr<nanosm::Machine> machine;
-    uint64_t reuse_cycle = 0; // the old load's final RF write, and the second command's admission
+    uint64_t reuse_cycle = 0; // the second command's admission (dispatch)
     AssemblyAfter after;      // the register after that cycle
+    std::map<uint64_t, AssemblyAfter> by_cycle; // the register after every cycle
 };
 
 // `old_load` is LSU command 0, `second` (opcode `second_name`) command 1. With
-// one command slot and one assembly register, the second waits for both and
-// is admitted in the cycle the load's final RF write releases them (d).
+// one command slot and one assembly register, the second waits for both: it
+// issues in the cycle the load's final RF write releases them (look-ahead
+// (c)) and the LSU admits it issue_to_dispatch later (I6a), into the register
+// free since then. (Before I6a the admission was that same cycle, a reuse
+// (d) of the register the drain was emptying; a claim now waits for the
+// release, so issue cannot line the two up.)
 // gmem holds pattern words; r5 = 4 * lane, r6 = 2048 + 4 * lane, r24..r31 =
 // 101..108.
 ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
@@ -5651,10 +5772,12 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
     for (const auto& event : machine.trace().events())
         if (event.category == nanosm::TraceCategory::gmem && event.name == second_name && event.id == 1)
             admitted = event.start_cycle;
-    require(admitted == final_drain,
-        second_name + " was not admitted in the cycle '" + old_load + "' made its final RF write");
-    run.reuse_cycle = final_drain;
-    run.after = after.at(final_drain);
+    const auto dispatch = final_drain + nanosm::issue_to_dispatch(config);
+    require(admitted == dispatch,
+        second_name + " was not admitted issue_to_dispatch after '" + old_load + "' made its final RF write");
+    run.reuse_cycle = dispatch;
+    run.after = after.at(dispatch);
+    run.by_cycle = std::move(after);
     return run;
 }
 
@@ -5685,8 +5808,8 @@ void test_assembly_reuse_load_to_scalar_store() {
     }
 }
 
-// A stg.v8 admitted in that cycle: its first RF read beat (bypass (e)) fills
-// the register in the same cycle, after the old load's drain emptied it.
+// A stg.v8 admitted then: its first RF read beat is sampled in its admission
+// cycle (bypass (e)) and fills the register Lr later (I6a).
 void test_assembly_reuse_load_to_vector_store() {
     const std::string old_load = "ldg.v8 r8, [r0]";
     const auto run = run_reuse_after_final_drain(old_load, "stg.v8 [r2], r24", "stg.v8");
@@ -5694,9 +5817,11 @@ void test_assembly_reuse_load_to_vector_store() {
     for (const auto& event : run.machine->edge_events())
         if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == run.reuse_cycle) first_read_now = true;
     require(first_read_now, "the stg.v8's first RF read was not in the reuse cycle; the test proves little");
-    require(run.after.owner == 1u, "the stg.v8 does not own the register after the reuse cycle");
-    require(run.after.valid_count == 16 && run.after.valid == std::vector<uint8_t>(16, 1),
-        "the stg.v8's first chunk is not valid after the reuse cycle");
+    require(run.after.owner == 1u && run.after.valid_count == 0,
+        "the stg.v8 does not own an empty register after the reuse cycle");
+    const auto filled = run.by_cycle.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles);
+    require(filled.owner == 1u && filled.valid_count == 16 && filled.valid == std::vector<uint8_t>(16, 1),
+        "the stg.v8's first chunk is not valid Lr after the reuse cycle");
     for (uint32_t j = 0; j < 8; ++j)
         for (uint32_t lane = 0; lane < 16; ++lane)
             require(run.machine->read_gmem_u32(2048 + 4 * (16 * j + lane)) == 101 + j,
@@ -5786,22 +5911,31 @@ void test_mbar_engine_events_visible_next_cycle() {
 // ldg that waits on sb0 and sets it again issues in that same cycle: issue
 // sees the completion at once (bypass (b)), and the counter is one
 // calculation, 1 - 1 + 1 = 1. Neither event is deferred.
+// I6a: a completion reaches issue through the counter (Q), so an instruction
+// WAITING on the depbar issues the cycle after its completion. The one
+// calculation still combines a completion and an admission that land in one
+// cycle: here the ldg sets sb0 without waiting on it, issued exactly when the
+// lds.uni's RF write lands. The lds.uni at L (one round): dispatch L +
+// issue_to_dispatch, its slot visible to A-read one cycle later, the RAM
+// sample D after that grant, its word Lb later, the gather register one cycle
+// later (the RF write decision's grant), the write lands Wd after it: its
+// depbar completion is presented then. `pad` independent movs put the ldg
+// there.
 void test_simultaneous_depbar_completion_and_admission() {
     const auto& profile = canonical_profile();
-    const auto assembly =
-        ".profile " + profile.name + ", 0x" +
-        nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + R"(
-        mov  r0, 0 {pred=PT, stall=0, set=-, wait=-}
-        lds  r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}
-        mov  r5, 7 {pred=PT, stall=0, set=-, wait=-}
-        ldg  r3, [r0] {pred=PT, stall=0, set=sb0, wait=sb0}
-        halt {pred=PT, stall=0, set=-, wait=sb0}
-    )";
+    const uint64_t lds_issue = nanosm::issue_to_visible(nanosm::decode(compile("mov r0, 0\nhalt").words[0]), profile) -
+        nanosm::issue_register_stages; // mov r0 at c0, the lds that reads it at its distance
+    const auto completion_cycle = lds_issue + nanosm::issue_to_dispatch(profile) + 1 + profile.shmem_port_a_depth +
+        profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles;
+    const auto pad = completion_cycle - lds_issue - 1;
+    std::string body = "mov r0, 0\nlds.uni r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}\n";
+    for (uint64_t i = 0; i < pad; ++i) body += "mov r5, 7\n";
+    body += "ldg r3, [r0] {pred=PT, stall=0, set=sb0, wait=-}\nhalt {pred=PT, stall=0, set=-, wait=sb0}\n";
     nanosm::Launch launch;
     launch.active_warps = 1;
     write_u32(image_bytes(launch.shmem_image, 64), 0, 0xabcd);
     write_u32(image_bytes(launch.gmem_image, 64), 0, 0x1234);
-    nanosm::Machine machine(profile, nanosm::assemble_asm(assembly, profile), std::move(launch), {.timeline = true});
+    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch), {.timeline = true});
     std::map<uint64_t, uint32_t> sb0_after; // cycle -> sb0 at the next cycle's start
     while (!machine.done()) {
         const auto cycle = machine.cycle();
@@ -5812,8 +5946,9 @@ void test_simultaneous_depbar_completion_and_admission() {
     uint64_t ldg_issue = 0;
     for (const auto& event : machine.trace().events()) {
         if (event.name == "depbar sb0" && event.track == 100) sb0_events.emplace_back(event.start_cycle, event.detail);
-        if (event.name == "ldg") ldg_issue = event.start_cycle;
+        if (event.category == nanosm::TraceCategory::instruction && event.name == "ldg") ldg_issue = event.start_cycle;
     }
+    require(ldg_issue == completion_cycle, "the ldg did not issue at the lds's completion; re-derive the test");
     const auto completion = std::find(sb0_events.begin(), sb0_events.end(),
         std::make_pair(ldg_issue, std::string("value=0")));
     require(completion != sb0_events.end(), "the lds did not complete in the ldg's issue cycle");
@@ -5857,12 +5992,20 @@ void test_simultaneous_full_queue_pop_and_push() {
         if (event.name == "MMA tmem write" && event.id == 1) first_last_result = std::max(first_last_result, event.start_cycle);
         if (event.category == nanosm::TraceCategory::warp && event.detail == "MMA command queue full") waited_full = true;
     }
+    // I6a: the "mma.async" event is the MMA's acceptance, at dispatch. The
+    // third issues in the cycle the head retires (look-ahead (c): the queue
+    // as that cycle leaves it) and reaches the queue issue_to_dispatch later:
+    // the pop and the push no longer share a cycle (a claim waits for the
+    // pop), so the depth is 2, then 1 until the dispatch, then 2.
+    const auto dispatch = nanosm::issue_to_dispatch(canonical_profile());
+    const auto third_accept = third_issue;
     require(waited_full, "the third mma.async never found the queue full");
-    require(third_issue == first_last_result,
-        "the third mma.async did not issue in the cycle the head retired (" + std::to_string(third_issue) +
-            " vs " + std::to_string(first_last_result) + ")");
-    require(depth_after.at(third_issue - 1) == 2 && depth_after.at(third_issue) == 2,
-        "the full queue's pop and push did not combine");
+    require(third_accept == first_last_result + dispatch,
+        "the third mma.async did not issue in the cycle the head retired (accepted " +
+            std::to_string(third_accept) + " vs retired " + std::to_string(first_last_result) + ")");
+    require(depth_after.at(first_last_result - 1) == 2 && depth_after.at(first_last_result) == 1 &&
+            depth_after.at(third_accept - 1) == 1 && depth_after.at(third_accept) == 2,
+        "the queue's pop and the dispatched push did not land in their cycles");
 }
 
 // The ingress FIFO's declared full flag is registered (B2.1 implementer
@@ -6150,11 +6293,15 @@ void test_b3_lds_uni_one_round_one_write() {
         require(shmem_request_rounds(*machine) == std::vector<uint32_t>{rounds}, operation + ": wrong round count");
         require(machine->trace().summary().shmem_rounds == rounds, operation + ": port A served extra rounds");
         // I2: the last round's words reach the slot D + Lb after its grant.
+        // I6a: the first round is granted the cycle after dispatch (issue +
+        // issue_to_dispatch, the slot register), the gather register is
+        // complete the cycle after the last words, the RF write is granted
+        // then and lands Wd later.
         const auto issue = issued_at(*machine, 16);
         const auto& profile = canonical_profile();
-        require(issue.size() == 1 && load.cycle == issue[0] + rounds + 1 + profile.shmem_port_a_depth +
-                profile.shmem_read_latency_cycles,
-            operation + ": the RF write did not land D + Lb + 1 cycles after the last round");
+        require(issue.size() == 1 && load.cycle == issue[0] + nanosm::issue_to_dispatch(profile) + rounds + 1 +
+                profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + profile.rf_write_depth_cycles,
+            operation + ": the RF write did not land D + Lb + 1 + Wd cycles after the last round");
     }
 }
 
@@ -6266,7 +6413,7 @@ void test_b3_lds_uni_composes_like_lds() {
     const auto timeline = [](const nanosm::Machine& machine) {
         std::vector<std::pair<uint64_t, uint64_t>> issues; // cycle, pc
         for (const auto& event : machine.trace().events()) {
-            if (event.category == nanosm::TraceCategory::instruction && event.name != "RF read") {
+            if (is_issue_event(event)) {
                 issues.emplace_back(event.start_cycle, event.id);
             }
         }
@@ -6453,24 +6600,20 @@ void test_b3_lds_uni_encoding() {
 // their RF scenarios by moving the fadd bookings and the instructions after
 // each lds.uni by the same amount (fadd latency + X, the lds.uni's stall
 // 1 + X), so every cycle after the lds.uni is the old one + X.
+// I6a: the lds.uni also reaches its slot at dispatch, issue_to_dispatch after
+// its issue, so X = D + Lb + issue_to_dispatch. A fadd's booking moves
+// issue_to_dispatch (the issue register and Lr ahead of its execution) by
+// itself, so its latency only adds D + Lb (i1_fadd_latency). And a result
+// written at the RF port in cycle t lands at t + Wd: a test that watches the
+// register sees it then. The scenarios' address register r1 is zero from
+// launch: a `mov r1, 0` feeding the lds.uni would now need six cycles before
+// it, which would move the scenario, so the first instruction writes r61.
 uint32_t i1_lds_shift(const nanosm::DeviceProfile& profile = canonical_profile()) {
-    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + nanosm::issue_to_dispatch(profile);
 }
 
-// Hand assembly: lines without a {...} control block get the default one.
-std::string i1_asm(const nanosm::DeviceProfile& profile, const std::string& body) {
-    std::string text = ".profile " + profile.name + ", 0x" +
-        nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + "\n";
-    std::istringstream lines(body);
-    std::string line;
-    while (std::getline(lines, line)) {
-        const auto first = line.find_first_not_of(" \t");
-        if (first == std::string::npos) continue;
-        text += line;
-        if (line[first] != '.' && line.find('{') == std::string::npos) text += " {pred=PT, stall=0, set=-, wait=-}";
-        text += "\n";
-    }
-    return text;
+uint8_t i1_fadd_latency(const nanosm::DeviceProfile& profile, uint32_t base) {
+    return static_cast<uint8_t>(base + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles);
 }
 
 std::unique_ptr<nanosm::Machine> i1_machine(
@@ -6479,7 +6622,7 @@ std::unique_ptr<nanosm::Machine> i1_machine(
     launch.active_warps = warps;
     auto& shmem = image_bytes(launch.shmem_image, 4096);
     for (uint32_t word = 0; word < 1024; ++word) write_u32(shmem, 4 * word, 0x100 + word);
-    return std::make_unique<nanosm::Machine>(profile, nanosm::assemble_asm(i1_asm(profile, body), profile),
+    return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, body), profile),
         std::move(launch), nanosm::TraceOptions{.timeline = true});
 }
 
@@ -6527,11 +6670,25 @@ std::string describe(const std::vector<std::pair<uint64_t, uint64_t>>& slices) {
 // round. Mask 7: lanes l and l + 8 share a bank, two rounds, and the result
 // would meet the fadd's booked write of bank 0. Before I1 the lds issued at c7
 // with mask 15 and was refused at c7 with mask 7 (its own addresses decided
-// its issue). Now both issue at c7; the rounds move only the completion.
+// its issue). Now both issue in the same cycle; the rounds move only the
+// completion.
+// I6a: the lds at L reaches its slot at dispatch, its first round is granted
+// one cycle later, its words come back D + Lb after its last grant and its
+// gather register is complete one cycle after that: one round -> its RF write
+// port cycle is L + one_round_port, two rounds -> one more. The fadd, issued
+// shli_distance - 1 before the lds (the stall on it waits out shli -> lds),
+// books bank 0's port at its issue + issue register + Lr + latency: the
+// latency below puts it on the two-round result's port cycle, which is denied
+// and written one cycle later. Every result lands Wd after its port.
 void test_i1_lds_issue_ignores_its_rounds() {
     auto profile = canonical_profile();
-    const auto x = i1_lds_shift(profile);
-    profile.timing.fadd = static_cast<uint8_t>(4 + x); // I2: the fadd's booking moves with the lds result
+    const auto dispatch = nanosm::issue_to_dispatch(profile);
+    const auto one_round_port = dispatch + 1 + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
+    const auto alu_distance = nanosm::issue_to_visible(nanosm::decode(compile("mov r0, 0\nhalt").words[0]), profile) -
+        nanosm::issue_register_stages;
+    const auto fadd_before_lds = alu_distance - 1; // shli, fadd, (stall), lds
+    profile.timing.fadd = static_cast<uint8_t>(fadd_before_lds + one_round_port + 1 -
+        nanosm::issue_register_stages - profile.rf_read_latency_cycles);
     const std::string body = R"(
         sread r0, LANE_ID
         mov r4, 0
@@ -6553,7 +6710,7 @@ void test_i1_lds_issue_ignores_its_rounds() {
         auto& shmem = image_bytes(launch.shmem_image, 256);
         write_u32(shmem, 0, mask);
         for (uint32_t word = 1; word < 64; ++word) write_u32(shmem, 4 * word, 0x100 + word);
-        nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, body), profile), std::move(launch),
+        nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch),
             nanosm::TraceOptions{.timeline = true});
         const auto written = i1_run(machine, {6});
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -6568,12 +6725,13 @@ void test_i1_lds_issue_ignores_its_rounds() {
     const auto two_rounds = run(7);
     require(one_round.rounds == std::vector<uint32_t>{1, 1} && two_rounds.rounds == std::vector<uint32_t>{1, 2},
         "the masks did not give one and two bank rounds");
-    // I2: the lds.uni's result, and so everything behind its depbar, is x later.
-    require(one_round.issue == 7 + x && two_rounds.issue == 7 + x,
+    require(one_round.issue == two_rounds.issue,
         "the lds's issue cycle depends on its own addresses (C8): " + std::to_string(one_round.issue) + " vs " +
             std::to_string(two_rounds.issue));
-    require(one_round.written == one_round.issue + 2 + x, "one round: the result was not written at issue + 2 + x");
-    require(two_rounds.written == two_rounds.issue + 4 + x,
+    const auto wd = profile.rf_write_depth_cycles;
+    require(one_round.written == one_round.issue + one_round_port + wd,
+        "one round: the result did not land at issue + one_round_port + Wd");
+    require(two_rounds.written == two_rounds.issue + one_round_port + 2 + wd,
         "two rounds: the result (ready when the fadd's booking holds bank 0) was not written one cycle later");
 }
 
@@ -6640,9 +6798,9 @@ void test_i1_refused_attempts_read_nothing() {
     {   // RF write inhibited: a fadd while a load result is owed service
         auto profile = canonical_profile();
         const auto x = i1_lds_shift(profile);
-        profile.timing.fadd = static_cast<uint8_t>(4 + x);
+        profile.timing.fadd = i1_fadd_latency(profile, 4);
         auto machine = i1_machine(profile, R"(
-            mov r1, 0
+            mov r61, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
             lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
@@ -6672,7 +6830,7 @@ void test_i1_refused_attempts_read_nothing() {
         nanosm::Launch launch;
         launch.active_warps = 1;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-        nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, R"(
+        nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, R"(
             .acc C0, 0, 0, 16, 16
             .acc C1, 0, 256, 16, 16
             sread r0, LANE_ID
@@ -6704,9 +6862,10 @@ void test_i1_refused_attempts_read_nothing() {
 void test_i1_rf_owed_inhibits_after_denial() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
-    profile.timing.fadd = static_cast<uint8_t>(4 + x);
+    const auto wd = profile.rf_write_depth_cycles;
+    profile.timing.fadd = i1_fadd_latency(profile, 4);
     auto machine = i1_machine(profile, R"(
-        mov r1, 0
+        mov r61, 0
         fadd r6, r4, r4
         fadd r9, r4, r4
         lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
@@ -6721,7 +6880,8 @@ void test_i1_rf_owed_inhibits_after_denial() {
     });
     require(!bank0.at(0).first && bank0.at(1).first, "a successful booking of bank 0 did not set async_owed");
     require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{3}, "lds.uni issue");
-    require(written.at(3) == std::vector<uint64_t>{7 + x}, "the result was not written when the old bookings drained (c7 + x)");
+    require(written.at(3) == std::vector<uint64_t>{7 + x + wd},
+        "the result was not written when the old bookings drained (c7 + x, landing Wd later)");
     require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{5 + x, 2}},
         "bank 0 was not inhibited exactly while the result was denied with service owed (c5 + x, c6 + x)");
     require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{7 + x}, "the inhibited fadd did not issue in the grant cycle");
@@ -6741,10 +6901,11 @@ void test_i1_rf_owed_inhibits_after_denial() {
 void test_i1_rf_owed_one_more_booking() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
-    profile.timing.fadd = static_cast<uint8_t>(5 + x);
+    const auto wd = profile.rf_write_depth_cycles;
+    profile.timing.fadd = i1_fadd_latency(profile, 5);
     {
         auto machine = i1_machine(profile, R"(
-            mov r1, 0
+            mov r61, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
             lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
@@ -6758,7 +6919,7 @@ void test_i1_rf_owed_one_more_booking() {
         const auto written = i1_run(*machine, {3, 12}, [&](uint64_t cycle) {
             bank0[cycle] = {machine->rf_write_owed(0), machine->rf_write_cursor(0)};
         });
-        require(written.at(3) == std::vector<uint64_t>{5 + x} && written.at(12) == std::vector<uint64_t>{8 + x},
+        require(written.at(3) == std::vector<uint64_t>{5 + x + wd} && written.at(12) == std::vector<uint64_t>{8 + x + wd},
             "write cycles");
         require(!bank0.at(5 + x).first, "an async grant with no booking in its cycle did not clear async_owed");
         require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
@@ -6770,9 +6931,14 @@ void test_i1_rf_owed_one_more_booking() {
                 bank0.at(8 + x).second == 2,
             "the cursor moved without a grant, or not on one");
     }
-    {   // A refused booking (its port taken) does not set the bit.
-        auto machine = i1_machine(profile, R"(
-            mov r1, 0
+    {   // A refused booking (its port taken) does not set the bit. I6a: the add
+        // after the lds.uni moved X with it, but its booking is only
+        // issue_to_dispatch + alu ahead of its issue: the fadd latency that
+        // puts their ports on one cycle is 5 + X here.
+        auto refusing = profile;
+        refusing.timing.fadd = static_cast<uint8_t>(5 + x);
+        auto machine = i1_machine(refusing, R"(
+            mov r61, 0
             fadd r6, r4, r4
             lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
             mov r2, 1
@@ -6796,9 +6962,10 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
     {
         auto profile = canonical_profile();
         const auto x = i1_lds_shift(profile);
-        profile.timing.fadd = static_cast<uint8_t>(4 + x);
+        const auto wd = profile.rf_write_depth_cycles;
+        profile.timing.fadd = i1_fadd_latency(profile, 4);
         auto machine = i1_machine(profile, R"(
-            mov r1, 0
+            mov r61, 0
             fadd r6, r4, r4
             fadd r9, r4, r4
             lds.uni r3, [r1] {pred=PT, stall=)" + std::to_string(1 + x) + R"(, set=sb0, wait=-}
@@ -6809,12 +6976,12 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
         const auto written = i1_run(*machine, {3, 13, 21});
-        require(written.at(3) == std::vector<uint64_t>{7 + x}, "the first result was not written at c7 + x");
+        require(written.at(3) == std::vector<uint64_t>{7 + x + wd}, "the first result was not written at c7 + x (+ Wd)");
         require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5 + x}, "a bank-1 write was held by bank 0's inhibition");
         require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
             "an lds.uni into bank 0 was held by bank 0's inhibition");
         // The second lds.uni's own result is x later too (it meets fadd r12's booking).
-        require(written.at(21) == std::vector<uint64_t>{9 + 2 * x}, "the second result");
+        require(written.at(21) == std::vector<uint64_t>{9 + 2 * x + wd}, "the second result");
         require(machine->trace().summary().rf_simt_inhibited == 0, "nothing should have been inhibited");
     }
     {
@@ -6884,12 +7051,16 @@ void test_i1_rf_round_robin_among_holders() {
             std::to_string(order[i].second) + ", not r" + std::to_string(expected[i]));
         require(order[i].first == order.front().first + i, "a cycle passed without a write (a refill bubble)");
     }
-    const auto mov_cycle = order[1].first;
-    require(cursor.at(mov_cycle - 1) == 5 && cursor.at(mov_cycle) == 5,
+    // I6a: a write is granted (at the port) Wd cycles before the register
+    // changes; the cursor moves at the grant.
+    const auto wd = profile.rf_write_depth_cycles;
+    const auto mov_port = order[1].first - wd;
+    require(cursor.at(mov_port - 1) == 5 && cursor.at(mov_port) == 5,
         "the cursor moved in the cycle no holder was granted");
     for (std::size_t i = 2; i < order.size(); ++i) {
         const bool pipeline1 = order[i].second >= 24;
-        require(cursor.at(order[i].first) == (pipeline1 ? 0u : 5u), "the cursor did not move past the holder granted");
+        require(cursor.at(order[i].first - wd) == (pipeline1 ? 0u : 5u),
+            "the cursor did not move past the holder granted");
     }
 }
 
@@ -6920,19 +7091,30 @@ void test_i1_round_robin_grant() {
     require(turns == std::vector<uint32_t>{1, 3, 1, 3, 1, 3}, "two persistently ready holders did not alternate");
 }
 
-// The acc.ld transfer pipeline freezes and resumes (rfc10 section 2). fadd
-// latency 16: the six fadds before the acc.st book RF bank 1 for c27..c32,
-// exactly when beat 0 (r16, bank 1) is the pipeline's output. Denied, the
+// The acc.ld transfer pipeline freezes and resumes (rfc10 section 2). The six
+// fadds before the acc.st book RF bank 1 for six consecutive cycles from P,
+// the cycle beat 0 (r16, bank 1) is first the pipeline's output. Denied, the
 // whole pipeline holds -- same destination and data, no tmem read, depbar
 // set, done() false -- while the add that wants bank 1 is held back first by
-// its own booked port, then by the inhibition. At c33 the beat is written and
-// the pipeline refills with no bubble; beat 3 (r19, bank 1) holds one cycle
-// at c36 behind the add's booking while beats 0-2 are already in the RF. The
-// depbar clears in the cycle the last beat is written.
+// its own booked port, then by the inhibition. At P + 6 the beat is written
+// and the pipeline refills with no bubble; later beats hold one cycle behind
+// each add's booking. The depbar clears as the last beat's write lands.
+// I6a (src/rf.hpp): the acc.ld at A reaches its slot at dispatch (A +
+// issue_to_dispatch), its first tmem read one cycle later, its output stage
+// one more: P = A + issue_to_dispatch + 2. A calibration run (fadd latency 1,
+// bookings long gone) measures A and the first fadd's issue F0; the fadd
+// latency that puts F0's booking (F0 + issue register + Lr + latency) on P is
+// then used. The add r46 issues two cycles after the acc.ld, at P - 3, and
+// books issue + 4 (issue register, Lr, alu): its ports P + 1 .. P + 5 are
+// the fadds', then (P + 2 .. P + 5) bank 1 is inhibited while beat 0 is
+// denied with service owed; it issues at P + 6 and books P + 10. The add
+// r43 issues at P + 8 and books P + 12. The beats r16..r23 sit in banks 1,
+// 2, 0, 1, 2, 0, 1, 2: beats 0-5 are written at P + 6 .. P + 11 (r46's
+// bank-1 booking at P + 10 is not beat 4's bank), beat 6 (bank 1) meets
+// r43's booking at P + 12 and goes at P + 13, beat 7 at P + 14. Every
+// register changes Wd after its write.
 void test_i1_acc_ld_pipeline_freeze() {
-    auto profile = canonical_profile();
-    profile.timing.fadd = 16;
-    auto machine = i1_machine(profile, R"(
+    const std::string body = R"(
         .acc C, 0, 0, 64, 64
         sread r0, LANE_ID
         addi r0, r0, 1
@@ -6956,7 +7138,21 @@ void test_i1_acc_ld_pipeline_freeze() {
         add r46, r10, r10 {pred=PT, stall=2, set=-, wait=-}
         add r43, r10, r10
         halt {pred=PT, stall=0, set=-, wait=sb1}
-    )");
+    )";
+    auto profile = canonical_profile();
+    profile.timing.fadd = 1;
+    uint64_t acc_ld_issue = 0;
+    uint64_t first_fadd = 0;
+    {
+        auto calibration = i1_machine(profile, body);
+        calibration->run();
+        acc_ld_issue = issued_at(*calibration, 18 * 8).at(0);
+        first_fadd = issued_at(*calibration, 11 * 8).at(0);
+    }
+    const auto p = acc_ld_issue + nanosm::issue_to_dispatch(profile) + 2;
+    profile.timing.fadd = static_cast<uint8_t>(p - first_fadd - nanosm::issue_register_stages -
+        profile.rf_read_latency_cycles);
+    auto machine = i1_machine(profile, body);
     require(nanosm::Machine::acc_ld_pipeline_stages() == 1, "this test is written for a one-stage pipeline");
     struct Seen {
         std::optional<nanosm::Machine::AccLdStageView> output;
@@ -6971,58 +7167,71 @@ void test_i1_acc_ld_pipeline_freeze() {
         seen[cycle] = {machine->acc_ld_stage(0, 0), machine->trace().summary().tmem_load_beats,
             machine->depbar_value(0, 1), machine->done()};
     });
-    require(issued_at(*machine, 18 * 8) == std::vector<uint64_t>{25}, "acc.ld issue (c25)");
-    // Held: the output after the ticks of c26..c32 (Q of c27..c33) is beat 0, unchanged.
-    for (uint64_t cycle = 26; cycle <= 32; ++cycle) {
+    require(issued_at(*machine, 18 * 8) == std::vector<uint64_t>{acc_ld_issue},
+        "acc.ld issue moved with the fadd latency; the calibration does not hold");
+    // Held: the output after the ticks of P - 1 .. P + 5 (Q of P .. P + 6) is beat 0, unchanged.
+    for (uint64_t cycle = p - 1; cycle <= p + 5; ++cycle) {
         const auto& at = seen.at(cycle);
         require(at.output.has_value() && at.output->reg == 16 && !at.output->last,
             "the output stage did not hold beat 0 after c" + std::to_string(cycle));
-        require(at.output->values == seen.at(26).output->values, "the held beat's data changed");
+        require(at.output->values == seen.at(p - 1).output->values, "the held beat's data changed");
         require(at.tmem_reads == 1, "a tmem read launched while the output was held (c" + std::to_string(cycle) + ")");
         require(at.sb1 == 1 && !at.done, "the depbar or done() moved while a beat was held");
     }
-    const std::vector<uint64_t> expected{33, 34, 35, 37, 38, 39, 40, 41};
+    const auto wd = profile.rf_write_depth_cycles;
+    const std::vector<uint64_t> port{p + 6, p + 7, p + 8, p + 9, p + 10, p + 11, p + 13, p + 14};
     for (uint32_t beat = 0; beat < 8; ++beat) {
         const auto reg = 16 + beat;
-        require(written.at(reg) == std::vector<uint64_t>{expected[beat]},
-            "beat " + std::to_string(beat) + " was not written exactly once at c" + std::to_string(expected[beat]));
+        std::string seen_writes;
+        for (const auto cycle : written.at(reg)) seen_writes += " " + std::to_string(cycle);
+        require(written.at(reg) == std::vector<uint64_t>{port[beat] + wd},
+            "beat " + std::to_string(beat) + " was not written exactly once at c" + std::to_string(port[beat]) +
+                " (landing Wd later; P = " + std::to_string(p) + ", landed" + seen_writes + "; inhibited" +
+                describe(refusals(*machine, 0, "RF write inhibited")) + "; booked" +
+                describe(refusals(*machine, 0, "RF write reservation")) + "; issues" + issue_log(*machine) + ")");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_reg(0, lane, reg) == lane + 1 + 100 * beat, "beat " + std::to_string(beat) + " data");
         }
     }
-    require(seen.at(36).output.has_value() && seen.at(36).output->reg == 19,
-        "beat 3 did not hold through c36 after beats 0-2 were written");
-    require(seen.at(40).sb1 == 1 && seen.at(41).sb1 == 0, "the depbar did not clear exactly at the last beat's write");
-    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{32, 1}},
+    require(seen.at(p + 12).output.has_value() && seen.at(p + 12).output->reg == 22,
+        "beat 6 did not hold through P + 12 after beats 0-5 were written");
+    require(seen.at(port[7] + wd - 1).sb1 == 1 && seen.at(port[7] + wd).sb1 == 0,
+        "the depbar did not clear exactly as the last beat's write landed");
+    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{p + 2, 4}},
         "the add was not inhibited while beat 0 was denied with service owed");
     require(machine->trace().summary().tmem_load_beats == 8 && machine->trace().summary().rf_async_writes == 8,
         "beats launched or written more than once");
 }
 
-// Load slots (rfc12 section 3; shmem.load_slots = 2). fadd latency 7 keeps
-// RF bank 0 booked c21..c25. Warp 0's first two lds.uni hold both slots,
-// their results complete and waiting for the RF; the third is refused
-// (structural, counted) until the RF write decision grants slot 0 (c26) and
-// issues in that same cycle. Meanwhile port A serves warp 1's sts.
-// I2: the results come back x = D + Lb later; fadd latency 7 + x keeps the
-// bookings over them. (qtxc schedules the second lds.uni at c20 with that
-// latency, and warp 1 issues inside the refusal window, which splits the
-// refused interval.) The third lds.uni is refused until slot 0's write is
-// granted (c30) and takes the slot then; A-write serves warp 1's sts while
-// both slots hold results.
+// Load slots (rfc12 section 3; shmem.load_slots = 2). Two lds.uni hold both
+// slots, their results complete and waiting for the RF (eight fadds keep RF
+// bank 0 booked over them); a third is refused (structural, counted) until
+// the RF write decision grants slot 0 and issues in that same cycle.
+// Meanwhile port A serves a store while both slots hold results.
+// I6a re-derivation (was two warps, qtxc): one warp, hand assembly, so the
+// fadd bookings are contiguous (a second warp's issues used to leave holes in
+// them, and a hole under a ready result grants it). Relative to the first
+// lds.uni at L0: the eight fadds issue at L0 - 8 .. L0 - 1 and book bank 0
+// for L0 - 5 + latency .. L0 + 2 + latency (issue register, Lr, latency:
+// src/rf.hpp); latency 13 covers L0 + 8 .. L0 + 15. Each lds.uni's result is
+// at its RF port x + 2 after its issue (x = i1_lds_shift): L0 + 9 and
+// L0 + 10, denied until the bookings end, so slot 0's write is granted at
+// G0 = L0 + 16. The sts (a write) is ordered behind the two loads until the
+// second one's round is granted (L0 + 5), issues then and is granted at
+// L0 + 9 (dispatch, slot register), reaching the RAM at L0 + 11 while both
+// results wait. The third lds.uni is ordered behind the sts until that grant
+// (L0 + 6 .. L0 + 8; before I6a the sts was granted the cycle after its
+// issue, so no order wait showed), then refused for load slots from L0 + 9
+// to G0, and issues at G0. Results land Wd after their grants.
 void test_i1_load_slots() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
-    profile.timing.fadd = static_cast<uint8_t>(7 + x);
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
-    for (uint32_t word = 0; word < 1024; ++word) write_u32(shmem, 4 * word, 0x100 + word);
-    nanosm::Machine machine(profile, compile(R"(
-        sread r29, WARP_ID
-        setp.ne p0, r29, 0
-        @p0 bra.uni other
-        mov r1, 0
+    const auto wd = profile.rf_write_depth_cycles;
+    profile.timing.fadd = i1_fadd_latency(profile, 9);
+    auto machine = i1_machine(profile, R"(
+        sread r20, LANE_ID
+        mov r21, 7
+        shli r20, r20, 2
         fadd r30, r4, r4
         fadd r33, r4, r4
         fadd r36, r4, r4
@@ -7031,53 +7240,56 @@ void test_i1_load_slots() {
         fadd r45, r4, r4
         fadd r48, r4, r4
         fadd r51, r4, r4
-        lds.uni r3, [r1]
-        lds.uni r6, [r1 + 4]
-        lds.uni r9, [r1 + 8]
-        addi r10, r3, 1
-        addi r11, r9, 1
-        addi r13, r6, 1
-        halt
-    other:
-        sread r1, LANE_ID
-        shli r1, r1, 2
-        mov r2, 7
-        fadd r5, r2, r2
-        fadd r7, r5, r5
-        sts [r1 + 1024], r2
-        halt
-    )", profile), std::move(launch), nanosm::TraceOptions{.timeline = true});
+        lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+        lds.uni r6, [r1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+        sts [r20 + 1024], r21 {pred=PT, stall=0, set=sb2, wait=-}
+        lds.uni r9, [r1 + 8] {pred=PT, stall=0, set=sb3, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3}
+    )");
     // The slots as they stand during each cycle (Q: observed after the
-    // previous tick), and the cycle port A's store round lands.
+    // previous tick), and the cycle the store's round lands.
     bool both_waiting = false;
     std::optional<uint64_t> store_cycle;
     bool store_while_both_waiting = false;
-    const auto written = i1_run(machine, {3, 6, 9}, [&](uint64_t cycle) {
-        if (!store_cycle.has_value() && machine.read_shmem_u32(1024) == 7) {
+    const auto written = i1_run(*machine, {3, 6, 9}, [&](uint64_t cycle) {
+        if (!store_cycle.has_value() && machine->read_shmem_u32(1024) == 7) {
             store_cycle = cycle;
             store_while_both_waiting = both_waiting;
         }
-        both_waiting = machine.load_slot_complete(0) && machine.load_slot_complete(1);
+        both_waiting = machine->load_slot_complete(0) && machine->load_slot_complete(1);
     });
-    const auto lds = [&](uint32_t n) { return issued_at(machine, (12 + n) * 8); };
+    const auto lds = [&](uint32_t n) { return issued_at(*machine, (11 + n) * 8 + (n == 2 ? 8 : 0)); };
     const auto at = [](const std::vector<uint64_t>& cycles) { return cycles.empty() ? std::string("-") : std::to_string(cycles.front()); };
     const auto observed = " lds " + at(lds(0)) + " " + at(lds(1)) + " " + at(lds(2)) + "; written " + at(written.at(3)) +
-        " " + at(written.at(6)) + " " + at(written.at(9)) + "; refused" + describe(refusals(machine, 0, "load slots full"));
-    require(lds(0) == std::vector<uint64_t>{19} && lds(1) == std::vector<uint64_t>{20}, "the first two lds.uni:" + observed);
-    const auto refused = refusals(machine, 0, "load slots full");
-    uint64_t refused_cycles = 0;
-    for (const auto& [start, length] : refused) refused_cycles += length;
-    require(!refused.empty() && refused.front().first == 21 && refused.back().first + refused.back().second == 30,
-        "the third lds.uni was not refused for load slots from c21 until slot 0's write (c30):" + observed);
-    require(machine.trace().summary().shmem_load_slot_waits == refused_cycles, "the refusals were not counted");
-    require(lds(2) == std::vector<uint64_t>{30} && written.at(3) == std::vector<uint64_t>{30},
+        " " + at(written.at(6)) + " " + at(written.at(9)) + "; refused" + describe(refusals(*machine, 0, "load slots full")) +
+        "; store c" + (store_cycle.has_value() ? std::to_string(*store_cycle) : std::string("-")) +
+        "; issues" + issue_log(*machine);
+    require(lds(0).size() == 1 && lds(1) == std::vector<uint64_t>{lds(0)[0] + 1}, "the first two lds.uni:" + observed);
+    const auto l0 = lds(0)[0];
+    const auto g0 = l0 + 16;
+    require(issued_at(*machine, 13 * 8) == std::vector<uint64_t>{l0 + 5},
+        "the sts did not issue as the second load's round was granted:" + observed);
+    // The sts behind the second load (L0 + 2 .. L0 + 4), the third load behind
+    // the sts (L0 + 6 .. L0 + 8): issue_to_dispatch cycles each.
+    const auto t = nanosm::issue_to_dispatch(profile);
+    require(refusals(*machine, 0, "ordered behind own access") ==
+            std::vector<std::pair<uint64_t, uint64_t>>{{l0 + 2, t}, {l0 + 6, t}},
+        "the sts was not ordered behind the second load until its grant (L0 + 5), or the third lds.uni behind "
+        "the sts until its grant (L0 + 9):" + observed + "; ordered" +
+            describe(refusals(*machine, 0, "ordered behind own access")));
+    const auto refused = refusals(*machine, 0, "load slots full");
+    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{l0 + 9, g0 - l0 - 9}},
+        "the third lds.uni was not refused for load slots from L0 + 9 until slot 0's write (G0):" + observed);
+    require(machine->trace().summary().shmem_load_slot_waits == g0 - l0 - 9, "the refusals were not counted");
+    require(lds(2) == std::vector<uint64_t>{g0} && written.at(3) == std::vector<uint64_t>{g0 + wd},
         "the third lds.uni did not take slot 0 in the cycle its write was granted:" + observed);
-    require(written.at(6) == std::vector<uint64_t>{31} && written.at(9) == std::vector<uint64_t>{30 + 2 + x},
+    require(written.at(6) == std::vector<uint64_t>{g0 + 1 + wd} &&
+            written.at(9) == std::vector<uint64_t>{g0 + x + 2 + wd},
         "results:" + observed);
-    require(machine.read_reg(0, 7, 9) == 0x102, "the third load's word");
-    require(store_cycle.has_value() && store_while_both_waiting,
-        "port A did not serve warp 1's sts while both load slots held results waiting for the RF");
-    for (uint32_t lane = 0; lane < 16; ++lane) require(machine.read_shmem_u32(1024 + 4 * lane) == 7, "sts data");
+    require(machine->read_reg(0, 7, 9) == 0x102, "the third load's word");
+    require(store_cycle == l0 + 11 && store_while_both_waiting,
+        "port A did not serve the sts while both load slots held results waiting for the RF:" + observed);
+    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(1024 + 4 * lane) == 7, "sts data");
 }
 
 // shmem.load_slots: optional in the profile JSON (default 2), an integer of
@@ -7114,7 +7326,7 @@ void test_i1_load_slots_profile_field() {
     auto one = canonical_profile();
     one.shmem_load_slots = 1;
     auto machine = i1_machine(one, R"(
-        mov r1, 0
+        mov r61, 0
         lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
         lds.uni r6, [r1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
@@ -7124,7 +7336,9 @@ void test_i1_load_slots_profile_field() {
     const auto refused = refusals(*machine, 0, "load slots full");
     require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{2, 1 + i1_lds_shift(one)}},
         "the second lds.uni was not refused until the one slot freed:" + describe(refused));
-    require(issued_at(*machine, 2 * 8) == written.at(3), "the second lds.uni did not take the slot as it freed");
+    require(written.at(3).size() == 1 &&
+            issued_at(*machine, 2 * 8) == std::vector<uint64_t>{written.at(3)[0] - one.rf_write_depth_cycles},
+        "the second lds.uni did not take the slot as it freed (the first's write grant, Wd before it lands)");
     require(machine->read_reg(0, 0, 6) == 0x101, "the second load's word");
 }
 
@@ -7282,6 +7496,18 @@ uint32_t i2_return(const nanosm::DeviceProfile& profile) {
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
 }
 
+// I6a: issue to dependent issue behind a one-cycle ALU result (mov, sread,
+// shli, ...): visible issue_to_visible after its producer's issue, sampled
+// issue_register_stages after the consumer's (src/rf.hpp; 6 at canonical).
+// The hand-assembled timelines below are built from it and from
+// issue_to_dispatch (an lds / sts / mbar operation reaches its slot or
+// register that long after its issue, and is served from the next cycle).
+uint64_t alu_distance(const nanosm::DeviceProfile& profile) {
+    nanosm::Instruction mov;
+    mov.opcode = nanosm::Opcode::mov;
+    return nanosm::issue_to_visible(mov, profile) - nanosm::issue_register_stages;
+}
+
 struct I2Grant {
     uint64_t cycle = 0;
     std::string service; // "A-read", "A-write", "B-write"
@@ -7327,7 +7553,7 @@ std::unique_ptr<nanosm::Machine> i2_machine(const nanosm::DeviceProfile& profile
     mbar.expected = 1;
     mbar.tx_bytes = 64;
     write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(mbar));
-    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+    const auto kernel = hand_assembly ? hand_assemble(i1_asm(profile, program), profile)
                                       : compile(program, profile);
     return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -7402,9 +7628,30 @@ void i2_run_until(nanosm::Machine& machine, uint64_t cycle) {
 //   words, ordered behind it, follows at w + 2.
 // Then a tight RAW (an lds granted the cycle after the sts's last grant sees
 // the new words) and a WAW of two two-round stores.
+// I6a re-derivation, the scenario unchanged; every access reaches its slot
+// issue_to_dispatch (t) after its issue and is served from the next cycle,
+// and the cycles are relative to issues in the trace:
+//   lds.uni P issues at p, is granted at p + t + 1 (the pointer moves past
+//   slot 0); its result is at the RF port x + 2 after its issue (x =
+//   i1_lds_shift) and visible Wd + 1 later, when sb4 clears: OLD issues
+//   then, YOUNG the cycle after; they take slots 0 and 1 at their dispatches.
+//   Warp 1's sts is granted b .. b + 15 (b: its issue + t + 1); the RMW,
+//   started at b + 1, reads at r = b + 16, then YOUNG at r + 1, OLD at r + 2.
+//   WAR: the sts over OLD's words (tried from the cycle its r5 is visible)
+//   is ordered behind OLD until OLD's grant r + 2; in that cycle warp 1's
+//   halt (its sts's last round at the RAM) takes the issue slot, so the sts
+//   issues at r + 3, is in its slot by the end of the store pause w = r + D
+//   + Lb + C, and is granted at w + 1: it reaches the RAM long after OLD's
+//   sample (r + 2 + D). The sts over YOUNG's words, ordered behind it,
+//   issues at that grant and is granted t + 1 later.
+// The tight RAW is now t + 1 cycles wide: the lds, ordered behind the sts
+// until its grant, issues there and reaches A-read t + 1 later (a same-warp
+// read can no longer be granted the cycle after the store). The WAW's second
+// sts likewise follows the first's last round t + 1 later.
 void test_i2_same_warp_order_with_reordered_reads() {
     const auto& profile = canonical_profile();
     require(i2_return(profile) == 4 && profile.shmem_load_slots == 2, "the timeline is derived for D = Lb = 2");
+    const uint64_t t = nanosm::issue_to_dispatch(profile);
     const uint64_t c = profile.shmem_rmw_compute_cycles;
     auto machine = i2_machine(profile, i3_with_blocker(R"(
         sread r0, LANE_ID
@@ -7422,25 +7669,34 @@ void test_i2_same_warp_order_with_reordered_reads() {
     const uint64_t r = blocker + 16;            // the RMW's read: the cycle after the blocker's last round
     const uint64_t w = r + i2_return(profile) + c; // its write
     const auto reads = i2_grants(*machine, "A-read");
-    require(blocker == 13 && reads == std::vector<I2Grant>{{11, "A-read", "simt", 0}, {r, "A-read", "rmw", 0},
-                                          {r + 1, "A-read", "simt", 1}, {r + 2, "A-read", "simt", 0}},
-        "A-read grants (blocker from c" + std::to_string(blocker) + "):" + describe(reads));
+    constexpr uint32_t p_pc = 5 * 8, blocker_pc = 15 * 8, r5_pc = 8 * 8;
+    const auto p = issued_at(*machine, p_pc).at(0);
+    require(issued_at(*machine, blocker_pc) == std::vector<uint64_t>{blocker - t - 1} &&
+            reads == std::vector<I2Grant>{{p + t + 1, "A-read", "simt", 0}, {r, "A-read", "rmw", 0},
+                         {r + 1, "A-read", "simt", 1}, {r + 2, "A-read", "simt", 0}},
+        "A-read grants (blocker from c" + std::to_string(blocker) + "):" + describe(reads) + " | all" +
+            describe(i2_grants(*machine)) + " | issues" + issue_log(*machine) + " | ordered" +
+            describe(refusals(*machine, 0, "ordered behind own access")) + " slots" +
+            describe(refusals(*machine, 0, "load slots full")));
     constexpr uint32_t old_pc = 6 * 8, young_pc = 7 * 8, war_pc = 9 * 8;
-    require(issued_at(*machine, old_pc) == std::vector<uint64_t>{16} &&
-            issued_at(*machine, young_pc) == std::vector<uint64_t>{17},
-        "OLD did not take slot 0 at c16 (P's RF write), or YOUNG slot 1 at c17");
-    // (At r + 1 warp 1's halt -- its sts's last round reached the RAM -- takes
-    // the issue slot, so warp 0's refusal slice ends a cycle early.)
+    const auto old_issue = p + i1_lds_shift(profile) + 2 + profile.rf_write_depth_cycles + 1; // P visible: sb4 clear
+    require(issued_at(*machine, old_pc) == std::vector<uint64_t>{old_issue} &&
+            issued_at(*machine, young_pc) == std::vector<uint64_t>{old_issue + 1},
+        "OLD did not issue as P's result became visible (sb4), or YOUNG the cycle after");
+    // (At r + 2 warp 1's halt -- its sts's last round reached the RAM -- takes
+    // the issue slot, so the WAR sts, admissible at OLD's grant, issues at
+    // r + 3 and its refusal slice ends at r + 1.)
     const auto ordered = refusals(*machine, 0, "ordered behind own access");
-    require(issued_at(*machine, war_pc) == std::vector<uint64_t>{r + 2} && ordered.size() == 2 &&
-            ordered.front() == std::pair<uint64_t, uint64_t>{19, r + 1 - 19},
-        "the sts over OLD's words was not ordered behind OLD from c19 and admitted at OLD's grant:" +
-            describe(ordered) + "; grants:" + describe(i2_grants(*machine)));
+    const auto war_first_try = issued_at(*machine, r5_pc).at(0) + alu_distance(profile);
+    require(issued_at(*machine, war_pc) == std::vector<uint64_t>{r + 3} && ordered.size() == 2 &&
+            ordered.front() == std::pair<uint64_t, uint64_t>{war_first_try, r + 2 - war_first_try},
+        "the sts over OLD's words was not ordered behind OLD until OLD's grant:" +
+            describe(ordered) + "; grants:" + (describe(i2_grants(*machine)) + " | issues" + issue_log(*machine)));
     std::vector<I2Grant> writes;
     for (uint64_t round = 0; round < 16; ++round) writes.push_back({blocker + round, "A-write", "simt", 0});
     writes.push_back({w, "A-write", "rmw", 0});
     writes.push_back({w + 1, "A-write", "simt", 0});
-    writes.push_back({w + 2, "A-write", "simt", 0});
+    writes.push_back({w + t + 2, "A-write", "simt", 0});
     require(i2_grants(*machine, "A-write") == writes, "A-write grants:" + describe(i2_grants(*machine, "A-write")));
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_reg(0, lane, 7) == 0x100 + 32 + lane, "OLD did not read the words before the sts");
@@ -7449,8 +7705,10 @@ void test_i2_same_warp_order_with_reordered_reads() {
             "sts data");
     }
 
-    // Tight RAW: the sts's one round is granted at c4 and reaches the RAM at
-    // c6; the lds, admitted at c4, is granted at c5 and samples at c7.
+    // Tight RAW: the sts (issued at s = 2 alu_distance + 1: it needs the mov's
+    // r5) has its one round granted at s + t + 1 and reaching the RAM D
+    // later; the lds, admitted at that grant, is granted t + 1 later and
+    // samples D after that.
     auto raw = i2_machine(profile, R"(
         sread r0, LANE_ID
         shli r0, r0, 2
@@ -7460,14 +7718,17 @@ void test_i2_same_warp_order_with_reordered_reads() {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )");
     raw->run();
-    require(i2_grants(*raw) == std::vector<I2Grant>{{4, "A-write", "simt", 0}, {5, "A-read", "simt", 0}},
-        "the lds was not granted the cycle after the sts's last grant:" + describe(i2_grants(*raw)));
+    const uint64_t raw_store = 2 * alu_distance(profile) + 1 + t + 1;
+    require(i2_grants(*raw) == std::vector<I2Grant>{{raw_store, "A-write", "simt", 0},
+                                   {raw_store + t + 1, "A-read", "simt", 0}},
+        "the lds was not granted t + 1 after the sts's last grant:" + describe(i2_grants(*raw)));
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(raw->read_reg(0, lane, 6) == 0x777, "RAW: the lds did not see the sts (write path deeper than read?)");
     }
 
     // WAW: lanes l and l + 8 share a bank (two rounds). The second sts waits
-    // for the first's last round and its rounds follow at once.
+    // for the first's last round, issues there and its rounds follow t + 1
+    // later.
     auto waw = i2_machine(profile, R"(
         sread r0, LANE_ID
         andi r1, r0, 7
@@ -7483,7 +7744,7 @@ void test_i2_same_warp_order_with_reordered_reads() {
     )");
     waw->run();
     const auto stores = i2_grants(*waw, "A-write");
-    require(stores.size() == 4 && stores[1].cycle == stores[0].cycle + 1 && stores[2].cycle == stores[1].cycle + 1 &&
+    require(stores.size() == 4 && stores[1].cycle == stores[0].cycle + 1 && stores[2].cycle == stores[1].cycle + t + 1 &&
             stores[3].cycle == stores[2].cycle + 1,
         "the second sts did not follow the first's last round:" + describe(stores));
     require(refusals(*waw, 0, "ordered behind own access").size() == 1, "the second sts was not ordered once");
@@ -7531,7 +7792,9 @@ void test_i2_divergence() {
         }
         require(!slot_taken, "an access with no active lane took a slot");
         require(shmem_request_rounds(*machine).empty() && i2_grants(*machine).empty(), "an absent access was served");
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6}, "the halt waited on a depbar nothing set");
+        const auto lds_issue = issued_at(*machine, 5 * 8);
+        require(lds_issue.size() == 1 && issued_at(*machine, 6 * 8) == std::vector<uint64_t>{lds_issue[0] + 1},
+            "the halt waited on a depbar nothing set");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_shmem_u32(64 * lane) == 0x100 + 16 * lane && machine->read_reg(0, lane, 3) == 0x77,
                 "an absent access changed memory or its destination");
@@ -7556,7 +7819,10 @@ void test_i2_divergence() {
 // store two rounds; with one slot the second warp's sts waits for the slot
 // (refused "store slots full") until the first's last round is granted,
 // then takes the slot in that cycle; with two it waits in its own slot. The
-// rounds are back to back and the memory is the same either way.
+// memory is the same either way. With two slots the rounds are back to back;
+// with one, since I6a, the second sts issues as the first's last round frees
+// the slot and reaches it at dispatch, so its first round is
+// issue_to_dispatch + 1 after that.
 void test_i2_store_slots_one_and_two() {
     const std::string program = R"(
         sread r29, WARP_ID
@@ -7581,7 +7847,9 @@ void test_i2_store_slots_one_and_two() {
         const auto stores = i2_grants(*machine, "A-write");
         require(stores.size() == 4, "four store rounds");
         for (std::size_t round = 1; round < 4; ++round) {
-            require(stores[round].cycle == stores[round - 1].cycle + 1, "the stores' rounds were not back to back");
+            const auto gap = slots == 1 && round == 2 ? 1 + nanosm::issue_to_dispatch(profile) : 1;
+            require(stores[round].cycle == stores[round - 1].cycle + gap,
+                std::to_string(slots) + " store slots: the stores' rounds were not where expected:" + describe(stores));
         }
         const auto waits = machine->trace().summary().shmem_store_slot_waits;
         require(slots == 1 ? waits != 0 : waits == 0, std::to_string(slots) + " store slots: store_slot_full=" +
@@ -7600,13 +7868,16 @@ void test_i2_store_slots_one_and_two() {
 
 // One store slot, reused while the previous store is still in the A-write
 // pipeline (rfc12 section 3), and done() when the last instruction is a
-// store. sts X (c3) is granted at c4, which frees the slot; sts Y takes it at
-// c4 and is granted at c5. X reaches the RAM at c4 + D, Y at c5 + D; the
-// halt issues at c5, and the machine is done only after Y's write edge.
+// store. sts X (issued at x) reaches the slot at its dispatch (x +
+// issue_to_dispatch, I6a) and is granted the next cycle, gx, which frees the
+// slot; sts Y issues then and is granted gy = gx + issue_to_dispatch + 1.
+// X reaches the RAM at gx + D, Y at gy + D; the halt issues at gx + 1, and
+// the machine is done only after Y's write edge.
 void test_i2_store_slot_reuse_and_done() {
     auto profile = canonical_profile();
     profile.shmem_store_slots = 1;
     const auto d = profile.shmem_port_a_depth;
+    const auto dispatch = nanosm::issue_to_dispatch(profile);
     auto machine = i2_machine(profile, R"(
         sread r0, LANE_ID
         shli r0, r0, 2
@@ -7622,14 +7893,19 @@ void test_i2_store_slot_reuse_and_done() {
         after[cycle] = {machine->store_slot_held(0), machine->read_shmem_u32(512) == 0xa1,
             machine->read_shmem_u32(576) == 0xa1, machine->done()};
     }
-    require(i2_grants(*machine, "A-write") == std::vector<I2Grant>{{4, "A-write", "simt", 0}, {5, "A-write", "simt", 0}},
-        "the two stores were not granted at c4 and c5:" + describe(i2_grants(*machine)));
-    require(std::get<0>(after.at(3)) && std::get<0>(after.at(4)) && !std::get<0>(after.at(5)),
-        "the slot was not taken again in the cycle X's last round freed it");
-    require(!std::get<1>(after.at(4 + d - 1)) && std::get<1>(after.at(4 + d)), "X did not reach the RAM at c4 + D");
-    require(!std::get<2>(after.at(5 + d - 1)) && std::get<2>(after.at(5 + d)), "Y did not reach the RAM at c5 + D");
-    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5}, "halt");
-    require(!std::get<3>(after.at(5 + d - 1)) && std::get<3>(after.at(5 + d)),
+    const auto x = issued_at(*machine, 3 * 8).at(0);
+    const auto gx = x + dispatch + 1;
+    const auto gy = gx + dispatch + 1;
+    require(i2_grants(*machine, "A-write") == std::vector<I2Grant>{{gx, "A-write", "simt", 0}, {gy, "A-write", "simt", 0}},
+        "the two stores were not granted at gx and gy:" + (describe(i2_grants(*machine)) + " | issues" + issue_log(*machine)));
+    require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{gx}, "Y did not issue as X's last round freed the slot");
+    require(std::get<0>(after.at(gx - 1)) && !std::get<0>(after.at(gx)) && std::get<0>(after.at(gy - 1)) &&
+            !std::get<0>(after.at(gy)),
+        "the slot was not held from each store's dispatch to its last round");
+    require(!std::get<1>(after.at(gx + d - 1)) && std::get<1>(after.at(gx + d)), "X did not reach the RAM at gx + D");
+    require(!std::get<2>(after.at(gy + d - 1)) && std::get<2>(after.at(gy + d)), "Y did not reach the RAM at gy + D");
+    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{gx + 1}, "halt");
+    require(!std::get<3>(after.at(gy + d - 1)) && std::get<3>(after.at(gy + d)),
         "done() did not cover the store travelling to its write edge");
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(576 + 4 * lane) == 0xa1, "Y's data");
 }
@@ -7673,6 +7949,11 @@ void test_i2_a_read_and_a_write_same_cycle() {
 //   pointer at 0 (nothing granted yet): slot 0, slot 1, then the TMA;
 //   pointer past slot 1 (two earlier lds.uni, granted before the hold): the
 //   TMA, then slot 0, slot 1.
+// I6a: a request becomes ready for A-read at its dispatch + 1, issue +
+// issue_to_dispatch + 1, and warp 1's blocking store starts later (its
+// sources' fixed distances, then its dispatch). The stall (was 6 / 5)
+// re-places warp 0's three requests: the tma.async issues at c31 in both
+// runs (b = c32: ready from b + 3, inside the hold that starts at b + 1).
 void test_i2_round_robin_tma_reads_and_loads() {
     const auto& profile = canonical_profile();
     require(i2_return(profile) == 4, "the timeline is derived for D = Lb = 2");
@@ -7690,8 +7971,8 @@ void test_i2_round_robin_tma_reads_and_loads() {
         const std::string priming = primed ? "lds.uni r5, [r1 + 8] {pred=PT, stall=0, set=sb3, wait=-}\n"
                                              "lds.uni r6, [r1 + 12] {pred=PT, stall=0, set=sb4, wait=-}\n"
                                            : "";
-        const std::string stall = primed ? "5" : "6";
-        nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, i3_with_blocker(priming +
+        const std::string stall = primed ? "15" : "18";
+        nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, i3_with_blocker(priming +
             "mov r31, 0 {pred=PT, stall=" + stall + ", set=-, wait=-}\n" + R"(
             tma.async [5120], r8
             lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
@@ -7701,12 +7982,14 @@ void test_i2_round_robin_tma_reads_and_loads() {
         const auto blocker = i3_hold_a_read(machine);
         machine.run();
         const uint64_t r = blocker + 16; // the RMW's read
-        // warp 0's tma.async and two lds.uni (the last three before halt) issued while A-read was held
+        // warp 0's tma.async and two lds.uni (the last three before halt)
+        // became ready (dispatch + 1) while A-read was held
         const uint32_t tma_pc = (primed ? 6 : 4) * 8;
+        const auto ready = [&](uint32_t pc) { return issued_at(machine, pc).front() + nanosm::issue_to_dispatch(profile) + 1; };
         for (const uint32_t pc : {tma_pc, tma_pc + 8, tma_pc + 16}) {
-            require(issued_at(machine, pc).size() == 1 && issued_at(machine, pc).front() + 1 < r &&
-                    issued_at(machine, pc).front() > blocker,
-                "a request did not become ready inside the hold (blocker c" + std::to_string(blocker) + ")");
+            require(issued_at(machine, pc).size() == 1 && ready(pc) < r && ready(pc) > blocker,
+                "a request did not become ready inside the hold (blocker c" + std::to_string(blocker) + "):" +
+                    describe(i2_grants(machine)) + " | issues" + issue_log(machine));
         }
         auto reads = i2_grants(machine, "A-read");
         reads.resize(std::min<std::size_t>(reads.size(), primed ? 6 : 4));
@@ -7831,13 +8114,22 @@ void test_i3_store_pause_two_warps() {
         for (uint64_t round = 0; round < 16; ++round) cycles.push_back(first + round);
         return cycles;
     };
-    require(start == 9 && mbar_rmw_services(*machine).front().first == start,
-        "the RMW did not start in the cycle the event was held (c9)");
-    require(store0 == rounds(7) && read == 23 && write == read + i2_return(profile) + c,
-        "the RMW's read was not granted the cycle after the store's last round (c22), or its write D + Lb + C "
+    // Relative to warp 0's first store round g (I6a moved the program, not
+    // the scenario): the event is held from g + 2 and starts the RMW there;
+    // the RMW reads the cycle after the store's last round (g + 16). Warp 0's
+    // lds is ordered behind its sts until that last round, issues then and
+    // reaches its slot at dispatch: its rounds start issue_to_dispatch + 1
+    // after the store's last round, i.e. read + issue_to_dispatch.
+    require(store0.size() == 16, "warp 0's sts:" + describe(grants));
+    const auto g = store0.front();
+    require(start == g + 2 && mbar_rmw_services(*machine).front().first == start,
+        "the RMW did not start in the cycle the event was held (g + 2)");
+    require(store0 == rounds(g) && read == g + 16 && write == read + i2_return(profile) + c,
+        "the RMW's read was not granted the cycle after the store's last round, or its write D + Lb + C "
         "later:" + describe(grants));
-    require(load0 == rounds(read + 1), "reads did not continue during the RMW: warp 0's lds was not granted from "
-        "the cycle after the RMW's read:" + describe(grants));
+    require(load0 == rounds(read + nanosm::issue_to_dispatch(profile)),
+        "reads did not continue during the RMW: warp 0's lds (ordered behind its sts, then dispatched) was not "
+        "granted from read + issue_to_dispatch:" + describe(grants));
     require(store1 == rounds(write + 1), "warp 1's paused sts was not granted from the cycle after the RMW's "
         "write grant:" + describe(grants));
     require(machine->trace().summary().shmem_store_paused == write - start,
@@ -7893,11 +8185,17 @@ void test_i2_profile_fields() {
         const auto written = i1_run(*machine, {3});
         return written.at(3).front();
     };
+    // I6a: the lds.uni at c0 reaches its slot at dispatch, its round is
+    // granted the cycle after, its word comes back D + Lb later, the gather
+    // register is complete one cycle later (its RF grant), and the write lands
+    // Wd after that.
     auto slow = canonical_profile();
     slow.shmem_read_latency_cycles = 7;
-    require(result_cycle(canonical_profile()) == 1 + i2_return(canonical_profile()) + 1 &&
+    const auto& canonical_run = canonical_profile();
+    require(result_cycle(canonical_run) == nanosm::issue_to_dispatch(canonical_run) + 1 + i2_return(canonical_run) +
+                1 + canonical_run.rf_write_depth_cycles &&
             result_cycle(slow) == result_cycle(canonical_profile()) + 5,
-        "an lds result did not arrive grant + D + Lb + 1 (the gather register) after its issue");
+        "an lds result did not arrive dispatch + 1 + D + Lb + 1 (the gather register) + Wd after its issue");
 }
 
 // READ_FIRST (rfc12 section 1): a read and a write of one word reaching the
@@ -7996,7 +8294,8 @@ void test_i2_read_first_across_services() {
         }
 #if NANOSM_SANITIZER
         {
-            // The MMA's accept: its issue (pc = 8 * (10 + pad)), or the PANIC it raised there.
+            // The MMA's accept: its dispatch (I6a: its issue, pc = 8 * (10 + pad), +
+            // issue_to_dispatch), or the PANIC it raised there.
             std::vector<I2Grant> stores;
             for (const auto& grant : i2_grants(mma, "A-write")) {
                 if (grant.client == "simt") stores.push_back(grant);
@@ -8004,7 +8303,7 @@ void test_i2_read_first_across_services() {
             const auto what = "pad " + std::to_string(pad) + ":" + describe(stores);
             const uint64_t accept = panic.has_value()
                 ? std::stoull(panic->substr(panic->find("cycle=") + 6))
-                : issued_at(mma, 8 * (10 + pad)).at(0);
+                : issued_at(mma, 8 * (10 + pad)).at(0) + nanosm::issue_to_dispatch(dense);
             const bool in_flight = stores.size() < 16 || stores.back().cycle + depth > accept;
             require(panic.has_value() == in_flight, what + ": accepted at c" + std::to_string(accept) +
                 (panic.has_value() ? " with every store round at the RAM, yet: " + *panic
@@ -8067,7 +8366,7 @@ std::unique_ptr<nanosm::Machine> i21_machine(const nanosm::DeviceProfile& profil
     auto& shmem = image_bytes(launch.shmem_image, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     for (const auto& [address, state] : mbars) write_u64(shmem, address, nanosm::encode_mbar_state(state));
-    return std::make_unique<nanosm::Machine>(profile, nanosm::assemble_asm(i1_asm(profile, program), profile),
+    return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program), profile),
         std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
 }
 
@@ -8120,11 +8419,14 @@ void i21_check_optional_field(const char* section, const char* field, uint32_t c
 
 // F1 (rfc12 section 2: every latency is a nonzero number of register
 // stages): the RMW engine's update crosses shmem.rmw_compute_cycles (C) ALU
-// stages. A SIMT mbar.arrive issued at c1 has its read granted at c2; its
-// words reach the port output at c2 + D + Lb; the update is in the ALU's last
-// stage C cycles later and its write is granted then; the write reaches the
-// RAM -- the phase flips at that clock edge -- D cycles after that. The
-// engine is busy (its trace slice) D + Lb + C + 1 cycles.
+// stages. A SIMT mbar.arrive issued at i reaches the SIMT RMW register at its
+// dispatch (I6a: i + issue_to_dispatch) and has its read granted the cycle
+// after, r; its words reach the port output at r + D + Lb; the update is in
+// the ALU's last stage C cycles later and its write is granted then; the
+// write reaches the RAM -- the phase flips at that clock edge -- D cycles
+// after that. The engine is busy (its trace slice) D + Lb + C + 1 cycles.
+// (Before I6a the arrive issued at c1 and was read at c2; now it waits for
+// the mov's r4 -- src/rf.hpp -- and for its dispatch.)
 void test_i21_rmw_compute_stage() {
     i21_check_optional_field("shmem", "rmw_compute_cycles", 2, &nanosm::DeviceProfile::shmem_rmw_compute_cycles);
     for (const uint32_t c : {1u, 2u, 3u}) {
@@ -8145,9 +8447,13 @@ void test_i21_rmw_compute_stage() {
         }
         const auto what = "C = " + std::to_string(c) + ": ";
         const auto grants = i2_grants(*machine);
-        require(grants == std::vector<I2Grant>{{2, "A-read", "rmw", 0}, {2 + d + lb + c, "A-write", "rmw", 0}},
-            what + "the write was not granted D + Lb + C after the read:" + describe(grants));
-        require(flipped == 2 + d + lb + c + d, what + "the update did not reach the RAM D cycles after its write grant");
+        const auto arrive = issued_at(*machine, 8);
+        require(arrive.size() == 1, what + "the arrive did not issue once");
+        const auto r = arrive[0] + nanosm::issue_to_dispatch(profile) + 1;
+        require(grants == std::vector<I2Grant>{{r, "A-read", "rmw", 0}, {r + d + lb + c, "A-write", "rmw", 0}},
+            what + "the read was not granted the cycle after the arrive's dispatch, or the write D + Lb + C after "
+            "it:" + describe(grants));
+        require(flipped == r + d + lb + c + d, what + "the update did not reach the RAM D cycles after its write grant");
         require(mbar_rmw_services(*machine).size() == 1 && rmw_busy_cycles(profile) == d + lb + c + 1,
             what + "one RMW");
         for (const auto& event : machine->trace().events()) {
@@ -8172,6 +8478,12 @@ void test_i21_rmw_compute_stage() {
 // register free); at c4 it and the MMA's event are both held and the
 // engine's class rule -- the class that did not start last; at the first
 // tie, SIMT -- starts the arrive. Same cycles as in I2.1.
+// I6a: the same scenario, moved: the commit issues at m (it needs the
+// first mov's r4: alu_distance), reaches the MMA queue at its dispatch
+// m + issue_to_dispatch and presents at P = m + issue_to_dispatch + 1. The
+// arrive issues at m + 1 and reaches the SIMT RMW register at its own
+// dispatch, P: the cycle the commit is presented, as before. Both are held
+// at P + 1 and the arrive is served first.
 void test_i21_simt_rmw_admission_registered_state() {
     const auto& profile = canonical_profile();
     auto machine = i21_machine(profile, R"(
@@ -8181,15 +8493,19 @@ void test_i21_simt_rmw_admission_registered_state() {
         mbar.arrive [r5]
         halt
     )", {{4160, i21_mbar(1, 1)}, {4168, i21_mbar(2, 2)}});
-    i2_run_until(*machine, 4);
-    require(machine->mma_mbar_event_held(), "the commit was not presented at c3 (held from c4)");
+    const auto m = alu_distance(profile);
+    const auto p = m + nanosm::issue_to_dispatch(profile) + 1;
+    i2_run_until(*machine, p + 1);
+    require(machine->mma_mbar_event_held(), "the commit was not presented at P (held from P + 1)");
     machine->run();
-    require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{3},
-        "the arrive was not accepted in the cycle the commit was presented");
+    require(issued_at(*machine, 2 * 8) == std::vector<uint64_t>{m} &&
+            issued_at(*machine, 3 * 8) == std::vector<uint64_t>{m + 1},
+        "the commit did not issue at m or the arrive at m + 1 (dispatched in the cycle the commit was presented)");
     const auto busy = rmw_busy_cycles(profile);
     const auto services = mbar_rmw_services(*machine);
-    require(services == std::vector<RmwService>{{4, "arrive, address=4168"}, {4 + busy, "arrive (mma.commit), address=4160"}},
-        "the SIMT arrive was not served at c4 and the commit after it");
+    require(services == std::vector<RmwService>{{p + 1, "arrive, address=4168"},
+                            {p + 1 + busy, "arrive (mma.commit), address=4160"}},
+        "the SIMT arrive was not served at P + 1 and the commit after it");
     require(machine->read_mbar_state(4160).phase && machine->read_mbar_state(4168).remaining == 1,
         "an arrive was lost");
 }
@@ -8203,6 +8519,14 @@ void test_i21_simt_rmw_admission_registered_state() {
 // c37 and written D + Lb + C later. The same at canonical and at two
 // noncanonical depths (D = 3, Lb = 1, C = 1; D = 1, Lb = 3, C = 3): the
 // grants, the refusals and the RAW data do not move.
+// I6a re-derivation, relative to the sts's issue s (it needs r5, written by
+// the mov at s - alu_distance) and t = issue_to_dispatch: each access
+// reaches its slot or register t after its issue and is served from the
+// next cycle, so the sts's rounds are s + t + 1 .. s + t + 16; the lds,
+// ordered behind it from s + 1 (refused t + 15 cycles), is admitted at its
+// last grant and granted from s + 2t + 17; the arrive, ordered behind the
+// lds (again t + 15 cycles), is admitted at the lds's last grant (s + 2t +
+// 32) and read at s + 3t + 33.
 void test_i21_simt_rmw_behind_own_lds_and_sts() {
     for (const auto& [d, lb, c] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t>>{{2, 2, 2}, {3, 1, 1}, {1, 3, 3}}) {
         auto profile = canonical_profile();
@@ -8234,14 +8558,21 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
             }
             return true;
         };
-        require(consecutive(store_rounds, 5) && consecutive(load_rounds, 21),
-            what + "sts rounds not c5..c20 or lds rounds not c21..c36:" + describe(i2_grants(*machine)));
-        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{20} && issued_at(*machine, 6 * 8) == std::vector<uint64_t>{36},
+        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto s = 2 + 2 * alu_distance(profile); // sread, shli; mov r4, mov r5; the sts
+        const auto issues = " | issues" + issue_log(*machine);
+        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s}, what + "the sts did not issue at s:" + issues);
+        require(consecutive(store_rounds, s + t + 1) && consecutive(load_rounds, s + 2 * t + 17),
+            what + "sts rounds not from s + t + 1 or lds rounds not from s + 2t + 17:" + describe(i2_grants(*machine)) +
+                issues);
+        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + t + 16} &&
+                issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s + 2 * t + 32},
             what + "the lds was not admitted at the sts's last grant, or the arrive at the lds's");
         const auto ordered = refusals(*machine, 0, "ordered behind own access");
-        require(ordered == std::vector<std::pair<uint64_t, uint64_t>>{{5, 15}, {21, 15}},
+        require(ordered == std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, t + 15}, {s + t + 17, t + 15}},
             what + "ordered refusals:" + describe(ordered));
-        require(rmw_read == 37 && rmw_write == 37 + d + lb + c, what + "the RMW was not read at c37 and written D + Lb + C later");
+        require(rmw_read == s + 3 * t + 33 && rmw_write == rmw_read + d + lb + c,
+            what + "the RMW was not read at s + 3t + 33 and written D + Lb + C later");
         for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_reg(0, lane, 6) == 0x5a, what + "RAW: the lds missed the sts");
         require(machine->read_mbar_state(4160).remaining == 1, what + "the arrive was lost");
     }
@@ -8253,6 +8584,11 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
 // read: ordered behind the sts (refused c7..c21), admitted at its last grant
 // (c22), its probe granted c23, sampling D cycles later, after the last
 // round reached the RAM (c22 + D): the predicate says "phase complete".
+// I6a re-derivation, relative to the sts's issue s (it needs r6, written by
+// the mov at s - alu_distance, after sread -> xori -> shli) and t =
+// issue_to_dispatch: rounds s + t + 1 .. s + t + 16; the test_wait refused
+// from s + 1 (t + 15 cycles), admitted at the last grant s + t + 16 and
+// granted its probe at s + 2t + 17, after its dispatch.
 void test_i21_probe_behind_own_sts() {
     auto flipped = i21_mbar(1, 1);
     flipped.phase = true;
@@ -8276,11 +8612,18 @@ void test_i21_probe_behind_own_sts() {
         done: halt {pred=PT, stall=0, set=-, wait=sb0}
         )", {{6144, i21_mbar(1, 1)}});
         machine->run();
-        require(issued_at(*machine, 7 * 8) == std::vector<uint64_t>{22}, what + "the probe was not admitted at the sts's last grant");
-        require(refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{7, 15}},
-            what + "the probe was not ordered behind the sts (c7..c21)");
+        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto s = 3 * alu_distance(profile) + 1; // sread, xori, shli; mov r6; the sts
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s},
+            what + "the sts did not issue at s:" + issue_log(*machine));
+        require(issued_at(*machine, 7 * 8) == std::vector<uint64_t>{s + t + 16},
+            what + "the probe was not admitted at the sts's last grant");
+        require(refusals(*machine, 0, "ordered behind own access") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, t + 15}},
+            what + "the probe was not ordered behind the sts (s + 1 .. s + t + 15)");
         const auto reads = i2_grants(*machine, "A-read");
-        require(reads == std::vector<I2Grant>{{23, "A-read", "probe", 0}}, what + "probe grant:" + describe(reads));
+        require(reads == std::vector<I2Grant>{{s + 2 * t + 17, "A-read", "probe", 0}},
+            what + "probe grant:" + describe(reads));
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_reg(0, lane, 9) == 1, what + "the probe did not see its own sts's last round");
         }
@@ -8290,7 +8633,9 @@ void test_i21_probe_behind_own_sts() {
 // F3 / rfc12 section 9: a wake that arrives while a try_wait's probe is in
 // flight ends the wait; the probe, when it returns, is stale and does
 // nothing. Warp 0's try_wait installs its wait slot and its probe is granted
-// the next cycle. I3 re-derivation: in I2 the host's event, placed then,
+// the next cycle (I6a: both at its dispatch, issue_to_dispatch after its
+// issue, so the probe's grant is issue + issue_to_dispatch + 1, and warp 1's
+// try_wait takes its slot at ITS dispatch). I3 re-derivation: in I2 the host's event, placed then,
 // held A until its write, so the probe was granted right after the write.
 // Reads are not paused any more, so the event is placed D + Lb + C cycles
 // EARLIER: the RMW's write is granted in the probe's grant cycle w. The
@@ -8305,6 +8650,7 @@ void test_i21_stale_probe_after_wake() {
     const uint64_t d = profile.shmem_port_a_depth;
     const uint64_t lb = profile.shmem_read_latency_cycles;
     const uint64_t c = profile.shmem_rmw_compute_cycles;
+    const uint64_t t = nanosm::issue_to_dispatch(profile);
     const auto program = [](uint32_t warp1_stall) {
         return R"(
             sread r29, WARP_ID
@@ -8345,11 +8691,12 @@ void test_i21_stale_probe_after_wake() {
     };
     const auto run = [&](uint32_t warps, uint32_t warp1_stall) {
         const auto t0 = try_wait_issue(warps, warp1_stall);
-        require(t0 + 1 >= d + lb + c, "warp 0's try_wait issues too early to place the event before it");
+        require(t0 + t + 1 >= d + lb + c, "warp 0's try_wait issues too early to place the event before it");
         auto machine = i21_machine(profile, program(warp1_stall), mbars, warps);
-        // The probe is granted at t0 + 1; the RMW, read in its start cycle,
-        // has its write granted D + Lb + C later: start it at t0 + 1 - (D + Lb + C).
-        i2_run_until(*machine, t0 + 1 - (d + lb + c));
+        // The probe is granted at t0 + t + 1; the RMW, read in its start
+        // cycle, has its write granted D + Lb + C later: start it at
+        // t0 + t + 1 - (D + Lb + C).
+        i2_run_until(*machine, t0 + t + 1 - (d + lb + c));
         host_rmw_event(*machine);
         machine->run();
         Seen seen;
@@ -8368,7 +8715,7 @@ void test_i21_stale_probe_after_wake() {
     };
     // One warp: the slot is gone when the probe returns.
     const auto alone = run(1, 0);
-    const auto w = alone.warp0_issue + 1; // the probe's grant and the RMW's write grant
+    const auto w = alone.warp0_issue + t + 1; // the probe's grant and the RMW's write grant
     require(alone.reads.size() >= 2 && alone.reads[0] == I2Grant{w - (d + lb + c), "A-read", "rmw", 0} &&
             alone.reads[1] == I2Grant{w, "A-read", "probe", 0} &&
             alone.writes == std::vector<I2Grant>{{w, "A-write", "rmw", 0}},
@@ -8378,18 +8725,19 @@ void test_i21_stale_probe_after_wake() {
     require(alone.r9 == 1, "the woken try_wait did not return true");
     // Two warps (warp 1's stall count swept): warp 1's try_wait takes slot 0
     // between the wake (w + D) and the stale probe's return (w + D + Lb), with
-    // w the probe's grant (the cycle after warp 0's try_wait) and the RMW's
-    // write grant.
+    // w the probe's grant (the cycle after warp 0's try_wait's dispatch) and
+    // the RMW's write grant.
     uint32_t recycled = 0;
     std::string schedules;
     for (uint32_t stall = 0; stall < 32; ++stall) {
         const auto seen = run(2, stall);
-        const auto grant = seen.warp0_issue + 1;
+        const auto grant = seen.warp0_issue + t + 1;
         const auto wake = grant + d;
         const auto probe_return = grant + d + lb;
         schedules += " stall " + std::to_string(stall) + ": warp 0 c" + std::to_string(seen.warp0_issue) +
             ", warp 1 c" + std::to_string(seen.warp1_issue) + ";";
-        if (seen.warp1_issue < wake || seen.warp1_issue >= probe_return) continue;
+        const auto warp1_slot = seen.warp1_issue + t; // its dispatch takes the lowest free slot
+        if (warp1_slot < wake || warp1_slot >= probe_return) continue;
         ++recycled;
         const auto what = "warp 1 try_wait at c" + std::to_string(seen.warp1_issue) + ": ";
         require(seen.r9 == 1, what + "warp 0's woken try_wait did not return true");
@@ -8408,6 +8756,9 @@ void test_i21_stale_probe_after_wake() {
 // waits for its read; the read is granted at c19 and the write D + Lb + C
 // later -- the same grants as in I2, where the event was claimed only at its
 // read grant. Also at a noncanonical depth.
+// I6a: the same scenario relative to the lds's first grant g (its issue,
+// after sread -> shli, at 2 alu_distance, plus issue_to_dispatch + 1): the
+// event is held from g + 2, the RMW reads at g + 16.
 void test_i21_rmw_read_behind_a_read_transaction() {
     for (const auto& [d, lb, c] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t>>{{2, 2, 2}, {3, 1, 1}}) {
         auto profile = canonical_profile();
@@ -8421,16 +8772,17 @@ void test_i21_rmw_read_behind_a_read_transaction() {
             lds r6, [r0 + 12] {pred=PT, stall=0, set=sb0, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
-        i2_run_until(*machine, 5);
+        const auto g = 2 * alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1;
+        i2_run_until(*machine, g + 2);
         host_rmw_event(*machine);
         machine->run();
         std::vector<I2Grant> expected;
-        for (uint64_t round = 0; round < 16; ++round) expected.push_back({3 + round, "A-read", "simt", 0});
-        expected.push_back({19, "A-read", "rmw", 0});
-        expected.push_back({19 + d + lb + c, "A-write", "rmw", 0});
+        for (uint64_t round = 0; round < 16; ++round) expected.push_back({g + round, "A-read", "simt", 0});
+        expected.push_back({g + 16, "A-read", "rmw", 0});
+        expected.push_back({g + 16 + d + lb + c, "A-write", "rmw", 0});
         const auto grants = i2_grants(*machine);
         require(grants == expected, what + "the RMW's read preempted the lds or waited too long:" + describe(grants));
-        require(mbar_rmw_services(*machine).front().first == 5, what + "the RMW did not start at c5");
+        require(mbar_rmw_services(*machine).front().first == g + 2, what + "the RMW did not start at g + 2");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_reg(0, lane, 6) == 0x100 + 16 * lane + 3, what + "lds data");
         }
@@ -8530,6 +8882,8 @@ void test_i21_tma_store_sector_registers() {
 // An mma.async.init on the accumulator accepted after the last tmem read but
 // before that RF write is legal (no PANIC; the acc.ld still returns the old
 // values); one accepted before the last tmem read is a tmem race (PANIC).
+// I6a: the MMA accepts the command (and the sanitizer judges it) at its
+// dispatch, issue_to_dispatch after its issue.
 void test_i21_acc_ld_read_ownership() {
     auto profile = canonical_profile();
     profile.timing.fadd = 16;
@@ -8554,7 +8908,11 @@ void test_i21_acc_ld_read_ownership() {
             setp.eq p5, r0, 0
             acc.ld.v8 r16, C, r8 {pred=PT, stall=0, set=sb0, wait=-}
         )";
-        for (uint32_t i = 0; i < gap; ++i) body += "setp.eq p" + std::to_string(5 + i % 2) + ", r0, 0\n";
+        // One filler per cycle: they rotate over six predicates (I6a: a setp
+        // waits until the previous write of its predicate is in the file,
+        // issue_to_predicate_visible after it, so two alternating predicates
+        // would issue in pairs five cycles apart).
+        for (uint32_t i = 0; i < gap; ++i) body += "setp.eq p" + std::to_string(1 + i % 6) + ", r0, 0\n";
         body += R"(
             mma.async.init C, [r1], [r2] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
@@ -8566,7 +8924,7 @@ void test_i21_acc_ld_read_ownership() {
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 4096);
         for (uint32_t i = 0; i < 1024; ++i) write_u16(shmem, 2 * i, 0x3c00); // A and B: 1.0
-        return std::make_unique<nanosm::Machine>(profile, nanosm::assemble_asm(i1_asm(profile, program(gap)), profile),
+        return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program(gap)), profile),
             std::move(launch), nanosm::TraceOptions{.timeline = true});
     };
     constexpr uint32_t acc_ld_pc = 19 * 8;
@@ -8584,15 +8942,19 @@ void test_i21_acc_ld_read_ownership() {
     const auto acc_ld_issue = issued_at(*reference, acc_ld_pc).front();
     uint32_t legal_between = 0;
     uint32_t races = 0;
-    for (uint32_t gap = 0; acc_ld_issue + 1 + gap < final_write; ++gap) {
+    const auto dispatch = nanosm::issue_to_dispatch(profile);
+    for (uint32_t gap = 0; acc_ld_issue + 1 + gap + dispatch < final_write; ++gap) {
         auto machine = machine_for(gap);
         const auto mma_issue = acc_ld_issue + 1 + gap;
-        const auto where = "mma.async.init at c" + std::to_string(mma_issue) + " (last tmem read c" +
-            std::to_string(final_read) + ", last RF write c" + std::to_string(final_write) + "): ";
-        if (mma_issue < final_read) {
+        const auto mma_accept = mma_issue + dispatch;
+        const auto where = "mma.async.init issued c" + std::to_string(mma_issue) + ", accepted c" +
+            std::to_string(mma_accept) + " (last tmem read c" + std::to_string(final_read) + ", last RF write c" +
+            std::to_string(final_write) + "): ";
+        if (mma_accept < final_read) {
             try {
                 machine->run(5000);
-                throw std::runtime_error(where + "accepted while the acc.ld still reads its region");
+                throw std::runtime_error(where + "accepted while the acc.ld still reads its region; issues" +
+                    issue_log(*machine));
             } catch (const nanosm::SimError& error) {
                 require_mentions(error.what(), {"tmem race: mma.async", "acc.ld #0", "until its final tmem read"}, where);
             }
@@ -8676,6 +9038,11 @@ std::vector<uint64_t> i3_store_starts(const nanosm::Machine& machine) {
 // RMW's final write GRANT, not after its commit -- and still reaches the RAM
 // after the RMW's write: the mbar lands at the edge of w + D, Y's first round
 // at w + 1 + D. No store round between the RMW's read and its write.
+// I6a: the same sequence relative to X's first grant g (X issues at s =
+// 2 alu_distance + 1 -- it needs the mov's r5 -- and reaches its slot
+// issue_to_dispatch later, t): X g .. g + 15, the event held from g + 4,
+// the RMW read at g + 16; Y admitted at g + 15 waits in its slot from
+// g + 16 + t to w (store_paused w - (g + 15 + t)).
 void test_i3_store_pause_sequence() {
     for (const uint32_t d : {2u, 3u}) {
         auto profile = canonical_profile();
@@ -8691,7 +9058,9 @@ void test_i3_store_pause_sequence() {
             sts [r0 + 12], r5 {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
-        i2_run_until(*machine, 8);
+        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto g = 2 * alu_distance(profile) + 1 + t + 1;
+        i2_run_until(*machine, g + 4);
         host_rmw_event(*machine);
         std::optional<uint64_t> mbar_landed; // the cycle at whose clock edge the RMW's write landed
         std::optional<uint64_t> y_landed;    // ... Y's round 0 (lane 0's word)
@@ -8701,25 +9070,25 @@ void test_i3_store_pause_sequence() {
             if (!mbar_landed && machine->read_mbar_state(i2_event_mbar).phase) mbar_landed = cycle;
             if (!y_landed && machine->read_shmem_u32(12) == 0x5a) y_landed = cycle;
         }
-        const uint64_t w = 20 + d + lb + c;
+        const uint64_t w = g + 16 + d + lb + c;
         const auto rmws = i3_rmws(*machine);
-        require(rmws.size() == 1 && rmws[0].start == 8 && rmws[0].read == 20 && rmws[0].write == w,
-            what + "the RMW did not start at c8, read at c20 (X's last round + 1), write at c20 + D + Lb + C:" +
-                describe(rmws));
+        require(rmws.size() == 1 && rmws[0].start == g + 4 && rmws[0].read == g + 16 && rmws[0].write == w,
+            what + "the RMW did not start at g + 4, read at g + 16 (X's last round + 1), write at g + 16 + D + Lb + C:" +
+                describe(rmws) + " | issues" + issue_log(*machine));
         std::vector<uint64_t> stores;
         for (const auto& grant : i2_grants(*machine, "A-write")) {
             if (grant.client == "simt") stores.push_back(grant.cycle);
         }
         std::vector<uint64_t> expected;
-        for (uint64_t round = 0; round < 16; ++round) expected.push_back(4 + round);     // X
+        for (uint64_t round = 0; round < 16; ++round) expected.push_back(g + round);     // X
         for (uint64_t round = 0; round < 16; ++round) expected.push_back(w + 1 + round); // Y
-        require(stores == expected, what + "store rounds (X c4..c19, Y from w + 1):" +
+        require(stores == expected, what + "store rounds (X g..g + 15, Y from w + 1):" +
             describe(i2_grants(*machine, "A-write")));
-        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{19}, what + "Y was not admitted at X's last grant");
+        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{g + 15}, what + "Y was not admitted at X's last grant");
         require(mbar_landed == w + d && y_landed == w + 1 + d,
             what + "the RMW's write did not land at w + D, or Y's first round at w + 1 + D");
-        require(machine->trace().summary().shmem_store_paused == w - 19,
-            what + "store_paused should count c20..w (Y waiting under the pause)");
+        require(machine->trace().summary().shmem_store_paused == w - (g + 15 + t),
+            what + "store_paused should count g + 16 + t .. w (Y waiting in its slot under the pause)");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_shmem_u32(64 * lane + 8) == 0x5a && machine->read_shmem_u32(64 * lane + 12) == 0x5a,
                 what + "store data");
@@ -8731,6 +9100,11 @@ void test_i3_store_pause_sequence() {
 // from c5 and read at c5 (nothing waits on A); its write is granted at c5 +
 // D + Lb + C = c11. In between A-read serves warp 0's lds.uni (c6), the
 // TMA's descriptor read (c7) and warp 0's probe (c8).
+// I6a: the three requests issue at c5, c6, c7 as before but reach A-read
+// issue_to_dispatch later, so the event is placed at the lds.uni's dispatch
+// e = 5 + issue_to_dispatch: the RMW reads at e, the lds.uni, the TMA and
+// the probe are granted at e + 1, e + 2, e + 3, before its write at
+// e + D + Lb + C.
 void test_i3_reads_during_an_rmw() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
@@ -8740,7 +9114,7 @@ void test_i3_reads_during_an_rmw() {
     write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(i21_mbar(1, 0, 64)));
     write_rank1_load(shmem, 5120, 0, 16, 2048, 4104);
     fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
-    nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, R"(
+    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, R"(
         mov r12, 4104
         mov r24, 0
         mov r25, 0
@@ -8751,17 +9125,18 @@ void test_i3_reads_during_an_rmw() {
         mbar.test_wait p0, [r12], 0
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    i2_run_until(machine, 5);
+    const uint64_t e = 5 + nanosm::issue_to_dispatch(profile);
+    i2_run_until(machine, e);
     host_rmw_event(machine);
     machine.run();
-    const uint64_t w = 5 + i2_return(profile) + profile.shmem_rmw_compute_cycles;
+    const uint64_t w = e + i2_return(profile) + profile.shmem_rmw_compute_cycles;
     const auto rmws = i3_rmws(machine);
-    require(rmws.size() == 2 && rmws[0].start == 5 && rmws[0].read == 5 && rmws[0].write == w,
+    require(rmws.size() == 2 && rmws[0].start == e && rmws[0].read == e && rmws[0].write == w,
         "the host event's RMW:" + describe(rmws));
     auto reads = i2_grants(machine, "A-read");
     reads.resize(std::min<std::size_t>(reads.size(), 4));
-    require(reads == std::vector<I2Grant>{{5, "A-read", "rmw", 0}, {6, "A-read", "simt", 0}, {7, "A-read", "tma", 0},
-                         {8, "A-read", "probe", 0}} && reads.back().cycle < w,
+    require(reads == std::vector<I2Grant>{{e, "A-read", "rmw", 0}, {e + 1, "A-read", "simt", 0},
+                         {e + 2, "A-read", "tma", 0}, {e + 3, "A-read", "probe", 0}} && reads.back().cycle < w,
         "A-read did not serve an lds, the TMA and a probe between the RMW's read and its write:" + describe(reads));
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine.read_reg(0, lane, 3) == 0x100 + 16, "lds.uni data");
     for (uint32_t i = 0; i < 16; ++i) require(machine.read_shmem_u32(2048 + 4 * i) == pattern_word(i), "TMA data");
@@ -8773,9 +9148,17 @@ void test_i3_reads_during_an_rmw() {
 // w + D, completing the phase. Warp 0's test_wait, placed by its stall count,
 // is granted at g and samples at g + D: it sees the new phase iff g > w --
 // granted at w itself (the write-grant cycle) it reads the old phase.
+// I6a: the test_wait needs the first mov's r4 (alu_distance) and reaches
+// the probe register at its dispatch, so its probe is granted at
+// alu_distance + issue_to_dispatch + 1 at the earliest (stalls 0..5), one
+// cycle later per stall beyond. The host's event is placed (read at
+// k = w - D - Lb - C) so that its write grant w is one cycle after that
+// earliest grant: stalls 0..8 still cross w.
 void test_i3_read_first_at_rmw_write() {
     const auto& profile = canonical_profile();
-    const uint64_t w = i2_return(profile) + profile.shmem_rmw_compute_cycles;
+    const uint64_t rmw = i2_return(profile) + profile.shmem_rmw_compute_cycles;
+    const uint64_t w = alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 2;
+    const uint64_t k = w - rmw;
     std::set<int> sides;
     for (uint32_t stall = 0; stall <= 8; ++stall) {
         auto machine = i2_machine(profile, R"(
@@ -8786,6 +9169,7 @@ void test_i3_read_first_at_rmw_write() {
             mov r9, 1
         done: halt
         )");
+        i2_run_until(*machine, k);
         host_rmw_event(*machine);
         machine->run();
         uint64_t probe = 0;
@@ -8794,7 +9178,7 @@ void test_i3_read_first_at_rmw_write() {
         }
         const auto rmws = i3_rmws(*machine);
         const auto what = "probe granted c" + std::to_string(probe) + "," + describe(rmws) + ": ";
-        require(probe != 0 && rmws.size() == 1 && rmws[0].read == 0 && rmws[0].write == w, what + "timeline");
+        require(probe != 0 && rmws.size() == 1 && rmws[0].read == k && rmws[0].write == w, what + "timeline");
         require(machine->read_reg(0, 0, 9) == (probe > w ? 1u : 0u),
             what + (probe > w ? "the probe missed the RMW's write" : "READ_FIRST: the probe did not read the old phase"));
         sides.insert(probe < w ? -1 : probe == w ? 0 : 1);
@@ -8812,19 +9196,30 @@ void test_i3_read_first_at_rmw_write() {
 // w + 1). So the starts go R, S, R, S, ... -- back-to-back RMWs do not starve
 // the stores -- and no store round is granted between an RMW's read and its
 // write.
+// I6a re-derivation: an arrive now reaches the SIMT RMW register
+// issue_to_dispatch after its issue, so one warp's next arrive (issued at
+// the previous one's write grant w) is there only at w + issue_to_dispatch
+// + 1 -- after the waiting store already started alone at w + 1: the two
+// never waited together and the alternation went unexercised. The arrives
+// now come from two warps (0 and 2, four each): while one's RMW runs, the
+// other's waits in the register, so at every w + 1 both classes wait, as in
+// the one-warp scenario before I6a. Warp 1 issues the eight stores. The
+// arrive warps' mov r4 stalls 10 cycles (its result needs alu_distance, 6)
+// so that warp 1's first store reaches its slot while the first RMW runs:
+// it waits under that RMW's pause, as every later one does.
 void test_i3_rmw_store_alternation() {
     const auto& profile = canonical_profile();
     std::string arrives;
     std::string stores;
     for (int i = 0; i < 8; ++i) {
-        arrives += "mbar.arrive [r4]\n";
+        if (i < 4) arrives += "mbar.arrive [r4]\n";
         stores += "sts [r20 + 2048], r21 {pred=PT, stall=0, set=sb0, wait=-}\n";
     }
     auto machine = i21_machine(profile, R"(
         sread r29, WARP_ID
-        setp.ne p6, r29, 0
+        setp.eq p6, r29, 1
         bra.uni stores {pred=p6, stall=0, set=-, wait=-}
-        mov r4, 4160
+        mov r4, 4160 {pred=PT, stall=10, set=-, wait=-}
     )" + arrives + R"(
         halt
     stores: sread r20, LANE_ID
@@ -8832,7 +9227,7 @@ void test_i3_rmw_store_alternation() {
         mov r21, 0x33
     )" + stores + R"(
         halt {pred=PT, stall=0, set=-, wait=sb0}
-    )", {{4160, i21_mbar(8, 8)}}, 2);
+    )", {{4160, i21_mbar(8, 8)}}, 3);
     machine->run();
     const auto rmws = i3_rmws(*machine);
     const auto store_starts = i3_store_starts(*machine);
@@ -8870,9 +9265,17 @@ void test_i3_rmw_store_alternation() {
 // warp's mbar.arrive is ordered behind that sts (refused c5..c21), admitted
 // at its last grant (c22), starts the next cycle with nothing to wait for
 // (read c23) and is written D + Lb + C later.
+// I6a: the sts issues at s (it needs the mov's r5: 2 alu_distance + 2) and
+// reaches its slot at s + issue_to_dispatch (t). The host's event is placed
+// as the sts issues (held, started and read at k = s + 1; written at w =
+// k + D + Lb + C), so its pause holds the sts in its slot until w; the sts
+// is granted w + 1 .. w + 16. The arrive is ordered behind it from s + 1,
+// admitted at its last grant (w + 16), reaches the register at its dispatch
+// and starts (reads) the cycle after, w + t + 17.
 void test_i3_simt_rmw_waits_for_own_stores() {
     const auto& profile = canonical_profile();
     const uint64_t rmw = i2_return(profile) + profile.shmem_rmw_compute_cycles; // read to write
+    const uint64_t t = nanosm::issue_to_dispatch(profile);
     auto machine = i21_machine(profile, R"(
         sread r0, LANE_ID
         shli r0, r0, 6
@@ -8882,23 +9285,30 @@ void test_i3_simt_rmw_waits_for_own_stores() {
         mbar.arrive [r4]
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )", {{i2_event_mbar, i21_mbar(1, 0, 64)}, {4160, i21_mbar(2, 2)}});
+    const uint64_t s = 2 * alu_distance(profile) + 2;
+    const uint64_t k = s + 1;
+    const uint64_t w = k + rmw;
+    require(s + t < w, "the sts would not reach its slot under the pause");
+    i2_run_until(*machine, k);
     host_rmw_event(*machine);
     machine->run();
     const auto rmws = i3_rmws(*machine);
-    require(rmws.size() == 2 && rmws[0].start == 0 && rmws[0].read == 0 && rmws[0].write == rmw,
+    require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s}, "the sts did not issue at s:" + issue_log(*machine));
+    require(rmws.size() == 2 && rmws[0].start == k && rmws[0].read == k && rmws[0].write == w,
         "the host event's RMW:" + describe(rmws));
     std::vector<uint64_t> stores;
     for (const auto& grant : i2_grants(*machine, "A-write")) {
         if (grant.client == "simt") stores.push_back(grant.cycle);
     }
     std::vector<uint64_t> expected;
-    for (uint64_t round = 0; round < 16; ++round) expected.push_back(rmw + 1 + round);
+    for (uint64_t round = 0; round < 16; ++round) expected.push_back(w + 1 + round);
     require(stores == expected, "the sts did not resume at the event's write grant + 1:" + describe(i2_grants(*machine)));
-    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{rmw + 16} &&
-            refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{5, rmw + 11}},
-        "the arrive was not ordered behind its own sts until the sts's last grant (c5..c21, admitted c22)");
-    require(rmws[1].detail == "arrive, address=4160" && rmws[1].start == rmw + 17 && rmws[1].read == rmw + 17 &&
-            rmws[1].write == rmw + 17 + rmw, "the arrive's RMW did not start and read at c23:" + describe(rmws));
+    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{w + 16} &&
+            refusals(*machine, 0, "ordered behind own access") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, w + 16 - (s + 1)}},
+        "the arrive was not ordered behind its own sts until the sts's last grant (s + 1 .. w + 15, admitted w + 16)");
+    require(rmws[1].detail == "arrive, address=4160" && rmws[1].start == w + t + 17 && rmws[1].read == w + t + 17 &&
+            rmws[1].write == w + t + 17 + rmw, "the arrive's RMW did not start and read at w + t + 17:" + describe(rmws));
     require(machine->read_mbar_state(4160).remaining == 1, "the arrive was lost");
 }
 
@@ -8911,6 +9321,16 @@ void test_i3_simt_rmw_waits_for_own_stores() {
 // TMA, SIMT, TMA, SIMT, ... one busy period apart: an endless supply of
 // engine events cannot starve the warp. (Before I3 a held engine event
 // refused a SIMT RMW at issue: engine events always went first.)
+// I6a re-derivation: an arrive reaches the register issue_to_dispatch after
+// its issue, and one warp issues its next arrive only at the previous one's
+// write grant, so one warp's arrive would miss every other engine start
+// (the TMA event then went alone, untested). Two warps issue two arrives
+// each: while one's arrive runs, the other's waits in the register. Warp
+// 0's first arrive issues at alu_distance (it needs the mov's r4) and is in
+// the register from its dispatch + 1, a = alu_distance + issue_to_dispatch +
+// 1; the host starts feeding one busy period before (f = a - busy), so the
+// first TMA event ends as that arrive is held, and from then on both
+// classes always hold a request.
 void test_i3_rmw_admission_fairness() {
     const auto& profile = canonical_profile();
     const auto busy = rmw_busy_cycles(profile);
@@ -8918,18 +9338,20 @@ void test_i3_rmw_admission_fairness() {
         mov r4, 4160
         mbar.arrive [r4]
         mbar.arrive [r4]
-        mbar.arrive [r4]
-        mbar.arrive [r4]
         halt
-    )", {{4160, i21_mbar(5, 5)}, {4168, i21_mbar(1, 1)}});
+    )", {{4160, i21_mbar(5, 5)}, {4168, i21_mbar(1, 1)}}, 2);
+    const uint64_t f = alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1 - busy;
     while (!machine->done()) {
-        if (machine->cycle() < 9 * busy && !machine->tma_mbar_event_held()) machine->complete_mbar_tx(4168, 0, 0);
+        const auto cycle = machine->cycle();
+        if (cycle >= f && cycle < f + 9 * busy && !machine->tma_mbar_event_held()) {
+            machine->complete_mbar_tx(4168, 0, 0);
+        }
         tick_capped(*machine);
     }
     const auto services = mbar_rmw_services(*machine);
     std::vector<RmwService> expected;
     for (uint64_t k = 0; k < 9; ++k) {
-        expected.emplace_back(k * busy, k % 2 == 0 ? "complete_tx (tma), address=4168" : "arrive, address=4160");
+        expected.emplace_back(f + k * busy, k % 2 == 0 ? "complete_tx (tma), address=4168" : "arrive, address=4160");
     }
     std::string seen;
     for (const auto& [cycle, detail] : services) seen += " c" + std::to_string(cycle) + ": " + detail + ";";
@@ -8945,6 +9367,11 @@ void test_i3_rmw_admission_fairness() {
 //   expectation first: (1, 0) -arrive.expect_tx 128-> (0, 128) -complete_tx 128-> (0, 0): complete
 // At c18 the mbar holds the intermediate count; at the end the phase has
 // flipped (arrivals reloaded, tx 0) and the warp's try_wait returned true.
+// I6a: the observation moves to c20. Expectation first, the arrive issues at
+// alu_distance (6: it needs the mov's r4), starts at its dispatch + 1 (10),
+// is written D + Lb + C later (16) and lands D after that, at the edge of
+// c18: seen from c19. Completion first, the arrive (behind the stall of 20)
+// issues at c20, so nothing of it has landed by then.
 void test_i3_signed_tx_both_orders() {
     const auto& profile = canonical_profile();
     for (const bool completion_first : {true, false}) {
@@ -8964,7 +9391,7 @@ void test_i3_signed_tx_both_orders() {
             halt
         )", {{4160, i21_mbar(1, 1)}});
         if (completion_first) machine->complete_mbar_tx(4160, 128, 0);
-        i2_run_until(*machine, 18);
+        i2_run_until(*machine, 20);
         const auto middle = machine->read_mbar_state(4160);
         require(!middle.phase && middle.remaining == (completion_first ? 1 : 0) &&
                 middle.tx_bytes == (completion_first ? -128 : 128),
@@ -9004,7 +9431,7 @@ void test_i3_tma_start_reads_no_mbar() {
         mov r9, 1
         halt
     )";
-    nanosm::Machine machine(profile, nanosm::assemble_asm(i1_asm(profile, program), profile), std::move(launch),
+    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, program), profile), std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
     std::vector<int32_t> counts{0}; // every tx count the mbar held, in order
     while (!machine.done()) {
@@ -9081,7 +9508,7 @@ void test_i3_sanitizer_wrong_phase_complete_tx() {
         write_rank1_load(shmem, 5184, 0, 16, 2112, 4104);
         write_u64(shmem, 4104, nanosm::encode_mbar_state(i21_mbar(1, 1)));
         fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
-        return std::make_unique<nanosm::Machine>(profile, nanosm::assemble_asm(i1_asm(profile, program), profile),
+        return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program), profile),
             std::move(launch));
     };
     auto plain = machine_for(R"(
@@ -9137,7 +9564,7 @@ std::unique_ptr<nanosm::Machine> i4_machine(const nanosm::DeviceProfile& profile
     if (setup) setup(shmem);
     auto& gmem = image_bytes(launch.gmem_image, 4096);
     for (uint32_t word = 0; word < 1024; ++word) write_u32(gmem, 4 * word, 5 * word + 2);
-    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+    const auto kernel = hand_assembly ? hand_assemble(i1_asm(profile, program), profile)
                                       : compile(program, profile);
     return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -9196,7 +9623,7 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
         }
     }
     try {
-        (void)nanosm::assemble_asm(i1_asm(profile, "fence.sh {pred=PT, stall=0, set=sb0, wait=-}\nhalt\n"), profile);
+        (void)hand_assemble(i1_asm(profile, "fence.sh {pred=PT, stall=0, set=sb0, wait=-}\nhalt\n"), profile);
         throw std::runtime_error("the hand assembler let fence.sh set a depbar");
     } catch (const nanosm::SimError& error) {
         require(std::string(error.what()).find("this opcode cannot set a depbar") != std::string::npos,
@@ -9226,12 +9653,19 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
 //     and gmem gets the new words.
 // (Mutation: admitting fence.sh at "no unserviced slot" alone -- without the
 // + D -- puts it at the last grant, c4 / c9 / c3, and fails every case.)
+// I6a re-derivation: the access issues at s (its register sources' fixed
+// distances, alu_distance each, decide it) and reaches its slot
+// issue_to_dispatch (t) later, so its first grant is g = s + t + 1; the
+// fence is refused from s + 1 (t + D cycles for one round) and admitted at
+// the last grant + D as before.
 void test_i4_fence_waits_until_own_accesses_reach_ram() {
     for (const uint32_t d : {2u, 3u}) {
         auto profile = canonical_profile();
         profile.shmem_port_a_depth = d;
         const auto what = "D=" + std::to_string(d) + ": ";
         using Slices = std::vector<std::pair<uint64_t, uint64_t>>;
+        const uint64_t t = nanosm::issue_to_dispatch(profile);
+        const uint64_t distance = alu_distance(profile);
 
         auto one = i4_machine(profile, R"(
             sread r0, LANE_ID
@@ -9243,12 +9677,15 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
         one->run();
-        require(i2_grants(*one) == std::vector<I2Grant>{{4, "A-write", "simt", 0}},
-            what + "one-round sts:" + describe(i2_grants(*one)));
-        require(issued_at(*one, 4 * 8) == std::vector<uint64_t>{4 + d} &&
-                issued_at(*one, 5 * 8) == std::vector<uint64_t>{5 + d} &&
-                refusals(*one, 0, i4_fence_wait) == Slices{{4, d}},
-            what + "one-round sts: fence.sh not admitted exactly at its grant + D (c" + std::to_string(4 + d) +
+        const uint64_t s1 = 2 * distance + 1; // sread, shli, mov r5; the sts needs r5
+        const uint64_t g1 = s1 + t + 1;
+        require(issued_at(*one, 3 * 8) == std::vector<uint64_t>{s1} &&
+                i2_grants(*one) == std::vector<I2Grant>{{g1, "A-write", "simt", 0}},
+            what + "one-round sts:" + describe(i2_grants(*one)) + " | issues" + issue_log(*one));
+        require(issued_at(*one, 4 * 8) == std::vector<uint64_t>{g1 + d} &&
+                issued_at(*one, 5 * 8) == std::vector<uint64_t>{g1 + 1 + d} &&
+                refusals(*one, 0, i4_fence_wait) == Slices{{s1 + 1, t + d}},
+            what + "one-round sts: fence.sh not admitted exactly at its grant + D (c" + std::to_string(g1 + d) +
                 "); waits:" + describe(refusals(*one, 0, i4_fence_wait)));
 
         auto two = i4_machine(profile, R"(
@@ -9265,10 +9702,16 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
         two->run();
-        require(i2_grants(*two) == std::vector<I2Grant>{{8, "A-write", "simt", 0}, {9, "A-write", "simt", 0}},
-            what + "two-round sts:" + describe(i2_grants(*two)));
-        require(issued_at(*two, 8 * 8) == std::vector<uint64_t>{9 + d} && refusals(*two, 0, i4_fence_wait) == Slices{{8, 1 + d}},
-            what + "two-round sts: fence.sh not admitted at its LAST round's grant + D (c" + std::to_string(9 + d) +
+        // sread; andi / shri; shli / shli; add (needs the second shli); mov r5;
+        // the sts needs r5.
+        const uint64_t s2 = 4 * distance + 2;
+        const uint64_t g2 = s2 + t + 1;
+        require(issued_at(*two, 7 * 8) == std::vector<uint64_t>{s2} &&
+                i2_grants(*two) == std::vector<I2Grant>{{g2, "A-write", "simt", 0}, {g2 + 1, "A-write", "simt", 0}},
+            what + "two-round sts:" + describe(i2_grants(*two)) + " | issues" + issue_log(*two));
+        require(issued_at(*two, 8 * 8) == std::vector<uint64_t>{g2 + 1 + d} &&
+                refusals(*two, 0, i4_fence_wait) == Slices{{s2 + 1, t + 1 + d}},
+            what + "two-round sts: fence.sh not admitted at its LAST round's grant + D (c" + std::to_string(g2 + 1 + d) +
                 "); waits:" + describe(refusals(*two, 0, i4_fence_wait)));
 
         auto load = i4_machine(profile, R"(
@@ -9280,20 +9723,28 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
         const auto written = i1_run(*load, {6});
-        require(i2_grants(*load) == std::vector<I2Grant>{{3, "A-read", "simt", 0}}, what + "lds:" + describe(i2_grants(*load)));
-        require(issued_at(*load, 3 * 8) == std::vector<uint64_t>{3 + d} && refusals(*load, 0, i4_fence_wait) == Slices{{3, d}},
-            what + "lds: fence.sh not admitted at its sample (grant + D = c" + std::to_string(3 + d) + ")");
-        require(written.at(6).size() == 1 && written.at(6).front() > 3 + d && load->read_reg(0, 5, 6) == 0x100 + 64 + 5,
+        const uint64_t l = 2 * distance; // sread, shli; the lds needs r0
+        const uint64_t gl = l + t + 1;
+        require(issued_at(*load, 2 * 8) == std::vector<uint64_t>{l} &&
+                i2_grants(*load) == std::vector<I2Grant>{{gl, "A-read", "simt", 0}},
+            what + "lds:" + describe(i2_grants(*load)) + " | issues" + issue_log(*load));
+        require(issued_at(*load, 3 * 8) == std::vector<uint64_t>{gl + d} &&
+                refusals(*load, 0, i4_fence_wait) == Slices{{l + 1, t + d}},
+            what + "lds: fence.sh not admitted at its sample (grant + D = c" + std::to_string(gl + d) + ")");
+        require(written.at(6).size() == 1 && written.at(6).front() > gl + d && load->read_reg(0, 5, 6) == 0x100 + 64 + 5,
             what + "lds: the fence waited for the RF write, or the lds read the wrong word");
 
+        // The TMA's coordinates and mbar are written first (I6a): their fixed
+        // distances are long met when the TMA follows the fence, so qtxc's
+        // static schedule puts no stall between them.
         auto engine = i4_machine(profile, R"(
-            sread r0, LANE_ID
-            shli r0, r0, 2
-            mov r5, 0x777
             mov r8, 0
             mov r9, 0
             mov r10, 0
             mov r12, 4104
+            sread r0, LANE_ID
+            shli r0, r0, 2
+            mov r5, 0x777
             sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
             fence.sh
             tma.async [5120], r8
@@ -9302,9 +9753,11 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )", i4_tma(true, 0, 1024));
         engine->run(); // the sanitizer build: no missing-fence PANIC
-        require(i2_grants(*engine, "A-write").front().cycle == 8 && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{8 + d} &&
-                issued_at(*engine, 9 * 8) == std::vector<uint64_t>{9 + d},
-            what + "the TMA store did not follow the fence at the sts's grant + D + 1");
+        const uint64_t ge = 4 + 2 * distance + 1 + t + 1; // four movs, then as in `one`
+        require(i2_grants(*engine, "A-write").front().cycle == ge && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{ge + d} &&
+                issued_at(*engine, 9 * 8) == std::vector<uint64_t>{ge + 1 + d},
+            what + "the TMA store did not follow the fence at the sts's grant + D + 1:" + describe(i2_grants(*engine)) +
+                " | issues" + issue_log(*engine));
         for (uint32_t i = 0; i < 256; ++i) {
             require(engine->read_gmem_u32(4 * i) == (i < 16 ? 0x777u : 0x100 + i), what + "TMA store word " + std::to_string(i));
         }
@@ -9435,6 +9888,10 @@ void test_i4_missing_fence_panics() {
 // sts is serviced; no depbar wait), warp 0 waits on the mbar and stores the
 // words: the arrive's RMW commits after the store's last round reached the
 // RAM, so the TMA's accept finds nothing in flight.
+// I6a: the TMA is accepted at its dispatch and warp 1's access reaches its
+// slot at its own; the stall (was 8) is re-chosen so the TMA's accept falls
+// inside warp 1's rounds (before, warp 1's sts was dispatched into the TMA's
+// bytes and PANICked from warp 1's side).
 void test_i4_cross_warp_race() {
     const auto& profile = canonical_profile();
     const auto two_warps = [](const std::string& access) {
@@ -9444,7 +9901,7 @@ void test_i4_cross_warp_race() {
             bra.uni other {pred=p6, stall=0, set=-, wait=-}
             mov r8, 0
             mov r9, 0
-            mov r10, 0 {pred=PT, stall=8, set=-, wait=-}
+            mov r10, 0 {pred=PT, stall=20, set=-, wait=-}
             tma.async [5120], r8
             mov r4, 4104
         wait: mbar.try_wait p0, [r4], 0
@@ -9723,7 +10180,7 @@ std::unique_ptr<nanosm::Machine> i5_machine(const nanosm::DeviceProfile& profile
     auto& gmem = image_bytes(launch.gmem_image, 4096);
     for (uint32_t word = 0; word < 1024; ++word) write_u32(gmem, 4 * word, 5 * word + 2);
     if (setup) setup(launch);
-    const auto kernel = hand_assembly ? nanosm::assemble_asm(i1_asm(profile, program), profile)
+    const auto kernel = hand_assembly ? hand_assemble(i1_asm(profile, program), profile)
                                       : compile(program, profile);
     return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -9789,7 +10246,7 @@ void test_i5_atomic_encoding_and_assembly() {
     require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "atom did not survive hex");
     const auto rejects = [&](const std::string& source, bool hand, const std::string& needle) {
         try {
-            if (hand) (void)nanosm::assemble_asm(i1_asm(profile, source), profile);
+            if (hand) (void)hand_assemble(i1_asm(profile, source), profile);
             else (void)nanosm::compile_qtx(source, profile);
         } catch (const nanosm::SimError& error) {
             require(std::string(error.what()).find(needle) != std::string::npos,
@@ -9816,6 +10273,11 @@ void test_i5_atomic_encoding_and_assembly() {
 // admitted only at the write grant and reads the new word. Each op at the
 // canonical D = Lb = C = 2 (7 cycles from start to the end of the pause);
 // add also at D = 3, C = 3.
+// I6a: the atomic reaches the SIMT RMW register at its dispatch, so it
+// starts issue_to_dispatch + 1 after its issue; rD's RF write is granted at
+// a + 1 (still before the word's write grant) and lands Wd later; the
+// lds.uni, admitted at the write grant w, is granted at its dispatch + 1,
+// w + issue_to_dispatch + 1.
 void test_i5_one_word_timeline() {
     const std::string program_tail = R"( r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
         lds.uni r8, [r1 + 2048] {pred=PT, stall=0, set=sb1, wait=-}
@@ -9842,18 +10304,19 @@ void test_i5_one_word_timeline() {
         auto machine = i5_machine(profile, program_head + test.name + program_tail);
         const auto written = i1_run(*machine, {7});
         const auto atomic = i5_atomic(*machine, what);
+        const auto t = nanosm::issue_to_dispatch(profile);
         const auto issue = issued_at(*machine, 16).at(0);
-        require(atomic.start == issue + 1, what + ": did not start the cycle after its issue");
+        require(atomic.start == issue + t + 1, what + ": did not start the cycle after its dispatch");
         i5_require_timeline(atomic, profile, atomic.start, what);
         const auto a = atomic.reads.at(0) + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
         const auto w = atomic.writes.at(0);
-        require(written.at(7) == std::vector<uint64_t>{a + 1} && a + 1 < w,
-            what + ": rD was not written at a + 1 (c" + std::to_string(a + 1) + "), before the write grant c" +
-                std::to_string(w));
+        require(written.at(7) == std::vector<uint64_t>{a + 1 + profile.rf_write_depth_cycles} && a + 1 < w,
+            what + ": rD's RF write was not granted at a + 1 (c" + std::to_string(a + 1) + "), before the write grant c" +
+                std::to_string(w) + ", landing Wd later");
         require(issued_at(*machine, 24) == std::vector<uint64_t>{w}, what + ": the lds.uni was not admitted at the write grant");
         const auto lds = i2_grants(*machine, "A-read");
-        require(lds.size() == 2 && lds[1] == I2Grant{w + 1, "A-read", "simt", lds[1].slot},
-            what + ": the lds.uni's read was not granted at w + 1:" + describe(lds));
+        require(lds.size() == 2 && lds[1] == I2Grant{w + t + 1, "A-read", "simt", lds[1].slot},
+            what + ": the lds.uni's read was not granted at w + issue_to_dispatch + 1:" + describe(lds));
         const uint32_t updated = i5_expected(test.opcode, 0x300, 0x5a5);
         require(machine->read_shmem_u32(2048) == updated, what + ": the word was not updated once");
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -9926,6 +10389,10 @@ void test_i5_add_wraps_at_the_int32_boundary() {
 // 1; the atomic (not ordered: the lds is serviced at its grant) is refused
 // "load slots full" G .. G + D + Lb and admitted in the cycle the lds's RF
 // write frees the slot (same-cycle reuse), then runs.
+// I6a: the lds issues at l (it needs the shli's r1: 2 alu_distance) and is
+// granted at G = l + issue_to_dispatch + 1; the atomic, first tried at l + 2
+// (it needs the second mov's r3), is ordered behind the unserviced lds
+// until G, then refused for its return slot exactly as before.
 void test_i5_return_slot_admission() {
     auto profile = canonical_profile();
     profile.shmem_load_slots = 1;
@@ -9941,8 +10408,13 @@ void test_i5_return_slot_admission() {
     )");
     machine->run();
     const auto g = i2_grants(*machine, "A-read").at(0);
-    require(g.client == "simt" && issued_at(*machine, 32) == std::vector<uint64_t>{g.cycle - 1},
-        "the lds was not granted the cycle after its issue");
+    const auto t = nanosm::issue_to_dispatch(profile);
+    const auto l = 2 * alu_distance(profile);
+    require(g.client == "simt" && issued_at(*machine, 32) == std::vector<uint64_t>{l} && g.cycle == l + t + 1,
+        "the lds was not granted the cycle after its dispatch:" + issue_log(*machine));
+    require(refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{l + 2, t - 1}},
+        "the atomic was not ordered behind the lds until its grant:" +
+            describe(refusals(*machine, 0, "ordered behind own access")));
     require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{g.cycle, back + 1}} &&
             issued_at(*machine, 40) == std::vector<uint64_t>{g.cycle + back + 1},
         "the atomic was not refused for its return slot c" + std::to_string(g.cycle) + " .. c" +
@@ -9995,6 +10467,11 @@ void test_i5_simt_rmw_register_busy() {
 // exactly at w + 1; store_paused counts its wait.
 // (Mutation: the pause ends at the atomic's read grant -> the sts goes in
 // before w + 1 and this test fails.)
+// I6a: every access now reaches its slot or register issue_to_dispatch after
+// its issue. The stall on warp 0's mov r5 (11) re-places the atomic: it
+// issues at c26 and starts at c30 (w = c36); warp 1's lds (issued c27) is
+// granted at c31, during it; its sts, ordered behind the lds, issues at c31
+// and is in its slot from c35, paused until w.
 void test_i5_store_pause_and_resume() {
     const auto& profile = canonical_profile();
     auto machine = i5_machine(profile, R"(
@@ -10002,7 +10479,7 @@ void test_i5_store_pause_and_resume() {
         setp.ne p6, r29, 0
         bra.uni other {pred=p6, stall=0, set=-, wait=-}
         mov r1, 0
-        mov r5, 1
+        mov r5, 1 {pred=PT, stall=11, set=-, wait=-}
         atom.add.uni r7, [r1 + 2048], r5 {pred=PT, stall=0, set=sb0, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0}
     other: sread r20, LANE_ID
@@ -10024,14 +10501,14 @@ void test_i5_store_pause_and_resume() {
     const auto w = atomic.writes.at(0);
     const auto sts_issue = issued_at(*machine, 11 * 8);
     require(loads.size() == 1 && loads[0] > atomic.start && loads[0] < w,
-        "warp 1's lds was not granted while the atomic ran (reads continue):" + describe(i2_grants(*machine)) +
+        "warp 1's lds was not granted while the atomic ran (reads continue):" + (describe(i2_grants(*machine)) + " | issues" + issue_log(*machine)) +
             describe(atomic));
     require(sts_issue.size() == 1 && sts_issue[0] < w, "warp 1's sts was not admitted before the atomic's write");
     require(stores == std::vector<uint64_t>{w + 1},
         "the sts was not granted at the atomic's write + 1 (c" + std::to_string(w + 1) + "):" +
             describe(i2_grants(*machine, "A-write")) + describe(atomic));
-    require(machine->trace().summary().shmem_store_paused == w - sts_issue[0],
-        "store_paused should count the sts's wait, its admission + 1 .. the atomic's write");
+    require(machine->trace().summary().shmem_store_paused == w - (sts_issue[0] + nanosm::issue_to_dispatch(profile)),
+        "store_paused should count the sts's wait in its slot, its dispatch + 1 .. the atomic's write");
     require(machine->read_shmem_u32(2048) == 0x301, "the atomic's word");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_reg(0, lane, 7) == 0x300 && machine->read_reg(1, lane, 23) == 0x100 + 64 + lane &&
@@ -10048,6 +10525,10 @@ void test_i5_store_pause_and_resume() {
 // granted the cycle after the last round, and it reads the stored word.
 // (Mutation: the read granted while the store is under way -> it is early
 // and returns the old word.)
+// I6a: warp 1's sts now reaches its slot issue_to_dispatch after its issue
+// (rounds c32..c47) and the atomic starts issue_to_dispatch + 1 after its
+// own; the stall on the last filler mov (14) re-places the atomic's start
+// inside those rounds.
 void test_i5_read_after_the_store_under_way() {
     const auto& profile = canonical_profile();
     auto machine = i5_machine(profile, R"(
@@ -10058,7 +10539,7 @@ void test_i5_read_after_the_store_under_way() {
         mov r5, 1
         mov r6, 0
         mov r6, 1
-        mov r6, 2
+        mov r6, 2 {pred=PT, stall=14, set=-, wait=-}
         atom.add.uni r7, [r1 + 960], r5 {pred=PT, stall=0, set=sb0, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0}
     other: sread r20, LANE_ID
@@ -10620,6 +11101,406 @@ void test_i5_launch_declared_mbars_format() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// I6a: the RF's read latency Lr and write depth Wd, the issue register, and
+// src/rf.hpp as the ONE timing helper of qtxc, the simulator and the
+// sanitizer (trash/rfc10.md section 5, trash/i6a-rf-pipeline-2026-10-13.md).
+// Port A's edge convention: a read SAMPLED at S has its operand at S + Lr; a
+// write PRESENTED at the RF write port at W is at the RAM at W + Wd, lands at
+// that edge and is visible to samples from W + Wd + 1 -- no forwarding.
+// The debug trace shows the samples ("RF read") and the presentations ("RF
+// write"); the landing is the cycle whose tick changed the register.
+// ---------------------------------------------------------------------------
+
+nanosm::DeviceProfile i6a_profile(uint32_t lr, uint32_t wd) {
+    auto profile = canonical_profile();
+    profile.rf_read_latency_cycles = lr;
+    profile.rf_write_depth_cycles = wd;
+    nanosm::validate_device_profile(profile);
+    return profile;
+}
+
+const std::vector<std::pair<uint32_t, uint32_t>> i6a_depths = {{1, 1}, {2, 2}, {3, 1}};
+
+std::string i6a_what(const nanosm::DeviceProfile& profile) {
+    return "Lr/Wd " + std::to_string(profile.rf_read_latency_cycles) + "/" +
+        std::to_string(profile.rf_write_depth_cycles) + ": ";
+}
+
+// I2-style shmem (word w holds 0x100 + w), a debug trace.
+std::unique_ptr<nanosm::Machine> i6a_machine(
+    const nanosm::DeviceProfile& profile, const nanosm::Kernel& kernel, uint32_t warps = 1) {
+    nanosm::Launch launch;
+    launch.active_warps = warps;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
+    return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+}
+
+// Warp 0's debug RF events of one register (its warp track): "RF read"
+// samples or "RF write" port presentations, by cycle.
+std::vector<uint64_t> i6a_rf_events(const nanosm::Machine& machine, const std::string& name, uint8_t reg) {
+    std::vector<uint64_t> cycles;
+    for (const auto& event : machine.trace().events()) {
+        if (event.category == nanosm::TraceCategory::instruction && event.name == name && event.id == reg &&
+            event.track == 100) {
+            cycles.push_back(event.start_cycle);
+        }
+    }
+    return cycles;
+}
+
+// The helper contract: for an add, an fadd, an SFU op, an lds, an sts and
+// an acc.ld, the cycles the trace shows -- the samples, the port, the RAM
+// (the register's landing edge), the visibility (a depbar waiter's issue) --
+// are the helper's, relative to each instruction's accepted issue i, at
+// Lr/Wd 1/1, 2/2 and 3/1 (t = issue_to_dispatch):
+//   fixed:  samples i + issue_to_sample, port i + issue_to_port, RAM port +
+//           Wd, visible i + issue_to_visible = RAM + 1;
+//   lds:    address sampled at i + 1; A-read grant i + t + 1; the words at
+//           port A's output D + Lb later; the RF port the cycle after; RAM
+//           + Wd; its depbar clears at the visibility, when the waiting add
+//           issues (the counter is 1 through the RAM cycle, 0 from RAM + 1);
+//   sts:    address and data sampled at i + 1; A-write grant i + t + 1, the
+//           word at the shmem RAM D later;
+//   acc.ld: coordinates sampled at i + 1; tmem read (beat 0) at i + t + 1;
+//           RF port i + t + 2; RAM + Wd; the waiting add at RAM + 1.
+// Every RF write's visibility is at least earliest_rf_visible after its
+// issue. The shli's stall lets every fixed result reach the RAM before the
+// async section, and the acc.ld goes before the lds (its waiter first), so
+// no write port or issue slot is contested: the uncontended pipeline.
+void test_i6a_helper_contract() {
+    for (const auto& [lr, wd] : i6a_depths) {
+        const auto profile = i6a_profile(lr, wd);
+        const auto what = i6a_what(profile);
+        const auto kernel = hand_assemble(i1_asm(profile, R"(
+            .acc C, 0, 0, 64, 64
+            mov r1, 7
+            mov r2, 0x3f8
+            shli r2, r2, 20
+            mov r11, 77
+            mov r8, 0
+            mov r9, 0
+            sread r0, LANE_ID
+            add r3, r0, r1
+            fadd r4, r2, r2
+            ex2 r5, r2
+            shli r6, r0, 2 {pred=PT, stall=16, set=-, wait=-}
+            acc.ld r11, C, r8 {pred=PT, stall=0, set=sb2, wait=-}
+            lds r7, [r6 + 256] {pred=PT, stall=0, set=sb0, wait=-}
+            sts [r6 + 512], r4 {pred=PT, stall=0, set=sb1, wait=-}
+            add r14, r11, r11 {pred=PT, stall=0, set=-, wait=sb2}
+            add r12, r7, r7 {pred=PT, stall=0, set=-, wait=sb0}
+            halt {pred=PT, stall=0, set=-, wait=sb1}
+        )"), profile);
+        auto machine = i6a_machine(profile, kernel);
+        std::optional<uint64_t> stored; // the cycle whose edge put the sts's lane-0 word in the RAM
+        std::map<uint64_t, uint32_t> sb0;  // depbar sb0 (Q) during each cycle
+        const auto landed = i1_run(*machine, {3, 4, 5, 7, 11}, [&](uint64_t cycle) {
+            if (!stored.has_value() && machine->read_shmem_u32(512) == nanosm::float_bits(2.0f)) stored = cycle;
+            sb0[cycle + 1] = machine->depbar_value(0, 0);
+        });
+        const auto issue = [&](uint32_t index) {
+            const auto cycles = issued_at(*machine, index * 8);
+            require(cycles.size() == 1, what + "instruction " + std::to_string(index) + " did not issue once");
+            return cycles[0];
+        };
+        const auto inst = [&](uint32_t index) { return nanosm::decode(kernel.words.at(index)); };
+        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto floor = nanosm::earliest_rf_visible(profile);
+        const auto log = " | issues" + issue_log(*machine);
+        const auto sampled_once = [&](uint8_t reg, uint64_t cycle) {
+            const auto samples = i6a_rf_events(*machine, "RF read", reg);
+            return std::count(samples.begin(), samples.end(), cycle) == 1;
+        };
+
+        // Fixed results: the add (sources in banks 0 and 1), the fadd, the ex2.
+        for (const auto& [index, dst, sources] : std::vector<std::tuple<uint32_t, uint8_t, std::vector<uint8_t>>>{
+                 {7, 3, {0, 1}}, {8, 4, {2}}, {9, 5, {2}}}) {
+            const auto i = issue(index);
+            const auto op = inst(index);
+            const auto name = what + nanosm::opcode_name(op.opcode) + ": ";
+            for (const auto& read : nanosm::rf_read_plan(op, profile, sources)) {
+                require(sampled_once(read.reg, i + nanosm::issue_to_sample(read)),
+                    name + "r" + std::to_string(read.reg) + " was not sampled at issue + issue_to_sample" + log);
+            }
+            const auto port = i + nanosm::issue_to_port(op, profile);
+            require(i6a_rf_events(*machine, "RF write", dst) == std::vector<uint64_t>{port},
+                name + "not presented at the RF write port at issue + issue_to_port" + log);
+            require(landed.at(dst) == std::vector<uint64_t>{port + wd}, name + "did not land at port + Wd");
+            require(nanosm::issue_to_visible(op, profile) == nanosm::issue_to_port(op, profile) + wd + 1 &&
+                    nanosm::issue_to_visible(op, profile) >= floor,
+                name + "visibility is not the landing + 1, or under the floor");
+        }
+
+        // lds r7, [r6 + 256]: one round; its depbar waiter is the add r12.
+        {
+            const auto i = issue(12);
+            const auto name = what + "lds: ";
+            require(sampled_once(6, i + nanosm::issue_register_stages),
+                name + "the address was not sampled after the issue register");
+            const auto reads = i2_grants(*machine, "A-read");
+            require(reads.size() == 1 && reads[0].cycle == i + t + 1, name + "A-read grant:" + describe(reads));
+            const auto port = reads[0].cycle + i2_return(profile) + 1;
+            require(i6a_rf_events(*machine, "RF write", 7) == std::vector<uint64_t>{port},
+                name + "not presented at the RF port the cycle after its words" + log);
+            require(landed.at(7) == std::vector<uint64_t>{port + wd}, name + "did not land at port + Wd");
+            require(sb0.at(port + wd) == 1 && sb0.at(port + wd + 1) == 0,
+                name + "the depbar did not clear at the visibility (W + Wd + 1)");
+            require(issue(15) == port + wd + 1, name + "the waiting add did not issue at the visibility" + log);
+            require(port + wd + 1 - i >= floor, name + "visible before the floor");
+        }
+
+        // sts [r6 + 512], r4: one round.
+        {
+            const auto i = issue(13);
+            const auto name = what + "sts: ";
+            require(sampled_once(4, i + nanosm::issue_register_stages) && sampled_once(6, i + nanosm::issue_register_stages),
+                name + "the address and data were not sampled after the issue register" + log);
+            const auto writes = i2_grants(*machine, "A-write");
+            require(writes.size() == 1 && writes[0].cycle == i + t + 1, name + "A-write grant:" + describe(writes));
+            require(stored == writes[0].cycle + profile.shmem_port_a_depth, name + "the word did not reach the RAM D after the grant");
+        }
+
+        // acc.ld r11, C, r8: one beat; its depbar waiter is the add r14.
+        {
+            const auto i = issue(11);
+            const auto name = what + "acc.ld: ";
+            require(sampled_once(8, i + nanosm::issue_register_stages) && sampled_once(9, i + nanosm::issue_register_stages),
+                name + "the coordinates were not sampled after the issue register");
+            std::vector<uint64_t> beats;
+            for (const auto& event : machine->trace().events()) {
+                if (event.name == "acc.ld beat") beats.push_back(event.start_cycle);
+            }
+            require(beats == std::vector<uint64_t>{i + t + 1}, name + "the tmem read was not at the dispatch + 1");
+            const auto port = i + t + 2;
+            require(i6a_rf_events(*machine, "RF write", 11).back() == port, // after the mov's 77
+                name + "not presented at the RF port after the pipeline stage" + log);
+            require(landed.at(11).size() == 2 && landed.at(11).back() == port + wd,
+                name + "did not land at port + Wd (after the mov's 77)");
+            require(issue(14) == port + wd + 1, name + "the waiting add did not issue at the visibility" + log);
+            require(port + wd + 1 - i >= floor, name + "visible before the floor");
+        }
+        require(machine->read_reg(0, 5, 3) == 12 && machine->read_reg(0, 5, 7) == 0x100 + 64 + 5 &&
+                machine->read_reg(0, 5, 11) == 0 && machine->read_reg(0, 0, 5) == nanosm::float_bits(2.0f),
+            what + "data");
+    }
+}
+
+// The qtxc distance for a dependent add -> add is issue_to_visible -
+// issue_register_stages (the consumer samples one cycle after its issue);
+// hand assembly with exactly that stall runs and reads the new value. One
+// cycle less puts the consumer's sample at the producer's RAM cycle W + Wd:
+// the sanitizer PANICs (RF RAW); without it the machine is quiet and the
+// sample sees the OLD word -- the write lands at that edge, after every read
+// of the cycle (READ_FIRST, no forwarding).
+void test_i6a_dependent_add_distance() {
+    for (const auto& [lr, wd] : i6a_depths) {
+        const auto profile = i6a_profile(lr, wd);
+        const auto what = i6a_what(profile);
+        const auto scheduled = nanosm::compile_qtx("add r1, r0, r0\nadd r2, r1, r1\nhalt\n", profile);
+        const auto distance = nanosm::issue_to_visible(scheduled.instructions[0], profile) - nanosm::issue_register_stages;
+        require(scheduled.instructions[0].control.stall == distance, what + "qtxc's stall is not the helper's distance");
+        const auto run = [&](uint64_t stall) {
+            const auto text = i1_asm(profile, "sread r0, LANE_ID {pred=PT, stall=" +
+                std::to_string(alu_distance(profile)) + ", set=-, wait=-}\nadd r1, r0, r0 {pred=PT, stall=" +
+                std::to_string(stall) + ", set=-, wait=-}\nadd r2, r1, r1\nhalt\n");
+            return i6a_machine(profile, nanosm::assemble_asm(text, profile));
+        };
+        auto exact = run(distance);
+        exact->run();
+        require(issued_at(*exact, 16).at(0) - issued_at(*exact, 8).at(0) == distance, what + "the consumer moved");
+        require(exact->read_reg(0, 5, 2) == 20, what + "at the qtxc distance the add did not read the new r1");
+        auto early = run(distance - 1);
+#if NANOSM_SANITIZER
+        require_mentions(i4_panic(*early, what + "one cycle early"),
+            {"RF RAW hazard: missing stall or depbar wait for r1", "inst='add r2, r1, r1"}, what + "one cycle early");
+#else
+        early->run();
+        require(early->read_reg(0, 5, 1) == 10 && early->read_reg(0, 5, 2) == 0,
+            what + "one cycle early, the sample at the landing edge did not see the OLD r1 (write-first forwarding?)");
+#endif
+    }
+}
+
+// WAW: an add after an fadd to the same register must land after it. qtxc
+// stalls the fadd fadd - alu + 1 cycles (the younger's landing one past the
+// older's); then r3 holds the add's value. Two cycles less the add lands
+// first: the sanitizer PANICs (RF WAW); without it the older fadd's value
+// lands last and stays. (One cycle less the two results meet at one write
+// port in one cycle and the add is refused for the port: structurally
+// safe.)
+void test_i6a_waw_order() {
+    for (const auto& [lr, wd] : i6a_depths) {
+        const auto profile = i6a_profile(lr, wd);
+        const auto what = i6a_what(profile);
+        const auto scheduled = nanosm::compile_qtx("fadd r3, r1, r1\nadd r3, r2, r2\nhalt\n", profile);
+        const uint64_t stall = profile.timing.fadd - profile.timing.alu + 1;
+        require(scheduled.instructions[0].control.stall == stall, what + "qtxc's WAW stall");
+        // r1 = 1.0f (0x3f8 << 20), r2 = 3; each mov / shli stalls its full
+        // distance (assembled as written: the stalls under test are not raised).
+        const auto run = [&](uint64_t fadd_stall) {
+            const auto distance = std::to_string(alu_distance(profile));
+            const auto text = i1_asm(profile, "mov r1, 0x3f8 {pred=PT, stall=" + distance + ", set=-, wait=-}\n"
+                "shli r1, r1, 20\nmov r2, 3 {pred=PT, stall=" + distance + ", set=-, wait=-}\n"
+                "fadd r3, r1, r1 {pred=PT, stall=" + std::to_string(fadd_stall) + ", set=-, wait=-}\n"
+                "add r3, r2, r2\nhalt\n");
+            return i6a_machine(profile, nanosm::assemble_asm(text, profile));
+        };
+        auto ordered = run(stall);
+        ordered->run();
+        require(ordered->read_reg(0, 0, 3) == 6, what + "the younger add's value did not land last");
+        auto early = run(stall - 2);
+#if NANOSM_SANITIZER
+        require_mentions(i4_panic(*early, what + "WAW"), {"RF WAW hazard: missing stall or depbar wait for r3"},
+            what + "WAW");
+#else
+        early->run();
+        require(early->read_reg(0, 0, 3) == nanosm::float_bits(2.0f), what + "the add did not land before the fadd");
+#endif
+    }
+}
+
+// The read calendar's horizon (src/rf.hpp: its ring is the window plus the
+// issue register). Window 3: an instruction accepted at c books its one
+// bank-0 read at the window's last round, sampled at c + 3 -- the farthest
+// cycle any issue books. The add right after it needs bank 0 twice (r3, r6:
+// rounds sampled at c + 3 and c + 4) and is refused at c + 1 for the one
+// port of c + 3: that booking is still there (a ring of `rounds` slots
+// would have wiped it with c's own slot). It issues at c + 2.
+void test_i6a_read_calendar_horizon() {
+    auto profile = canonical_profile();
+    profile.rf_arithmetic_read_cycles = 3;
+    auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
+        addi r10, r0, 1
+        add r11, r3, r6
+        halt
+    )"), profile));
+    machine->run();
+    const auto first = issued_at(*machine, 0).at(0);
+    require(issued_at(*machine, 8) == std::vector<uint64_t>{first + 2},
+        "the two-round add was not refused for the booked port at c + 3:" + issue_log(*machine));
+    require(refusals(*machine, 0, "RF read reservation") == std::vector<std::pair<uint64_t, uint64_t>>{{first + 1, 1}},
+        "the refusal:" + describe(refusals(*machine, 0, "RF read reservation")));
+    require(i6a_rf_events(*machine, "RF read", 0) == std::vector<uint64_t>{first + 3} &&
+            i6a_rf_events(*machine, "RF read", 3) == std::vector<uint64_t>{first + 4} &&
+            i6a_rf_events(*machine, "RF read", 6) == std::vector<uint64_t>{first + 5},
+        "the samples were not at c + 3, c + 4, c + 5");
+    check_read_capacity(*machine, profile);
+}
+
+// An async writer against a fixed booking: an lds.uni's result reaches the
+// RF write port at P (issue + i1_lds_shift + 2) in bank 0, where an add
+// accepted earlier (at P - issue_to_port) booked bank 0's one port. The
+// booking wins; the lds's write is denied (one wait), granted at P + 1 and
+// lands Wd later; the add's lands at P + Wd.
+void test_i6a_async_writer_vs_fixed_booking() {
+    for (const auto& [lr, wd] : i6a_depths) {
+        const auto profile = i6a_profile(lr, wd);
+        const auto what = i6a_what(profile);
+        nanosm::Instruction add;
+        add.opcode = nanosm::Opcode::add;
+        const auto p = i1_lds_shift(profile) + 2;
+        const auto add_issue = p - nanosm::issue_to_port(add, profile);
+        auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile,
+            "lds.uni r3, [r1] {pred=PT, stall=" + std::to_string(add_issue) + ", set=sb0, wait=-}\n"
+            "add r6, r1, r1\n"
+            "halt {pred=PT, stall=0, set=-, wait=sb0}\n"), profile));
+        const auto landed = i1_run(*machine, {3});
+        require(issued_at(*machine, 8) == std::vector<uint64_t>{add_issue}, what + "the add moved" + issue_log(*machine));
+        require(i6a_rf_events(*machine, "RF write", 6) == std::vector<uint64_t>{p} &&
+                i6a_rf_events(*machine, "RF write", 3) == std::vector<uint64_t>{p + 1},
+            what + "the booked add did not keep the port at P, or the lds was not written at P + 1");
+        require(landed.at(3) == std::vector<uint64_t>{p + 1 + wd} && machine->trace().summary().rf_async_waits == 1,
+            what + "the lds's write did not land at P + 1 + Wd after one wait");
+        require(machine->read_reg(0, 0, 3) == 0x100, what + "lds data");
+    }
+}
+
+// Slots are claimed at admission and held while the operands travel (the
+// coupled lds / sts slots stay reserved from accept; the unit takes the
+// instruction issue_to_dispatch later). One load slot: lds.uni A accepted at
+// a; lds.uni B, tried from a + 1, is refused "load slots full" although the
+// slot register is still empty (A is in the dispatch pipeline). One store
+// slot, two warps: warp 1's sts, tried the cycle after warp 0's, is refused
+// "store slots full" while warp 0's sts travels and its slot is still empty.
+void test_i6a_slots_claimed_while_operands_travel() {
+    auto profile = canonical_profile();
+    profile.shmem_load_slots = 1;
+    profile.shmem_store_slots = 1;
+    const auto t = nanosm::issue_to_dispatch(profile);
+    {
+        auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
+            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r6, [r1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+        )"), profile));
+        std::map<uint64_t, bool> held; // the slot register (Q) during each cycle
+        while (!machine->done()) {
+            held[machine->cycle()] = machine->load_slot_held(0);
+            tick_capped(*machine);
+        }
+        const auto a = issued_at(*machine, 0).at(0);
+        const auto refused = refusals(*machine, 0, "load slots full");
+        require(!refused.empty() && refused.front().first == a + 1, "B was not refused from a + 1:" + describe(refused));
+        for (uint64_t cycle = a + 1; cycle <= a + t; ++cycle) {
+            require(!held.at(cycle), "the slot register was not empty while A's operands travelled");
+        }
+        require(held.at(a + t + 1), "A did not take the slot at its dispatch");
+    }
+    {
+        auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
+            sread r0, LANE_ID
+            sread r1, WARP_ID
+            shli r0, r0, 2
+            shli r1, r1, 6
+            add r0, r0, r1
+            sts [r0 + 1024], r1 {pred=PT, stall=0, set=sb0, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )"), profile), 2);
+        std::map<uint64_t, bool> held;
+        while (!machine->done()) {
+            held[machine->cycle()] = machine->store_slot_held(0);
+            tick_capped(*machine);
+        }
+        const auto issues = issued_at(*machine, 5 * 8);
+        require(issues.size() == 2 && issues[1] > issues[0], "two sts:" + issue_log(*machine));
+        const auto refused = refusals(*machine, 1, "store slots full");
+        require(!refused.empty() && refused.front().first == issues[0] + 1 && !held.at(issues[0] + 1),
+            "warp 1's sts was not refused for the slot warp 0's travelling sts claimed:" + describe(refused) +
+                issue_log(*machine));
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine->read_shmem_u32(1024 + 4 * lane) == 0 && machine->read_shmem_u32(1024 + 64 + 4 * lane) == 64,
+                "sts data");
+        }
+    }
+}
+
+// rf.read_latency_cycles (Lr) and rf.write_depth_cycles (Wd): optional in
+// the JSON (absent: the canonical 2), nonzero register stages (1..8), part of
+// the fingerprint. And the longest fixed dependency must fit the five-bit
+// stall field (src/profile.cpp): window - 1 + Lr + E + Wd + 1 <= 31, E the
+// longest fixed execution (canonical: the effective SFU latency, 11).
+void test_i6a_profile_fields() {
+    i21_check_optional_field("rf", "read_latency_cycles", 2, &nanosm::DeviceProfile::rf_read_latency_cycles);
+    i21_check_optional_field("rf", "write_depth_cycles", 2, &nanosm::DeviceProfile::rf_write_depth_cycles);
+    auto profile = canonical_profile();
+    const uint32_t execution = profile.timing.sfu;
+    profile.rf_read_latency_cycles = 8;
+    profile.rf_write_depth_cycles = 8;
+    profile.rf_arithmetic_read_cycles = 31 - (8 + execution + 8 + 1) + 1; // exactly 31
+    nanosm::validate_device_profile(profile);
+    ++profile.rf_arithmetic_read_cycles; // 32
+    try {
+        nanosm::validate_device_profile(profile);
+        throw std::runtime_error("a fixed dependency longer than the stall field passed validation");
+    } catch (const nanosm::ProfileError& error) {
+        require(std::string(error.what()).find("five-bit stall field") != std::string::npos,
+            "the stall-field refusal has the wrong text");
+    }
+}
+
 int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"encoding round trip", test_encoding_round_trip},
@@ -10817,6 +11698,13 @@ int main() {
         {"D12.1: every uniform op under a partial mask", test_d12_1_every_uniform_op_under_a_partial_mask},
         {"D12.1: mbar.init over an mbar with a live waiter", test_d12_1_mbar_init_over_a_live_waiter},
         {"D12.1: TMA load over an mbar with a live waiter", test_d12_1_tma_load_over_a_live_waiter},
+        {"I6a: the RF timing helper is the trace's (Lr/Wd 1/1, 2/2, 3/1)", test_i6a_helper_contract},
+        {"I6a: dependent add at the qtxc distance; one less is a RAW", test_i6a_dependent_add_distance},
+        {"I6a: WAW order", test_i6a_waw_order},
+        {"I6a: read calendar horizon", test_i6a_read_calendar_horizon},
+        {"I6a: async writer vs a fixed booking", test_i6a_async_writer_vs_fixed_booking},
+        {"I6a: slots claimed while operands travel", test_i6a_slots_claimed_while_operands_travel},
+        {"I6a: profile fields Lr, Wd; the stall-field bound", test_i6a_profile_fields},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips

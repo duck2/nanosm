@@ -83,21 +83,34 @@ public:
     void record_cycle_start();
 
     // ---- RF / predicate hazards (there is no scoreboard; a violation PANICS) ----
-    void record_reg_ready(uint32_t warp, uint32_t reg, uint64_t cycle);
+    // Cycles follow src/rf.hpp. An RF register's READY cycle is its latest
+    // write's VISIBILITY, the first cycle an RF sample sees it (a pending
+    // asynchronous write: never, until it lands). READ_UNTIL is the exclusive
+    // end of its pending fixed samples. A predicate's ready cycle is the first
+    // cycle issue reads it from the file.
+    void record_reg_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle);
     void record_reg_read_until(uint32_t warp, uint32_t reg, uint64_t exclusive_end);
     void record_async_reader_add(uint32_t warp, uint32_t reg);
     void record_async_reader_done(uint32_t warp, uint32_t reg, AsyncReader reader);
     void record_pred_ready(uint32_t warp, uint32_t pred, uint64_t cycle);
     void check_pred_waw(const IssueSite& site, uint8_t pred) const;
     void check_pred_raw(const IssueSite& site, uint8_t pred) const;
-    void check_rf_raw(const IssueSite& site, const std::vector<uint8_t>& sources) const;
-    void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width) const;
+    // RAW: each source register with the cycle this instruction samples it
+    // must be visible by then.
+    void check_rf_raw(const IssueSite& site, const std::vector<std::pair<uint8_t, uint64_t>>& samples) const;
+    // WAW / WAR for a write that cannot become visible before
+    // earliest_visible: it must land (earliest_visible - 1) after the older
+    // write lands and at or after the older samples, and no asynchronous
+    // reader may still own the register.
+    void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width, uint64_t earliest_visible) const;
 
     // ---- admission reads no operand (rfc10 section 1) ----
     // Every issue attempt opens with record_issue_attempt; record_issue_accepted
-    // marks the moment admission has decided. Issue captures an operand only
-    // after that: a capture in an attempt not (yet) accepted is an internal
-    // PANIC (a refused attempt must consume nothing).
+    // marks the moment admission has decided. RF operands are never read at
+    // issue (they are sampled through the issue register, I6a); the predicate
+    // file (bra.uni) is read by issue only after acceptance: a capture in an
+    // attempt not (yet) accepted is an internal PANIC (a refused attempt must
+    // consume nothing).
     void record_issue_attempt(uint32_t warp);
     void record_issue_accepted();
     void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;
@@ -292,8 +305,8 @@ private:
     };
 
     struct WarpHazards {
-        std::vector<uint64_t> ready_cycle;   // RAW/WAW: the scheduled write's commit cycle
-        std::vector<uint64_t> read_until;    // WAR: last scheduled read, exclusive end
+        std::vector<uint64_t> ready_cycle;   // RAW/WAW: the latest write's visibility (src/rf.hpp)
+        std::vector<uint64_t> read_until;    // WAR: last scheduled sample, exclusive end
         std::vector<uint32_t> async_readers; // WAR: acc.st / stg.v8 sources not yet read
         std::array<uint64_t, 7> predicate_ready_cycle{};
     };

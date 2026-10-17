@@ -779,6 +779,92 @@ std::string read_file(const std::string& path) {
     return contents.str();
 }
 
+// The registers an instruction's issue reads (acc.st reads only its
+// coordinates at issue, its data beat by beat; stg.v8 only its base).
+std::vector<uint8_t> issue_sources(const Instruction& inst) {
+    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
+        return {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
+    }
+    if (inst.opcode == Opcode::stg_v8) return {inst.src0};
+    return sources(inst);
+}
+
+// The fixed-latency part of the virtual issue timeline (vtime: a warp's issue
+// cycles, relative). Every distance comes from src/rf.hpp, the helper the
+// simulator and the sanitizer use:
+//   reg_visible: the vtime from which an RF sample sees a fixed result (async
+//     results are covered by depbars instead);
+//   read_until: the exclusive end of the fixed reads' samples;
+//   predicate_ready: the vtime from which issue reads a predicate.
+// A consumer is placed so its sample of each source is at or after that
+// source's visibility; a writer so its earliest landing comes after the older
+// write's (WAW) and at or after the older reads' samples (WAR).
+struct FixedTimeline {
+    std::array<int64_t, 256> reg_visible{};
+    std::array<int64_t, 256> read_until{};
+    std::array<int64_t, 7> predicate_ready{};
+
+    // The earliest vtime `inst` may issue at, given the instructions before it.
+    [[nodiscard]] int64_t required(
+        const Instruction& inst, const std::vector<RfRead>& reads, const DeviceProfile& profile, int64_t vtime) const {
+        int64_t at = vtime;
+        for (const auto source : sources(inst)) {
+            at = std::max(at, reg_visible[source] - issue_to_sample_of(reads, source)); // RAW
+        }
+        if (const auto dst = destination(inst); dst.has_value()) {
+            const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
+            const int64_t earliest = issue_to_visible_min(inst, profile);
+            for (unsigned j = 0; j < width; ++j) {
+                at = std::max(at, reg_visible[*dst + j] - earliest + 1); // WAW: land after the older write
+                at = std::max(at, read_until[*dst + j] - earliest);      // WAR: land at or after older samples
+            }
+        }
+        if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+            at = std::max(at, predicate_ready[inst.control.predicate]);
+        }
+        if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);
+        return at;
+    }
+
+    // `inst` issues at vtime: its reads and fixed results.
+    void record(const Instruction& inst, const std::vector<RfRead>& reads, const DeviceProfile& profile, int64_t vtime) {
+        for (const auto& read : reads) {
+            read_until[read.reg] = std::max<int64_t>(read_until[read.reg], vtime + issue_to_sample(read) + 1);
+        }
+        if (uses_arithmetic_pipeline(inst)) {
+            if (const auto dst = destination(inst); dst.has_value()) {
+                reg_visible[*dst] = vtime + issue_to_visible(inst, profile);
+            }
+            if (const auto dst = predicate_destination(inst); dst.has_value()) {
+                predicate_ready[*dst] = vtime + issue_to_predicate_visible(inst, profile);
+            }
+        } else if (const auto dst = predicate_destination(inst);
+                   dst.has_value() && fixed_latency(inst, profile.timing) != 0) {
+            // mbar.test_wait: its warp issues nothing until the probe is back
+            // and its predicate written, so its one-cycle latency always holds.
+            predicate_ready[*dst] = vtime + fixed_latency(inst, profile.timing);
+        }
+    }
+
+    // The earliest vtime any next instruction may issue at once every fixed
+    // result is visible, every older write landed after, every older sample
+    // passed, every predicate written: a branch's block boundary.
+    [[nodiscard]] int64_t drained(int64_t vtime, const DeviceProfile& profile) const {
+        int64_t all_ready = vtime + 1;
+        const int64_t earliest = earliest_rf_visible(profile);
+        for (const auto visible : reg_visible) all_ready = std::max<int64_t>(all_ready, visible - issue_register_stages);
+        for (const auto end : read_until) all_ready = std::max(all_ready, end - earliest);
+        for (const auto ready : predicate_ready) all_ready = std::max(all_ready, ready);
+        return all_ready;
+    }
+
+    void reset() {
+        reg_visible.fill(0);
+        read_until.fill(0);
+        predicate_ready.fill(0);
+    }
+};
+
 } // namespace
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile) {
@@ -792,16 +878,14 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     std::array<uint8_t, 256> pending_async_read_mask{};
     std::optional<uint8_t> store_barrier;
     std::optional<uint8_t> mma_barrier;
-    std::array<int64_t, 7> predicate_ready{};
 
     // Virtual issue timeline. Consecutive same-warp issues are at least max(stall, 1)
     // apart, and real gaps only grow (scheduler contention, depbar waits, structural
-    // stalls), so any spacing proven here holds on the machine. reg_ready is the vtime
-    // a fixed-latency result commits; async results are covered by depbars instead.
-    // A stall is paid only when a consumer sits closer than its producer's latency,
-    // and it lands on the instruction just before the consumer.
-    std::array<int64_t, 256> reg_ready{};
-    std::array<int64_t, 256> read_until{};
+    // stalls), so any spacing proven here holds on the machine. The fixed-latency
+    // distances are FixedTimeline's (src/rf.hpp). A stall is paid only when a
+    // consumer sits closer than that, and it lands on the instruction just before
+    // the consumer.
+    FixedTimeline timeline;
     int64_t vtime = 0;
     int64_t previous_vtime = 0;
     Instruction* previous = nullptr;
@@ -883,25 +967,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 mma_barrier.reset();
         }
 
-        int64_t required = vtime;
-        for (const auto source : sources(inst)) {
-            required = std::max(required, reg_ready[source]);
-        }
-        if (const auto dst = destination(inst); dst.has_value()) {
-            const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-            for (unsigned j = 0; j < width; ++j) {
-                required = std::max(required, reg_ready[*dst + j]); // RF write order = issue order
-                // Conservative WAR rule: do not even admit a writer until older
-                // fixed-window source captures are done. Reads follow cycle writeback.
-                required = std::max(required, read_until[*dst + j]);
-            }
-        }
-        if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
-            required = std::max(required, predicate_ready[inst.control.predicate]);
-        }
-        if (const auto dst = predicate_destination(inst); dst.has_value()) {
-            required = std::max(required, predicate_ready[*dst]);
-        }
+        const auto reads = rf_read_plan(inst, profile, issue_sources(inst));
+        const auto required = timeline.required(inst, reads, profile, vtime);
         if (required > vtime) {
             if (previous == nullptr) {
                 throw SimError("internal: first instruction cannot need a stall");
@@ -916,24 +983,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             vtime = required;
         }
         inst.control.stall = 0;
-
-        auto issue_sources = sources(inst);
-        if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-            issue_sources = {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
-        } else if (inst.opcode == Opcode::stg_v8) {
-            issue_sources = {inst.src0};
-        }
-        const auto reads = rf_read_plan(inst, profile, issue_sources);
-        for (const auto& read : reads) {
-            read_until[read.reg] = std::max(read_until[read.reg], vtime + read.offset + 1);
-        }
-        const auto latency = scheduled_fixed_latency(inst, profile);
-        if (const auto dst = destination(inst); latency != 0 && dst.has_value()) {
-            reg_ready[*dst] = vtime + latency;
-        }
-        if (const auto dst = predicate_destination(inst); latency != 0 && dst.has_value()) {
-            predicate_ready[*dst] = vtime + latency;
-        }
+        timeline.record(inst, reads, profile, vtime);
         if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
             const auto bar = allocate();
@@ -964,10 +1014,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
 
         if (is_branch(inst.opcode)) {
-            int64_t all_ready = vtime + 1;
-            for (const auto ready : reg_ready) all_ready = std::max(all_ready, ready);
-            for (const auto end : read_until) all_ready = std::max(all_ready, end);
-            for (const auto ready : predicate_ready) all_ready = std::max(all_ready, ready);
+            const auto all_ready = timeline.drained(vtime, profile);
             if (all_ready > vtime + 1) {
                 const auto stall = all_ready - vtime;
                 if (stall > static_cast<int64_t>(encoding::stall_mask)) {
@@ -986,9 +1033,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             pending_async_read_mask.fill(0);
             store_barrier.reset();
             mma_barrier.reset();
-            reg_ready.fill(0);
-            read_until.fill(0);
-            predicate_ready.fill(0);
+            timeline.reset();
             previous = nullptr;
             previous_vtime = 0;
             vtime = 0;
@@ -1272,6 +1317,53 @@ Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profil
 
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile) {
     return compile_and_assemble(read_file(path), profile);
+}
+
+// Hand assembly's fixed-latency stalls: each instruction's stall becomes the
+// larger of its own and what the fixed-latency register and predicate
+// dependencies of the instructions after it need under `profile` -- the
+// distances qtxc schedules with (FixedTimeline, src/rf.hpp) -- so the result
+// never trips the sanitizer's RAW / WAW / WAR checks on a fixed result.
+// Depbars, waits and every other field stay the author's. A branch drains
+// like qtxc's block boundary, and the code after it starts clean.
+Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
+    std::vector<Instruction> instructions;
+    for (const auto word : kernel.words) instructions.push_back(decode(word));
+    FixedTimeline timeline;
+    int64_t vtime = 0;
+    int64_t previous_vtime = 0;
+    std::optional<std::size_t> previous;
+    const auto set_stall = [](Instruction& inst, int64_t stall) {
+        if (stall > static_cast<int64_t>(encoding::stall_mask)) {
+            throw SimError("a fixed-latency dependency needs a stall beyond the five-bit field");
+        }
+        inst.control.stall = static_cast<uint8_t>(stall);
+    };
+    for (std::size_t index = 0; index < instructions.size(); ++index) {
+        auto& inst = instructions[index];
+        const auto reads = rf_read_plan(inst, profile, issue_sources(inst));
+        const auto required = timeline.required(inst, reads, profile, vtime);
+        if (required > vtime) {
+            if (!previous.has_value()) throw SimError("internal: first instruction cannot need a stall");
+            set_stall(instructions[*previous], required - previous_vtime);
+            vtime = required;
+        }
+        timeline.record(inst, reads, profile, vtime);
+        if (is_branch(inst.opcode)) {
+            const auto all_ready = timeline.drained(vtime, profile);
+            if (all_ready - vtime > std::max<int64_t>(inst.control.stall, 1)) set_stall(inst, all_ready - vtime);
+            timeline.reset();
+            previous.reset();
+            previous_vtime = 0;
+            vtime = 0;
+            continue;
+        }
+        previous = index;
+        previous_vtime = vtime;
+        vtime += std::max<int64_t>(inst.control.stall, 1);
+    }
+    for (std::size_t index = 0; index < instructions.size(); ++index) kernel.words[index] = encode(instructions[index]);
+    return kernel;
 }
 
 } // namespace nanosm

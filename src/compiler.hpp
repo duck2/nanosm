@@ -47,4 +47,9 @@ void validate_kernel(const Kernel& kernel);
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);
 
+// Hand assembly: raise each stall to what the kernel's fixed-latency register
+// and predicate dependencies need under `profile` (the distances qtxc
+// schedules with, src/rf.hpp); depbars and waits stay the author's.
+Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile);
+
 } // namespace nanosm

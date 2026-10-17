@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -24,6 +25,8 @@ json profile_json(const DeviceProfile& p) {
             {"read_ports_per_bank", p.rf_read_ports_per_bank},
             {"write_ports_per_bank", p.rf_write_ports_per_bank},
             {"arithmetic_read_cycles", p.rf_arithmetic_read_cycles},
+            {"read_latency_cycles", p.rf_read_latency_cycles},
+            {"write_depth_cycles", p.rf_write_depth_cycles},
         }},
         {"shmem", {
             {"bytes", p.shmem_bytes},
@@ -103,6 +106,22 @@ T field(const json& object, const char* name) {
 void validate_device_profile(const DeviceProfile& p) {
     if (p.rf_arithmetic_read_cycles == 0 || p.rf_arithmetic_read_cycles > 32) {
         throw ProfileError("device profile: arithmetic RF read window must be in 1..32 cycles");
+    }
+    // The RF's own depths (trash/rfc10.md section 5): nonzero register stages.
+    if (p.rf_read_latency_cycles == 0 || p.rf_read_latency_cycles > 8 ||
+        p.rf_write_depth_cycles == 0 || p.rf_write_depth_cycles > 8) {
+        throw ProfileError("device profile: rf read_latency_cycles and write_depth_cycles must be in 1..8 "
+            "register stages");
+    }
+    // The longest fixed-latency dependency must fit the five-bit stall field:
+    // a consumer issued d cycles after its producer samples at d + 1 (the
+    // issue register), the producer's result is visible from window + Lr + E
+    // + Wd + 1 (src/rf.hpp), so d = window - 1 + Lr + E + Wd + 1.
+    const uint32_t longest_execution = std::max({p.timing.alu, p.timing.fadd, p.timing.sfu});
+    if (p.rf_arithmetic_read_cycles - 1 + p.rf_read_latency_cycles + longest_execution +
+            p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
+        throw ProfileError("device profile: the longest fixed-latency dependency (read window, RF depths and "
+            "execution) must fit the five-bit stall field");
     }
     if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
         throw ProfileError("device profile: shmem load and store slots must be at least 1");
@@ -218,6 +237,17 @@ DeviceProfile parse_device_profile(std::string_view source) {
         }
         p.rf_arithmetic_read_cycles = value.get<uint32_t>();
     }
+    // Optional (absent: the canonical 2); present: an integer in 1..8.
+    const auto optional_rf = [&](const char* name, uint32_t& out) {
+        if (!rf.contains(name)) return;
+        const auto& value = rf.at(name);
+        if (!value.is_number_unsigned() || value < 1 || value > 8) {
+            throw ProfileError(std::string("device profile: rf ") + name + " must be an integer in 1..8");
+        }
+        out = value.get<uint32_t>();
+    };
+    optional_rf("read_latency_cycles", p.rf_read_latency_cycles);
+    optional_rf("write_depth_cycles", p.rf_write_depth_cycles);
     const auto& shmem = document.at("shmem");
     p.shmem_bytes = field<uint32_t>(shmem, "bytes");
     p.shmem_banks = field<uint32_t>(shmem, "banks");

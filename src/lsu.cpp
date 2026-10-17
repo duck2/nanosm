@@ -405,7 +405,8 @@ void Machine::finish_gmem_write(GmemSectorRequest request) {
 
 // Acks due now. A TMA ack returns its sector credit; an LSU ack its scatter
 // tag, and the command's last ack completes it: the depbar clears and its
-// slot and assembly register are released at the next cycle's RF write port.
+// slot and assembly register are released at the next cycle's RF write port
+// (a completion with no destination: its port and landing are that cycle).
 void Machine::deliver_write_acks(Wires& w) {
     while (!pending_write_acks_.empty() && pending_write_acks_.front().dram_tick <= dram_tick_) {
         const auto ack = pending_write_acks_.front();
@@ -421,7 +422,8 @@ void Machine::deliver_write_acks(Wires& w) {
         const auto acks = command->acks + ++w.controller.lsu_acks[ack.command];
         if (acks != command->requests_total) continue;
         Writeback completion;
-        completion.ready_cycle = cycle_ + 1;
+        completion.port_cycle = cycle_ + 1;
+        completion.land_cycle = cycle_ + 1;
         completion.warp = command->warp;
         completion.clear_depbar = command->depbar;
         completion.release_lsu_command = command->id;
@@ -446,15 +448,16 @@ bool Machine::is_store(LsuKind kind) {
 // request per lane in lane order, and with the placeholder controller's
 // queue-front order the highest lane's lands last; a reordering controller
 // may land another, which is why no program may rely on it).
-Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instruction& inst) const {
+Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
+    const auto& inst = op.instruction;
     LsuCommand command;
-    command.warp = warp.id;
-    command.pc = warp.pc;
+    command.warp = op.warp;
+    command.pc = op.pc;
     command.instruction = inst;
     const uint64_t lane_bytes = static_cast<uint64_t>(config_.lanes) * 4;
     const auto checked_address = [&](uint32_t base) {
         const auto address = static_cast<int64_t>(base) + inst.imm;
-        if (address < 0) panic(warp, inst, "gmem address arithmetic underflow");
+        if (address < 0) panic(op, "gmem address arithmetic underflow");
         return static_cast<uint64_t>(address);
     };
     switch (inst.opcode) {
@@ -464,14 +467,14 @@ Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instructio
         command.kind = load ? LsuKind::vector_load : LsuKind::vector_store;
         command.reg = load ? inst.dst : inst.src1;
         const auto address = checked_address(
-            uniform_reg(warp, inst, inst.src0, opcode_name(inst.opcode) + " base address"));
+            uniform_reg(op, inst.src0, opcode_name(inst.opcode) + " base address"));
         if (address % lane_bytes != 0) {
-            panic(warp, inst, opcode_name(inst.opcode) + " address " + std::to_string(address) +
+            panic(op, opcode_name(inst.opcode) + " address " + std::to_string(address) +
                 " is not " + std::to_string(lane_bytes) + "-byte aligned");
         }
         const uint64_t block = 8 * lane_bytes;
         if (address > gmem_.size() || block > gmem_.size() - address) {
-            panic(warp, inst, "gmem access out of bounds");
+            panic(op, "gmem access out of bounds");
         }
         command.base = address;
         command.requests_total = static_cast<uint32_t>(block / config_.gmem_sector_bytes);
@@ -483,29 +486,28 @@ Machine::LsuCommand Machine::plan_lsu_command(const Warp& warp, const Instructio
         command.kind = load ? LsuKind::scalar_load : LsuKind::scalar_store;
         command.reg = load ? inst.dst : inst.src1;
         std::vector<uint64_t> words;
-        const auto bases = capture(warp, inst.src0);
+        const auto bases = capture(op, inst.src0);
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             const auto address = checked_address(bases[lane]);
-            if (address % 4 != 0) panic(warp, inst, "unaligned 32-bit gmem access");
+            if (address % 4 != 0) panic(op, "unaligned 32-bit gmem access");
             if (address > gmem_.size() || gmem_.size() - address < 4) {
-                panic(warp, inst, "gmem access out of bounds");
+                panic(op, "gmem access out of bounds");
             }
             words.push_back(address);
             const uint64_t sector = address / config_.gmem_sector_bytes * config_.gmem_sector_bytes;
             command.sectors.push_back({sector, lane, static_cast<uint32_t>(address - sector)});
         }
-        if (!load) sanitizer_.check_store_word_collision(site(warp, inst), words, "gmem");
+        if (!load) sanitizer_.check_store_word_collision(site(op), words, "gmem");
         command.requests_total = config_.lanes;
         break;
     }
     case Opcode::ldg_uni: {
         command.kind = LsuKind::uniform_load;
         command.reg = inst.dst;
-        const auto address = checked_address(
-            uniform_reg(warp, inst, inst.src0, "ldg.uni base address"));
-        if (address % 4 != 0) panic(warp, inst, "unaligned 32-bit gmem access");
+        const auto address = checked_address(uniform_reg(op, inst.src0, "ldg.uni base address"));
+        if (address % 4 != 0) panic(op, "unaligned 32-bit gmem access");
         if (address > gmem_.size() || gmem_.size() - address < 4) {
-            panic(warp, inst, "gmem access out of bounds");
+            panic(op, "gmem access out of bounds");
         }
         const uint64_t sector = address / config_.gmem_sector_bytes * config_.gmem_sector_bytes;
         command.sectors.push_back({sector, 0, static_cast<uint32_t>(address - sector)});
@@ -529,6 +531,19 @@ std::optional<uint32_t> Machine::free_assembly_register(const Wires& w) const {
         }
     }
     return std::nullopt;
+}
+
+uint32_t Machine::free_assembly_register_count(const Wires& w) const {
+    uint32_t count = 0;
+    for (uint32_t index = 0; index < staging_.size(); ++index) {
+        const auto& owner = staging_[index].cur().owner;
+        if (!owner.has_value() ||
+            std::find(w.released_lsu_commands.begin(), w.released_lsu_commands.end(), *owner) !=
+                w.released_lsu_commands.end()) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 std::optional<uint32_t> Machine::free_id_tag() const {
@@ -814,41 +829,31 @@ void Machine::note_first_return(uint64_t command) {
 // client of the RF write decision: decide_rf_writes in sim.cpp.
 // ---------------------------------------------------------------------------
 
-// RF -> assembly (vector stores), after issue in RF read priority: one
-// full-width read beat per cycle. The oldest vector store whose assembly
-// register is empty -- in Q, or drained into the egress FIFO now (d) --
-// reads its next source register. A stg.v8 issued this cycle takes part
-// (its first beat in its issue cycle: bypass (e)).
-Machine::LsuRfRead Machine::decide_lsu_rf_read(const Wires& w) {
-    LsuRfRead read;
+// RF -> assembly (vector stores): the LSU's async RF reader, one full-width
+// read beat per cycle at most (decide_rf_reads grants it the current read
+// slot). Its candidate: the oldest vector store whose assembly register is
+// empty -- in Q, or drained into the egress FIFO now (d) -- with no beat of
+// its own still travelling to it (a beat fills the register Lr after its
+// read), reading its next source register. A stg.v8 dispatched this cycle
+// takes part (its first beat in its dispatch cycle: bypass (e)).
+std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wires& w) const {
     std::vector<const LsuCommand*> commands;
     for (const auto& command : lsu_commands_.cur()) commands.push_back(&command);
-    if (w.issue.lsu.has_value()) commands.push_back(&w.issue.lsu->command);
+    if (w.dispatch.lsu.has_value()) commands.push_back(&w.dispatch.lsu->command);
+    const auto& travelling = lsu_read_pipe_.cur();
     for (const auto* command : commands) {
         if (command->kind != LsuKind::vector_store || command->chunks_done == 8) continue;
-        const bool admitted_now = w.issue.lsu.has_value() && command == &w.issue.lsu->command;
+        const bool in_flight = std::any_of(travelling.begin(), travelling.end(),
+            [&](const LsuRfRead& beat) { return beat.command == command->id; });
+        if (in_flight) continue;
+        const bool admitted_now = w.dispatch.lsu.has_value() && command == &w.dispatch.lsu->command;
         const bool drained_now = w.egress.lsu_chunk_drained && w.egress.lsu_command == command->id;
         const bool empty = admitted_now || drained_now || staging_.at(command->assembly).cur().valid_count == 0;
         if (!empty) continue;
         const auto reg = static_cast<uint8_t>(command->reg + command->chunks_done);
-        const std::vector<RfRead> reads{{reg, 0}};
-        if (!can_reserve_reads(reads)) {
-            ++trace_->lsu_counters().lsu_rf_read_wait_cycles;
-            ++lsu_phases_[command->id].rf_wait;
-            break;
-        }
-        reserve_reads(reads, RfRequester::lsu_store_read);
-        const auto& warp = warps_.at(command->warp);
-        trace_->rf_read(cycle_, warp.id, reg, reg % config_.rf_banks);
-        read.command = command->id;
-        read.assembly = command->assembly;
-        read.values.resize(config_.lanes);
-        for (uint32_t lane = 0; lane < config_.lanes; ++lane) read.values[lane] = rf(warp, lane, reg);
-        probe(LsuEdge::rf_read_beat, command->id, reg, config_.lanes * 4);
-        sanitizer_.record_async_reader_done(warp.id, reg, AsyncReader::stg_v8);
-        break;
+        return RfReadRequest{RfReader::lsu_store, 0, command->warp, reg, command->id, command->assembly};
     }
-    return read;
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------

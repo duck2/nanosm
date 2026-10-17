@@ -23,8 +23,19 @@ struct DeviceProfile {
     uint32_t rf_rows_per_bank = 0;
     uint32_t rf_read_ports_per_bank = 0;
     uint32_t rf_write_ports_per_bank = 0;
-    // Fixed arithmetic read window; execution latency starts at its final cycle.
+    // Fixed arithmetic read window: how many consecutive RF read rounds (address
+    // cycles) one accepted instruction may own; its operands are right-aligned
+    // in it (src/rf.hpp). A capacity, not a latency.
     uint32_t rf_arithmetic_read_cycles = 1;
+    // Lr (trash/rfc10.md section 5, I6a): register stages of the RF itself
+    // from a read's address sample to its operand at the RF output. >= 1.
+    uint32_t rf_read_latency_cycles = 2;
+    // Wd: register stages from a write's presentation at the RF write port to
+    // the RAM, inclusive (the port-A convention, rfc12 section 2): a write
+    // presented at W is written at the clock edge ending W + Wd; a read
+    // sampled at W + Wd still sees the old word (READ_FIRST), one sampled from
+    // W + Wd + 1 the new one. >= 1.
+    uint32_t rf_write_depth_cycles = 2;
     uint32_t shmem_bytes = 0;
     uint32_t shmem_banks = 0;
     // Load slots (rfc12 section 3): an admitted lds / lds.uni holds one from

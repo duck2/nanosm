@@ -101,8 +101,8 @@ void Sanitizer::check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, 
 // RF / predicate hazards
 // ---------------------------------------------------------------------------
 
-void Sanitizer::record_reg_ready(uint32_t warp, uint32_t reg, uint64_t cycle) {
-    warps_.at(warp).ready_cycle[reg] = cycle;
+void Sanitizer::record_reg_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle) {
+    warps_.at(warp).ready_cycle[reg] = visible_cycle;
 }
 
 void Sanitizer::record_reg_read_until(uint32_t warp, uint32_t reg, uint64_t exclusive_end) {
@@ -139,22 +139,27 @@ void Sanitizer::check_pred_raw(const IssueSite& site, uint8_t pred) const {
     }
 }
 
-void Sanitizer::check_rf_raw(const IssueSite& site, const std::vector<uint8_t>& sources) const {
+void Sanitizer::check_rf_raw(
+    const IssueSite& site, const std::vector<std::pair<uint8_t, uint64_t>>& samples) const {
     const auto& warp = warps_.at(site.warp);
-    for (const auto reg : sources) {
-        if (warp.ready_cycle.at(reg) > site.cycle) {
+    for (const auto& [reg, sample] : samples) {
+        if (warp.ready_cycle.at(reg) > sample) {
             throw_issue_panic(site, "RF RAW hazard: missing stall or depbar wait for r" + std::to_string(reg));
         }
     }
 }
 
-void Sanitizer::check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width) const {
+// The younger write lands at earliest_visible - 1 or later; the older write
+// landed (or lands) at ready_cycle - 1; the older samples end before
+// read_until.
+void Sanitizer::check_rf_waw_war(
+    const IssueSite& site, uint8_t dst, unsigned width, uint64_t earliest_visible) const {
     const auto& warp = warps_.at(site.warp);
     for (unsigned j = 0; j < width; ++j) {
         const auto reg = dst + j;
-        if (warp.ready_cycle[reg] > site.cycle)
+        if (warp.ready_cycle[reg] >= earliest_visible)
             throw_issue_panic(site, "RF WAW hazard: missing stall or depbar wait for r" + std::to_string(reg));
-        if (warp.read_until[reg] > site.cycle || warp.async_readers[reg] != 0)
+        if (warp.read_until[reg] > earliest_visible || warp.async_readers[reg] != 0)
             throw_issue_panic(site, "RF WAR hazard: pending reader of r" + std::to_string(reg));
     }
 }
