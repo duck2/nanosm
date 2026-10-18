@@ -40,6 +40,7 @@ LAUNCHES = [
     ("pipeline_tma_wide", "kernels/pipeline_tma_wide.launch.py", []),
     ("vadd", "kernels/vadd.launch.py", []),
     ("vadd_warps2", "kernels/vadd.launch.py", ["--warps", "2"]),
+    ("vadd_warps16", "kernels/vadd.launch.py", ["--warps", "16"]),
 ]
 
 SKIP_PREFIX = "SKIP "

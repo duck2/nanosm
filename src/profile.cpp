@@ -24,7 +24,6 @@ json profile_json(const DeviceProfile& p) {
             {"rows_per_bank", p.rf_rows_per_bank},
             {"read_ports_per_bank", p.rf_read_ports_per_bank},
             {"write_ports_per_bank", p.rf_write_ports_per_bank},
-            {"arithmetic_read_cycles", p.rf_arithmetic_read_cycles},
             {"read_latency_cycles", p.rf_read_latency_cycles},
             {"write_depth_cycles", p.rf_write_depth_cycles},
         }},
@@ -104,9 +103,6 @@ T field(const json& object, const char* name) {
 } // namespace
 
 void validate_device_profile(const DeviceProfile& p) {
-    if (p.rf_arithmetic_read_cycles == 0 || p.rf_arithmetic_read_cycles > 32) {
-        throw ProfileError("device profile: arithmetic RF read window must be in 1..32 cycles");
-    }
     // The RF's own depths (trash/rfc10.md section 5): nonzero register stages.
     if (p.rf_read_latency_cycles == 0 || p.rf_read_latency_cycles > 8 ||
         p.rf_write_depth_cycles == 0 || p.rf_write_depth_cycles > 8) {
@@ -115,13 +111,12 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     // The longest fixed-latency dependency must fit the five-bit stall field:
     // a consumer issued d cycles after its producer samples at d + 1 (the
-    // issue register), the producer's result is visible from window + Lr + E
-    // + Wd + 1 (src/rf.hpp), so d = window - 1 + Lr + E + Wd + 1.
+    // issue register), the producer's result is visible from 1 + Lr + E + Wd
+    // + 1 (src/rf.hpp), so d = Lr + E + Wd + 1.
     const uint32_t longest_execution = std::max({p.timing.alu, p.timing.fadd, p.timing.sfu});
-    if (p.rf_arithmetic_read_cycles - 1 + p.rf_read_latency_cycles + longest_execution +
-            p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
-        throw ProfileError("device profile: the longest fixed-latency dependency (read window, RF depths and "
-            "execution) must fit the five-bit stall field");
+    if (p.rf_read_latency_cycles + longest_execution + p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
+        throw ProfileError("device profile: the longest fixed-latency dependency (RF depths and execution) "
+            "must fit the five-bit stall field");
     }
     if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
         throw ProfileError("device profile: shmem load and store slots must be at least 1");
@@ -230,12 +225,12 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.rf_rows_per_bank = field<uint32_t>(rf, "rows_per_bank");
     p.rf_read_ports_per_bank = field<uint32_t>(rf, "read_ports_per_bank");
     p.rf_write_ports_per_bank = field<uint32_t>(rf, "write_ports_per_bank");
+    // Removed (trash/rfc14.md section 3): every instruction reads its operands
+    // in one round, so there is no read window to size. A profile that still
+    // names one is refused rather than silently read differently.
     if (rf.contains("arithmetic_read_cycles")) {
-        const auto& value = rf.at("arithmetic_read_cycles");
-        if (!value.is_number_integer() || value < 1 || value > 32) {
-            throw ProfileError("device profile: arithmetic RF read window must be an integer in 1..32");
-        }
-        p.rf_arithmetic_read_cycles = value.get<uint32_t>();
+        throw ProfileError("device profile: rf.arithmetic_read_cycles was removed (every instruction reads "
+            "its operands in one round); delete the field");
     }
     // Optional (absent: the canonical 2); present: an integer in 1..8.
     const auto optional_rf = [&](const char* name, uint32_t& out) {

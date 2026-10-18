@@ -20,13 +20,16 @@ struct DeviceProfile {
     std::string name;
     uint32_t lanes = 0;
     uint32_t rf_banks = 0;
+    // One row of one bank holds one lane-wide register (lanes x 4 B). A
+    // launch fits when active warps x the kernel's rows in every bank fit
+    // (no separate warp-count field). Canonical 352: 3 x 352 x 64 B = 66 KiB,
+    // about the size of shmem; 16 warps x 22 rows (66 registers each).
     uint32_t rf_rows_per_bank = 0;
+    // Distinct registers one bank serves per cycle. Every instruction reads
+    // its operands in one round (src/rf.hpp), so its distinct sources in a
+    // bank may not exceed this (one at the canonical profile).
     uint32_t rf_read_ports_per_bank = 0;
     uint32_t rf_write_ports_per_bank = 0;
-    // Fixed arithmetic read window: how many consecutive RF read rounds (address
-    // cycles) one accepted instruction may own; its operands are right-aligned
-    // in it (src/rf.hpp). A capacity, not a latency.
-    uint32_t rf_arithmetic_read_cycles = 1;
     // Lr (trash/rfc10.md section 5, I6a): register stages of the RF itself
     // from a read's address sample to its operand at the RF output. >= 1.
     uint32_t rf_read_latency_cycles = 2;

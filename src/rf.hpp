@@ -3,6 +3,8 @@
 #include "profile.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <string>
 #include <vector>
 
 // The RF's timing: the one helper the compiler (qtxc's stall distances), the
@@ -25,72 +27,70 @@
 //   - The predicate file is flip-flops, not an SRAM: a predicate presented at
 //     W is in the file from W + 1.
 //
-// Fixed arithmetic (the "arithmetic pipeline"): an accepted instruction owns
-// a read window of rf.arithmetic_read_cycles rounds; its reads are
-// right-aligned in it, so the last one is sampled at c0 + window; all its
-// operands are at the RF output at c0 + window + Lr, when execution starts;
-// its result reaches the write port E cycles later:
+// RF reads (trash/rfc14.md sections 3 and 4): every instruction reads all
+// its operands in ONE round, sampled at the same offset after its accepted
+// issue -- the issue register's cycle, c0 + 1. At most one instruction is
+// accepted per cycle, so the reads of two instructions never meet in one
+// cycle: the accepted instruction's bank use, carried by the issue
+// register, owns the RF read ports in its sample cycle, and the asynchronous
+// readers (acc.st beats, the LSU's store data) take the ports it leaves free.
+// No future read is booked anywhere. An instruction whose distinct source
+// registers need more of one bank's read ports than the bank has is
+// MALFORMED for this machine (rf_read_port_conflict): qtxc, the hand
+// assembler and kernel load reject it; nothing serializes it.
 //
-//     accept c0, sample c0 + 1 + offset, operands c0 + window + Lr,
-//     port W = c0 + window + Lr + E, RAM W + Wd, visible W + Wd + 1
+// Fixed arithmetic (the "arithmetic pipeline"): all its operands are at the
+// RF output Lr after the sample, when execution starts; its result reaches
+// the write port E cycles later:
 //
-// Canonical (window 1, Lr 2, E 1, Wd 2): an add accepted at c0 samples at
-// c1, has its operands at c3, presents its result at c4, writes the RAM at
-// c6, and a dependent add sampling from c7 sees it -- it issues at c6, six
-// cycles later.
+//     accept c0, sample c0 + 1, operands c0 + 1 + Lr,
+//     port W = c0 + 1 + Lr + E, RAM W + Wd, visible W + Wd + 1
 //
-// Everything else (memory, engines, mbar operations) also reads its operands
-// through the issue register and the RF (one round, sampled at c0 + 1) and
-// reaches its unit at DISPATCH, c0 + 1 + Lr, when its operands exist.
+// Canonical (Lr 2, E 1, Wd 2): an add accepted at c0 samples at c1, has its
+// operands at c3, presents its result at c4, writes the RAM at c6, and a
+// dependent add sampling from c7 sees it -- it issues at c6, six cycles
+// later.
+//
+// Everything else (memory, engines, mbar operations) reads its operands the
+// same way and reaches its unit at DISPATCH, c0 + 1 + Lr, when its operands
+// exist.
 
 namespace nanosm {
 
 // The issue register: one cycle from accepted issue to the RF address inputs.
 inline constexpr uint32_t issue_register_stages = 1;
 
-// One scheduled capture: read `reg` `offset` rounds into the read window,
-// i.e. sample it issue_register_stages + offset cycles after issue.
-struct RfRead {
-    uint8_t reg;
-    uint32_t offset;
-};
+// Accepted issue -> the sample of every register the instruction reads (its
+// one round). A source read later, beat by beat (acc.st / stg.v8 data), is
+// read-owned from here too: the conservative answer for a RAW check.
+inline constexpr uint32_t issue_to_sample = issue_register_stages;
 
 // Fixed-latency ALU/FPU/SFU work (MOV/SREAD and setp included) runs through
 // the arithmetic read pipeline. Everything else -- memory, TMA, mbar engines,
-// and mbar.test_wait's predicate broadcast -- reads its operands in one round
-// and is dispatched to its unit. The Timing{1, 1, 1} probe only asks "is this
-// opcode in the fixed-latency class at all"; any nonzero dummy latencies
-// would do.
+// and mbar.test_wait's predicate broadcast -- is dispatched to its unit. The
+// Timing{1, 1, 1} probe only asks "is this opcode in the fixed-latency class
+// at all"; any nonzero dummy latencies would do.
 inline bool uses_arithmetic_pipeline(const Instruction& inst) {
     if (inst.opcode == Opcode::mbar_test_wait_i) return false;
     if (inst.opcode == Opcode::mbar_test_wait_r) return false;
     return fixed_latency(inst, Timing{1, 1, 1}) != 0;
 }
 
-inline uint32_t read_window(const Instruction& inst, const DeviceProfile& profile) {
-    return uses_arithmetic_pipeline(inst) ? profile.rf_arithmetic_read_cycles : 1;
-}
-
-// Accepted issue -> this read's address sample.
-inline uint32_t issue_to_sample(const RfRead& read) {
-    return issue_register_stages + read.offset;
-}
-
 // Accepted issue -> every operand at the RF output (execution starts, or the
 // unit takes the instruction).
-inline uint32_t issue_to_operands(const Instruction& inst, const DeviceProfile& profile) {
-    return issue_register_stages + read_window(inst, profile) - 1 + profile.rf_read_latency_cycles;
+inline uint32_t issue_to_operands(const DeviceProfile& profile) {
+    return issue_to_sample + profile.rf_read_latency_cycles;
 }
 
 // Accepted issue -> a memory / engine instruction reaches its unit.
 inline uint32_t issue_to_dispatch(const DeviceProfile& profile) {
-    return issue_register_stages + profile.rf_read_latency_cycles;
+    return issue_to_operands(profile);
 }
 
 // Accepted issue -> a fixed result's presentation at the RF write port (or
 // the predicate file's input).
 inline uint32_t issue_to_port(const Instruction& inst, const DeviceProfile& profile) {
-    return issue_to_operands(inst, profile) + fixed_latency(inst, profile.timing);
+    return issue_to_operands(profile) + fixed_latency(inst, profile.timing);
 }
 
 // Accepted issue -> the first cycle a read sample sees a fixed RF result.
@@ -106,11 +106,11 @@ inline uint32_t issue_to_predicate_visible(const Instruction& inst, const Device
 // The floor under every RF write's visibility, fixed or not: a destination
 // is written from something the instruction read through the issue register
 // and the RF (Lr), held in at least one register before the write port, then
-// written through Wd. The fastest fixed result (window 1, E 1) meets it
-// exactly; every asynchronous writer (an lds's gather, an atomic's return
-// slot, an LSU assembly register, an acc.ld pipeline) is slower.
+// written through Wd. The fastest fixed result (E 1) meets it exactly; every
+// asynchronous writer (an lds's gather, an atomic's return slot, an LSU
+// assembly register, an acc.ld pipeline) is slower.
 inline uint32_t earliest_rf_visible(const DeviceProfile& profile) {
-    return issue_register_stages + profile.rf_read_latency_cycles + 1 + profile.rf_write_depth_cycles + 1;
+    return issue_to_sample + profile.rf_read_latency_cycles + 1 + profile.rf_write_depth_cycles + 1;
 }
 
 // Accepted issue -> the earliest cycle this instruction's RF destination can
@@ -120,61 +120,43 @@ inline uint32_t issue_to_visible_min(const Instruction& inst, const DeviceProfil
     return uses_arithmetic_pipeline(inst) ? issue_to_visible(inst, profile) : earliest_rf_visible(profile);
 }
 
-// Place this instruction's RF reads inside its fixed window.
-//
-//   - A register is read once, however many operand slots name it; the value
-//     is broadcast from its latch.
-//   - A bank serves rf_read_ports_per_bank distinct registers per cycle, so a
-//     bank holding more operands than that needs several rounds.
-//   - Banks are independent: reads in different banks may share a cycle.
-//   - Each bank's rounds are pushed as late as possible ("right-aligned"), so
-//     every instruction's last capture lands on the window's final round --
-//     all its operands reach the RF output together, Lr later. That shared
-//     alignment is what gives all arithmetic one uniform result latency.
-//   - Operands that cannot fit the window make the instruction illegal for
-//     this profile: qtxc rejects it at compile time, and the same throw fires
-//     at issue for hand-written asm.
-//
-// Example, canonical 3 banks / 1 port, window 3, add r4, r0, r3:
-// r0 and r3 both live in bank 0, so bank 0 needs two rounds, right-aligned
-// to offsets 1 and 2; bank-independent operands would have joined at offset 2.
-inline std::vector<RfRead> rf_read_plan(
-    const Instruction& inst, const DeviceProfile& profile, const std::vector<uint8_t>& sources) {
-    const auto window = read_window(inst, profile);
-
-    // Distinct source registers, grouped by their RF bank (reg mod banks).
-    std::vector<std::vector<uint8_t>> banks(profile.rf_banks);
+// The registers an instruction reads in its one round, from the source
+// registers its issue reads: each distinct register once. A register named
+// by several operand slots is read once; the value is broadcast from its
+// latch.
+inline std::vector<uint8_t> rf_read_round(const std::vector<uint8_t>& sources) {
+    std::vector<uint8_t> round;
     for (const auto reg : sources) {
-        auto& bank = banks[reg % profile.rf_banks];
-        if (std::find(bank.begin(), bank.end(), reg) == bank.end()) bank.push_back(reg);
+        if (std::find(round.begin(), round.end(), reg) == round.end()) round.push_back(reg);
     }
-
-    std::vector<RfRead> plan;
-    for (const auto& bank : banks) {
-        if (bank.empty()) continue;
-        const auto ports = profile.rf_read_ports_per_bank;
-        const auto rounds = static_cast<uint32_t>(1 + (bank.size() - 1) / ports); // ceil(size / ports)
-        if (rounds > window) {
-            throw ProfileError(
-                "RF operands exceed the fixed read window in '" + format_instruction(inst) + "'");
-        }
-        const auto first_round = window - rounds; // right-aligned
-        for (std::size_t i = 0; i < bank.size(); ++i) {
-            plan.push_back({bank[i], first_round + static_cast<uint32_t>(i / ports)});
-        }
-    }
-    return plan;
+    return round;
 }
 
-// Accepted issue -> this instruction's sample of `reg`. A source the plan
-// does not read at issue (acc.st / stg.v8 data, read beat by beat later)
-// counts as sampled as early as possible, after the issue register: the
-// conservative answer for a RAW check.
-inline uint32_t issue_to_sample_of(const std::vector<RfRead>& plan, uint8_t reg) {
-    for (const auto& read : plan) {
-        if (read.reg == reg) return issue_to_sample(read);
+// A bank (reg mod rf.banks) serves rf.read_ports_per_bank distinct
+// registers per cycle -- one at the canonical profile. An instruction whose
+// round needs more of one bank is malformed: the text names the instruction,
+// the registers and their bank (callers add the line or pc). None when every
+// bank fits.
+//
+// Example, canonical 3 banks / 1 port: add r4, r0, r3 reads r0 and r3, both
+// in bank 0 -- malformed. add r4, r0, r0 reads r0 once -- fine.
+inline std::optional<std::string> rf_read_port_conflict(
+    const Instruction& inst, const DeviceProfile& profile, const std::vector<uint8_t>& sources) {
+    std::vector<std::vector<uint8_t>> banks(profile.rf_banks);
+    for (const auto reg : rf_read_round(sources)) banks[reg % profile.rf_banks].push_back(reg);
+    for (uint32_t bank = 0; bank < banks.size(); ++bank) {
+        if (banks[bank].size() <= profile.rf_read_ports_per_bank) continue;
+        std::string registers;
+        for (std::size_t i = 0; i < banks[bank].size(); ++i) {
+            registers += (i == 0 ? "" : i + 1 == banks[bank].size() ? " and " : ", ") +
+                ("r" + std::to_string(banks[bank][i]));
+        }
+        const auto ports = profile.rf_read_ports_per_bank;
+        return "malformed instruction '" + format_instruction(inst, false) + "': its distinct sources " +
+            registers + " are in one RF bank (" + std::to_string(bank) + "), which has " +
+            std::to_string(ports) + (ports == 1 ? " read port" : " read ports");
     }
-    return issue_register_stages;
+    return std::nullopt;
 }
 
 } // namespace nanosm

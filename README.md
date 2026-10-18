@@ -57,7 +57,12 @@ fields and is the intended human-editable layer. `hex` is one annotated 64-bit i
 line and is what the simulator fetches. The same human-editable device profile is required at all
 three stages. Assembly and hex carry its fingerprint, so a schedule cannot silently run with
 different machine timings. Hex also carries the register count derived by qtxas; launch residency
-is checked against the physical RF banks in the profile.
+is checked against the physical RF banks in the profile. An instruction reads the source registers
+it names at issue in one RF round (the data of `acc.st` and `stg.v8` is read later, beat by beat,
+and is not part of that round). An instruction whose distinct issue-time sources need more reads of
+one bank (register mod `rf.banks`) than `rf.read_ports_per_bank` allows -- at the canonical one port,
+two distinct sources in one bank -- is malformed: qtxc, qtxas and kernel load reject it with the
+registers named.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
 `setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands, and `@p0 bra.uni label`. A

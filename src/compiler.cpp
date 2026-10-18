@@ -789,6 +789,14 @@ std::vector<uint8_t> issue_sources(const Instruction& inst) {
     return sources(inst);
 }
 
+// The one-round read rule (src/rf.hpp): distinct sources beyond a bank's read
+// ports make the instruction malformed. `where` is "line N" or "pc N".
+void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if (const auto conflict = rf_read_port_conflict(inst, profile, issue_sources(inst)); conflict.has_value()) {
+        throw SimError(where + ": " + *conflict);
+    }
+}
+
 // The fixed-latency part of the virtual issue timeline (vtime: a warp's issue
 // cycles, relative). Every distance comes from src/rf.hpp, the helper the
 // simulator and the sanitizer use:
@@ -805,11 +813,12 @@ struct FixedTimeline {
     std::array<int64_t, 7> predicate_ready{};
 
     // The earliest vtime `inst` may issue at, given the instructions before it.
-    [[nodiscard]] int64_t required(
-        const Instruction& inst, const std::vector<RfRead>& reads, const DeviceProfile& profile, int64_t vtime) const {
+    // Every source is sampled (or, read later beat by beat, read-owned) from
+    // issue + issue_to_sample.
+    [[nodiscard]] int64_t required(const Instruction& inst, const DeviceProfile& profile, int64_t vtime) const {
         int64_t at = vtime;
         for (const auto source : sources(inst)) {
-            at = std::max(at, reg_visible[source] - issue_to_sample_of(reads, source)); // RAW
+            at = std::max(at, reg_visible[source] - int64_t{issue_to_sample}); // RAW
         }
         if (const auto dst = destination(inst); dst.has_value()) {
             const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
@@ -826,10 +835,10 @@ struct FixedTimeline {
         return at;
     }
 
-    // `inst` issues at vtime: its reads and fixed results.
-    void record(const Instruction& inst, const std::vector<RfRead>& reads, const DeviceProfile& profile, int64_t vtime) {
-        for (const auto& read : reads) {
-            read_until[read.reg] = std::max<int64_t>(read_until[read.reg], vtime + issue_to_sample(read) + 1);
+    // `inst` issues at vtime: its one read round and fixed results.
+    void record(const Instruction& inst, const DeviceProfile& profile, int64_t vtime) {
+        for (const auto reg : rf_read_round(issue_sources(inst))) {
+            read_until[reg] = std::max<int64_t>(read_until[reg], vtime + issue_to_sample + 1);
         }
         if (uses_arithmetic_pipeline(inst)) {
             if (const auto dst = destination(inst); dst.has_value()) {
@@ -967,8 +976,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 mma_barrier.reset();
         }
 
-        const auto reads = rf_read_plan(inst, profile, issue_sources(inst));
-        const auto required = timeline.required(inst, reads, profile, vtime);
+        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
+        const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (previous == nullptr) {
                 throw SimError("internal: first instruction cannot need a stall");
@@ -983,7 +992,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             vtime = required;
         }
         inst.control.stall = 0;
-        timeline.record(inst, reads, profile, vtime);
+        timeline.record(inst, profile, vtime);
         if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
             const auto bar = allocate();
@@ -1189,6 +1198,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                 throw SimError("line " + std::to_string(inst.line) + ": invalid branch displacement");
             }
         }
+        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
         kernel.words.push_back(encode(inst));
     }
     return kernel;
@@ -1311,6 +1321,12 @@ Kernel load_hex_file(const std::string& path) {
     return load_hex(read_file(path));
 }
 
+void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        check_rf_read_round(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
+    }
+}
+
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile) {
     return assemble_asm(emit_asm(compile_qtx(source, profile)), profile);
 }
@@ -1341,14 +1357,13 @@ Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
     };
     for (std::size_t index = 0; index < instructions.size(); ++index) {
         auto& inst = instructions[index];
-        const auto reads = rf_read_plan(inst, profile, issue_sources(inst));
-        const auto required = timeline.required(inst, reads, profile, vtime);
+        const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (!previous.has_value()) throw SimError("internal: first instruction cannot need a stall");
             set_stall(instructions[*previous], required - previous_vtime);
             vtime = required;
         }
-        timeline.record(inst, reads, profile, vtime);
+        timeline.record(inst, profile, vtime);
         if (is_branch(inst.opcode)) {
             const auto all_ready = timeline.drained(vtime, profile);
             if (all_ready - vtime > std::max<int64_t>(inst.control.stall, 1)) set_stall(inst, all_ready - vtime);

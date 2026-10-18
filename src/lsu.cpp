@@ -830,8 +830,8 @@ void Machine::note_first_return(uint64_t command) {
 // ---------------------------------------------------------------------------
 
 // RF -> assembly (vector stores): the LSU's async RF reader, one full-width
-// read beat per cycle at most (decide_rf_reads grants it the current read
-// slot). Its candidate: the oldest vector store whose assembly register is
+// read beat per cycle at most (decide_rf_reads grants it a read port the
+// issue register leaves free). Its candidate: the oldest vector store whose assembly register is
 // empty -- in Q, or drained into the egress FIFO now (d) -- with no beat of
 // its own still travelling to it (a beat fills the register Lr after its
 // read), reading its next source register. A stg.v8 dispatched this cycle

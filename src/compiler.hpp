@@ -43,6 +43,11 @@ std::string emit_hex(const Kernel& kernel);
 Kernel load_hex(std::string_view source);
 Kernel load_hex_file(const std::string& path);
 void validate_kernel(const Kernel& kernel);
+// Kernel load: every instruction's distinct sources fit its RF banks' read
+// ports in one round (src/rf.hpp), else a SimError naming the pc, the
+// instruction and the registers. qtxc and the assembler apply the same rule
+// per source line.
+void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);

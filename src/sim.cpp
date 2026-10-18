@@ -236,7 +236,6 @@ std::optional<uint8_t> depbar_wait(const Instruction& inst, const std::array<uin
 // count, so that never refuses.
 std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePlan& plan, const ResourceView& view) {
     const auto opcode = inst.opcode;
-    if (!view.reads_fit) return Refusal::rf_read_booked;
     if (view.read_inhibited) return Refusal::rf_read_inhibited;
     if (uses_arithmetic_pipeline(inst)) {
         if (is_sfu(opcode) && !view.sfu_free) return Refusal::sfu_busy;
@@ -307,6 +306,9 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             }
         }
     }
+    // Distinct sources beyond a bank's read ports are a property of the
+    // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
+    check_rf_read_rounds(kernel_, config_);
     if (launch.active_warps == 0) throw SimError("active warp count is zero");
     for (const auto& acc : kernel_.accumulators) {
         const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
@@ -354,8 +356,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         read_policy.owed.assign(config_.rf_banks, 0);
         read_policy.cursor.assign(config_.rf_banks, 0);
         rf_read_policy_.poke(std::move(read_policy));
-        read_reservations_.assign(config_.rf_arithmetic_read_cycles + issue_register_stages,
-            std::vector<uint32_t>(config_.rf_banks, 0));
+        issue_read_banks_.poke(std::vector<uint8_t>(config_.rf_banks, 0));
         for (uint32_t index = 0; index < config_.lsu_staging_vectors; ++index) {
             AssemblyRegister empty;
             empty.words.assign(config_.lanes, 0);
@@ -506,14 +507,16 @@ void Machine::tick() {
     // whose operands arrive now goes to its unit.
     dispatch_issued(w);
     // The async RF readers (acc.st beats, the LSU's store-data read) take the
-    // current read slot's free ports, from Q, before issue.
+    // read ports the issue register's instruction leaves free now, from Q,
+    // before issue.
     w.rf_read = decide_rf_reads(w);
 
-    // The scheduler. Its bookings are all in future cycles; they only update
-    // the owed bits' next state.
+    // The scheduler. Its write booking is in a future cycle and its read
+    // round is the next cycle's (the issue register); it updates the owed
+    // bits' next state.
     decide_issue(w);
 
-    // The RF read stage: this cycle's booked samples.
+    // The RF read stage: the issue register's round samples now.
     step_rf_reads(w);
 
     run_drivers(w);
@@ -637,15 +640,16 @@ uint32_t Machine::read_reg(
 // every cycle number follows src/rf.hpp)
 // ===========================================================================
 
-// The RF's two calendars hold fixed bookings only, and fixed issue books
-// FUTURE cycles only (the issue register): its reads from issue + 1, its
-// write at issue + issue_to_port. The current cycle's read slot and write
-// port are therefore never contested by issue. What is left of them goes to
-// the asynchronous clients, decided from Q before issue:
-//   READS   decide_rf_reads: acc.st beats and the LSU's store-data read
-//           share the current read slot's unbooked ports by round-robin;
-//           a denied reader whose bank's read_owed bit is set inhibits new
-//           fixed read bookings to that bank (the mirrored rule).
+// Fixed issue never contests the current cycle's RF ports (the issue
+// register): its read round samples at issue + 1, its fixed write is booked
+// in the write calendar at issue + issue_to_port. What the current cycle
+// leaves goes to the asynchronous clients, decided from Q before issue:
+//   READS   decide_rf_reads (trash/rfc14.md sections 4 and 5): the issue
+//           register's instruction owns the read ports its round samples
+//           now; acc.st beats and the LSU's store-data read share the rest
+//           by round-robin. A denied reader whose bank's read_owed bit is
+//           set inhibits the acceptance of new SIMT reads of that bank, so
+//           the bank's ports are free one cycle later (the mirrored rule).
 //   WRITES  decide_rf_writes: load slots, the LSU's assembly register and the
 //           acc.ld pipelines share the current write port's unbooked ports;
 //           a denied writer whose bank's async_owed bit is set inhibits new
@@ -653,32 +657,6 @@ uint32_t Machine::read_reg(
 // A read SAMPLES the RF at its cycle and has its operand Lr cycles later; a
 // write PRESENTED at the port lands at the clock edge Wd cycles later and is
 // visible to samples from the next cycle (no same-edge forwarding).
-
-std::vector<uint32_t>& Machine::read_slot(uint64_t cycle) {
-    return read_reservations_[cycle % read_reservations_.size()];
-}
-
-const std::vector<uint32_t>& Machine::read_slot(uint64_t cycle) const {
-    return read_reservations_[cycle % read_reservations_.size()];
-}
-
-// All-or-none admission test: does every read in the plan still fit its
-// bank's ports in its sample cycle? Counting runs on a scratch copy of the
-// ring so a rejected attempt books nothing. The count must be cumulative
-// because one plan can put several reads in the same (cycle, bank) slot when
-// a bank has more than one read port.
-bool Machine::can_reserve_reads(const std::vector<RfRead>& reads) const {
-    auto proposed = read_reservations_;
-    for (const auto& read : reads) {
-        auto& count = proposed[(cycle_ + issue_to_sample(read)) % proposed.size()][read.reg % config_.rf_banks];
-        if (++count > config_.rf_read_ports_per_bank) return false;
-    }
-    return true;
-}
-
-void Machine::reserve_reads(const std::vector<RfRead>& reads) {
-    for (const auto& read : reads) ++read_slot(cycle_ + issue_to_sample(read))[read.reg % config_.rf_banks];
-}
 
 bool Machine::write_slot_free(uint8_t reg, uint64_t at_cycle) const {
     const auto found = write_reservations_.find(at_cycle);
@@ -952,15 +930,20 @@ void Machine::land_rf_writes(const Wires& w) {
 }
 
 // The async RF readers' decision (trash/rfc10.md section 3, "RF reads: the
-// same rule, mirrored"), per RF bank, from Q before issue:
-//   read_ready   = an async reader wants the bank's current read slot
-//   read_grant   = read_ready AND a port of the current slot is unbooked
+// same rule, mirrored"; trash/rfc14.md section 5), per RF bank, from Q
+// before issue:
+//   read_ready   = an async reader wants the bank now
+//   read_grant   = read_ready AND the issue register's round leaves one of
+//                  the bank's read ports free (simt_read_now: its bank use)
 //   inhibit_simt = read_ready AND NOT read_grant AND read_owed
-// The readers granted (round-robin from the bank's cursor) sample the RF now:
-// an acc.st beat reaches tmem Lr + tmem_port_stages later, the LSU's beat
-// fills its assembly register Lr later. A denied reader holds (an acc.st
-// keeps its beat, the LSU its candidate; a source stays read-owned). The
-// owed bit and cursor change in drive_rf_read_policy.
+// A candidate instruction whose round uses an inhibited bank is not accepted
+// this cycle (resource_view), so the issue register leaves that bank free
+// next cycle: the hole the denied reader is owed. Reads already accepted are
+// never stopped. The readers granted (round-robin from the bank's cursor)
+// sample the RF now: an acc.st beat reaches tmem Lr + tmem_port_stages
+// later, the LSU's beat fills its assembly register Lr later. A denied
+// reader holds (an acc.st keeps its beat, the LSU its candidate; a source
+// stays read-owned). The owed bit and cursor change in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     RfReadDecision decision;
     const auto& transfers = acc_transfers_.cur();
@@ -978,14 +961,14 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     decision.banks.resize(config_.rf_banks);
     w.acc_st_reads.assign(transfers.size(), std::nullopt);
     const auto& policy = rf_read_policy_.cur();
-    const auto& now = read_slot(cycle_);
+    const auto& simt_read_now = issue_read_banks_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
         std::vector<uint8_t> ready(decision.holders.size(), 0);
         for (std::size_t holder = 0; holder < ready.size(); ++holder) {
             const auto& read = decision.holders[holder];
             ready[holder] = read.has_value() && read->reg % config_.rf_banks == bank ? 1 : 0;
         }
-        const auto free_ports = config_.rf_read_ports_per_bank - now.at(bank);
+        const auto free_ports = config_.rf_read_ports_per_bank - simt_read_now.at(bank);
         const auto choice = round_robin_grant(ready, policy.cursor.at(bank), free_ports);
         for (const auto holder : choice.granted) decision.granted[holder] = 1;
         auto& state = decision.banks[bank];
@@ -1004,7 +987,6 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             }
             continue;
         }
-        ++read_slot(cycle_).at(read->reg % config_.rf_banks);
         const auto& warp = warps_.at(read->warp);
         trace_->rf_read(cycle_, warp.id, read->reg, read->reg % config_.rf_banks);
         auto values = lane_values(warp, read->reg);
@@ -3072,13 +3054,15 @@ void Machine::decide_issue(Wires& w) {
 
 // One warp's issue attempt (trash/rfc10.md section 1):
 //   1. metadata panics; the depbar wait, on the counters' Q (a completion
-//      presented at t is seen from t + 1); the plan (bookings from metadata
-//      and the profile); register ranges and the sanitizer's hazard checks
-//      against the cycles the plan samples at (at every attempt, as before:
-//      contention must not hide a missing stall);
+//      presented at t is seen from t + 1); the plan (its read round and
+//      write booking, from metadata and the profile); register ranges and
+//      the sanitizer's hazard checks against the cycles the round samples
+//      at (at every attempt, as before: contention must not hide a missing
+//      stall);
 //   2. admission: structural_refusal, on metadata and resource state alone.
 //      A refusal books nothing and reads nothing;
-//   3. acceptance: bookings (all in future cycles, past the issue register),
+//   3. acceptance: the read round into the issue register, the write
+//      booking (both in future cycles, past the issue register),
 //      the metadata share of each unit's work and, for a memory / engine /
 //      mbar instruction, its entry into the dispatch pipeline, which carries
 //      it to its unit as its operands arrive. Operand-value panics
@@ -3094,7 +3078,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         return {false, WarpState::depbar, "sb" + std::to_string(*bar)};
     }
     const auto plan = issue_plan(inst);
-    check_issue_hazards(warp, inst, plan);
+    check_issue_hazards(warp, inst);
     if (const auto refusal = structural_refusal(inst, plan, resource_view(warp, inst, plan, w)); refusal.has_value()) {
         return refuse(*refusal);
     }
@@ -3129,8 +3113,9 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
 
 // Register, predicate and accumulator-id ranges (machine panics: properties
 // of the instruction), then the sanitizer's hazard checks, at the cycles the
-// plan samples and writes at (src/rf.hpp). Neither looks at an operand value.
-void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst, const IssuePlan& plan) const {
+// read round samples and its destination lands at (src/rf.hpp). Neither looks
+// at an operand value.
+void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) const {
     for (const auto reg : source_registers(inst)) {
         if (reg >= kernel_.register_count) panic(warp, inst, "source register out of range");
     }
@@ -3145,7 +3130,7 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst, con
     if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
         sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate);
     }
-    check_register_hazards(warp, inst, plan);
+    check_register_hazards(warp, inst);
     if (is_acc_transfer(inst.opcode)) {
         const auto accumulator = is_acc_load(inst.opcode) ? inst.src0 : inst.dst;
         if (accumulator >= kernel_.accumulators.size()) panic(warp, inst, "accumulator id out of range");
@@ -3158,9 +3143,11 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst, con
     }
 }
 
-// What an accepted instruction books, from metadata and the profile. acc.st
-// reads only its coordinates at issue (its data beat by beat) and stg.v8
-// only its base (its data in the LSU's RF read stage).
+// What an accepted instruction books, from metadata and the profile: its one
+// read round (src/rf.hpp; kernel load refused any round that does not fit
+// its banks' read ports) and a fixed result's write. acc.st reads only its
+// coordinates at issue (its data beat by beat) and stg.v8 only its base (its
+// data in the LSU's RF read stage).
 IssuePlan Machine::issue_plan(const Instruction& inst) const {
     IssuePlan plan;
     auto sources = source_registers(inst);
@@ -3169,7 +3156,7 @@ IssuePlan Machine::issue_plan(const Instruction& inst) const {
     } else if (inst.opcode == Opcode::stg_v8) {
         sources = {inst.src0};
     }
-    plan.reads = rf_read_plan(inst, config_, sources);
+    plan.reads = rf_read_round(sources);
     const auto destination = destination_register(inst);
     if (uses_arithmetic_pipeline(inst) && destination.has_value()) {
         plan.write_reg = destination;
@@ -3179,7 +3166,7 @@ IssuePlan Machine::issue_plan(const Instruction& inst) const {
 }
 
 // The resource state admission may see, as this cycle leaves it (c): the RF
-// calendars and this cycle's RF read / write decisions, unit occupancy,
+// write calendar and this cycle's RF read / write decisions, unit occupancy,
 // queue and slot space less what the dispatch pipeline's instructions will
 // take (dispatch_claims). Instruction fields select WHICH resource (a
 // register number's bank, an accumulator's tmem bank); no register content
@@ -3188,11 +3175,10 @@ ResourceView Machine::resource_view(
     const Warp& warp, const Instruction& inst, const IssuePlan& plan, const Wires& w) const {
     const auto claims = dispatch_claims();
     ResourceView view;
-    view.reads_fit = can_reserve_reads(plan.reads);
-    for (const auto& read : plan.reads) {
-        if (w.rf_read.banks.at(read.reg % config_.rf_banks).inhibit_simt) view.read_inhibited = true;
+    for (const auto reg : plan.reads) {
+        if (w.rf_read.banks.at(reg % config_.rf_banks).inhibit_simt) view.read_inhibited = true;
     }
-    view.sfu_free = cycle_ + issue_to_operands(inst, config_) >= sfu_busy_until_;
+    view.sfu_free = cycle_ + issue_to_operands(config_) >= sfu_busy_until_;
     if (plan.write_reg.has_value()) {
         view.write_slot_free = write_slot_free(*plan.write_reg, plan.write_cycle);
         view.write_inhibited = w.rf_write.banks.at(*plan.write_reg % config_.rf_banks).inhibit_simt;
@@ -3226,7 +3212,6 @@ ResourceView Machine::resource_view(
 // A refused attempt: the warp state and reason for the trace, and its counter.
 Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     switch (refusal) {
-    case Refusal::rf_read_booked: return {false, WarpState::structural, "RF read reservation"};
     case Refusal::rf_read_inhibited:
         trace_->rf_simt_read_inhibited();
         return {false, WarpState::structural, "RF read inhibited"};
@@ -3297,30 +3282,29 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
     trace_->issue(cycle_, warp.id, old_pc, inst);
 }
 
-// Fixed-latency work books its read window and its result write as one
-// bundle; step_rf_reads captures the operands at their samples and executes
-// the instruction when they are all at the RF output. A booking of the
-// result's bank is what sets that bank's async_owed bit; a read booking sets
-// its bank's read_owed bit.
+// Fixed-latency work books its result write; its read round goes into the
+// issue register (the next cycle's samples). step_rf_reads captures the
+// operands at the sample and executes the instruction when they are at the
+// RF output. A booking of the result's bank is what sets that bank's
+// async_owed bit; the read round sets its banks' read_owed bits.
 void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     // One accepted issue per cycle, each living issue_to_operands + 1 cycles.
-    if (arithmetic_reads_.size() > issue_to_operands(inst, config_)) {
-        throw SimError("internal RF read pipeline exceeded its bounded window");
+    if (arithmetic_reads_.size() > issue_to_operands(config_)) {
+        throw SimError("internal RF read pipeline exceeded its bounded depth");
     }
     if (plan.write_reg.has_value()) {
         reserve_write(*plan.write_reg, plan.write_cycle);
         w.issue.rf_write_bank = *plan.write_reg % config_.rf_banks;
     }
-    reserve_reads(plan.reads);
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
-    for (const auto& read : plan.reads) w.issue.rf_read_banks[read.reg % config_.rf_banks] = 1;
+    for (const auto reg : plan.reads) ++w.issue.rf_read_banks[reg % config_.rf_banks];
     if (is_sfu(inst.opcode)) {
         const auto occupancy = (config_.lanes + config_.sfu_lanes - 1) / config_.sfu_lanes;
-        sfu_busy_until_ = cycle_ + issue_to_operands(inst, config_) + occupancy;
+        sfu_busy_until_ = cycle_ + issue_to_operands(config_) + occupancy;
         trace_->sfu_accept(occupancy);
     }
-    for (const auto& read : plan.reads) {
-        sanitizer_.record_reg_read_until(warp.id, read.reg, cycle_ + issue_to_sample(read) + 1);
+    for (const auto reg : plan.reads) {
+        sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
     }
     if (plan.write_reg.has_value()) {
         sanitizer_.record_reg_ready(warp.id, *plan.write_reg, cycle_ + issue_to_visible(inst, config_));
@@ -3351,9 +3335,10 @@ bool Machine::needs_dispatch(const Instruction& inst, uint64_t active_mask) {
 // metadata alone happens now: the depbar it sets (so the warp's next
 // instruction sees it), the sanitizer's records for its destination (not
 // ready until written) and its asynchronously read sources (read-owned
-// until each beat). Its RF reads are booked (sampled at issue + 1), and it
-// enters the dispatch pipeline; at issue + 1 + Lr its unit takes it with
-// its operands (hand_over). Admission secured that unit's space.
+// until each beat). Its read round goes into the issue register (sampled at
+// issue + 1), and it enters the dispatch pipeline; at issue + 1 + Lr its
+// unit takes it with its operands (hand_over). Admission secured that unit's
+// space.
 void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     const auto opcode = inst.opcode;
     const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_lsu_opcode(opcode) ||
@@ -3380,11 +3365,10 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
         const auto width = opcode == Opcode::acc_st ? 1u : 8u;
         for (uint32_t j = 0; j < width; ++j) sanitizer_.record_async_reader_add(warp.id, inst.src1 + j);
     }
-    reserve_reads(plan.reads);
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
-    for (const auto& read : plan.reads) {
-        w.issue.rf_read_banks[read.reg % config_.rf_banks] = 1;
-        sanitizer_.record_reg_read_until(warp.id, read.reg, cycle_ + issue_to_sample(read) + 1);
+    for (const auto reg : plan.reads) {
+        ++w.issue.rf_read_banks[reg % config_.rf_banks];
+        sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
     }
     DispatchEntry entry;
     entry.issue_cycle = cycle_;
@@ -3870,13 +3854,13 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     auto& warp = warps_.at(pending.warp);
     const auto& inst = pending.instruction;
     std::vector<uint32_t> result(config_.lanes, 0);
-    // The plan holds each source register once; duplicated operand slots
+    // The round holds each source register once; duplicated operand slots
     // broadcast from the same captured latch.
     const auto operand = [&](uint8_t reg, uint32_t lane) {
         for (std::size_t i = 0; i < pending.reads.size(); ++i) {
-            if (pending.reads[i].reg == reg) return pending.operands[i][lane];
+            if (pending.reads[i] == reg) return pending.operands[i][lane];
         }
-        throw SimError("internal arithmetic operand was not reserved");
+        throw SimError("internal arithmetic operand was not in its read round");
     };
     switch (inst.opcode) {
     case Opcode::sread:
@@ -4037,20 +4021,27 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     }
 }
 
-// The RF read stage (src/rf.hpp): every read booked for this cycle samples
-// the RF now -- before this cycle's writes land at its edge (READ_FIRST). An
-// arithmetic instruction whose operands are all at the RF output now (issue
-// + issue_to_operands) executes, and its result is on its way to the write
-// port it booked. A dispatch entry's samples are latched into the entry (the
-// RF output pipeline carries them to its dispatch).
+// The RF read stage (src/rf.hpp): the round of the instruction in the issue
+// register (accepted last cycle) samples the RF now -- before this cycle's
+// writes land at its edge (READ_FIRST). An arithmetic instruction whose
+// operands are all at the RF output now (issue + issue_to_operands)
+// executes, and its result is on its way to the write port it booked. A
+// dispatch entry's samples are latched into the entry (the RF output
+// pipeline carries them to its dispatch). Each bank's samples -- the round's
+// and the async readers' (decide_rf_reads) -- never exceed its read ports,
+// and the round's are exactly the issue register's bank use.
 void Machine::step_rf_reads(Wires& w) {
+    std::vector<uint32_t> simt_reads(config_.rf_banks, 0);
+    const auto sample = [&](uint32_t warp, uint8_t reg) {
+        ++simt_reads[reg % config_.rf_banks];
+        trace_->rf_read(cycle_, warp, reg, reg % config_.rf_banks);
+        return lane_values(warps_[warp], reg);
+    };
     for (auto it = arithmetic_reads_.begin(); it != arithmetic_reads_.end();) {
-        for (std::size_t i = 0; i < it->reads.size(); ++i) {
-            if (it->issue_cycle + issue_to_sample(it->reads[i]) != cycle_) continue;
-            it->operands[i] = lane_values(warps_[it->warp], it->reads[i].reg);
-            trace_->rf_read(cycle_, it->warp, it->reads[i].reg, it->reads[i].reg % config_.rf_banks);
+        if (it->issue_cycle + issue_to_sample == cycle_) {
+            for (std::size_t i = 0; i < it->reads.size(); ++i) it->operands[i] = sample(it->warp, it->reads[i]);
         }
-        if (it->issue_cycle + issue_to_operands(it->instruction, config_) == cycle_) {
+        if (it->issue_cycle + issue_to_operands(config_) == cycle_) {
             execute_arithmetic(*it, w);
             it = arithmetic_reads_.erase(it);
         } else {
@@ -4060,19 +4051,25 @@ void Machine::step_rf_reads(Wires& w) {
     const auto& pipe = dispatch_pipe_.cur();
     for (std::size_t index = 0; index < pipe.size(); ++index) {
         const auto& op = pipe[index];
-        std::optional<std::vector<std::vector<uint32_t>>> operands;
-        for (std::size_t i = 0; i < op.reads.size(); ++i) {
-            if (op.issue_cycle + issue_to_sample(op.reads[i]) != cycle_) continue;
-            if (!operands.has_value()) operands = op.operands;
-            (*operands)[i] = lane_values(warps_[op.warp], op.reads[i].reg);
-            trace_->rf_read(cycle_, op.warp, op.reads[i].reg, op.reads[i].reg % config_.rf_banks);
-        }
-        if (operands.has_value()) w.dispatch_samples.emplace_back(index, std::move(*operands));
+        if (op.issue_cycle + issue_to_sample != cycle_ || op.reads.empty()) continue;
+        auto operands = op.operands;
+        for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
+        w.dispatch_samples.emplace_back(index, std::move(operands));
     }
-    // This cycle's ring slot is spent; cleared, it becomes the slot for
-    // cycle + window + 1, the farthest cycle the next cycle's issue may book.
-    auto& expired = read_slot(cycle_);
-    std::fill(expired.begin(), expired.end(), 0);
+    const auto& owned = issue_read_banks_.cur();
+    for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        uint32_t async_reads = 0;
+        for (std::size_t holder = 0; holder < w.rf_read.holders.size(); ++holder) {
+            const auto& read = w.rf_read.holders[holder];
+            if (w.rf_read.granted[holder] != 0 && read->reg % config_.rf_banks == bank) ++async_reads;
+        }
+        if (simt_reads[bank] != owned.at(bank) || simt_reads[bank] + async_reads > config_.rf_read_ports_per_bank) {
+            throw SimError("internal: RF bank " + std::to_string(bank) + " sampled " +
+                std::to_string(simt_reads[bank]) + " issued and " + std::to_string(async_reads) +
+                " async reads (issue register: " + std::to_string(owned.at(bank)) + ") at cycle " +
+                std::to_string(cycle_));
+        }
+    }
 }
 
 // ===========================================================================
@@ -4088,7 +4085,7 @@ void Machine::step_rf_reads(Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 31> canonical = {
+    static constexpr std::array<Driver, 32> canonical = {
         &Machine::drive_depbar,
         &Machine::drive_wait_slots,
         &Machine::drive_load_slots,
@@ -4118,6 +4115,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_writebacks,
         &Machine::drive_rf_write_policy,
         &Machine::drive_rf_read_policy,
+        &Machine::drive_issue_read_banks,
         &Machine::drive_dispatch_pipe,
         &Machine::drive_lsu_read_pipe,
     };
@@ -4388,21 +4386,31 @@ void Machine::drive_rf_write_policy(const Wires& w) {
     rf_write_policy_.set_next(std::move(next), "drive_rf_write_policy");
 }
 
-// The RF read decision's state, per bank (trash/rfc10.md section 3, mirrored):
-//   read_owed_next = simt_read_booked_this_cycle OR (read_owed AND NOT read_grant)
-// (a successful fixed read booking sets it, an actual async read grant clears
-// it, set wins); the cursor moves past the reader granted last, only on a
-// grant.
+// The RF read decision's state, per bank (trash/rfc10.md section 3,
+// mirrored; trash/rfc14.md section 5):
+//   read_owed_next = simt_accepted_using_bank OR (read_owed AND NOT read_grant)
+// (an accepted instruction whose round uses the bank sets it, an actual async
+// read grant clears it, set wins); the cursor moves past the reader granted
+// last, only on a grant.
 void Machine::drive_rf_read_policy(const Wires& w) {
     auto next = rf_read_policy_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
         const auto& decision = w.rf_read.banks[bank];
-        const bool booked = !w.issue.rf_read_banks.empty() && w.issue.rf_read_banks[bank] != 0;
-        next.owed[bank] = booked || (next.owed[bank] != 0 && !decision.granted) ? 1 : 0;
+        const bool accepted = !w.issue.rf_read_banks.empty() && w.issue.rf_read_banks[bank] != 0;
+        next.owed[bank] = accepted || (next.owed[bank] != 0 && !decision.granted) ? 1 : 0;
         next.cursor[bank] = decision.cursor_after;
     }
     if (next == rf_read_policy_.cur()) return;
     rf_read_policy_.set_next(std::move(next), "drive_rf_read_policy");
+}
+
+// The issue register's bank use: the round of the instruction accepted now
+// samples in the next cycle; nothing accepted leaves it empty.
+void Machine::drive_issue_read_banks(const Wires& w) {
+    auto next = w.issue.rf_read_banks;
+    if (next.empty()) next.assign(config_.rf_banks, 0);
+    if (next == issue_read_banks_.cur()) return;
+    issue_read_banks_.set_next(std::move(next), "drive_issue_read_banks");
 }
 
 // The TMA command queue: step_tma's result, plus issue's new command.
@@ -4835,9 +4843,9 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
 // cycles src/rf.hpp gives (each source's sample; the destination's earliest
 // landing), the same numbers qtxc schedules with. Only the destination range
 // check is a property of the instruction itself.
-void Machine::check_register_hazards(const Warp& warp, const Instruction& inst, const IssuePlan& plan) const {
+void Machine::check_register_hazards(const Warp& warp, const Instruction& inst) const {
     std::vector<std::pair<uint8_t, uint64_t>> samples;
-    for (const auto reg : source_registers(inst)) samples.emplace_back(reg, cycle_ + issue_to_sample_of(plan.reads, reg));
+    for (const auto reg : source_registers(inst)) samples.emplace_back(reg, cycle_ + issue_to_sample);
     sanitizer_.check_rf_raw(site(warp, inst), samples);
     if (const auto dst = destination_register(inst); dst.has_value()) {
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
@@ -4851,7 +4859,7 @@ void Machine::check_register_hazards(const Warp& warp, const Instruction& inst, 
 // sample (step_rf_reads). It is never read from the RF array here.
 std::vector<uint32_t> Machine::capture(const DispatchEntry& op, uint8_t reg) const {
     for (std::size_t i = 0; i < op.reads.size(); ++i) {
-        if (op.reads[i].reg != reg) continue;
+        if (op.reads[i] != reg) continue;
         if (op.operands[i].size() != config_.lanes) {
             throw SimError("internal: r" + std::to_string(reg) + " used at dispatch before its RF sample");
         }

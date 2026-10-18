@@ -81,7 +81,7 @@ struct LsuEdgeEvent {
 
 // What an instruction books if it is accepted, from metadata and the profile.
 struct IssuePlan {
-    std::vector<RfRead> reads;          // RF read samples at issue + issue_to_sample (src/rf.hpp)
+    std::vector<uint8_t> reads;         // its one RF read round: each register sampled at issue + issue_to_sample (src/rf.hpp)
     std::optional<uint8_t> write_reg;   // a fixed RF-write booking (arithmetic with an RF destination)
     uint64_t write_cycle = 0;           // the cycle that result enters its bank's write port
 };
@@ -89,8 +89,7 @@ struct IssuePlan {
 // Resource state as issue sees it this cycle: Q, plus what this cycle's
 // decisions free (look-ahead (c) in Machine::tick).
 struct ResourceView {
-    bool reads_fit = false;          // the read plan fits the RF read calendar
-    bool read_inhibited = false;     // the RF read decision inhibits new bookings to a bank of the plan
+    bool read_inhibited = false;     // the RF read decision inhibits new SIMT reads of a bank the round uses
     bool sfu_free = false;           // the SFU is free by this op's execution start
     bool write_slot_free = false;    // the write booking's (bank, cycle) has a free port
     bool write_inhibited = false;    // the RF write decision inhibits new bookings to that bank
@@ -112,7 +111,6 @@ struct ResourceView {
 };
 
 enum class Refusal : uint8_t {
-    rf_read_booked,
     rf_read_inhibited,
     sfu_busy,
     rf_write_booked,
@@ -204,6 +202,11 @@ public:
     [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
     [[nodiscard]] uint32_t rf_write_lsu_cursor() const { return rf_write_policy_.cur().lsu_cursor; }
+    // Test seams (Q, between ticks): the RF read decision's state per bank,
+    // and the issue register's bank use (reads its round samples this cycle).
+    [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().owed.at(bank) != 0; }
+    [[nodiscard]] uint32_t rf_read_cursor(uint32_t bank) const { return rf_read_policy_.cur().cursor.at(bank); }
+    [[nodiscard]] uint32_t issue_read_bank_use(uint32_t bank) const { return issue_read_banks_.cur().at(bank); }
     // Test seam (Q, between ticks): stage `stage` of tmem bank `bank`'s acc.ld
     // pipeline (the last stage is its output): (destination register, lane
     // values, last beat), or none when the stage is empty.
@@ -301,8 +304,8 @@ private:
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         Instruction instruction;
-        std::vector<RfRead> reads;
-        std::vector<std::vector<uint32_t>> operands;
+        std::vector<uint8_t> reads;                  // the round's registers
+        std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
     };
 
     // A memory / engine / mbar instruction between accepted issue and its
@@ -320,8 +323,8 @@ private:
         uint32_t pc = 0;
         uint64_t active_mask = 0;
         Instruction instruction;
-        std::vector<RfRead> reads;
-        std::vector<std::vector<uint32_t>> operands; // by read, latched at its sample
+        std::vector<uint8_t> reads;                  // the round's registers
+        std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
     };
 
     struct LaneAccess {
@@ -1020,8 +1023,9 @@ private:
         [[nodiscard]] bool granted_to(AsyncWriter writer, uint32_t index) const;
     };
 
-    // The async RF readers (rfc10 section 3, mirrored): each wants the
-    // CURRENT read slot of one bank -- fixed issue books only future ones.
+    // The async RF readers (rfc10 section 3, mirrored): each wants a read
+    // port of one bank in the CURRENT cycle, where the issue register's
+    // instruction owns the ports it samples (trash/rfc14.md section 4).
     // Round-robin order: each tmem bank's acc.st transfer, then the LSU's
     // store-data read (vector stores).
     enum class RfReader : uint8_t { acc_st, lsu_store };
@@ -1036,7 +1040,8 @@ private:
 
     // The RF read decision of this cycle, from Q before issue:
     //   read_ready   = an async reader wants this bank
-    //   read_grant   = read_ready AND the current read slot has a free port
+    //   read_grant   = read_ready AND the issue register's instruction leaves
+    //                  one of the bank's read ports free now
     //   inhibit_simt = read_ready AND NOT read_grant AND read_owed
     struct RfReadDecision {
         std::vector<std::optional<RfReadRequest>> holders;
@@ -1218,7 +1223,7 @@ private:
     struct IssueDecision {
         std::optional<DepbarEvent> depbar_admission;
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
-        std::vector<uint8_t> rf_read_banks;              // per bank: 1 = its fixed reads booked it (read_owed)
+        std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
     };
 
@@ -1234,7 +1239,7 @@ private:
         std::optional<AccAdmission> acc;
         struct LsuAdmission {
             LsuCommand command;
-            std::optional<std::vector<uint32_t>> store_data; // scalar stg: its booked RF read, latched
+            std::optional<std::vector<uint32_t>> store_data; // scalar stg: its issue round's read, latched
         };
         std::optional<LsuAdmission> lsu;
         std::optional<TmaCommand> tma;
@@ -1284,7 +1289,7 @@ private:
         // The dispatch pipeline's end: its unit takes an instruction now.
         bool dispatched = false;
         DispatchDecision dispatch;
-        // The async RF readers (current read slot), before issue.
+        // The async RF readers (the read ports the issue register leaves free now), before issue.
         RfReadDecision rf_read;
         std::vector<std::optional<AccStBeat>> acc_st_reads; // per tmem bank: the beat read now
         LsuRfRead lsu_rf_read;                              // the LSU store-data beat read now
@@ -1373,6 +1378,12 @@ private:
     Reg<std::deque<Writeback>> writebacks_{registers_, "RF write pipeline"};
     Reg<RfWritePolicy> rf_write_policy_{registers_, "RF write policy (async_owed, cursors)"};
     Reg<RfReadPolicy> rf_read_policy_{registers_, "RF read policy (read_owed, cursors)"};
+    // The issue register's RF bank use (trash/rfc14.md section 4): per bank,
+    // how many registers the instruction accepted last cycle samples now (at
+    // most rf.read_ports_per_bank: one bit per bank at the canonical one
+    // port; zero when nothing was accepted). It owns those read ports this
+    // cycle; the async readers take the rest (decide_rf_reads).
+    Reg<std::vector<uint8_t>> issue_read_banks_{registers_, "issue register: RF read bank use"};
     // Issue -> units: the issue register and the RF read pipeline
     // (issue_to_dispatch stages), carrying memory / engine instructions.
     Reg<std::deque<DispatchEntry>> dispatch_pipe_{registers_, "dispatch pipeline"};
@@ -1383,22 +1394,19 @@ private:
     // Issue: scheduler cursor, SFU occupancy, the arithmetic operand latches.
     uint32_t scheduler_cursor_ = 0;
     // First cycle the SFU is free again. The unit is occupied from an SFU
-    // op's execution start (window end) for ceil(lanes / sfu_lanes) cycles;
-    // a later SFU op stalls structurally until its own execution start fits.
+    // op's execution start (issue + issue_to_operands) for ceil(lanes /
+    // sfu_lanes) cycles; a later SFU op stalls structurally until its own
+    // execution start fits.
     uint64_t sfu_busy_until_ = 0;
     std::deque<ArithmeticRead> arithmetic_reads_;
-    // The RF ports' reservation calendars (the arbiter's schedule). Fixed
-    // issue books future cycles only (the issue register): its reads from
-    // issue + 1 to issue + window, its write at issue + issue_to_port. The
-    // async readers use the current read slot, the async writers the current
-    // write port (rfc10 section 3).
-    // Write calendar: a map by absolute cycle; in hardware a shift register
-    // per bank of issue_to_port(slowest fixed op) bits.
+    // The RF write port's reservation calendar (the arbiter's schedule):
+    // fixed issue books a FUTURE cycle only, its write at issue +
+    // issue_to_port; the async writers use the current write port (rfc10
+    // section 3). A map by absolute cycle; in hardware a shift register per
+    // bank of issue_to_port(slowest fixed op) bits. (There is no read
+    // calendar: reads are one round at issue + 1, owned by the issue
+    // register -- issue_read_banks_.)
     std::map<uint64_t, std::vector<uint32_t>> write_reservations_;
-    // Read calendar: a ring of window + 1 slots by absolute cycle (the
-    // farthest booking is issue + window); the current slot is cleared at the
-    // end of each cycle and becomes cycle + window + 1's.
-    std::vector<std::vector<uint32_t>> read_reservations_;
     // gmem controller (outside the SM): its queue, bus and B channel.
     std::deque<GmemSectorRequest> gmem_queue_;
     std::optional<GmemSectorRequest> gmem_bus_;
@@ -1488,7 +1496,7 @@ private:
     void dispatch_atomic(const DispatchEntry& op, Wires& w);
     void dispatch_mbar_wait(const DispatchEntry& op, Wires& w);
     [[nodiscard]] DispatchClaims dispatch_claims() const;
-    // ---- the async RF readers (the current read slot), before issue ----
+    // ---- the async RF readers (the read ports free now), before issue ----
     RfReadDecision decide_rf_reads(Wires& w);
     [[nodiscard]] std::optional<RfReadRequest> lsu_store_read_request(const Wires& w) const;
     // ---- issue (the scheduler): admission, then acceptance ----
@@ -1501,13 +1509,13 @@ private:
     void accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     void accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     // An accepted memory / engine / mbar instruction: its metadata work now
-    // (depbar, the sanitizer's destination and reader records), its operand
-    // reads booked, its entry into the dispatch pipeline.
+    // (depbar, the sanitizer's destination and reader records), its read
+    // round's bank use, its entry into the dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     [[nodiscard]] static bool needs_dispatch(const Instruction& inst, uint64_t active_mask);
     [[nodiscard]] uint32_t branch_target(const Warp& warp, const Instruction& inst) const;
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
-    void check_issue_hazards(const Warp& warp, const Instruction& inst, const IssuePlan& plan) const;
+    void check_issue_hazards(const Warp& warp, const Instruction& inst) const;
     void check_issue_latency(const Warp& warp, const Instruction& inst) const;
     // ---- the RF read stage: this cycle's fixed samples ----
     void step_rf_reads(Wires& w);
@@ -1543,6 +1551,7 @@ private:
     void drive_acc_ld_pipes(const Wires& w);
     void drive_rf_write_policy(const Wires& w);
     void drive_rf_read_policy(const Wires& w);
+    void drive_issue_read_banks(const Wires& w);
     void drive_dispatch_pipe(const Wires& w);
     void drive_lsu_read_pipe(const Wires& w);
     void run_drivers(const Wires& w);
@@ -1565,15 +1574,9 @@ private:
     [[nodiscard]] std::optional<uint64_t> pending_tma_completion_mbar(
         const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, const Wires& w) const;
 
-    // RF reservation calendars. Issue books its reads (at issue +
-    // issue_to_sample) and its fixed write (at issue + issue_to_port), all
-    // future cycles; the async readers take the current read slot's free
-    // ports (decide_rf_reads), the async writers the current write port's
-    // (decide_rf_writes).
-    [[nodiscard]] std::vector<uint32_t>& read_slot(uint64_t cycle);
-    [[nodiscard]] const std::vector<uint32_t>& read_slot(uint64_t cycle) const;
-    [[nodiscard]] bool can_reserve_reads(const std::vector<RfRead>& reads) const;
-    void reserve_reads(const std::vector<RfRead>& reads);
+    // The RF write calendar. Issue books its fixed write (at issue +
+    // issue_to_port), a future cycle; the async writers take the current
+    // write port's free ports (decide_rf_writes).
     [[nodiscard]] bool write_slot_free(uint8_t reg, uint64_t at_cycle) const;
     void reserve_write(uint8_t reg, uint64_t at_cycle);
 
@@ -1667,7 +1670,7 @@ private:
     [[nodiscard]] Instruction instruction(const Warp& warp) const;
     [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
     [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
-    void check_register_hazards(const Warp& warp, const Instruction& inst, const IssuePlan& plan) const;
+    void check_register_hazards(const Warp& warp, const Instruction& inst) const;
     // A dispatched instruction's operand: every lane of one register, as its
     // RF read latched it at its sample.
     [[nodiscard]] std::vector<uint32_t> capture(const DispatchEntry& op, uint8_t reg) const;

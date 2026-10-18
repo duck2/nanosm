@@ -45,7 +45,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, default=ROOT / "profiles" / "nanosm-v0.json")
     parser.add_argument("--trace", type=Path)
-    parser.add_argument("--warps", type=int, default=WARPS, choices=(1, 2, 4, 8),
+    parser.add_argument("--warps", type=int, default=WARPS, choices=(1, 2, 4, 8, 16),
                         help="active warps; the kernel's two stride constants are rewritten")
     args = parser.parse_args()
 
