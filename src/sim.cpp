@@ -310,6 +310,12 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
     if (launch.active_warps == 0) throw SimError("active warp count is zero");
+    // The SM's warp slots (core.warps): the scheduler's and the front end's
+    // per-warp state exists for that many warps, whatever the RF could hold.
+    if (launch.active_warps > config_.core_warps) {
+        throw SimError("launch of " + std::to_string(launch.active_warps) + " warps exceeds the SM's " +
+            std::to_string(config_.core_warps) + " warp slots (core.warps)");
+    }
     for (const auto& acc : kernel_.accumulators) {
         const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
         if (acc.bank >= config_.tmem_banks || acc.base_word % config_.tmem_fine_banks != 0 ||
@@ -379,6 +385,11 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             for (auto& predicate : warp.predicates) predicate.resize(config_.lanes, 0);
             warps_.push_back(std::move(warp));
         }
+        // Every slot's FIFO empty and nothing in flight: launched warps fetch
+        // from pc 0; a slot not launched stays halted.
+        std::vector<WarpFrontEnd> front_end(config_.core_warps);
+        for (uint32_t slot = launch.active_warps; slot < config_.core_warps; ++slot) front_end[slot].halted = true;
+        front_end_.poke(std::move(front_end));
         depbar_.poke(DepbarCounters(launch.active_warps));
         shmem_to_ram_.poke(std::vector<uint32_t>(launch.active_warps, 0));
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
@@ -454,6 +465,13 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          admission, A-read). A SIMT access or RMW accepted at issue sits in
 //          its slot / register and is served from the next cycle. A new MMA
 //          fetch serves its first port-B round in the cycle it starts.
+//      (i) None from issue into fetch (HUMAN 10-18, trash/front-end-
+//          2026-10-18.md): the fetch decision reads registers only (the
+//          FIFOs' valid words, the read in flight, halted, the issue
+//          register's branch). A slot an issue frees at t is seen by fetch
+//          at t + 1; a branch accepted at t blocks its warp's fetch from
+//          t + 1. Issue sees the FIFO heads' Q: a word landing at t issues
+//          from t + 1.
 // 2. DRIVERS. Each register's next value, from Q and the wires. They run in
 //    any order (set_driver_shuffle_seed() permutes them every cycle).
 // 3. CLOCK EDGE. Every register takes D; shmem takes the write rounds that
@@ -463,6 +481,12 @@ void Machine::tick() {
     if (done()) return;
     sanitizer_.record_cycle_start();
     Wires w;
+
+    // The front end, from Q only (i): the fetch grant, the word at the
+    // instruction memory's output, the branch in the issue register resolved.
+    w.fetch = decide_fetch();
+    w.fetched = instruction_memory_output();
+    w.branch = resolve_branch();
 
     // The RF write path, from Q and before any SIMT candidate: the one RF
     // write decision (the ready async holders share this cycle's unbooked
@@ -516,6 +540,10 @@ void Machine::tick() {
     // bits' next state.
     decide_issue(w);
 
+    // The front ends' next state: issue's pop (and halt), the landing word,
+    // the redirect, the fetch grant -- one calculation per warp.
+    step_front_end(w);
+
     // The RF read stage: the issue register's round samples now.
     step_rf_reads(w);
 
@@ -539,9 +567,12 @@ void Machine::run(uint64_t cycle_limit) {
 }
 
 bool Machine::done() const {
-    const bool warps_halted = std::all_of(warps_.begin(), warps_.end(), [](const Warp& warp) {
+    // Every warp halted and no instruction-memory read in flight (its word
+    // would be dropped, but the read is still under way).
+    const auto& front_end = front_end_.cur();
+    const bool warps_halted = std::all_of(front_end.begin(), front_end.end(), [](const WarpFrontEnd& warp) {
         return warp.halted;
-    });
+    }) && !fetch_read_.cur().has_value();
     const auto& waits = mbar_wait_slots_.cur();
     const bool wait_slots_empty = std::all_of(
         waits.begin(), waits.end(), [](const auto& slot) { return !slot.has_value(); });
@@ -632,6 +663,143 @@ uint32_t Machine::read_reg(
         throw SimError("invalid host RF read");
     }
     return rf(warps_[warp], lane, reg);
+}
+
+// ===========================================================================
+// The front end (trash/front-end-2026-10-18.md; the cycles in src/rf.hpp).
+// Every decision here reads registers only (tick() (i)).
+// ===========================================================================
+
+// One instruction-memory read per cycle. A warp asks for one when it has not
+// halted, its next pc is known (no branch of its in the issue register) and
+// its FIFO has room: valid words + its read in flight < the FIFO's depth (a
+// read in flight owns its entry until it lands or is dropped, so two reads
+// never count on one free entry, and a landing always finds room).
+// Round-robin over the askers (round_robin_grant, its own cursor). Whether
+// the warp could issue does not matter: prefetch goes on through stall
+// counts, depbars, probes, wait slots and refused heads.
+Machine::FetchGrant Machine::decide_fetch() const {
+    const auto& front_end = front_end_.cur();
+    const auto& read = fetch_read_.cur();
+    const auto& branch = issue_branch_.cur();
+    std::vector<uint8_t> has_space(front_end.size(), 0);
+    for (uint32_t warp = 0; warp < front_end.size(); ++warp) {
+        const auto& slot = front_end[warp];
+        const std::size_t in_flight = read.has_value() && read->warp == warp ? 1 : 0;
+        const bool branch_unresolved = branch.has_value() && branch->warp == warp;
+        has_space[warp] = !slot.halted && !branch_unresolved &&
+            slot.fifo.size() + in_flight < config_.core_instruction_buffer_words ? 1 : 0;
+    }
+    const auto choice = round_robin_grant(has_space, fetch_cursor_.cur(), 1);
+    FetchGrant grant;
+    grant.cursor_after = choice.cursor_after;
+    if (!choice.granted.empty()) {
+        grant.warp = choice.granted.front();
+        grant.pc = front_end[*grant.warp].fetch_pc;
+    }
+    return grant;
+}
+
+// The word at the instruction memory's output now, for the read in flight:
+// the kernel's word at its address, zero past the kernel's words (whatever
+// the memory holds there, no such word may have an effect unless it reaches
+// issue, which reports it: head_instruction). Whether it enters its warp's
+// FIFO is step_front_end's choice.
+std::optional<Machine::FetchedWord> Machine::instruction_memory_output() const {
+    const auto& read = fetch_read_.cur();
+    if (!read.has_value()) return std::nullopt;
+    const auto index = read->pc / 8;
+    return FetchedWord{read->warp, index < kernel_.words.size() ? kernel_.words[index] : 0};
+}
+
+// The branch in the issue register (accepted last cycle) resolves now
+// (issue_to_branch_resolve). bra and bra.uni @PT are taken and bra.uni @!PT
+// is not; any other bra.uni reads its predicate from the file now, like an
+// operand through the issue register: lane 0 (a declared-uniform operand;
+// the sanitizer checks the other lanes, and the active mask -- bra.uni is a
+// uniform operation in every form, backlog D12.1). Taken: the one target
+// adder, the branch's pc + 8 + its offset.
+std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
+    const auto& branch = issue_branch_.cur();
+    if (!branch.has_value()) return std::nullopt;
+    const auto& inst = branch->instruction;
+    const auto& warp = warps_.at(branch->warp);
+    const IssueSite here{cycle_, branch->warp, branch->pc, inst};
+    if (inst.opcode == Opcode::bra_uni) sanitizer_.check_uniform_mask(here, warp.active_mask, full_mask());
+    bool take = true;
+    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+        const auto lanes = capture_predicate(warp, inst.control.predicate);
+        sanitizer_.check_warp_uniform(here, lanes, "bra.uni predicate");
+        take = (lanes[0] != 0) != inst.control.predicate_invert;
+    } else if (inst.opcode == Opcode::bra_uni && inst.control.predicate_invert) {
+        take = false; // @!PT
+    }
+    BranchResolution resolution;
+    resolution.warp = branch->warp;
+    resolution.taken = take;
+    if (!take) return resolution;
+    const auto target = static_cast<int64_t>(branch->pc) + 8 + inst.imm;
+    if (inst.imm % 8 != 0 || target < 0 || static_cast<uint64_t>(target / 8) >= kernel_.words.size()) {
+        throw_issue_panic(here, "branch target is outside the kernel");
+    }
+    resolution.target = static_cast<uint32_t>(target);
+    return resolution;
+}
+
+// Every warp's front end after this cycle, in one calculation per warp
+// (src/rf.hpp for the cycles), from Q, this cycle's front-end wires and
+// issue's acceptance:
+//   - pop: issue accepted the warp's head (captured into the issue register
+//     at this edge); the warp's pc moves to the next word;
+//   - landing: the word at the instruction memory's output joins the FIFO
+//     behind the valid words ([A, B, C] with A accepted and D landing ->
+//     [B, C, D]), unless a redirect or a halt clears the FIFO now, or the
+//     warp halted earlier (its read was granted in the halt's cycle);
+//   - halt accepted now: the FIFO is cleared and the warp stops;
+//   - redirect (a taken branch resolves now): the FIFO is cleared, the word
+//     landing now is dropped, pc and fetch pc take the target. A not-taken
+//     branch changes nothing: its buffered fall-through stays;
+//   - fetch granted now: the fetch pc moves to the next word.
+// No fetch is granted to a warp whose branch is in the issue register, so a
+// redirect and a grant never meet in one warp; a halt and a grant may (that
+// read is dropped as it lands). The credit check guarantees the FIFO never
+// holds more than its depth (an internal error otherwise). The trace counts
+// the fetch and the words dropped.
+void Machine::step_front_end(Wires& w) {
+    const auto& cur = front_end_.cur();
+    w.front_end_next = cur;
+    uint64_t discarded = 0;
+    for (uint32_t warp = 0; warp < cur.size(); ++warp) {
+        auto& slot = w.front_end_next[warp];
+        const bool popped = w.issue.popped == warp;
+        const bool halting = popped && w.issue.halt;
+        const bool redirect = w.branch.has_value() && w.branch->warp == warp && w.branch->taken;
+        const bool landing = w.fetched.has_value() && w.fetched->warp == warp;
+        if (popped) {
+            slot.fifo.erase(slot.fifo.begin());
+            slot.pc += 8;
+        }
+        if (halting || redirect) {
+            discarded += slot.fifo.size() + (landing ? 1 : 0);
+            slot.fifo.clear();
+        } else if (landing && cur[warp].halted) {
+            ++discarded;
+        } else if (landing) {
+            slot.fifo.push_back(w.fetched->word);
+        }
+        if (halting) slot.halted = true;
+        if (redirect) {
+            slot.pc = w.branch->target;
+            slot.fetch_pc = w.branch->target;
+        }
+        if (w.fetch.warp == warp) slot.fetch_pc += 8;
+        if (slot.fifo.size() > config_.core_instruction_buffer_words) {
+            throw SimError("internal: warp " + std::to_string(warp) + "'s instruction FIFO overflowed at cycle " +
+                std::to_string(cycle_));
+        }
+    }
+    if (w.fetch.warp.has_value()) trace_->fetch(cycle_, *w.fetch.warp, w.fetch.pc);
+    if (discarded != 0) trace_->fetches_discarded(discarded);
 }
 
 // ===========================================================================
@@ -3000,19 +3168,22 @@ void Machine::mark_tma_data_complete(TmaCommand& command) {
 // Issue: the scheduler, after the units and the dispatch pipeline's end
 // ===========================================================================
 
-// The scheduler: from the cursor, the first warp whose instruction can be
-// accepted issues (one per cycle); every warp's state is traced.
+// The scheduler: from the cursor, the first warp whose FIFO head can be
+// accepted issues (one per cycle); every warp's state is traced. The heads
+// are the FIFOs' Q: a word landing now is a candidate from the next cycle.
 void Machine::decide_issue(Wires& w) {
     struct State {
         WarpState state = WarpState::not_selected;
         std::string detail;
     };
+    const auto& front_end = front_end_.cur();
+    const auto& branch = issue_branch_.cur();
     std::vector<State> states(warps_.size());
     bool issued = false;
     for (uint32_t offset = 0; offset < warps_.size(); ++offset) {
         const auto index = (scheduler_cursor_ + offset) % static_cast<uint32_t>(warps_.size());
         auto& warp = warps_[index];
-        if (warp.halted) {
+        if (front_end[index].halted) {
             states[index].state = WarpState::halted;
             continue;
         }
@@ -3028,6 +3199,15 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::stall_count, "stall count"};
             continue;
         }
+        // Nothing after a branch issues until it resolves (no prediction).
+        if (branch.has_value() && branch->warp == index) {
+            states[index] = {WarpState::no_instruction, "branch unresolved"};
+            continue;
+        }
+        if (front_end[index].fifo.empty()) {
+            states[index] = {WarpState::no_instruction, "instruction FIFO empty"};
+            continue;
+        }
         const auto attempt = try_issue(warp, w);
         if (attempt.issued) {
             states[index] = {WarpState::issued, {}};
@@ -3039,13 +3219,13 @@ void Machine::decide_issue(Wires& w) {
     }
 
     if (!issued) {
-        const auto draining = std::all_of(warps_.begin(), warps_.end(), [](const Warp& warp) {
+        const auto draining = std::all_of(front_end.begin(), front_end.end(), [](const WarpFrontEnd& warp) {
             return warp.halted;
         });
         trace_->scheduler_idle(draining);
     }
     for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
-        if (states[warp].state == WarpState::not_selected && warps_[warp].halted) {
+        if (states[warp].state == WarpState::not_selected && front_end[warp].halted) {
             states[warp].state = WarpState::halted;
         }
         trace_->warp_state(cycle_, warp, states[warp].state, std::move(states[warp].detail));
@@ -3067,11 +3247,12 @@ void Machine::decide_issue(Wires& w) {
 //      mbar instruction, its entry into the dispatch pipeline, which carries
 //      it to its unit as its operands arrive. Operand-value panics
 //      (alignment, bounds) happen there, at dispatch.
-// The warp's own state (pc, stall count, halted, the SFU and the arithmetic
-// operand latches) is the issue unit's and changes in place; everything for
-// another unit goes into w.issue, which that unit's driver applies.
+// The issue unit's own state (stall count, the SFU and the arithmetic operand
+// latches) changes in place; everything else goes into w.issue, which its
+// drivers apply -- the FIFO's pop and the warp's pc included
+// (step_front_end).
 Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
-    const auto inst = instruction(warp);
+    const auto inst = head_instruction(warp);
     sanitizer_.record_issue_attempt(warp.id);
     panic_if_malformed(warp, inst);
     if (const auto bar = depbar_wait(inst, depbar_.cur().at(warp.id)); bar.has_value()) {
@@ -3128,7 +3309,7 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
         sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
     }
     if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
-        sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate);
+        sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate, cycle_ + issue_to_predicate_sample);
     }
     check_register_hazards(warp, inst);
     if (is_acc_transfer(inst.opcode)) {
@@ -3251,25 +3432,27 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     throw SimError("internal unknown issue refusal");
 }
 
-// An accepted instruction: fixed arithmetic books its bundle; a branch, halt
-// or fence.sh is complete now (the front end is unchanged until I6b: a branch
-// redirects at issue, on the predicate file's Q); everything else books its
-// operand reads and enters the dispatch pipeline.
+// An accepted instruction leaves its FIFO (the head pops, the warp's pc
+// moves to the next word: step_front_end). Fixed arithmetic books its
+// bundle; a branch goes into the issue register, where it resolves next
+// cycle (resolve_branch); a halt stops the warp's front end now (its FIFO is
+// cleared, nothing more is fetched or issued); fence.sh is complete now;
+// everything else books its operand reads and enters the dispatch pipeline.
 void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
+    w.issue.popped = warp.id;
     if (uses_arithmetic_pipeline(inst)) {
         accept_arithmetic(warp, inst, plan, w);
         return;
     }
-    auto next_pc = warp.pc + 8;
     switch (inst.opcode) {
     case Opcode::bra:
     case Opcode::bra_uni:
-        next_pc = branch_target(warp, inst);
+        w.issue.branch = IssuedBranch{warp.id, head_pc(warp.id), inst};
         break;
     case Opcode::fence_sh:
         break; // its admission was the whole of it (own_shmem_at_ram)
     case Opcode::halt:
-        warp.halted = true;
+        w.issue.halt = true;
         break;
     default:
         accept_for_dispatch(warp, inst, plan, w);
@@ -3277,9 +3460,7 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
     }
     check_issue_latency(warp, inst);
     warp.stall_until = cycle_ + inst.control.stall;
-    const auto old_pc = warp.pc;
-    warp.pc = next_pc;
-    trace_->issue(cycle_, warp.id, old_pc, inst);
+    trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
 // Fixed-latency work books its result write; its read round goes into the
@@ -3314,14 +3495,13 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     ArithmeticRead pending;
     pending.issue_cycle = cycle_;
     pending.warp = warp.id;
+    pending.pc = head_pc(warp.id);
     pending.instruction = inst;
     pending.reads = plan.reads;
     pending.operands.resize(plan.reads.size());
     arithmetic_reads_.push_back(std::move(pending));
     warp.stall_until = cycle_ + inst.control.stall;
-    const auto old_pc = warp.pc;
-    warp.pc += 8;
-    trace_->issue(cycle_, warp.id, old_pc, inst);
+    trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
 // An lds / sts with no active lane is absent (rfc12 section 3): no slot, no
@@ -3373,7 +3553,7 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     DispatchEntry entry;
     entry.issue_cycle = cycle_;
     entry.warp = warp.id;
-    entry.pc = warp.pc;
+    entry.pc = head_pc(warp.id);
     entry.active_mask = warp.active_mask;
     entry.instruction = inst;
     entry.reads = plan.reads;
@@ -3801,32 +3981,6 @@ void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
     w.dispatch.mbar_probe = std::move(request);
 }
 
-// bra / bra.uni. bra.uni's predicate is a declared-uniform operand: hardware
-// reads lane 0 (the sanitizer checks the other lanes). bra.uni is a uniform
-// operation in every form, @PT included: under a partial or empty mask it is
-// the sanitizer's PANIC (backlog D12.1). The predicate file is flip-flops,
-// read here at issue (the front end and its redirect delay are I6b).
-uint32_t Machine::branch_target(const Warp& warp, const Instruction& inst) const {
-    if (inst.opcode == Opcode::bra_uni) {
-        sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
-    }
-    bool take = true;
-    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
-        const auto lanes = capture_predicate(warp, inst.control.predicate);
-        sanitizer_.check_warp_uniform(site(warp, inst), lanes, "bra.uni predicate");
-        take = (lanes[0] != 0) != inst.control.predicate_invert;
-    } else if (inst.opcode == Opcode::bra_uni && inst.control.predicate_invert) {
-        take = false; // @!PT
-    }
-    if (!take) return warp.pc + 8;
-    const auto target = static_cast<int64_t>(warp.pc) + 8 + inst.imm;
-    if (inst.imm % 8 != 0 || target < 0 ||
-        static_cast<uint64_t>(target / 8) >= kernel_.words.size()) {
-        panic(warp, inst, "branch target is outside the kernel");
-    }
-    return static_cast<uint32_t>(target);
-}
-
 // The ISA tables' invariant: outside the arithmetic pipeline only
 // mbar.test_wait has a fixed (one-cycle predicate) latency, and only the
 // listed opcodes may have none.
@@ -3853,6 +4007,10 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
 void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     auto& warp = warps_.at(pending.warp);
     const auto& inst = pending.instruction;
+    // A panic names the instruction's own pc (the warp's has moved on).
+    const auto fail = [&](const std::string& reason) {
+        throw_issue_panic(IssueSite{cycle_, pending.warp, pending.pc, inst}, reason);
+    };
     std::vector<uint32_t> result(config_.lanes, 0);
     // The round holds each source register once; duplicated operand slots
     // broadcast from the same captured latch.
@@ -3870,7 +4028,7 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
             case SpecialReg::warp_id: result[lane] = warp.id; break;
             case SpecialReg::thread_id: result[lane] = warp.id * config_.lanes + lane; break;
             case SpecialReg::n_warps: result[lane] = static_cast<uint32_t>(warps_.size()); break;
-            default: panic(warp, inst, "invalid special register");
+            default: fail("invalid special register");
             }
         }
         break;
@@ -3888,13 +4046,13 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
         }
         break;
     case Opcode::shli:
-        if (inst.imm < 0 || inst.imm > 31) panic(warp, inst, "shift outside 0..31");
+        if (inst.imm < 0 || inst.imm > 31) fail("shift outside 0..31");
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             result[lane] = operand(inst.src0, lane) << inst.imm;
         }
         break;
     case Opcode::shri:
-        if (inst.imm < 0 || inst.imm > 31) panic(warp, inst, "shift outside 0..31");
+        if (inst.imm < 0 || inst.imm > 31) fail("shift outside 0..31");
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             result[lane] = operand(inst.src0, lane) >> inst.imm;
         }
@@ -4009,7 +4167,7 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
             result[lane] = compare_setp(inst.opcode, operand(inst.src0, lane), rhs);
         }
         break;
-    default: panic(warp, inst, "non-arithmetic instruction in RF read pipeline");
+    default: fail("non-arithmetic instruction in RF read pipeline");
     }
     // The execution pipeline's E cycles, then the write port it booked.
     const auto port_cycle = pending.issue_cycle + issue_to_port(inst, config_);
@@ -4085,7 +4243,10 @@ void Machine::step_rf_reads(Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 32> canonical = {
+    static constexpr std::array<Driver, 35> canonical = {
+        &Machine::drive_front_end,
+        &Machine::drive_fetch,
+        &Machine::drive_issue_branch,
         &Machine::drive_depbar,
         &Machine::drive_wait_slots,
         &Machine::drive_load_slots,
@@ -4122,6 +4283,30 @@ void Machine::run_drivers(const Wires& w) {
     auto order = canonical;
     if (shuffle_.has_value()) std::shuffle(order.begin(), order.end(), *shuffle_);
     for (const auto driver : order) (this->*driver)(w);
+}
+
+// The front ends' next state (step_front_end).
+void Machine::drive_front_end(const Wires& w) {
+    if (w.front_end_next == front_end_.cur()) return;
+    front_end_.set_next(w.front_end_next, "drive_front_end");
+}
+
+// The instruction memory's read: a granted fetch's address (and tag) is
+// sampled at this edge; the read at the output now leaves. The fetch cursor
+// moves past the granted warp, only on a grant.
+void Machine::drive_fetch(const Wires& w) {
+    std::optional<FetchRead> next;
+    if (w.fetch.warp.has_value()) {
+        next = FetchRead{*w.fetch.warp, w.fetch.pc};
+        if (w.fetch.cursor_after != fetch_cursor_.cur()) fetch_cursor_.set_next(w.fetch.cursor_after, "drive_fetch");
+    }
+    if (next != fetch_read_.cur()) fetch_read_.set_next(next, "drive_fetch");
+}
+
+// The issue register's branch: the branch accepted now, else empty.
+void Machine::drive_issue_branch(const Wires& w) {
+    if (!w.issue.branch.has_value() && !issue_branch_.cur().has_value()) return;
+    issue_branch_.set_next(w.issue.branch, "drive_issue_branch");
 }
 
 // depbar: next = Q - this cycle's completions + issue's admission. (The
@@ -4710,15 +4895,15 @@ void Machine::drive_lsu_read_pipe(const Wires& w) {
 // Helpers
 // ===========================================================================
 
-Instruction Machine::instruction(const Warp& warp) const {
-    if (warp.pc % 8 != 0) throw SimError("unaligned PC in warp " + std::to_string(warp.id));
-    const auto index = warp.pc / 8;
-    if (index >= kernel_.words.size()) {
+Instruction Machine::head_instruction(const Warp& warp) const {
+    const auto& slot = front_end_.cur().at(warp.id);
+    if (slot.pc % 8 != 0) throw SimError("unaligned PC in warp " + std::to_string(warp.id));
+    if (slot.pc / 8 >= kernel_.words.size()) {
         throw SimError(
             "warp " + std::to_string(warp.id) + " fell off kernel at pc " +
-            std::to_string(warp.pc));
+            std::to_string(slot.pc));
     }
-    return decode(kernel_.words[index]);
+    return decode(slot.fifo.front());
 }
 
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
@@ -4869,7 +5054,6 @@ std::vector<uint32_t> Machine::capture(const DispatchEntry& op, uint8_t reg) con
 }
 
 std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predicate) const {
-    sanitizer_.check_issue_capture(cycle_, warp.id, predicate, true);
     const auto& bits = warp.predicates.at(predicate);
     return std::vector<uint32_t>(bits.begin(), bits.end());
 }
@@ -4881,7 +5065,7 @@ std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predi
 // partial or empty mask (backlog D12.1, rfc13 section 2: a program with a
 // partial mask uses the per-lane instruction). Every lane-0-sourced operand
 // is read here, so every uniform operation with a register operand gets the
-// mask check; bra.uni checks it in branch_target.
+// mask check; bra.uni checks it in resolve_branch.
 uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const {
     sanitizer_.check_uniform_mask(site(op), op.active_mask, full_mask());
     const auto lanes = capture(op, reg);
@@ -5024,8 +5208,9 @@ void Machine::apply_image(
 // only to sanitizer_ (src/sanitizer.hpp). Nothing here feeds the machine.
 // ---------------------------------------------------------------------------
 
+// An issuing warp's site: its FIFO head's pc.
 IssueSite Machine::site(const Warp& warp, const Instruction& inst) const {
-    return IssueSite{cycle_, warp.id, warp.pc, inst};
+    return IssueSite{cycle_, warp.id, head_pc(warp.id), inst};
 }
 
 // A dispatched instruction's site: the dispatch cycle, its issue's pc.

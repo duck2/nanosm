@@ -49,7 +49,9 @@
   "core": {
     "clock_hz": 1000000000,
     "alu_latency_cycles": 1,
-    "fadd_latency_cycles": 4
+    "fadd_latency_cycles": 4,
+    "warps": 16,
+    "instruction_buffer_words": 3
   },
   "sfu": {
     "lanes": 4,

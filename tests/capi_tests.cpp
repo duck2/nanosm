@@ -88,7 +88,11 @@ int main() {
             NANOSM_TRACE_TIMELINE, 1000);
         require(handle != NANOSM_INVALID_HANDLE, "C API could not create qtx session");
         require(nanosm_session_run(handle, 100) == NANOSM_OK, "C API run failed");
-        require(nanosm_session_cycle(handle) == 1, "halt kernel took the wrong cycle count");
+        // The front end (src/rf.hpp): the halt's word, fetched at c0, issues at
+        // c2 (fetch_to_issue); the instruction-memory read granted in that same
+        // cycle is still in flight at c3 (its word is dropped there), and done()
+        // waits for it: the run is 4 cycles.
+        require(nanosm_session_cycle(handle) == 4, "halt kernel took the wrong cycle count");
         require(
             get_string(nanosm_session_summary, handle).find("instructions issued") != std::string::npos,
             "C API summary is missing");

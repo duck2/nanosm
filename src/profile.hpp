@@ -20,9 +20,17 @@ struct DeviceProfile {
     std::string name;
     uint32_t lanes = 0;
     uint32_t rf_banks = 0;
+    // The SM's warp slots (core.warps): the scheduler's and the front end's
+    // per-warp state is sized by it, and a launch may not ask for more warps
+    // (the RF rows must fit too). Canonical 16 (HUMAN 10-17). 1..64.
+    uint32_t core_warps = 16;
+    // Instruction FIFO entries per warp (core.instruction_buffer_words): 64-bit
+    // instruction words fetched ahead of issue (trash/front-end-2026-10-18.md).
+    // Canonical 3 (HUMAN 10-18: three entries per warp, configurable). 1..16.
+    uint32_t core_instruction_buffer_words = 3;
     // One row of one bank holds one lane-wide register (lanes x 4 B). A
     // launch fits when active warps x the kernel's rows in every bank fit
-    // (no separate warp-count field). Canonical 352: 3 x 352 x 64 B = 66 KiB,
+    // (and the warps fit core.warps). Canonical 352: 3 x 352 x 64 B = 66 KiB,
     // about the size of shmem; 16 warps x 22 rows (66 registers each).
     uint32_t rf_rows_per_bank = 0;
     // Distinct registers one bank serves per cycle. Every instruction reads

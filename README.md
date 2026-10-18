@@ -57,7 +57,7 @@ fields and is the intended human-editable layer. `hex` is one annotated 64-bit i
 line and is what the simulator fetches. The same human-editable device profile is required at all
 three stages. Assembly and hex carry its fingerprint, so a schedule cannot silently run with
 different machine timings. Hex also carries the register count derived by qtxas; launch residency
-is checked against the physical RF banks in the profile. An instruction reads the source registers
+is checked against the profile's warp slots (`core.warps`, 16) and its physical RF banks. An instruction reads the source registers
 it names at issue in one RF round (the data of `acc.st` and `stg.v8` is read later, beat by beat,
 and is not part of that round). An instruction whose distinct issue-time sources need more reads of
 one bank (register mod `rf.banks`) than `rf.read_ports_per_bank` allows -- at the canonical one port,
@@ -69,6 +69,12 @@ The current control-flow slice supports labels, unconditional `bra`, per-lane pr
 `bra.uni` predicate must agree across every lane in its warp or the simulator PANICs. General
 predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
 Qtx conservatively drains live depbars and fixed-latency writes at every branch.
+
+Each warp issues from its own instruction FIFO (`core.instruction_buffer_words`, 3), filled by one
+instruction-memory read per cycle (a fixed one-cycle read), round-robin over the warps with room.
+A branch resolves one cycle after it issues -- a conditional `bra.uni` reads its predicate then --
+and nothing after it issues before that: a not-taken branch continues with the words already
+fetched, a taken one clears its warp's FIFO and fetches the target (`src/rf.hpp` has the cycles).
 
 Mbar instructions currently take an address in a uniform register with no encoded offset:
 `mbar.init`, `mbar.arrive`, `mbar.arrive.expect_tx`, `mbar.test_wait`, and bounded

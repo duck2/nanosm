@@ -87,14 +87,16 @@ public:
     // write's VISIBILITY, the first cycle an RF sample sees it (a pending
     // asynchronous write: never, until it lands). READ_UNTIL is the exclusive
     // end of its pending fixed samples. A predicate's ready cycle is the first
-    // cycle issue reads it from the file.
+    // cycle it is in the file: a conditional branch's sample (issue +
+    // issue_to_predicate_sample, src/rf.hpp) must be at or after it, and a
+    // predicate writer may not issue before it.
     void record_reg_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle);
     void record_reg_read_until(uint32_t warp, uint32_t reg, uint64_t exclusive_end);
     void record_async_reader_add(uint32_t warp, uint32_t reg);
     void record_async_reader_done(uint32_t warp, uint32_t reg, AsyncReader reader);
     void record_pred_ready(uint32_t warp, uint32_t pred, uint64_t cycle);
     void check_pred_waw(const IssueSite& site, uint8_t pred) const;
-    void check_pred_raw(const IssueSite& site, uint8_t pred) const;
+    void check_pred_raw(const IssueSite& site, uint8_t pred, uint64_t sample_cycle) const;
     // RAW: each source register with the cycle this instruction samples it
     // must be visible by then.
     void check_rf_raw(const IssueSite& site, const std::vector<std::pair<uint8_t, uint64_t>>& samples) const;
@@ -106,11 +108,12 @@ public:
 
     // ---- admission reads no operand (rfc10 section 1) ----
     // Every issue attempt opens with record_issue_attempt; record_issue_accepted
-    // marks the moment admission has decided. RF operands are never read at
-    // issue (they are sampled through the issue register, I6a); the predicate
-    // file (bra.uni) is read by issue only after acceptance: a capture in an
-    // attempt not (yet) accepted is an internal PANIC (a refused attempt must
-    // consume nothing).
+    // marks the moment admission has decided. A capture in an attempt not
+    // (yet) accepted is an internal PANIC (a refused attempt must consume
+    // nothing). No machine path reads an operand at issue today: RF operands
+    // (I6a) and, since the front end (I6b-2), a conditional branch's
+    // predicate are sampled through the issue register, a cycle after
+    // acceptance. The tripwire stays for any future issue-time read.
     void record_issue_attempt(uint32_t warp);
     void record_issue_accepted();
     void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;

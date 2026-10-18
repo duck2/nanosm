@@ -133,8 +133,8 @@ void Sanitizer::check_pred_waw(const IssueSite& site, uint8_t pred) const {
     }
 }
 
-void Sanitizer::check_pred_raw(const IssueSite& site, uint8_t pred) const {
-    if (warps_.at(site.warp).predicate_ready_cycle[pred] > site.cycle) {
+void Sanitizer::check_pred_raw(const IssueSite& site, uint8_t pred, uint64_t sample_cycle) const {
+    if (warps_.at(site.warp).predicate_ready_cycle[pred] > sample_cycle) {
         throw_issue_panic(site, "predicate RAW hazard: missing stall for p" + std::to_string(pred));
     }
 }

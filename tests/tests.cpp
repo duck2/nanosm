@@ -3326,9 +3326,10 @@ void test_rf_read_profile_and_round() {
 // 1) are both sampled at issue + issue_to_sample; its operands are at the RF
 // output Lr later, its result at the write port fadd later, landing at the
 // edge Wd after that -- read_reg sees it after that cycle's tick. The
-// source-free mov issues right behind it. setp p0, r0, r0 reads r0 once, at
-// c1; its predicate reaches the file at its port cycle 1 + Lr + alu (c4), at
-// that edge, and done() waits for it: the run ends at c5.
+// source-free mov issues right behind it. setp p0, r0, r0 issues at c2 (its
+// word fetched at c0: fetch_to_issue, src/rf.hpp) and reads r0 once, at c3;
+// its predicate reaches the file at its port cycle c2 + 1 + Lr + alu (c6), at
+// that edge, and done() waits for it: the run ends at c7.
 void test_rf_one_round_fadd_and_halt() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
@@ -3370,12 +3371,14 @@ void test_rf_one_round_fadd_and_halt() {
     nanosm::Machine predicate(profile, compile("setp.eq.u32 p0, r0, r0\nhalt", profile),
         std::move(predicate_launch), {.timeline = true, .debug = true});
     predicate.run();
-    require(predicate.cycle() == nanosm::issue_to_sample + profile.rf_read_latency_cycles + profile.timing.alu + 1,
+    require(predicate.cycle() == nanosm::fetch_to_issue + nanosm::issue_to_sample + profile.rf_read_latency_cycles +
+                profile.timing.alu + 1,
         "HALT dropped a pending predicate-only read pipeline");
     uint32_t duplicate_reads = 0;
     for (const auto& event : predicate.trace().events()) {
         if (event.name == "RF read") {
-            require(event.start_cycle == nanosm::issue_to_sample, "the repeated operand was not sampled at c1");
+            require(event.start_cycle == nanosm::fetch_to_issue + nanosm::issue_to_sample,
+                "the repeated operand was not sampled at c3");
             ++duplicate_reads;
         }
     }
@@ -5856,11 +5859,13 @@ void test_mbar_engine_events_visible_next_cycle() {
 // sample D after that grant, its word Lb later, the gather register one cycle
 // later (the RF write decision's grant), the write lands Wd after it: its
 // depbar completion is presented then. `pad` independent movs put the ldg
-// there.
+// there. (The mov issues at fetch_to_issue, its word fetched at c0; the
+// three-word FIFO then supplies one instruction per cycle.)
 void test_simultaneous_depbar_completion_and_admission() {
     const auto& profile = canonical_profile();
-    const uint64_t lds_issue = nanosm::issue_to_visible(nanosm::decode(compile("mov r0, 0\nhalt").words[0]), profile) -
-        nanosm::issue_register_stages; // mov r0 at c0, the lds that reads it at its distance
+    const uint64_t lds_issue = nanosm::fetch_to_issue +
+        nanosm::issue_to_visible(nanosm::decode(compile("mov r0, 0\nhalt").words[0]), profile) -
+        nanosm::issue_register_stages; // mov r0 at c2, the lds that reads it at its distance
     const auto completion_cycle = lds_issue + nanosm::issue_to_dispatch(profile) + 1 + profile.shmem_port_a_depth +
         profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles;
     const auto pad = completion_cycle - lds_issue - 1;
@@ -6543,6 +6548,13 @@ void test_b3_lds_uni_encoding() {
 // register sees it then. The scenarios' address register r1 is zero from
 // launch: a `mov r1, 0` feeding the lds.uni would now need six cycles before
 // it, which would move the scenario, so the first instruction writes r61.
+// I6b-2 (the front end): the first instruction issues at fetch_to_issue
+// (c2: its word fetched at c0, src/rf.hpp), and the three-word FIFO then
+// supplies one instruction per cycle -- through every stall and refusal, the
+// FIFO fills behind them. So a scenario's cycles (the comments' c0, c1, ...)
+// all move by i1_launch_shift; the tests add it to every absolute cycle.
+constexpr uint64_t i1_launch_shift = nanosm::fetch_to_issue;
+
 uint32_t i1_lds_shift(const nanosm::DeviceProfile& profile = canonical_profile()) {
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + nanosm::issue_to_dispatch(profile);
 }
@@ -6809,19 +6821,21 @@ void test_i1_rf_owed_inhibits_after_denial() {
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )");
     require(!machine->rf_write_owed(0), "async_owed did not start clear");
+    const auto s = i1_launch_shift;
     std::map<uint64_t, std::pair<bool, uint32_t>> bank0; // cycle -> owed, cursor after it
     const auto written = i1_run(*machine, {3}, [&](uint64_t cycle) {
         bank0[cycle] = {machine->rf_write_owed(0), machine->rf_write_cursor(0)};
     });
-    require(!bank0.at(0).first && bank0.at(1).first, "a successful booking of bank 0 did not set async_owed");
-    require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{3}, "lds.uni issue");
-    require(written.at(3) == std::vector<uint64_t>{7 + x + wd},
+    require(!bank0.at(s).first && bank0.at(s + 1).first, "a successful booking of bank 0 did not set async_owed");
+    require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{s + 3}, "lds.uni issue");
+    require(written.at(3) == std::vector<uint64_t>{s + 7 + x + wd},
         "the result was not written when the old bookings drained (c7 + x, landing Wd later)");
-    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{5 + x, 2}},
+    require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{s + 5 + x, 2}},
         "bank 0 was not inhibited exactly while the result was denied with service owed (c5 + x, c6 + x)");
-    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{7 + x}, "the inhibited fadd did not issue in the grant cycle");
-    require(bank0.at(7 + x).first, "a grant and a booking in one cycle cleared async_owed (set must win)");
-    require(bank0.at(6 + x).second == 0 && bank0.at(7 + x).second == 1,
+    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + 7 + x},
+        "the inhibited fadd did not issue in the grant cycle");
+    require(bank0.at(s + 7 + x).first, "a grant and a booking in one cycle cleared async_owed (set must win)");
+    require(bank0.at(s + 6 + x).second == 0 && bank0.at(s + 7 + x).second == 1,
         "the cursor did not move past load slot 0 on its grant");
     const auto& summary = machine->trace().summary();
     require(summary.rf_async_waits == 2 && summary.rf_simt_inhibited == 2 && summary.rf_async_writes == 1,
@@ -6850,20 +6864,23 @@ void test_i1_rf_owed_one_more_booking() {
             fadd r18, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
+        const auto s = i1_launch_shift;
         std::map<uint64_t, std::pair<bool, uint32_t>> bank0;
         const auto written = i1_run(*machine, {3, 12}, [&](uint64_t cycle) {
             bank0[cycle] = {machine->rf_write_owed(0), machine->rf_write_cursor(0)};
         });
-        require(written.at(3) == std::vector<uint64_t>{5 + x + wd} && written.at(12) == std::vector<uint64_t>{8 + x + wd},
+        require(written.at(3) == std::vector<uint64_t>{s + 5 + x + wd} &&
+                written.at(12) == std::vector<uint64_t>{s + 8 + x + wd},
             "write cycles");
-        require(!bank0.at(5 + x).first, "an async grant with no booking in its cycle did not clear async_owed");
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
+        require(!bank0.at(s + 5 + x).first, "an async grant with no booking in its cycle did not clear async_owed");
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s + 6 + x},
             "with async_owed = 0 a denied writer did not let one more booking through");
-        require(bank0.at(6 + x).first, "that booking did not set async_owed");
-        require(refusals(*machine, 0, "RF write inhibited") == std::vector<std::pair<uint64_t, uint64_t>>{{7 + x, 1}},
+        require(bank0.at(s + 6 + x).first, "that booking did not set async_owed");
+        require(refusals(*machine, 0, "RF write inhibited") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{s + 7 + x, 1}},
             "the next booking was not inhibited (c7 + x)");
-        require(bank0.at(5 + x).second == 1 && bank0.at(6 + x).second == 1 && bank0.at(7 + x).second == 1 &&
-                bank0.at(8 + x).second == 2,
+        require(bank0.at(s + 5 + x).second == 1 && bank0.at(s + 6 + x).second == 1 &&
+                bank0.at(s + 7 + x).second == 1 && bank0.at(s + 8 + x).second == 2,
             "the cursor moved without a grant, or not on one");
     }
     {   // A refused booking (its port taken) does not set the bit. I6a: the add
@@ -6881,11 +6898,14 @@ void test_i1_rf_owed_one_more_booking() {
             add r9, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
+        const auto s = i1_launch_shift;
         std::map<uint64_t, bool> owed;
         (void)i1_run(*machine, {}, [&](uint64_t cycle) { owed[cycle] = machine->rf_write_owed(0); });
-        require(refusals(*machine, 0, "RF write reservation") == std::vector<std::pair<uint64_t, uint64_t>>{{5 + x, 1}},
+        require(refusals(*machine, 0, "RF write reservation") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{s + 5 + x, 1}},
             "the add was not refused at c5 + x (its write cycle is the fadd's)");
-        require(!owed.at(4 + x) && !owed.at(5 + x) && owed.at(6 + x), "a refused booking changed async_owed");
+        require(!owed.at(s + 4 + x) && !owed.at(s + 5 + x) && owed.at(s + 6 + x),
+            "a refused booking changed async_owed");
     }
 }
 
@@ -6910,13 +6930,16 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
             fadd r15, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
+        const auto s = i1_launch_shift;
         const auto written = i1_run(*machine, {3, 13, 21});
-        require(written.at(3) == std::vector<uint64_t>{7 + x + wd}, "the first result was not written at c7 + x (+ Wd)");
-        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{5 + x}, "a bank-1 write was held by bank 0's inhibition");
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{6 + x},
+        require(written.at(3) == std::vector<uint64_t>{s + 7 + x + wd},
+            "the first result was not written at c7 + x (+ Wd)");
+        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + 5 + x},
+            "a bank-1 write was held by bank 0's inhibition");
+        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s + 6 + x},
             "an lds.uni into bank 0 was held by bank 0's inhibition");
         // The second lds.uni's own result is x later too (it meets fadd r12's booking).
-        require(written.at(21) == std::vector<uint64_t>{9 + 2 * x + wd}, "the second result");
+        require(written.at(21) == std::vector<uint64_t>{s + 9 + 2 * x + wd}, "the second result");
         require(machine->trace().summary().rf_simt_inhibited == 0, "nothing should have been inhibited");
     }
     {
@@ -6929,12 +6952,14 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
             fadd r18, r4, r4
             halt
         )");
+        const auto s = i1_launch_shift;
         std::map<uint64_t, bool> owed;
         (void)i1_run(*machine, {}, [&](uint64_t cycle) { owed[cycle] = machine->rf_write_owed(0); });
         for (uint32_t pc = 1; pc <= 5; ++pc) {
-            require(issued_at(*machine, pc * 8) == std::vector<uint64_t>{pc}, "a booking was refused with no writer ready");
+            require(issued_at(*machine, pc * 8) == std::vector<uint64_t>{s + pc},
+                "a booking was refused with no writer ready");
         }
-        require(owed.at(1) && owed.at(5), "async_owed was not set by the bookings");
+        require(owed.at(s + 1) && owed.at(s + 5), "async_owed was not set by the bookings");
         require(machine->trace().summary().rf_simt_inhibited == 0, "inhibited with no async writer ready");
     }
 }
@@ -7269,7 +7294,7 @@ void test_i1_load_slots_profile_field() {
     const auto written = i1_run(*machine, {3, 6});
     // I2: the slot is held while the first load's words come back (D + Lb).
     const auto refused = refusals(*machine, 0, "load slots full");
-    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{2, 1 + i1_lds_shift(one)}},
+    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{i1_launch_shift + 2, 1 + i1_lds_shift(one)}},
         "the second lds.uni was not refused until the one slot freed:" + describe(refused));
     require(written.at(3).size() == 1 &&
             issued_at(*machine, 2 * 8) == std::vector<uint64_t>{written.at(3)[0] - one.rf_write_depth_cycles},
@@ -7640,8 +7665,9 @@ void test_i2_same_warp_order_with_reordered_reads() {
             "sts data");
     }
 
-    // Tight RAW: the sts (issued at s = 2 alu_distance + 1: it needs the mov's
-    // r5) has its one round granted at s + t + 1 and reaching the RAM D
+    // Tight RAW: the sts (issued at s = fetch_to_issue + 2 alu_distance + 1:
+    // the first instruction issues at fetch_to_issue, and the sts needs the
+    // mov's r5) has its one round granted at s + t + 1 and reaching the RAM D
     // later; the lds, admitted at that grant, is granted t + 1 later and
     // samples D after that.
     auto raw = i2_machine(profile, R"(
@@ -7653,7 +7679,7 @@ void test_i2_same_warp_order_with_reordered_reads() {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )");
     raw->run();
-    const uint64_t raw_store = 2 * alu_distance(profile) + 1 + t + 1;
+    const uint64_t raw_store = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 1 + t + 1;
     require(i2_grants(*raw) == std::vector<I2Grant>{{raw_store, "A-write", "simt", 0},
                                    {raw_store + t + 1, "A-read", "simt", 0}},
         "the lds was not granted t + 1 after the sts's last grant:" + describe(i2_grants(*raw)));
@@ -7847,6 +7873,13 @@ void test_i2_store_slot_reuse_and_done() {
 
 // A-read and A-write are independent services: one warp's sixteen-round lds
 // and another warp's sixteen-round sts are granted in the same cycles.
+// I6b-2: the two warps issue their bra.uni one cycle apart; the reader's lds
+// follows its not-taken branch by branch_not_taken_interval, the writer's sts
+// its mov at the branch target by alu_distance, and the target the taken
+// branch by branch_taken_interval (src/rf.hpp). So the sts issues 1 + taken
+// - not taken + alu_distance after the lds (9 at canonical), each is granted
+// t + 1 after its issue, and the two sixteen-cycle windows share 16 minus
+// that many cycles -- in every one of which both services grant.
 void test_i2_a_read_and_a_write_same_cycle() {
     auto machine = i2_machine(canonical_profile(), R"(
         sread r29, WARP_ID
@@ -7866,7 +7899,11 @@ void test_i2_a_read_and_a_write_same_cycle() {
     for (const auto& grant : i2_grants(*machine, "A-read")) read_cycles.insert(grant.cycle);
     uint32_t together = 0;
     for (const auto& grant : i2_grants(*machine, "A-write")) together += read_cycles.contains(grant.cycle) ? 1 : 0;
-    require(read_cycles.size() == 16 && together >= 8,
+    const auto apart = 1 + nanosm::branch_taken_interval - nanosm::branch_not_taken_interval +
+        alu_distance(canonical_profile());
+    require(issued_at(*machine, 8 * 8).at(0) == issued_at(*machine, 5 * 8).at(0) + apart,
+        "the sts did not issue 1 + taken - not taken + alu_distance after the lds:" + issue_log(*machine));
+    require(read_cycles.size() == 16 && together == 16 - apart,
         "A-read and A-write were not granted in the same cycles (" + std::to_string(together) + ")");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_reg(0, lane, 3) == 0x100 + 16 * lane, "the load's words");
@@ -7944,7 +7981,11 @@ void test_i2_round_robin_tma_reads_and_loads() {
 
 // TMA placement is the port-B write (rfc11 section 0): it runs in the same
 // cycles as another warp's sts stream (A-write) and the MMA's operand fetch
-// (port-B read). Everything lands correctly.
+// (port-B read). Everything lands correctly. I6b-2: the hammer's stores are
+// sixteen rounds each (all lanes on one bank), so A-write is busy 16 of
+// every t + 16 cycles; a stream of one-round stores (one per t + 1 cycles,
+// each ordered behind the last) met the placements (one per 8 cycles) only
+// at a lucky phase, which the front end's branch timing moved.
 void test_i2_tma_placement_on_port_b() {
     nanosm::Launch launch;
     launch.active_warps = 2;
@@ -7980,9 +8021,9 @@ void test_i2_tma_placement_on_port_b() {
         halt
     hammer:
         sread r20, LANE_ID
-        shli r20, r20, 2
+        shli r20, r20, 6
     )";
-    for (int i = 0; i < 200; ++i) program += "sts [r20 + 6144], r20\n";
+    for (int i = 0; i < 50; ++i) program += "sts [r20 + 6144], r20\n";
     program += "halt\n";
     nanosm::Machine machine(canonical_profile(), compile(program), std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -8001,7 +8042,7 @@ void test_i2_tma_placement_on_port_b() {
         "no cycle had a placement, an sts round and an MMA fetch together (" + std::to_string(all_three) + ")");
     for (uint32_t i = 0; i < 256; ++i) require(machine.read_shmem_u32(2048 + 4 * i) == pattern_word(i), "TMA data");
     for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_shmem_u32(6144 + 4 * lane) == 4 * lane, "sts data");
+        require(machine.read_shmem_u32(6144 + 64 * lane) == 64 * lane, "sts data");
         require(machine.read_reg(0, lane, 16) == nanosm::float_bits(8.0f), "MMA result");
     }
 }
@@ -8123,12 +8164,12 @@ void test_i2_profile_fields() {
     // I6a: the lds.uni at c0 reaches its slot at dispatch, its round is
     // granted the cycle after, its word comes back D + Lb later, the gather
     // register is complete one cycle later (its RF grant), and the write lands
-    // Wd after that.
+    // Wd after that. (I6b-2: it issues at fetch_to_issue, not c0.)
     auto slow = canonical_profile();
     slow.shmem_read_latency_cycles = 7;
     const auto& canonical_run = canonical_profile();
-    require(result_cycle(canonical_run) == nanosm::issue_to_dispatch(canonical_run) + 1 + i2_return(canonical_run) +
-                1 + canonical_run.rf_write_depth_cycles &&
+    require(result_cycle(canonical_run) == nanosm::fetch_to_issue + nanosm::issue_to_dispatch(canonical_run) + 1 +
+                i2_return(canonical_run) + 1 + canonical_run.rf_write_depth_cycles &&
             result_cycle(slow) == result_cycle(canonical_profile()) + 5,
         "an lds result did not arrive dispatch + 1 + D + Lb + 1 (the gather register) + Wd after its issue");
 }
@@ -8418,7 +8459,8 @@ void test_i21_rmw_compute_stage() {
 // m + issue_to_dispatch and presents at P = m + issue_to_dispatch + 1. The
 // arrive issues at m + 1 and reaches the SIMT RMW register at its own
 // dispatch, P: the cycle the commit is presented, as before. Both are held
-// at P + 1 and the arrive is served first.
+// at P + 1 and the arrive is served first. (I6b-2: the first mov issues at
+// fetch_to_issue, so m is that + alu_distance.)
 void test_i21_simt_rmw_admission_registered_state() {
     const auto& profile = canonical_profile();
     auto machine = i21_machine(profile, R"(
@@ -8428,7 +8470,7 @@ void test_i21_simt_rmw_admission_registered_state() {
         mbar.arrive [r5]
         halt
     )", {{4160, i21_mbar(1, 1)}, {4168, i21_mbar(2, 2)}});
-    const auto m = alu_distance(profile);
+    const auto m = nanosm::fetch_to_issue + alu_distance(profile);
     const auto p = m + nanosm::issue_to_dispatch(profile) + 1;
     i2_run_until(*machine, p + 1);
     require(machine->mma_mbar_event_held(), "the commit was not presented at P (held from P + 1)");
@@ -8461,7 +8503,7 @@ void test_i21_simt_rmw_admission_registered_state() {
 // ordered behind it from s + 1 (refused t + 15 cycles), is admitted at its
 // last grant and granted from s + 2t + 17; the arrive, ordered behind the
 // lds (again t + 15 cycles), is admitted at the lds's last grant (s + 2t +
-// 32) and read at s + 3t + 33.
+// 32) and read at s + 3t + 33. (I6b-2: the sread issues at fetch_to_issue.)
 void test_i21_simt_rmw_behind_own_lds_and_sts() {
     for (const auto& [d, lb, c] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t>>{{2, 2, 2}, {3, 1, 1}, {1, 3, 3}}) {
         auto profile = canonical_profile();
@@ -8494,7 +8536,7 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
             return true;
         };
         const auto t = nanosm::issue_to_dispatch(profile);
-        const auto s = 2 + 2 * alu_distance(profile); // sread, shli; mov r4, mov r5; the sts
+        const auto s = nanosm::fetch_to_issue + 2 + 2 * alu_distance(profile); // sread, shli; mov r4, mov r5; the sts
         const auto issues = " | issues" + issue_log(*machine);
         require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s}, what + "the sts did not issue at s:" + issues);
         require(consecutive(store_rounds, s + t + 1) && consecutive(load_rounds, s + 2 * t + 17),
@@ -8523,7 +8565,8 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
 // the mov at s - alu_distance, after sread -> xori -> shli) and t =
 // issue_to_dispatch: rounds s + t + 1 .. s + t + 16; the test_wait refused
 // from s + 1 (t + 15 cycles), admitted at the last grant s + t + 16 and
-// granted its probe at s + 2t + 17, after its dispatch.
+// granted its probe at s + 2t + 17, after its dispatch. (I6b-2: the sread
+// issues at fetch_to_issue.)
 void test_i21_probe_behind_own_sts() {
     auto flipped = i21_mbar(1, 1);
     flipped.phase = true;
@@ -8548,7 +8591,7 @@ void test_i21_probe_behind_own_sts() {
         )", {{6144, i21_mbar(1, 1)}});
         machine->run();
         const auto t = nanosm::issue_to_dispatch(profile);
-        const auto s = 3 * alu_distance(profile) + 1; // sread, xori, shli; mov r6; the sts
+        const auto s = nanosm::fetch_to_issue + 3 * alu_distance(profile) + 1; // sread, xori, shli; mov r6; the sts
         require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s},
             what + "the sts did not issue at s:" + issue_log(*machine));
         require(issued_at(*machine, 7 * 8) == std::vector<uint64_t>{s + t + 16},
@@ -8693,7 +8736,8 @@ void test_i21_stale_probe_after_wake() {
 // read grant. Also at a noncanonical depth.
 // I6a: the same scenario relative to the lds's first grant g (its issue,
 // after sread -> shli, at 2 alu_distance, plus issue_to_dispatch + 1): the
-// event is held from g + 2, the RMW reads at g + 16.
+// event is held from g + 2, the RMW reads at g + 16. (I6b-2: the sread
+// issues at fetch_to_issue.)
 void test_i21_rmw_read_behind_a_read_transaction() {
     for (const auto& [d, lb, c] : std::vector<std::tuple<uint32_t, uint32_t, uint32_t>>{{2, 2, 2}, {3, 1, 1}}) {
         auto profile = canonical_profile();
@@ -8707,7 +8751,7 @@ void test_i21_rmw_read_behind_a_read_transaction() {
             lds r6, [r0 + 12] {pred=PT, stall=0, set=sb0, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
-        const auto g = 2 * alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1;
+        const auto g = nanosm::fetch_to_issue + 2 * alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1;
         i2_run_until(*machine, g + 2);
         host_rmw_event(*machine);
         machine->run();
@@ -8977,7 +9021,8 @@ std::vector<uint64_t> i3_store_starts(const nanosm::Machine& machine) {
 // 2 alu_distance + 1 -- it needs the mov's r5 -- and reaches its slot
 // issue_to_dispatch later, t): X g .. g + 15, the event held from g + 4,
 // the RMW read at g + 16; Y admitted at g + 15 waits in its slot from
-// g + 16 + t to w (store_paused w - (g + 15 + t)).
+// g + 16 + t to w (store_paused w - (g + 15 + t)). (I6b-2: the sread
+// issues at fetch_to_issue, so s moves by that.)
 void test_i3_store_pause_sequence() {
     for (const uint32_t d : {2u, 3u}) {
         auto profile = canonical_profile();
@@ -8994,7 +9039,7 @@ void test_i3_store_pause_sequence() {
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )");
         const auto t = nanosm::issue_to_dispatch(profile);
-        const auto g = 2 * alu_distance(profile) + 1 + t + 1;
+        const auto g = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 1 + t + 1;
         i2_run_until(*machine, g + 4);
         host_rmw_event(*machine);
         std::optional<uint64_t> mbar_landed; // the cycle at whose clock edge the RMW's write landed
@@ -9039,7 +9084,8 @@ void test_i3_store_pause_sequence() {
 // issue_to_dispatch later, so the event is placed at the lds.uni's dispatch
 // e = 5 + issue_to_dispatch: the RMW reads at e, the lds.uni, the TMA and
 // the probe are granted at e + 1, e + 2, e + 3, before its write at
-// e + D + Lb + C.
+// e + D + Lb + C. (I6b-2: the program starts at fetch_to_issue, so the
+// lds.uni issues at fetch_to_issue + 5.)
 void test_i3_reads_during_an_rmw() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
@@ -9060,7 +9106,7 @@ void test_i3_reads_during_an_rmw() {
         mbar.test_wait p0, [r12], 0
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    const uint64_t e = 5 + nanosm::issue_to_dispatch(profile);
+    const uint64_t e = nanosm::fetch_to_issue + 5 + nanosm::issue_to_dispatch(profile);
     i2_run_until(machine, e);
     host_rmw_event(machine);
     machine.run();
@@ -9088,11 +9134,12 @@ void test_i3_reads_during_an_rmw() {
 // alu_distance + issue_to_dispatch + 1 at the earliest (stalls 0..5), one
 // cycle later per stall beyond. The host's event is placed (read at
 // k = w - D - Lb - C) so that its write grant w is one cycle after that
-// earliest grant: stalls 0..8 still cross w.
+// earliest grant: stalls 0..8 still cross w. (I6b-2: the first mov issues at
+// fetch_to_issue.)
 void test_i3_read_first_at_rmw_write() {
     const auto& profile = canonical_profile();
     const uint64_t rmw = i2_return(profile) + profile.shmem_rmw_compute_cycles;
-    const uint64_t w = alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 2;
+    const uint64_t w = nanosm::fetch_to_issue + alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 2;
     const uint64_t k = w - rmw;
     std::set<int> sides;
     for (uint32_t stall = 0; stall <= 8; ++stall) {
@@ -9206,7 +9253,8 @@ void test_i3_rmw_store_alternation() {
 // k + D + Lb + C), so its pause holds the sts in its slot until w; the sts
 // is granted w + 1 .. w + 16. The arrive is ordered behind it from s + 1,
 // admitted at its last grant (w + 16), reaches the register at its dispatch
-// and starts (reads) the cycle after, w + t + 17.
+// and starts (reads) the cycle after, w + t + 17. (I6b-2: the sread issues
+// at fetch_to_issue.)
 void test_i3_simt_rmw_waits_for_own_stores() {
     const auto& profile = canonical_profile();
     const uint64_t rmw = i2_return(profile) + profile.shmem_rmw_compute_cycles; // read to write
@@ -9220,7 +9268,7 @@ void test_i3_simt_rmw_waits_for_own_stores() {
         mbar.arrive [r4]
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )", {{i2_event_mbar, i21_mbar(1, 0, 64)}, {4160, i21_mbar(2, 2)}});
-    const uint64_t s = 2 * alu_distance(profile) + 2;
+    const uint64_t s = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 2;
     const uint64_t k = s + 1;
     const uint64_t w = k + rmw;
     require(s + t < w, "the sts would not reach its slot under the pause");
@@ -9261,11 +9309,12 @@ void test_i3_simt_rmw_waits_for_own_stores() {
 // write grant, so one warp's arrive would miss every other engine start
 // (the TMA event then went alone, untested). Two warps issue two arrives
 // each: while one's arrive runs, the other's waits in the register. Warp
-// 0's first arrive issues at alu_distance (it needs the mov's r4) and is in
-// the register from its dispatch + 1, a = alu_distance + issue_to_dispatch +
-// 1; the host starts feeding one busy period before (f = a - busy), so the
-// first TMA event ends as that arrive is held, and from then on both
-// classes always hold a request.
+// 0's first arrive issues at fetch_to_issue + alu_distance (its mov issues
+// first, at fetch_to_issue; the arrive needs its r4) and is in the register
+// from its dispatch + 1, a = that + issue_to_dispatch + 1; the host starts
+// feeding one busy period before (f = a - busy), so the first TMA event
+// ends as that arrive is held, and from then on both classes always hold a
+// request.
 void test_i3_rmw_admission_fairness() {
     const auto& profile = canonical_profile();
     const auto busy = rmw_busy_cycles(profile);
@@ -9275,7 +9324,8 @@ void test_i3_rmw_admission_fairness() {
         mbar.arrive [r4]
         halt
     )", {{4160, i21_mbar(5, 5)}, {4168, i21_mbar(1, 1)}}, 2);
-    const uint64_t f = alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1 - busy;
+    const uint64_t f =
+        nanosm::fetch_to_issue + alu_distance(profile) + nanosm::issue_to_dispatch(profile) + 1 - busy;
     while (!machine->done()) {
         const auto cycle = machine->cycle();
         if (cycle >= f && cycle < f + 9 * busy && !machine->tma_mbar_event_held()) {
@@ -9307,6 +9357,8 @@ void test_i3_rmw_admission_fairness() {
 // is written D + Lb + C later (16) and lands D after that, at the edge of
 // c18: seen from c19. Completion first, the arrive (behind the stall of 20)
 // issues at c20, so nothing of it has landed by then.
+// I6b-2: the program starts at fetch_to_issue (c2), so all of it -- and the
+// observation -- moves by that: c22.
 void test_i3_signed_tx_both_orders() {
     const auto& profile = canonical_profile();
     for (const bool completion_first : {true, false}) {
@@ -9326,7 +9378,7 @@ void test_i3_signed_tx_both_orders() {
             halt
         )", {{4160, i21_mbar(1, 1)}});
         if (completion_first) machine->complete_mbar_tx(4160, 128, 0);
-        i2_run_until(*machine, 20);
+        i2_run_until(*machine, nanosm::fetch_to_issue + 20);
         const auto middle = machine->read_mbar_state(4160);
         require(!middle.phase && middle.remaining == (completion_first ? 1 : 0) &&
                 middle.tx_bytes == (completion_first ? -128 : 128),
@@ -9592,7 +9644,8 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
 // distances, alu_distance each, decide it) and reaches its slot
 // issue_to_dispatch (t) later, so its first grant is g = s + t + 1; the
 // fence is refused from s + 1 (t + D cycles for one round) and admitted at
-// the last grant + D as before.
+// the last grant + D as before. (I6b-2: every program starts at
+// fetch_to_issue.)
 void test_i4_fence_waits_until_own_accesses_reach_ram() {
     for (const uint32_t d : {2u, 3u}) {
         auto profile = canonical_profile();
@@ -9601,6 +9654,7 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
         using Slices = std::vector<std::pair<uint64_t, uint64_t>>;
         const uint64_t t = nanosm::issue_to_dispatch(profile);
         const uint64_t distance = alu_distance(profile);
+        const uint64_t first = nanosm::fetch_to_issue; // I6b-2: the first instruction's issue
 
         auto one = i4_machine(profile, R"(
             sread r0, LANE_ID
@@ -9612,7 +9666,7 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
         one->run();
-        const uint64_t s1 = 2 * distance + 1; // sread, shli, mov r5; the sts needs r5
+        const uint64_t s1 = first + 2 * distance + 1; // sread, shli, mov r5; the sts needs r5
         const uint64_t g1 = s1 + t + 1;
         require(issued_at(*one, 3 * 8) == std::vector<uint64_t>{s1} &&
                 i2_grants(*one) == std::vector<I2Grant>{{g1, "A-write", "simt", 0}},
@@ -9639,7 +9693,7 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
         two->run();
         // sread; andi / shri; shli / shli; add (needs the second shli); mov r5;
         // the sts needs r5.
-        const uint64_t s2 = 4 * distance + 2;
+        const uint64_t s2 = first + 4 * distance + 2;
         const uint64_t g2 = s2 + t + 1;
         require(issued_at(*two, 7 * 8) == std::vector<uint64_t>{s2} &&
                 i2_grants(*two) == std::vector<I2Grant>{{g2, "A-write", "simt", 0}, {g2 + 1, "A-write", "simt", 0}},
@@ -9658,7 +9712,7 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )");
         const auto written = i1_run(*load, {6});
-        const uint64_t l = 2 * distance; // sread, shli; the lds needs r0
+        const uint64_t l = first + 2 * distance; // sread, shli; the lds needs r0
         const uint64_t gl = l + t + 1;
         require(issued_at(*load, 2 * 8) == std::vector<uint64_t>{l} &&
                 i2_grants(*load) == std::vector<I2Grant>{{gl, "A-read", "simt", 0}},
@@ -9688,7 +9742,7 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )", i4_tma(true, 0, 1024));
         engine->run(); // the sanitizer build: no missing-fence PANIC
-        const uint64_t ge = 4 + 2 * distance + 1 + t + 1; // four movs, then as in `one`
+        const uint64_t ge = first + 4 + 2 * distance + 1 + t + 1; // four movs, then as in `one`
         require(i2_grants(*engine, "A-write").front().cycle == ge && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{ge + d} &&
                 issued_at(*engine, 9 * 8) == std::vector<uint64_t>{ge + 1 + d},
             what + "the TMA store did not follow the fence at the sts's grant + D + 1:" + describe(i2_grants(*engine)) +
@@ -10327,7 +10381,8 @@ void test_i5_add_wraps_at_the_int32_boundary() {
 // I6a: the lds issues at l (it needs the shli's r1: 2 alu_distance) and is
 // granted at G = l + issue_to_dispatch + 1; the atomic, first tried at l + 2
 // (it needs the second mov's r3), is ordered behind the unserviced lds
-// until G, then refused for its return slot exactly as before.
+// until G, then refused for its return slot exactly as before. (I6b-2: the
+// sread issues at fetch_to_issue.)
 void test_i5_return_slot_admission() {
     auto profile = canonical_profile();
     profile.shmem_load_slots = 1;
@@ -10344,7 +10399,7 @@ void test_i5_return_slot_admission() {
     machine->run();
     const auto g = i2_grants(*machine, "A-read").at(0);
     const auto t = nanosm::issue_to_dispatch(profile);
-    const auto l = 2 * alu_distance(profile);
+    const auto l = nanosm::fetch_to_issue + 2 * alu_distance(profile);
     require(g.client == "simt" && issued_at(*machine, 32) == std::vector<uint64_t>{l} && g.cycle == l + t + 1,
         "the lds was not granted the cycle after its dispatch:" + issue_log(*machine));
     require(refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{l + 2, t - 1}},
@@ -11301,17 +11356,19 @@ void test_i6a_waw_order() {
 // RF write port at P (issue + i1_lds_shift + 2) in bank 0, where an add
 // accepted earlier (at P - issue_to_port) booked bank 0's one port. The
 // booking wins; the lds's write is denied (one wait), granted at P + 1 and
-// lands Wd later; the add's lands at P + Wd.
+// lands Wd later; the add's lands at P + Wd. (I6b-2: the lds.uni issues at
+// fetch_to_issue; its stall places the add.)
 void test_i6a_async_writer_vs_fixed_booking() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
         nanosm::Instruction add;
         add.opcode = nanosm::Opcode::add;
-        const auto p = i1_lds_shift(profile) + 2;
+        const auto lds_issue = nanosm::fetch_to_issue;
+        const auto p = lds_issue + i1_lds_shift(profile) + 2;
         const auto add_issue = p - nanosm::issue_to_port(add, profile);
         auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile,
-            "lds.uni r3, [r1] {pred=PT, stall=" + std::to_string(add_issue) + ", set=sb0, wait=-}\n"
+            "lds.uni r3, [r1] {pred=PT, stall=" + std::to_string(add_issue - lds_issue) + ", set=sb0, wait=-}\n"
             "add r6, r1, r1\n"
             "halt {pred=PT, stall=0, set=-, wait=sb0}\n"), profile));
         const auto landed = i1_run(*machine, {3});
@@ -11896,6 +11953,16 @@ void test_i6b1_persistent_readers_under_pressure() {
 // a + 3 -- denied, inhibited: warp 1's bank-0 addi is refused at a + 4, and
 // warp 2's bank-1 addi is accepted in that same cycle. At a + 5 the beat
 // takes the hole.
+// I6b-2: warp 2 can take the cycle only if it has an instruction then. Its
+// stream starts after a taken branch (an empty FIFO), and three warps
+// issuing every cycle get one fetch per cycle between them: the words
+// buffered stay as few as when the streams started (they grow only in
+// cycles nothing issues), so warp 2's next word would arrive just in time
+// for its own turn, not a cycle early. So the three warps first meet at an
+// mbar barrier (arrive, try_wait) at the head of their streams: while they
+// wait, fetch fills their FIFOs, and each stream starts with words in hand.
+// (warp 0's bank-0 stream is its own copy: a branch to warp 1's would
+// drain the acc.st's depbar first.)
 void test_i6b1_unrelated_banks_proceed() {
     const auto& profile = canonical_profile();
     std::string pad;
@@ -11904,8 +11971,16 @@ void test_i6b1_unrelated_banks_proceed() {
     for (uint32_t i = 0; i < 24; ++i) bank0 += "addi r2, r27, 2\n";
     std::string bank1;
     for (uint32_t i = 0; i < 48; ++i) bank1 += "addi r4, r28, 3\n";
+    const auto meet = [](const std::string& label) {
+        return "mbar.arrive [r6]\n" + label + ": mbar.try_wait p3, [r6], 0\n@!p3 bra.uni " + label + "\n";
+    };
     nanosm::Launch launch;
     launch.active_warps = 3;
+    nanosm::MbarState barrier;
+    barrier.valid = true;
+    barrier.expected = 3;
+    barrier.remaining = 3;
+    write_u64(image_bytes(launch.shmem_image, 8192), 4096, nanosm::encode_mbar_state(barrier));
     nanosm::Machine machine(profile, compile(R"(
         .acc C, 0, 0, 64, 64
         sread r50, WARP_ID
@@ -11913,18 +11988,21 @@ void test_i6b1_unrelated_banks_proceed() {
         mov r28, 7
         mov r30, 0
         mov r31, 0
+        mov r6, 4096
         sread r0, LANE_ID
         setp.eq p0, r50, 2
         @p0 bra.uni other
         setp.eq p1, r50, 1
         @p1 bra.uni plain
-    )" + pad + R"(
+    )" + meet("meet0") + pad + R"(
         acc.st C, r30, r0
-    plain:
     )" + bank0 + R"(
         halt
+    plain:
+    )" + meet("meet1") + bank0 + R"(
+        halt
     other:
-    )" + bank1 + R"(
+    )" + meet("meet2") + bank1 + R"(
         halt
     )", profile), std::move(launch), {.timeline = true, .debug = true});
     machine.run();
@@ -11956,28 +12034,34 @@ void test_i6b1_unrelated_banks_proceed() {
     check_read_capacity(machine, profile);
 }
 
-// 16 warps (HUMAN 10-17: "lets do 16 warps"). Nothing caps the warp count
-// but the RF: rf.rows_per_bank (352 at canonical, about as much RF as shmem)
-// = 16 warps x 22 rows, so a 66-register kernel launches 16 warps and is
-// refused at 17. A 16-warp run in which every warp touches its own state:
+// 16 warps (HUMAN 10-17: "lets do 16 warps"). rf.rows_per_bank (352 at
+// canonical, about as much RF as shmem) = 16 warps x 22 rows, so a
+// 66-register kernel fits 16 warps and not 17. (I6b-2: core.warps, 16, now
+// refuses a 17th warp first; with 32 warp slots declared, the RF rows still
+// refuse it.) A 16-warp run in which every warp touches its own state:
 // its RF rows and predicates, WARP_ID / THREAD_ID, a depbar (lds), its shmem
 // order (lds behind its own sts), the stall count, an mbar arrival and a
 // try_wait on a barrier all 16 arrive at (more waiters than the 8 wait
 // slots), and its trace track.
 void test_i6b1_sixteen_warps() {
     const auto& profile = canonical_profile();
-    const auto wide = compile("mov r65, 1\nhalt", profile);
-    require(wide.register_count == 66, "the residency kernel is not 66 registers");
-    for (const uint32_t warps : {16u, 17u}) {
-        nanosm::Launch launch;
-        launch.active_warps = warps;
-        try {
-            nanosm::Machine machine(profile, wide, std::move(launch));
-            require(warps == 16, "17 warps of 66 registers were resident in 352 rows");
-        } catch (const nanosm::SimError& error) {
-            require(warps == 17 && std::string(error.what()).find("RF allocation cannot fit 17 active warps") !=
-                    std::string::npos,
-                std::string("residency: ") + error.what());
+    auto more_slots = profile;
+    more_slots.core_warps = 32;
+    for (const auto* slots : std::vector<const nanosm::DeviceProfile*>{&profile, &more_slots}) {
+        const auto wide = compile("mov r65, 1\nhalt", *slots);
+        require(wide.register_count == 66, "the residency kernel is not 66 registers");
+        for (const uint32_t warps : {16u, 17u}) {
+            nanosm::Launch launch;
+            launch.active_warps = warps;
+            try {
+                nanosm::Machine machine(*slots, wide, std::move(launch));
+                require(warps == 16, "17 warps of 66 registers were resident in 352 rows");
+            } catch (const nanosm::SimError& error) {
+                const auto expected = slots->core_warps == 16 ? "launch of 17 warps exceeds the SM's 16 warp slots"
+                                                               : "RF allocation cannot fit 17 active warps";
+                require(warps == 17 && std::string(error.what()).find(expected) != std::string::npos,
+                    std::string("residency: ") + error.what());
+            }
         }
     }
     nanosm::Launch launch;
@@ -12029,6 +12113,536 @@ void test_i6b1_sixteen_warps() {
     require(warp_cycles == summary.cycles * 16, "warp attribution does not cover 16 warps");
     require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait_slot)] != 0,
         "16 waiters never found the 8 wait slots full");
+}
+
+// ---------------------------------------------------------------------------
+// I6b-2: the front end (trash/front-end-2026-10-18.md; the cycles in
+// src/rf.hpp). Per warp an instruction FIFO of core.instruction_buffer_words
+// (3 at canonical); one instruction-memory read per cycle, fixed at one
+// cycle; round-robin fetch over the warps with room, counting the read in
+// flight, from registered state only; a branch resolves in the issue
+// register's cycle and a taken one clears its warp's FIFO and read in flight.
+// ---------------------------------------------------------------------------
+
+// Every issue of the run, in order: (cycle, warp, pc).
+std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> i6b2_issues(const nanosm::Machine& machine) {
+    std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> issues;
+    for (const auto& event : machine.trace().events()) {
+        if (!is_issue_event(event)) continue;
+        const auto warp = std::stoul(event.detail.substr(5, event.detail.find(',') - 5));
+        issues.emplace_back(event.start_cycle, static_cast<uint32_t>(warp), static_cast<uint32_t>(event.id));
+    }
+    return issues;
+}
+
+// The fetches granted (debug traces): (cycle, warp, pc).
+std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> i6b2_fetches(const nanosm::Machine& machine) {
+    std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> fetches;
+    for (const auto& event : machine.trace().events()) {
+        if (event.category == nanosm::TraceCategory::warp && event.name == "fetch") {
+            fetches.emplace_back(event.start_cycle, event.track - 100, static_cast<uint32_t>(event.id));
+        }
+    }
+    return fetches;
+}
+
+// Raw hand assembly by default: every stall is the one written (no
+// block-boundary drain on branches), so each scenario's cycles are its own.
+// `scheduled`: the fixed-latency stalls raised as qtxc would (hand_assemble).
+std::unique_ptr<nanosm::Machine> i6b2_machine(
+    const nanosm::DeviceProfile& profile, const std::string& body, uint32_t warps = 1, bool scheduled = false) {
+    const auto text = i1_asm(profile, body);
+    return i6a_machine(profile, scheduled ? hand_assemble(text, profile) : nanosm::assemble_asm(text, profile), warps);
+}
+
+std::string i6b2_independent_movs(uint32_t count) {
+    std::string body;
+    for (uint32_t i = 0; i < count; ++i) body += "mov r" + std::to_string(i % 16) + ", " + std::to_string(i) + "\n";
+    return body;
+}
+
+// A lone warp of independent instructions from launch. Its first word is
+// fetched at c0 and issues at fetch_to_issue (c2). Each FIFO entry is a
+// credit that goes round in fetch_to_issue + 1 cycles: fetched at f, issued
+// at f + 2 at the earliest, its freed entry seen by fetch at f + 3 (fetch
+// reads the registered valid words, not this cycle's pop). So N entries
+// sustain min(N, 3) issues per 3 cycles: depth 1 issues every third cycle,
+// depth 2 two in every three, depth 3 (canonical) one per cycle from c2 --
+// and depth 4 no faster. Instruction k issues at
+// fetch_to_issue + floor(k x 3 / min(N, 3)).
+void test_i6b2_lone_warp_issue_rate() {
+    for (const uint32_t depth : {1u, 2u, 3u, 4u}) {
+        auto profile = canonical_profile();
+        profile.core_instruction_buffer_words = depth;
+        auto machine = i6b2_machine(profile, i6b2_independent_movs(12) + "halt\n");
+        machine->run();
+        const auto issues = i6b2_issues(*machine);
+        const uint64_t round_trip = nanosm::fetch_to_issue + 1;
+        const uint64_t credits = std::min<uint64_t>(depth, round_trip);
+        require(issues.size() == 13, "depth " + std::to_string(depth) + ": not 13 issues");
+        for (uint64_t k = 0; k < issues.size(); ++k) {
+            require(std::get<0>(issues[k]) == nanosm::fetch_to_issue + k * round_trip / credits &&
+                    std::get<2>(issues[k]) == 8 * k,
+                "depth " + std::to_string(depth) + ": instruction " + std::to_string(k) + " did not issue at " +
+                    std::to_string(nanosm::fetch_to_issue + k * round_trip / credits) + ":" + issue_log(*machine));
+        }
+        for (uint32_t reg = 0; reg < 12; ++reg) require(machine->read_reg(0, 3, reg) == reg, "mov data");
+    }
+}
+
+// Several warps of independent instructions. Fetch serves the warps with room
+// in turn and issue takes the heads in turn: two warps alternate from c2
+// (warp w's k-th instruction at fetch_to_issue + w + 2k), one issue per
+// cycle between them. Sixteen warps: warp w's first word is fetched at cw
+// and issues at fetch_to_issue + w; every warp then gets one fetch and one
+// issue in sixteen cycles, k-th at fetch_to_issue + w + 16k: fetch-bound
+// and issue-bound at once, the machine issuing every cycle.
+void test_i6b2_warps_interleave() {
+    for (const uint32_t warps : {2u, 16u}) {
+        const auto& profile = canonical_profile();
+        auto machine = i6b2_machine(profile, i6b2_independent_movs(8) + "halt\n", warps);
+        machine->run();
+        const auto issues = i6b2_issues(*machine);
+        require(issues.size() == 9u * warps, std::to_string(warps) + " warps: issue count");
+        for (std::size_t i = 0; i < issues.size(); ++i) {
+            const auto [cycle, warp, pc] = issues[i];
+            const uint64_t k = pc / 8;
+            require(cycle == nanosm::fetch_to_issue + i && warp == i % warps &&
+                    cycle == nanosm::fetch_to_issue + warp + warps * k,
+                std::to_string(warps) + " warps: issue " + std::to_string(i) + " at c" + std::to_string(cycle) +
+                    " warp " + std::to_string(warp) + " pc " + std::to_string(pc));
+        }
+        const auto fetches = i6b2_fetches(*machine);
+        for (std::size_t i = 0; i < 8u * warps; ++i) {
+            const auto [cycle, warp, pc] = fetches.at(i);
+            require(cycle == i && warp == i % warps && pc == 8 * (i / warps),
+                std::to_string(warps) + " warps: fetch " + std::to_string(i) + " was not round-robin");
+        }
+        for (uint32_t warp = 0; warp < warps; ++warp) require(machine->read_reg(warp, 0, 7) == 7, "mov data");
+    }
+}
+
+// Fetch round-robin with a hot warp and three waiting warps (core.warps 16,
+// launched 4). Warp 0 runs thirty independent movs; warps 1..3 sit on a
+// stall count of 31 twice. Fetch ignores the waits: while the waiters' FIFOs
+// have room the grants go round all four (the hot warp gets one fetch in
+// four and issues at that rate); a waiter whose FIFO is full stops asking.
+// Once all three are full the hot warp gets every fetch and, within
+// fetch_to_issue of that, issues one per cycle until a waiter's stall ends.
+// No priority policy: just the round-robin over warps with room.
+void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
+    const auto& profile = canonical_profile();
+    const auto depth = profile.core_instruction_buffer_words;
+    auto machine = i6b2_machine(profile, R"(
+        sread r29, WARP_ID
+        setp.ne p0, r29, 0
+        bra.uni waiter {pred=p0, stall=0, set=-, wait=-}
+    )" + i6b2_independent_movs(30) + R"(
+        halt
+    waiter: mov r20, 1 {pred=PT, stall=31, set=-, wait=-}
+        mov r21, 2 {pred=PT, stall=31, set=-, wait=-}
+        mov r22, 3
+        halt
+    )", 4, true);
+    // The first cycle (Q) in which every waiter's FIFO is full.
+    std::optional<uint64_t> full;
+    while (!machine->done()) {
+        if (!full.has_value() && machine->instruction_fifo_words(1) == depth &&
+            machine->instruction_fifo_words(2) == depth && machine->instruction_fifo_words(3) == depth) {
+            full = machine->cycle();
+        }
+        tick_capped(*machine);
+    }
+    require(full.has_value(), "the waiters' FIFOs never filled");
+    const auto fetches = i6b2_fetches(*machine);
+    const auto issues = i6b2_issues(*machine);
+    // The waiters' first stalled mov (pc 34 * 8: after sread, setp, bra.uni,
+    // thirty movs and the halt) and their second.
+    uint64_t waiter_start = 0;
+    uint64_t waiter_resume = std::numeric_limits<uint64_t>::max();
+    for (const auto& [cycle, warp, pc] : issues) {
+        if (warp == 3 && pc == 34 * 8) waiter_start = cycle;
+        if (warp != 0 && pc == 35 * 8) waiter_resume = std::min(waiter_resume, cycle);
+    }
+    require(waiter_start != 0 && waiter_resume != std::numeric_limits<uint64_t>::max(), "the waiters did not run");
+    // While all four ask (from the waiters' redirect to their FIFOs full),
+    // the grants rotate w0, w1, w2, w3.
+    std::vector<uint32_t> rotation;
+    for (const auto& [cycle, warp, pc] : fetches) {
+        if (cycle >= waiter_start - 3 && cycle < *full - 1) rotation.push_back(warp);
+    }
+    require(rotation.size() >= 8, "the window where all four warps ask is too short to show the rotation");
+    for (std::size_t i = 1; i < rotation.size(); ++i) {
+        require(rotation[i] == (rotation[i - 1] + 1) % 4, "fetch did not rotate over the warps with room");
+    }
+    // From then until the waiters ask again (their stall ends), every fetch
+    // is the hot warp's, and it issues every cycle from full + 1.
+    for (const auto& [cycle, warp, pc] : fetches) {
+        if (cycle >= *full && cycle < waiter_resume) require(warp == 0, "a full waiter was granted a fetch");
+    }
+    std::vector<uint64_t> hot;
+    for (const auto& [cycle, warp, pc] : issues) {
+        if (warp == 0 && cycle > *full && cycle < waiter_resume) hot.push_back(cycle);
+    }
+    require(hot.size() >= 10 && hot.front() <= *full + nanosm::fetch_to_issue,
+        "the hot warp did not issue within fetch_to_issue of the waiters' FIFOs filling");
+    for (std::size_t i = 1; i < hot.size(); ++i) {
+        require(hot[i] == hot[i - 1] + 1, "the hot warp lost a cycle while the waiters were full:" + issue_log(*machine));
+    }
+    for (uint32_t warp = 1; warp < 4; ++warp) require(machine->read_reg(warp, 0, 22) == 3, "waiter data");
+    require(machine->read_reg(0, 0, 13) == 29, "hot warp data");
+}
+
+// Conditional branches (HUMAN 10-18: the predicate is read one cycle after
+// issue). A lone warp in its steady state holds one word and has one read in
+// flight: when the bra.uni issues at t its fall-through (pc + 8) lands at t's
+// edge and the read of pc + 16, granted at t from registered state, is at
+// the memory output at t + 1. The branch resolves at t + 1:
+//   taken:      the FIFO (pc + 8) is cleared and the word landing at t + 1
+//               (pc + 16) is dropped -- a redirect and an old-path landing in
+//               one cycle, the redirect wins; pc and fetch pc take the target;
+//               the target is fetched at t + 2 and issues at t + 4
+//               (branch_taken_interval). Neither old-path mov has an effect.
+//   not taken:  the landing joins the kept fall-through; pc + 8 issues at
+//               t + 2 (branch_not_taken_interval); neither word is fetched
+//               again.
+// Nothing of the warp issues or is fetched at t + 1.
+void test_i6b2_conditional_branch() {
+    const auto& profile = canonical_profile();
+    for (const bool taken : {true, false}) {
+        const auto what = std::string(taken ? "taken: " : "not taken: ");
+        auto machine = i6b2_machine(profile, std::string("setp.eq p0, r0, ") + (taken ? "0" : "1") + R"(
+            mov r1, 1
+            mov r2, 2
+            mov r3, 3
+            mov r4, 4
+            mov r5, 5
+            bra.uni target {pred=p0, stall=0, set=-, wait=-}
+            mov r6, 6
+            mov r7, 7
+        target: mov r8, 8
+            halt
+        )");
+        constexpr uint32_t bra_pc = 6 * 8, target_pc = 9 * 8;
+        // setp at c2 (its p0 in the file from c2 + 5); the movs keep the warp
+        // busy, so the bra.uni issues at c8 and samples p0 at c9.
+        const uint64_t t = nanosm::fetch_to_issue + 6;
+        require(t + nanosm::issue_to_predicate_sample >=
+                    nanosm::fetch_to_issue + nanosm::issue_to_predicate_visible(
+                        nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq p0, r0, 0\nhalt"), profile).words[0]),
+                        profile),
+            "the scenario's bra.uni would sample p0 before the setp wrote it");
+        std::map<uint64_t, std::tuple<std::size_t, std::optional<uint32_t>, uint32_t, uint32_t>> after; // Q after each tick
+        while (!machine->done()) {
+            const auto cycle = machine->cycle();
+            tick_capped(*machine);
+            after[cycle] = {machine->instruction_fifo_words(0), machine->fetch_in_flight(), machine->warp_pc(0),
+                machine->warp_fetch_pc(0)};
+        }
+        require(issued_at(*machine, bra_pc) == std::vector<uint64_t>{t}, what + "bra.uni issue:" + issue_log(*machine));
+        // At t + 1 (Q after t): the fall-through in the FIFO, pc + 16 in flight.
+        require(after.at(t) == std::tuple<std::size_t, std::optional<uint32_t>, uint32_t, uint32_t>{
+                    1, 0u, bra_pc + 8, bra_pc + 24},
+            what + "the FIFO and the read in flight at the resolve");
+        const auto fetched = i6b2_fetches(*machine);
+        const auto fetches_of = [&](uint32_t pc) {
+            std::vector<uint64_t> cycles;
+            for (const auto& [cycle, warp, fetched_pc] : fetched) if (fetched_pc == pc) cycles.push_back(cycle);
+            return cycles;
+        };
+        for (const auto& [cycle, warp, pc] : fetched) {
+            require(cycle != t + nanosm::issue_to_branch_resolve, what + "a fetch was granted while the branch was unresolved");
+        }
+        if (taken) {
+            require(after.at(t + 1) == std::tuple<std::size_t, std::optional<uint32_t>, uint32_t, uint32_t>{
+                        0, std::nullopt, target_pc, target_pc},
+                what + "the redirect did not clear the FIFO and the read in flight, or set the pcs");
+            require(issued_at(*machine, target_pc) == std::vector<uint64_t>{t + nanosm::branch_taken_interval} &&
+                    fetches_of(target_pc) == std::vector<uint64_t>{t + nanosm::branch_taken_interval - nanosm::fetch_to_issue},
+                what + "the target was not fetched at t + 2 and issued at t + 4:" + issue_log(*machine));
+            require(issued_at(*machine, bra_pc + 8).empty() && issued_at(*machine, bra_pc + 16).empty() &&
+                    machine->read_reg(0, 0, 6) == 0 && machine->read_reg(0, 0, 7) == 0,
+                what + "an old-path word had an effect");
+        } else {
+            require(after.at(t + 1) == std::tuple<std::size_t, std::optional<uint32_t>, uint32_t, uint32_t>{
+                        2, std::nullopt, bra_pc + 8, bra_pc + 24},
+                what + "the buffered fall-through was not kept (with the word landing at the resolve)");
+            require(issued_at(*machine, bra_pc + 8) == std::vector<uint64_t>{t + nanosm::branch_not_taken_interval} &&
+                    issued_at(*machine, bra_pc + 16) == std::vector<uint64_t>{t + nanosm::branch_not_taken_interval + 1},
+                what + "the fall-through did not issue at t + 2:" + issue_log(*machine));
+            require(fetches_of(bra_pc + 8).size() == 1 && fetches_of(bra_pc + 16).size() == 1,
+                what + "a kept fall-through word was fetched again");
+            require(machine->read_reg(0, 0, 6) == 6 && machine->read_reg(0, 0, 7) == 7, what + "fall-through data");
+        }
+        require(machine->read_reg(0, 0, 8) == 8, what + "target data");
+    }
+}
+
+// The other branch forms resolve at the same point (implementer choice: one
+// rule for every branch, one target adder): bra and bra.uni @PT are taken
+// (the next instruction at t + branch_taken_interval), bra.uni @!PT is not
+// (t + branch_not_taken_interval).
+void test_i6b2_unconditional_branches() {
+    const auto& profile = canonical_profile();
+    for (const auto& [form, taken] : std::vector<std::pair<std::string, bool>>{
+             {"bra target", true}, {"bra.uni target", true}, {"bra.uni target {pred=!PT, stall=0, set=-, wait=-}", false}}) {
+        auto machine = i6b2_machine(profile, R"(
+            mov r1, 1
+            mov r2, 2
+            mov r3, 3
+        )" + form + R"(
+            mov r4, 4
+        target: mov r5, 5
+            halt
+        )");
+        machine->run();
+        const uint64_t t = nanosm::fetch_to_issue + 3;
+        require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{t}, form + ": the branch did not issue at c5");
+        const uint32_t next_pc = taken ? 5 * 8 : 4 * 8;
+        const auto interval = taken ? nanosm::branch_taken_interval : nanosm::branch_not_taken_interval;
+        require(issued_at(*machine, next_pc) == std::vector<uint64_t>{t + interval},
+            form + ": the next instruction did not issue at t + " + std::to_string(interval) + ":" + issue_log(*machine));
+        require(machine->read_reg(0, 0, 4) == (taken ? 0u : 4u) && machine->read_reg(0, 0, 5) == 5, form + ": data");
+    }
+}
+
+// Fetch runs ahead of issue: past a taken branch, past the kernel's last
+// word. Such words have no effect unless one reaches issue. The kernel's
+// last word is a taken branch: the words after it, past the end, are
+// fetched (the memory reads zeros there) and cleared by its redirect; the
+// halt after `bra skip` is fetched as its fall-through and cleared too (if
+// it had issued, r2 would be 0). A warp that really runs past its last word
+// is reported when that word reaches issue: "fell off kernel", nothing
+// earlier.
+void test_i6b2_words_past_the_end() {
+    const auto& profile = canonical_profile();
+    auto machine = i6b2_machine(profile, R"(
+            mov r1, 7
+            bra skip
+        done: halt
+        skip: mov r2, 5
+            bra done
+    )");
+    machine->run();
+    require(machine->read_reg(0, 0, 1) == 7 && machine->read_reg(0, 0, 2) == 5, "a cleared word had an effect");
+    bool past_the_end = false;
+    for (const auto& [cycle, warp, pc] : i6b2_fetches(*machine)) past_the_end = past_the_end || pc >= 5 * 8;
+    require(past_the_end, "no word past the kernel's end was fetched; the test proves little");
+    require(issued_at(*machine, 2 * 8).size() == 1, "the halt did not issue exactly once (from the second branch)");
+    require(machine->trace().summary().fetches_discarded >= 3, "the cleared words were not counted");
+
+    auto falls = i6b2_machine(profile, "mov r1, 7\nmov r2, 8\n");
+    try {
+        falls->run();
+        throw std::runtime_error("a warp ran past its last word without a report");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("warp 0 fell off kernel at pc 16") != std::string::npos,
+            std::string("wrong fall-off report: ") + error.what());
+    }
+    // The word past the end was fetched at c2 and would issue at c4: the
+    // report comes then, not at its fetch.
+    require(falls->cycle() == nanosm::fetch_to_issue + 2, "the fall-off was not reported as the word reached issue");
+}
+
+// Prefetch goes on while the warp waits: through a stall count, a depbar
+// wait and a refused head, the FIFO fills (3 words, Q), so when the wait ends
+// the waiting instruction and the next two issue on consecutive cycles, and
+// the warp is never "waiting for instruction" after its first two cycles.
+void test_i6b2_prefetch_through_waits() {
+    const auto check = [](nanosm::Machine& machine, uint32_t waiting_pc, uint64_t release, const std::string& what) {
+        const auto depth = canonical_profile().core_instruction_buffer_words;
+        std::map<uint64_t, std::size_t> words; // the FIFO's valid words (Q) in each cycle
+        while (!machine.done()) {
+            words[machine.cycle()] = machine.instruction_fifo_words(0);
+            tick_capped(machine);
+        }
+        require(words.at(release) == depth, what + ": the FIFO was not full when the wait ended");
+        for (uint32_t i = 0; i < 3; ++i) {
+            require(issued_at(machine, waiting_pc + 8 * i) == std::vector<uint64_t>{release + i},
+                what + ": instruction " + std::to_string(i) + " after the wait did not issue at release + " +
+                    std::to_string(i) + ":" + issue_log(machine));
+        }
+        require(machine.trace().summary().warp_cycles[static_cast<std::size_t>(nanosm::WarpState::no_instruction)] ==
+                nanosm::fetch_to_issue,
+            what + ": the warp waited for an instruction after launch");
+    };
+    const auto& profile = canonical_profile();
+    {   // A stall count of 12 on the first mov (c2): the next issues at c14.
+        auto machine = i6b2_machine(profile, "mov r1, 1 {pred=PT, stall=12, set=-, wait=-}\n" +
+            i6b2_independent_movs(4) + "halt\n");
+        check(*machine, 8, nanosm::fetch_to_issue + 12, "stall count");
+    }
+    {   // A depbar: the lds.uni at c2 completes at c2 + dispatch + 1 + D + Lb
+        // + 1 + Wd (its RF write lands); the waiting mov sees the counter at 0
+        // the cycle after.
+        auto machine = i6b2_machine(profile, R"(
+            lds.uni r20, [r21] {pred=PT, stall=0, set=sb0, wait=-}
+            mov r1, 1 {pred=PT, stall=0, set=-, wait=sb0}
+        )" + i6b2_independent_movs(3) + "halt\n");
+        const auto release = nanosm::fetch_to_issue + nanosm::issue_to_dispatch(profile) + 1 +
+            profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles + 1;
+        check(*machine, 8, release, "depbar");
+    }
+    {   // A refused head: one load slot; the second lds.uni (c3) is refused
+        // until the first's RF write frees the slot (the I1 timeline: at its
+        // grant, 1 + i1_lds_shift cycles after the refusal starts).
+        auto one = profile;
+        one.shmem_load_slots = 1;
+        auto machine = i6b2_machine(one, R"(
+            lds.uni r20, [r21] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r22, [r21 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+        )" + i6b2_independent_movs(3) + "halt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n");
+        const auto release = nanosm::fetch_to_issue + 1 + 1 + i1_lds_shift(one);
+        check(*machine, 8, release, "refused head");
+        require(refusals(*machine, 0, "load slots full") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{nanosm::fetch_to_issue + 1, 1 + i1_lds_shift(one)}},
+            "refused head: the second lds.uni was not refused from c3 until the slot freed");
+    }
+}
+
+// setp -> bra.uni (src/rf.hpp): a conditional branch samples its predicate
+// issue_to_predicate_sample after its issue, so it may issue that much
+// before the setp's predicate is in the file: issue_to_predicate_visible -
+// issue_to_predicate_sample after the setp (4 at canonical; 5 before the
+// front end). qtxc, the hand assembler's stall scheduling and the sanitizer
+// all use that distance. At it, the branch sees the new predicate; one cycle
+// less is a sanitizer PANIC (without the sanitizer the machine quietly reads
+// the old predicate).
+void test_i6b2_setp_to_branch_distance() {
+    const auto& profile = canonical_profile();
+    const auto setp = nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq p0, r0, r0\nhalt"), profile).words[0]);
+    const auto distance = nanosm::issue_to_predicate_visible(setp, profile) - nanosm::issue_to_predicate_sample;
+    require(distance == 1 + profile.rf_read_latency_cycles + profile.timing.alu + 1 - 1 && distance == 4,
+        "the canonical setp -> bra.uni distance is not 4");
+    const auto qtx = nanosm::compile_qtx("setp.eq p0, r0, r0\n@p0 bra.uni target\nmov r5, 1\ntarget: halt\n", profile);
+    require(qtx.instructions[0].control.stall == distance, "qtxc did not place the bra.uni at the distance");
+    const auto program = [&](uint32_t stall) {
+        return "setp.eq p0, r0, r0 {pred=PT, stall=" + std::to_string(stall) + R"(, set=-, wait=-}
+            bra.uni target {pred=p0, stall=0, set=-, wait=-}
+            mov r5, 1
+            halt
+        target: mov r5, 2
+            halt
+        )";
+    };
+    const auto scheduled = hand_assemble(i1_asm(profile, program(0)), profile);
+    require(nanosm::decode(scheduled.words[0]).control.stall == distance,
+        "the hand assembler's stall scheduling did not raise the setp's stall to the distance");
+    auto at = i6b2_machine(profile, program(static_cast<uint32_t>(distance)));
+    at->run();
+    require(at->read_reg(0, 0, 5) == 2, "at the distance the bra.uni did not see the new predicate");
+    auto early = i6b2_machine(profile, program(static_cast<uint32_t>(distance - 1)));
+#if NANOSM_SANITIZER
+    require_mentions(i4_panic(*early, "one cycle early"), {"predicate RAW hazard: missing stall for p0"},
+        "one cycle early");
+#else
+    early->run();
+    require(early->read_reg(0, 0, 5) == 1, "one cycle early, the machine did not read the old predicate");
+#endif
+}
+
+// core.warps (16 at canonical) declares the SM's warp slots and is enforced
+// at launch, before the RF rows: a one-register kernel launches 16 warps
+// and is refused at 17 and 32 (before I6b-2 the RF alone decided, and
+// accepted both). core.instruction_buffer_words (3) is the FIFO depth. Both
+// are optional in the JSON (absent: 16, 3), checked (warps 1..64, words
+// 1..16) and part of the fingerprint.
+void test_i6b2_warp_slots_and_profile_fields() {
+    const auto& profile = canonical_profile();
+    require(profile.core_warps == 16 && profile.core_instruction_buffer_words == 3,
+        "the canonical profile does not declare 16 warps and 3 instruction words");
+    const auto kernel = compile("mov r0, 1\nhalt", profile);
+    for (const uint32_t warps : {16u, 17u, 32u}) {
+        nanosm::Launch launch;
+        launch.active_warps = warps;
+        try {
+            nanosm::Machine machine(profile, kernel, std::move(launch));
+            require(warps == 16, std::to_string(warps) + " warps were accepted on 16 warp slots");
+            machine.run();
+        } catch (const nanosm::SimError& error) {
+            require(warps != 16 && std::string(error.what()).find("launch of " + std::to_string(warps) +
+                    " warps exceeds the SM's 16 warp slots (core.warps)") != std::string::npos,
+                std::string("warp slots: ") + error.what());
+        }
+    }
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    for (const auto& [field, canonical, bad] : std::vector<std::tuple<std::string, uint32_t, std::vector<int>>>{
+             {"warps", 16, {0, 65, -1}}, {"instruction_buffer_words", 3, {0, 17, -1}}}) {
+        auto defaulted = document;
+        defaulted["core"].erase(field);
+        require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(defaulted.dump())) ==
+                nanosm::device_profile_fingerprint(profile),
+            field + ": the default is not the canonical " + std::to_string(canonical));
+        for (const auto value : bad) {
+            auto modified = document;
+            modified["core"][field] = value;
+            try {
+                (void)nanosm::parse_device_profile(modified.dump());
+                throw std::runtime_error(field + " = " + std::to_string(value) + " was accepted");
+            } catch (const nanosm::ProfileError&) {}
+        }
+        auto other = document;
+        other["core"][field] = canonical + 1;
+        require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(other.dump())) !=
+                nanosm::device_profile_fingerprint(profile),
+            field + " was omitted from the profile fingerprint");
+    }
+    auto zero = profile;
+    zero.core_instruction_buffer_words = 0;
+    try {
+        nanosm::validate_device_profile(zero);
+        throw std::runtime_error("a zero-word instruction FIFO passed validation");
+    } catch (const nanosm::ProfileError&) {}
+}
+
+// The trace's instruction-supply state: "waiting for instruction" -- detail
+// "instruction FIFO empty" or "branch unresolved" -- apart from the
+// dependency and resource waits, counted in the summary's warp cycles and
+// its front-end line (fetches, discarded words, those warp-cycles). A taken
+// branch at t (the conditional-branch scenario): launch c0..c1 FIFO empty,
+// t + 1 branch unresolved, t + 2 .. t + 3 FIFO empty: 5 warp-cycles. Its two
+// old-path words and the two the halt drops are discarded: 4.
+void test_i6b2_trace_supply_state() {
+    const auto& profile = canonical_profile();
+    auto machine = i6b2_machine(profile, R"(
+        setp.eq p0, r0, 0
+        mov r1, 1
+        mov r2, 2
+        mov r3, 3
+        mov r4, 4
+        mov r5, 5
+        bra.uni target {pred=p0, stall=0, set=-, wait=-}
+        mov r6, 6
+        mov r7, 7
+    target: mov r8, 8
+        halt
+    )");
+    machine->run();
+    const uint64_t t = nanosm::fetch_to_issue + 6;
+    std::vector<std::tuple<uint64_t, uint64_t, std::string>> waits;
+    for (const auto& event : machine->trace().events()) {
+        if (event.category == nanosm::TraceCategory::warp && event.kind == nanosm::TraceEventKind::slice &&
+            event.name == "waiting for instruction") {
+            waits.emplace_back(event.start_cycle, event.duration_cycles, event.detail);
+        }
+    }
+    const std::vector<std::tuple<uint64_t, uint64_t, std::string>> expected{
+        {0, nanosm::fetch_to_issue, "instruction FIFO empty"},
+        {t + 1, 1, "branch unresolved"},
+        {t + 2, nanosm::fetch_to_issue, "instruction FIFO empty"}};
+    require(waits == expected, "the supply waits were not traced as launch, branch, refill");
+    const auto& summary = machine->trace().summary();
+    const auto supply = summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::no_instruction)];
+    require(supply == 5 && summary.fetches_discarded == 4, "the supply counters");
+    require(nanosm::warp_state_name(nanosm::WarpState::no_instruction) == "waiting for instruction",
+        "the state's name");
+    const auto text = machine->trace().summary_text();
+    require(text.find("  waiting for instruction    5\n") != std::string::npos &&
+            text.find("front end: fetches=" + std::to_string(summary.fetches) +
+                " discarded=4 waiting_for_instruction=5\n") != std::string::npos,
+        "the summary text lacks the supply state or the front-end line:\n" + text);
 }
 
 int main() {
@@ -12240,6 +12854,16 @@ int main() {
         {"I6b-1: persistent readers under SIMT pressure", test_i6b1_persistent_readers_under_pressure},
         {"I6b-1: unrelated banks proceed", test_i6b1_unrelated_banks_proceed},
         {"I6b-1: 16 warps", test_i6b1_sixteen_warps},
+        {"I6b-2: lone warp issue rate at depths 1-4", test_i6b2_lone_warp_issue_rate},
+        {"I6b-2: warps interleave (2, 16)", test_i6b2_warps_interleave},
+        {"I6b-2: fetch round-robin, hot and waiting warps", test_i6b2_fetch_round_robin_hot_and_waiting_warps},
+        {"I6b-2: conditional branch taken / not taken", test_i6b2_conditional_branch},
+        {"I6b-2: unconditional branches", test_i6b2_unconditional_branches},
+        {"I6b-2: words past the end and on a cleared path", test_i6b2_words_past_the_end},
+        {"I6b-2: prefetch through waits", test_i6b2_prefetch_through_waits},
+        {"I6b-2: setp -> bra.uni distance", test_i6b2_setp_to_branch_distance},
+        {"I6b-2: warp slots and profile fields", test_i6b2_warp_slots_and_profile_fields},
+        {"I6b-2: trace supply state", test_i6b2_trace_supply_state},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips

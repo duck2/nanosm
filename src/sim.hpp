@@ -198,6 +198,16 @@ public:
     // future work, and this mask is only a stand-in for that stack's top
     // entry. Never used by launches or kernels.
     void test_set_active_mask(uint32_t warp, uint64_t mask);
+    // Test seams (Q, between ticks): a warp's front end -- its FIFO's valid
+    // words, its pc (the head's) and fetch pc -- and the warp whose word is
+    // at the instruction memory's output now (a read in flight), if any.
+    [[nodiscard]] std::size_t instruction_fifo_words(uint32_t warp) const { return front_end_.cur().at(warp).fifo.size(); }
+    [[nodiscard]] uint32_t warp_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
+    [[nodiscard]] uint32_t warp_fetch_pc(uint32_t warp) const { return front_end_.cur().at(warp).fetch_pc; }
+    [[nodiscard]] std::optional<uint32_t> fetch_in_flight() const {
+        const auto& read = fetch_read_.cur();
+        return read.has_value() ? std::optional<uint32_t>(read->warp) : std::nullopt;
+    }
     // Test seams (Q, between ticks): the RF write decision's state per bank.
     [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
@@ -258,16 +268,59 @@ private:
 
     // Issue-internal warp state (only the scheduler reads or writes it), plus
     // the warp's RF and predicate memories. The depbar counters and the mbar
-    // wait slots, which other units complete, are registers (below).
+    // wait slots, which other units complete, are registers (below), and so
+    // is the warp's front end (its PCs, instruction FIFO and halted bit,
+    // WarpFrontEnd), which fetch reads.
     struct Warp {
         uint32_t id = 0;
-        uint32_t pc = 0; // byte PC; every decoded instruction still occupies one 64-bit slot
-        bool halted = false;
         uint64_t active_mask = 0; // all lanes; shmem-test-only (see test_set_active_mask)
+        // The stall count's end: the warp issues again from this cycle. Only
+        // the scheduler reads it (before it accepts anything) and writes it
+        // (at its acceptance, for the warp it accepted), so the in-place write
+        // is the register's next value; nothing else -- fetch included --
+        // reads it.
         uint64_t stall_until = 0;
         std::vector<uint32_t> rf;
         // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
         std::array<std::vector<uint8_t>, 7> predicates;
+    };
+
+    // One warp slot's front end (trash/front-end-2026-10-18.md), one of
+    // core.warps. Its instruction FIFO is a shift FIFO of
+    // core.instruction_buffer_words 64-bit words: only valid entries are held,
+    // head first (the valid bits are a thermometer, fifo.size() is the
+    // occupancy). An issue pops the head and a landing fetch appends, in one
+    // next-state update; the accepted word is captured by the issue register
+    // at that same edge. Consecutive entries are consecutive words: fetch is
+    // sequential and a taken branch clears the FIFO. Byte PCs (32 bits; the
+    // instruction memory's address width in hardware).
+    struct WarpFrontEnd {
+        std::vector<uint64_t> fifo; // fetched words, head first
+        uint32_t pc = 0;            // the head's pc: the warp's next instruction
+        uint32_t fetch_pc = 0;      // the next word to fetch
+        bool halted = false;        // a halt was accepted (or the slot was not launched): no fetch, no issue
+        bool operator==(const WarpFrontEnd&) const = default;
+    };
+
+    // The instruction memory's read in flight (instruction_read_cycles = 1,
+    // src/rf.hpp): the address it sampled at the grant's edge, and the tag
+    // beside it -- the warp the word is for (valid + 4 bits at 16 warps). The
+    // word is at the memory output in the cycle this register holds it. No
+    // stage stalls: the credit check guarantees its FIFO has room.
+    struct FetchRead {
+        uint32_t warp = 0;
+        uint32_t pc = 0; // the address sampled (32-bit byte pc)
+        bool operator==(const FetchRead&) const = default;
+    };
+
+    // The issue register's control part: a branch accepted last cycle. It
+    // resolves now (src/rf.hpp issue_to_branch_resolve): a conditional
+    // branch's predicate is read, and the one target adder adds the branch's
+    // pc + 8 and its offset. Its warp neither issues nor fetches meanwhile.
+    struct IssuedBranch {
+        uint32_t warp = 0;
+        uint32_t pc = 0;         // the branch's own pc (32 bits)
+        Instruction instruction; // opcode, predicate, invert, offset
     };
 
     // One write through the RF write port (src/rf.hpp): PRESENTED at
@@ -303,6 +356,7 @@ private:
     struct ArithmeticRead {
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
+        uint32_t pc = 0;                             // (S) PANIC text: the instruction's own pc
         Instruction instruction;
         std::vector<uint8_t> reads;                  // the round's registers
         std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
@@ -1219,8 +1273,30 @@ private:
         uint64_t arrive_cycle = 0;
     };
 
+    // The front end this cycle, all from Q: the fetch grant (round-robin over
+    // the warps with FIFO space, counting the read in flight; no input from
+    // this cycle's issue), the word at the instruction memory's output, and
+    // the branch in the issue register resolved.
+    struct FetchGrant {
+        std::optional<uint32_t> warp; // granted now: the memory samples its fetch_pc at this edge
+        uint32_t pc = 0;
+        uint32_t cursor_after = 0;
+    };
+    struct FetchedWord {
+        uint32_t warp = 0;
+        uint64_t word = 0;            // the memory output (zero past the kernel's words)
+    };
+    struct BranchResolution {
+        uint32_t warp = 0;
+        bool taken = false;
+        uint32_t target = 0;          // taken: the warp's pc and fetch pc from the next cycle
+    };
+
     // What an accepted instruction changes outside the issue unit now.
     struct IssueDecision {
+        std::optional<uint32_t> popped;                  // the warp whose FIFO head was accepted
+        bool halt = false;                               // ... a halt: the warp's front end stops
+        std::optional<IssuedBranch> branch;              // ... a branch: into the issue register
         std::optional<DepbarEvent> depbar_admission;
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
@@ -1261,6 +1337,10 @@ private:
 
     // All of a cycle's wires, in the order tick() computes them.
     struct Wires {
+        // The front end, from Q only.
+        FetchGrant fetch;
+        std::optional<FetchedWord> fetched;
+        std::optional<BranchResolution> branch;
         // The RF write port: async grants and SIMT inhibition.
         RfWriteDecision rf_write;
         std::vector<uint64_t> released_lsu_commands;  // their last write / ack at the port now
@@ -1295,6 +1375,8 @@ private:
         LsuRfRead lsu_rf_read;                              // the LSU store-data beat read now
         // Issue.
         IssueDecision issue;
+        // The front ends after this cycle (step_front_end, after issue).
+        std::vector<WarpFrontEnd> front_end_next;
         // The RF read stage: dispatch entries' operands latched now
         // (index in the pipeline's Q, operands by read).
         std::vector<std::pair<std::size_t, std::vector<std::vector<uint32_t>>>> dispatch_samples;
@@ -1320,6 +1402,13 @@ private:
     std::vector<std::vector<uint32_t>> tmem_;     // MMA results / acc beats, banks exclusive
 
     // ---- Registers: the declared storage boundaries ----
+    // The front end (trash/front-end-2026-10-18.md): per warp slot its FIFO,
+    // PCs and halted bit; the instruction memory's read in flight; the fetch
+    // round-robin cursor (4 bits at 16 warps); the issue register's branch.
+    Reg<std::vector<WarpFrontEnd>> front_end_{registers_, "instruction FIFOs and PCs"};
+    Reg<std::optional<FetchRead>> fetch_read_{registers_, "instruction memory read (address, tag)"};
+    Reg<uint32_t> fetch_cursor_{registers_, "fetch round-robin cursor"};
+    Reg<std::optional<IssuedBranch>> issue_branch_{registers_, "issue register: branch"};
     // Scheduler-visible state other units complete.
     Reg<DepbarCounters> depbar_{registers_, "depbar counters"};
     Reg<WaitSlots> mbar_wait_slots_{registers_, "mbar wait slots"};
@@ -1392,6 +1481,8 @@ private:
 
     // ---- Unit-internal state (only its own unit's code touches it) ----
     // Issue: scheduler cursor, SFU occupancy, the arithmetic operand latches.
+    // (Read only by the scheduler before it accepts, written at acceptance:
+    // fetch never reads them.)
     uint32_t scheduler_cursor_ = 0;
     // First cycle the SFU is free again. The unit is occupied from an SFU
     // op's execution start (issue + issue_to_operands) for ceil(lanes /
@@ -1437,6 +1528,13 @@ private:
     // tick(): decisions (wires) in dependency order, then drivers, then commit
     // =======================================================================
 
+    // ---- the front end, from Q only: fetch, the memory output, the branch ----
+    [[nodiscard]] FetchGrant decide_fetch() const;
+    [[nodiscard]] std::optional<FetchedWord> instruction_memory_output() const;
+    [[nodiscard]] std::optional<BranchResolution> resolve_branch() const;
+    // After issue: every warp's front end after this cycle (pop, landing,
+    // halt, redirect, fetch pc), and its trace.
+    void step_front_end(Wires& w);
     // ---- RF write path: the one async decision, the port, the RAM stage ----
     [[nodiscard]] RfWriteDecision decide_rf_writes() const;
     [[nodiscard]] std::vector<std::optional<AsyncWrite>> ready_async_writers(std::optional<uint32_t> lsu_presented) const;
@@ -1513,7 +1611,6 @@ private:
     // round's bank use, its entry into the dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     [[nodiscard]] static bool needs_dispatch(const Instruction& inst, uint64_t active_mask);
-    [[nodiscard]] uint32_t branch_target(const Warp& warp, const Instruction& inst) const;
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
     void check_issue_hazards(const Warp& warp, const Instruction& inst) const;
     void check_issue_latency(const Warp& warp, const Instruction& inst) const;
@@ -1522,6 +1619,9 @@ private:
 
     // ---- register drivers: next state from Q + wires; any order ----
     using Driver = void (Machine::*)(const Wires&);
+    void drive_front_end(const Wires& w);
+    void drive_fetch(const Wires& w);
+    void drive_issue_branch(const Wires& w);
     void drive_depbar(const Wires& w);
     void drive_wait_slots(const Wires& w);
     void drive_store_slots(const Wires& w);
@@ -1667,15 +1767,18 @@ private:
     void validate_tma_runtime_descriptor(const TmaCommand& command) const;
 
     // Issue.
-    [[nodiscard]] Instruction instruction(const Warp& warp) const;
+    // The warp's FIFO head (Q), decoded; "fell off kernel" if its pc is past
+    // the kernel's words (a word fetched there is reported only here).
+    [[nodiscard]] Instruction head_instruction(const Warp& warp) const;
+    [[nodiscard]] uint32_t head_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
     [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
     [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
     void check_register_hazards(const Warp& warp, const Instruction& inst) const;
     // A dispatched instruction's operand: every lane of one register, as its
     // RF read latched it at its sample.
     [[nodiscard]] std::vector<uint32_t> capture(const DispatchEntry& op, uint8_t reg) const;
-    // Issue's predicate capture (bra.uni), every lane. Only after acceptance
-    // (the sanitizer's tripwire checks it).
+    // A conditional branch's predicate, every lane, read from the predicate
+    // file in the issue register's cycle (resolve_branch).
     [[nodiscard]] std::vector<uint32_t> capture_predicate(const Warp& warp, uint8_t predicate) const;
     // A declared-uniform operand: lane 0's value (the sanitizer checks the rest).
     [[nodiscard]] uint32_t uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const;

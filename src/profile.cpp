@@ -64,6 +64,8 @@ json profile_json(const DeviceProfile& p) {
             {"clock_hz", p.core_clock_hz},
             {"alu_latency_cycles", p.timing.alu},
             {"fadd_latency_cycles", p.timing.fadd},
+            {"warps", p.core_warps},
+            {"instruction_buffer_words", p.core_instruction_buffer_words},
         }},
         {"sfu", {
             {"lanes", p.sfu_lanes},
@@ -117,6 +119,12 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.rf_read_latency_cycles + longest_execution + p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
         throw ProfileError("device profile: the longest fixed-latency dependency (RF depths and execution) "
             "must fit the five-bit stall field");
+    }
+    if (p.core_warps == 0 || p.core_warps > 64) {
+        throw ProfileError("device profile: core warps must be in 1..64");
+    }
+    if (p.core_instruction_buffer_words == 0 || p.core_instruction_buffer_words > 16) {
+        throw ProfileError("device profile: core instruction_buffer_words must be in 1..16");
     }
     if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
         throw ProfileError("device profile: shmem load and store slots must be at least 1");
@@ -300,6 +308,19 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");
     p.timing.alu = field<uint8_t>(core, "alu_latency_cycles");
     p.timing.fadd = field<uint8_t>(core, "fadd_latency_cycles");
+    // Optional (absent: the canonical 16 warps, 3 words); present: an integer
+    // in [low, high].
+    const auto optional_core = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
+        if (!core.contains(name)) return;
+        const auto& value = core.at(name);
+        if (!value.is_number_unsigned() || value < low || value > high) {
+            throw ProfileError(std::string("device profile: core ") + name + " must be an integer in " +
+                std::to_string(low) + ".." + std::to_string(high));
+        }
+        out = value.get<uint32_t>();
+    };
+    optional_core("warps", 1, 64, p.core_warps);
+    optional_core("instruction_buffer_words", 1, 16, p.core_instruction_buffer_words);
     const auto& sfu = document.at("sfu");
     const auto checked_sfu = [&](const char* name, uint32_t low, uint32_t high) {
         const auto& value = sfu.at(name);

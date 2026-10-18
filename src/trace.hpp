@@ -22,6 +22,10 @@ enum class WarpState : uint8_t {
     structural,
     shmem_slot,   // an lds / sts with no free load / store slot (rfc12 section 3)
     shmem_order,  // a shmem access ordered behind the warp's own unserviced access (rfc12 section 4)
+    // The warp has no instruction to offer issue: its instruction FIFO is
+    // empty, or its branch has not resolved (trash/front-end-2026-10-18.md).
+    // Instruction supply, not a dependency or resource wait.
+    no_instruction,
     halted,
     count,
 };
@@ -165,6 +169,12 @@ struct TraceSummary {
     uint64_t sfu_ops = 0;
     uint64_t sfu_busy_cycles = 0;
     uint64_t sfu_unit_stalls = 0;
+    // The front end: instruction-memory reads (one per cycle at most), and
+    // fetched words that never issued -- dropped as they came out of the
+    // memory, or cleared from a FIFO, by a taken branch or a halt. The
+    // warp-cycles with no instruction to offer are warp_cycles[no_instruction].
+    uint64_t fetches = 0;
+    uint64_t fetches_discarded = 0;
     uint64_t timeline_events_dropped = 0;
 };
 
@@ -177,6 +187,10 @@ public:
         TraceOptions options = {});
 
     void issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Instruction& instruction);
+    // A fetch granted (debug traces: an instant on the warp's track; its id
+    // is the pc read), and fetched words discarded without issuing.
+    void fetch(uint64_t cycle, uint32_t warp, uint32_t pc);
+    void fetches_discarded(uint64_t words) { summary_.fetches_discarded += words; }
     void rf_read(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank);
     // Debug only: a write presented at the RF write port (src/rf.hpp: it is
     // at the RAM Wd cycles later and visible from the cycle after that).

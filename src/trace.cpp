@@ -67,6 +67,7 @@ std::string warp_state_name(WarpState state) {
     case WarpState::structural: return "structural";
     case WarpState::shmem_slot: return "no free slot";
     case WarpState::shmem_order: return "ordered behind own access";
+    case WarpState::no_instruction: return "waiting for instruction";
     case WarpState::halted: return "halted";
     case WarpState::count: break;
     }
@@ -108,6 +109,22 @@ void TraceRecorder::issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Inst
         opcode_name(instruction.opcode),
         "warp=" + std::to_string(warp) + ", " + format_instruction(instruction),
         scheduler_track,
+        cycle,
+        0,
+        0,
+        pc,
+    });
+}
+
+void TraceRecorder::fetch(uint64_t cycle, uint32_t warp, uint32_t pc) {
+    ++summary_.fetches;
+    if (!options_.debug) return;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::warp,
+        "fetch",
+        "pc=" + std::to_string(pc),
+        warp_track_base + warp,
         cycle,
         0,
         0,
@@ -605,6 +622,10 @@ std::string TraceRecorder::summary_text() const {
     out << "sfu: ops=" << summary_.sfu_ops
         << " busy_cycles=" << summary_.sfu_busy_cycles
         << " unit_stalls=" << summary_.sfu_unit_stalls << '\n';
+    out << "front end: fetches=" << summary_.fetches
+        << " discarded=" << summary_.fetches_discarded
+        << " waiting_for_instruction="
+        << summary_.warp_cycles[static_cast<std::size_t>(WarpState::no_instruction)] << '\n';
     if (truncated()) out << "timeline events dropped        " << summary_.timeline_events_dropped << '\n';
     return out.str();
 }

@@ -803,7 +803,9 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
 //   reg_visible: the vtime from which an RF sample sees a fixed result (async
 //     results are covered by depbars instead);
 //   read_until: the exclusive end of the fixed reads' samples;
-//   predicate_ready: the vtime from which issue reads a predicate.
+//   predicate_ready: the vtime from which a predicate is in the file (a
+//     conditional branch samples it issue_to_predicate_sample after its issue;
+//     a predicate writer may issue from it).
 // A consumer is placed so its sample of each source is at or after that
 // source's visibility; a writer so its earliest landing comes after the older
 // write's (WAW) and at or after the older reads' samples (WAR).
@@ -829,7 +831,7 @@ struct FixedTimeline {
             }
         }
         if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
-            at = std::max(at, predicate_ready[inst.control.predicate]);
+            at = std::max(at, predicate_ready[inst.control.predicate] - int64_t{issue_to_predicate_sample});
         }
         if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);
         return at;

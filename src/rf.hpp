@@ -54,11 +54,50 @@
 // Everything else (memory, engines, mbar operations) reads its operands the
 // same way and reaches its unit at DISPATCH, c0 + 1 + Lr, when its operands
 // exist.
+//
+// The front end (trash/front-end-2026-10-18.md): every warp issues from its
+// instruction FIFO's head. One instruction-memory read per cycle, fixed at
+// one cycle (HUMAN 10-18): a fetch granted at f (its address sampled at f's
+// edge) has its word at the memory output at f + 1, written into the warp's
+// FIFO at that edge, and can issue from f + 2. Fetch decides from registered
+// state only (the FIFO's valid entries and the fetches in flight), so a slot
+// freed by an issue at t is refilled by a fetch at t + 1 at the earliest.
+//
+// Branches (HUMAN 10-18: "it can be one cycle later ... long latency is
+// ok"): nothing after a branch issues until it resolves, and it resolves in
+// the issue register's cycle, c0 + 1, where a conditional branch reads its
+// predicate like any operand (bra and the PT / !PT forms resolve there too).
+// Not taken: the buffered fall-through issues from c0 + 2. Taken: the FIFO is
+// cleared, the target is fetched from c0 + 2 and issues from c0 + 4 (at the
+// soonest: the target's fetch competes with the other warps' fetches).
+//
+// qtxc models none of this (issuing later is always safe); only the
+// predicate's sample point enters its distances (issue_to_predicate_sample).
 
 namespace nanosm {
 
 // The issue register: one cycle from accepted issue to the RF address inputs.
 inline constexpr uint32_t issue_register_stages = 1;
+
+// The instruction memory's read (fixed, not a profile field): an address
+// sampled at f has its word at the memory output at f + 1.
+inline constexpr uint32_t instruction_read_cycles = 1;
+
+// A fetch granted at f -> its word can issue (it is in the FIFO's Q) from f + 2.
+inline constexpr uint32_t fetch_to_issue = instruction_read_cycles + 1;
+
+// Accepted issue -> the branch resolves: its predicate is sampled, its next
+// PC is chosen. The issue register's cycle.
+inline constexpr uint32_t issue_to_branch_resolve = issue_register_stages;
+
+// Accepted issue -> a conditional branch's predicate sample.
+inline constexpr uint32_t issue_to_predicate_sample = issue_to_branch_resolve;
+
+// A branch accepted at c0: the warp's next instruction issues from c0 + this,
+// not taken (the fall-through already buffered), and taken (the target
+// fetched the cycle after the resolve, uncontended).
+inline constexpr uint32_t branch_not_taken_interval = issue_to_branch_resolve + 1;
+inline constexpr uint32_t branch_taken_interval = issue_to_branch_resolve + 1 + fetch_to_issue;
 
 // Accepted issue -> the sample of every register the instruction reads (its
 // one round). A source read later, beat by beat (acc.st / stg.v8 data), is
@@ -99,6 +138,9 @@ inline uint32_t issue_to_visible(const Instruction& inst, const DeviceProfile& p
 }
 
 // Accepted issue -> the first cycle a fixed predicate result is in the file.
+// A conditional branch reading it may issue issue_to_predicate_sample earlier:
+// a setp accepted at c0 (canonical, alu 1) is in the file from c5, so a
+// bra.uni on it issues from c4 and samples it at c5.
 inline uint32_t issue_to_predicate_visible(const Instruction& inst, const DeviceProfile& profile) {
     return issue_to_port(inst, profile) + 1;
 }
