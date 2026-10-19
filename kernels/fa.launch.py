@@ -103,15 +103,20 @@ def sum_eight(values: list[float]) -> float:
     return f32(f32(pairs[0] + pairs[1]) + f32(pairs[2] + pairs[3]))
 
 
-def dot4(a: list[float], b: list[float], c: float) -> float:
+# The MMA core's K (profile mma.core_k): one fused group per core step.
+CORE_K = 8
+
+
+def mma_group(a: list[float], b: list[float], c: float) -> float:
     """Finite-input reference for fp16_raw_window25_rz_v1, independent of C++.
 
     Inputs here are already exact FP16 values. Products are exact in double;
     as_integer_ratio then aligns them using Python integers, not float sums.
-    SF Tensor tcgen05's raw-exponent rule, applied per four-product core step.
+    SF Tensor tcgen05's raw-exponent rule, applied per core step: one fused
+    group of CORE_K products plus C (rfc11 section 0: dot8 + C at 4x4x8).
     See third_party/tcgen05-LICENSE and src/mma_numeric.cpp for provenance.
     """
-    assert len(a) == len(b) == 4 and all(math.isfinite(x) for x in (*a, *b, c))
+    assert len(a) == len(b) == CORE_K and all(math.isfinite(x) for x in (*a, *b, c))
     exponents = [max(math.frexp(abs(x))[1] - 1, -14)
                  + max(math.frexp(abs(y))[1] - 1, -14)
                  for x, y in zip(a, b) if x != 0 and y != 0]
@@ -148,7 +153,7 @@ def dot4(a: list[float], b: list[float], c: float) -> float:
 def references(q: list[list[float]], k: list[list[float]], v: list[list[float]]) -> dict:
     """Independent logical-matrix reference, with no simulator layout helpers.
 
-    Four-product groups use the shared raw-exponent window and FP32 truncation.
+    CORE_K-product groups use the shared raw-exponent window and FP32 truncation.
     Each group writes FP32; no hidden precision survives to the next group.
     Also compute direct double-precision attention as a separate accuracy check.
     """
@@ -159,8 +164,8 @@ def references(q: list[list[float]], k: list[list[float]], v: list[list[float]])
         scores = []
         for key in range(KEYS):
             acc = 0.0
-            for d in range(0, WIDTH, 4):
-                acc = dot4(q[row][d:d + 4], k[key][d:d + 4], acc)
+            for d in range(0, WIDTH, CORE_K):
+                acc = mma_group(q[row][d:d + CORE_K], k[key][d:d + CORE_K], acc)
             scores.append(acc)
         maximum, denominator = -math.inf, 0.0
         output = [0.0] * WIDTH
@@ -181,12 +186,12 @@ def references(q: list[list[float]], k: list[list[float]], v: list[list[float]])
             if block == 1:
                 final_p.append(packed)
                 output = [f32(value * alpha) for value in output]
-            for key in range(0, BLOCK, 4):
+            for key in range(0, BLOCK, CORE_K):
                 for d in range(WIDTH):
-                    a = packed[key:key + 4]
-                    b = [v[block * BLOCK + key + j][d] for j in range(4)]
-                    output[d] = dot4(a, b, output[d])
-                    broken[d] = dot4(a, b, broken[d])
+                    a = packed[key:key + CORE_K]
+                    b = [v[block * BLOCK + key + j][d] for j in range(CORE_K)]
+                    output[d] = mma_group(a, b, output[d])
+                    broken[d] = mma_group(a, b, broken[d])
             # broken deliberately omits the second block's old-O correction.
         inverse = f32(1.0 / denominator)
         model.extend(f32(value * inverse) for value in output)
@@ -270,8 +275,13 @@ def run_case(case: str, trace: Path | None) -> None:
             # section 8): the TMA reads no mbar at its start any more, -6
             # one-round mbar-phase reads (one per command): 2356 / 4660 before.
             "shmem": {"requests": 2350, "rounds": 4654},
-            "mma": {"commands": 32, "input_steps": 16384, "result_steps": 16384,
-                    "shmem_rounds": 16384, "recurrence_stalls": 0},
+            # 4x4x8 core (rfc11 section 0): 256 steps per 64x64x8 command
+            # (was 512 at 4x4x4). Hold A / stream B: each of the 16 A blocks
+            # is read once, with its first B block (two bank rounds); the
+            # other 15 steps read one B block (one round): 16 x 17 = 272
+            # rounds per command.
+            "mma": {"commands": 32, "input_steps": 8192, "result_steps": 8192,
+                    "shmem_rounds": 8704, "a_block_reads": 512, "recurrence_stalls": 0},
             "tmem": {"load_beats": 1536, "store_beats": 256},
             "sfu": {"ops": 524, "busy_cycles": 2096},
         }

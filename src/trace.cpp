@@ -220,11 +220,12 @@ void TraceRecorder::mma_command(uint64_t cycle, uint64_t command, uint32_t warp,
         "warp=" + std::to_string(warp), 1040, cycle, 0, 0, command});
 }
 
-void TraceRecorder::mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step) {
+void TraceRecorder::mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step, bool reads_a) {
     ++summary_.mma_input_steps;
     summary_.mma_shmem_rounds += rounds;
+    if (reads_a) ++summary_.mma_a_block_reads;
     add({TraceEventKind::instant, TraceCategory::mma, "MMA input step",
-        "rounds=" + std::to_string(rounds), 1040, cycle, 0, step, command});
+        "rounds=" + std::to_string(rounds) + (reads_a ? ", reads A" : ""), 1040, cycle, 0, step, command});
 }
 
 void TraceRecorder::mma_result(uint64_t cycle, uint64_t command, uint32_t step) {
@@ -618,6 +619,7 @@ std::string TraceRecorder::summary_text() const {
         << " input_steps=" << summary_.mma_input_steps
         << " result_steps=" << summary_.mma_result_steps
         << " shmem_rounds=" << summary_.mma_shmem_rounds
+        << " a_block_reads=" << summary_.mma_a_block_reads
         << " recurrence_stalls=" << summary_.mma_recurrence_stalls << '\n';
     out << "sfu: ops=" << summary_.sfu_ops
         << " busy_cycles=" << summary_.sfu_busy_cycles

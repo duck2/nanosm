@@ -350,6 +350,9 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         a_read_pipe_.poke(ReadPipeline(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles));
         a_write_pipe_.poke(WritePipeline(config_.shmem_port_a_depth));
         b_write_pipe_.poke(WritePipeline(config_.shmem_port_a_depth));
+        MmaPipeline mma;
+        mma.reads.resize(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
+        mma_.poke(std::move(mma));
         RmwEngine engine;
         engine.alu.resize(config_.shmem_rmw_compute_cycles);
         rmw_.poke(std::move(engine));
@@ -604,7 +607,8 @@ bool Machine::done() const {
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
         tma.credits_used == 0 && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
         dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() &&
-        mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() &&
+        mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
+        mma.arriving.empty() &&
         std::all_of(acc.begin(), acc.end(), [](const auto& slots) {
             return !slots[0].has_value() && !slots[1].has_value();
         });
@@ -1244,13 +1248,13 @@ void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
 // A transaction -- one SIMT access, one TMA read or placement, one RMW step --
 // keeps its service from its first round to its last (no preemption). Every
 // wait happens before a grant. A granted round reaches the RAM
-// shmem.port_a_depth (D) cycles later -- the same D on A-read, A-write and
-// B-write, so the RAM sees rounds in grant order -- and a read's words reach
-// the port output shmem.read_latency_cycles (Lb) cycles after its sample. An
-// RMW's update then crosses the RMW engine's shmem.rmw_compute_cycles (C) ALU
+// shmem.port_a_depth (D) cycles later -- the same D on all four services, so
+// the RAM sees rounds in grant order -- and a read's words reach the port
+// output shmem.read_latency_cycles (Lb) cycles after its sample. An RMW's
+// update then crosses the RMW engine's shmem.rmw_compute_cycles (C) ALU
 // stages before its write is granted. A read and a write of one word at the
 // RAM in one cycle: READ_FIRST (the write lands at the clock edge). The MMA's
-// port-B read is not pipelined: it reads the RAM in its fetch cycle.
+// port-B read pipeline lives in the MMA engine's register (advance_mma).
 //
 // The RMW engine (rfc12 section 6): one operation at a time, each one
 // coherent 8-byte mbar RMW (both words in one read round, one write round)
@@ -2378,10 +2382,16 @@ void Machine::step_mma(Wires& w) {
     w.mma_next = std::move(mma);
 }
 
-// One cycle of the MMA engine, applied to `mma` (a copy of its Q): results
-// due now write tmem, retired commands leave the queue head, then one port-B
-// round of the fetch in service -- or a new fetch, or the head commit's
-// presentation.
+// One cycle of the MMA engine, applied to `mma` (a copy of its Q):
+//   1. results due now write tmem; retired commands leave the queue head;
+//   2. the port-B read pipeline: the round at the RAM samples its elements;
+//      the round at the port output adds them to the core's operand latch,
+//      and a step's last round enters the core (C is read from tmem then);
+//   3. port B grants one round: the next round of the step in service, else
+//      a new step's first round (or the head commit's presentation);
+//   4. the read pipeline moves one stage; the granted round enters stage 0.
+// A step granted its last round at g samples it at g + D and enters the core
+// at g + D + Lb (the same D and Lb as port A, rfc10 section 5).
 void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
     for (auto it = mma.results.begin(); it != mma.results.end();) {
         if (it->ready_cycle > cycle_) { ++it; continue; }
@@ -2404,67 +2414,106 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
         sanitizer_.record_mma_retired(mma.queue.front().id); // last result retired
         mma.queue.pop_front();
     }
-    // Port service: one bank round per cycle for the in-flight fetch. A new
-    // fetch may start only in a cycle with no fetch in service, so the next
-    // step begins the cycle after the port frees; one-round layouts sustain
-    // one core step per cycle.
-    if (mma.fetch.has_value()) {
-        serve_mma_fetch_round(mma);
-        if (mma.fetch->next_round == mma.fetch->round_words.size()) complete_mma_fetch(mma, w);
-        return;
+    if (auto& at_ram = mma.reads.at(config_.shmem_port_a_depth - 1); at_ram.has_value())
+        sample_mma_read(mma, *at_ram, w);
+    if (const auto& output = mma.reads.back(); output.has_value()) {
+        mma.arriving.insert(mma.arriving.end(), output->values.begin(), output->values.end());
+        if (output->last_round) {
+            enter_mma_core(mma, output->step);
+            mma.arriving.clear();
+        }
     }
-    if (mma.queue.empty()) return;
+    std::optional<MmaRead> granted;
+    if (!mma.fetch.has_value()) mma.fetch = next_mma_step(mma, w);
+    if (mma.fetch.has_value()) {
+        granted = grant_mma_round(mma);
+        if (mma.fetch->next_round == mma.fetch->round_elements.size()) mma.fetch.reset();
+    }
+    for (std::size_t stage = mma.reads.size() - 1; stage > 0; --stage)
+        mma.reads[stage] = std::move(mma.reads[stage - 1]);
+    mma.reads.front() = std::move(granted);
+}
+
+// The next step port B may start now, if any; or the head commit presents
+// into the MMA's event register. Steps walk hold-A / stream-B (rfc11 section
+// 0): for each K block, for each A block (m), every B block (n) in order; the
+// first step of each A block reads A and B, the rest read B only and use the
+// held A block. A command's steps may start once the previous command's last
+// step has been granted (commands overlap in the pipelines).
+std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires& w) {
+    const uint32_t blocks_m = config_.mma_m / config_.mma_core_m;
+    const uint32_t blocks_n = config_.mma_n / config_.mma_core_n;
+    const uint32_t blocks_per_k = blocks_m * blocks_n;
+    const uint32_t total_steps = blocks_per_k * (config_.mma_k / config_.mma_core_k);
     auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(),
-        [](const auto& command) { return !command.operands_consumed; });
-    if (command_it == mma.queue.end()) return;
+        [total_steps](const auto& command) { return command.commit || command.next_step < total_steps; });
+    if (command_it == mma.queue.end()) return std::nullopt;
     auto& command = *command_it;
     if (command.commit) {
         // A commit at the queue head presents into the MMA's own event
         // register: free if empty in Q, or claimed by the RMW engine now (d).
         const bool register_free = !mma_mbar_event_.cur().has_value() || w.shmem.mma_event_claimed;
-        if (command_it != mma.queue.begin() || !register_free) return;
+        if (command_it != mma.queue.begin() || !register_free) return std::nullopt;
         MbarRmwRequest request;
         request.operation = MbarRmwOperation::arrive;
         request.byte_address = command.mbar_address;
         w.mma_present = std::move(request);
         mma.queue.pop_front();
-        return;
+        return std::nullopt;
     }
     // The bank's acc transfers: one in a slot, or one admission has secured
     // a slot for (in the dispatch pipeline), goes first.
     const auto& acc = kernel_.accumulators.at(command.accumulator);
     const auto& transfers = acc_transfers_.cur().at(acc.bank);
-    if (transfers[0].has_value() || transfers[1].has_value()) return;
+    if (transfers[0].has_value() || transfers[1].has_value()) return std::nullopt;
     const auto claims = dispatch_claims();
-    if (claims.acc.at(acc.bank)[0] != 0 || claims.acc.at(acc.bank)[1] != 0) return;
-    const uint32_t blocks_m = config_.mma_m / config_.mma_core_m;
-    const uint32_t blocks_n = config_.mma_n / config_.mma_core_n;
-    const uint32_t blocks_per_k = blocks_m * blocks_n;
+    if (claims.acc.at(acc.bank)[0] != 0 || claims.acc.at(acc.bank)[1] != 0) return std::nullopt;
+    MmaStep step;
     const uint32_t k_block = command.next_step / blocks_per_k;
     const uint32_t block = command.next_step % blocks_per_k;
-    const uint32_t n_block = block / blocks_m;
-    const uint32_t m_block = block % blocks_m;
-    const uint32_t m0 = m_block * config_.mma_core_m;
-    const uint32_t n0 = n_block * config_.mma_core_n;
-    const uint32_t k0 = k_block * config_.mma_core_k;
-    for (const auto& pending : mma.results) {
-        if (pending.accumulator == command.accumulator && pending.m0 == m0 && pending.n0 == n0)
-        {
-            trace_->mma_recurrence_stall();
-            return; // explicit recurrence bubble for a profile whose sweep is too short
-        }
-    }
-    std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
-    const auto insert_word = [&](uint32_t address) {
-        const auto word = address / 4;
-        words_by_bank[word % config_.shmem_banks].insert(word);
+    const uint32_t m_block = block / blocks_n;
+    const uint32_t n_block = block % blocks_n;
+    step.command = command.id;
+    step.accumulator = command.accumulator;
+    step.m0 = m_block * config_.mma_core_m;
+    step.n0 = n_block * config_.mma_core_n;
+    step.k0 = k_block * config_.mma_core_k;
+    step.a_base = command.a_base;
+    step.b_base = command.b_base;
+    step.init_step = command.init && step.k0 == 0;
+    step.reload_a = n_block == 0;
+    step.last_step = command.next_step + 1 == total_steps;
+    // A step whose tile is still on its way to tmem (a short sweep) waits:
+    // its C must be the earlier step's result.
+    const auto same_tile = [&](uint8_t accumulator, uint32_t m0, uint32_t n0) {
+        return accumulator == step.accumulator && m0 == step.m0 && n0 == step.n0;
     };
-    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            insert_word(mma_a_address(config_, command.a_base, m0 + mi, k0 + kk));
+    const bool tile_in_flight =
+        std::any_of(mma.results.begin(), mma.results.end(), [&](const MmaResult& result) {
+            return same_tile(result.accumulator, result.m0, result.n0);
+        }) ||
+        std::any_of(mma.reads.begin(), mma.reads.end(), [&](const std::optional<MmaRead>& read) {
+            return read.has_value() && same_tile(read->step.accumulator, read->step.m0, read->step.n0);
+        });
+    if (tile_in_flight) {
+        trace_->mma_recurrence_stall();
+        return std::nullopt; // explicit recurrence bubble for a profile whose sweep is too short
+    }
+    std::vector<uint32_t> elements;
+    if (step.reload_a) {
+        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+                elements.push_back(mma_a_address(config_, step.a_base, step.m0 + mi, step.k0 + kk));
+    }
     for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-            insert_word(mma_b_address(config_, command.b_base, k0 + kk, n0 + ni));
+            elements.push_back(mma_b_address(config_, step.b_base, step.k0 + kk, step.n0 + ni));
+    // Bank rounds: round r reads every bank's r-th distinct word.
+    std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
+    for (const auto address : elements) {
+        const auto word = address / 4;
+        words_by_bank[word % config_.shmem_banks].insert(word);
+    }
     uint32_t rounds = 1;
     std::map<uint32_t, uint32_t> word_round;
     for (const auto& words : words_by_bank) {
@@ -2473,104 +2522,92 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
         for (const auto word : words) word_round[word] = index++;
     }
     MmaFetch fetch;
-    fetch.command = command.id;
-    fetch.accumulator = command.accumulator;
-    fetch.init_step = command.init && k0 == 0;
-    fetch.m0 = m0;
-    fetch.n0 = n0;
-    fetch.k0 = k0;
-    fetch.a_base = command.a_base;
-    fetch.b_base = command.b_base;
-    fetch.round_words.resize(rounds);
+    fetch.step = step;
     fetch.round_elements.resize(rounds);
-    for (const auto& [word, round] : word_round) fetch.round_words[round].push_back(word);
-    const auto place_element = [&](uint32_t address) {
-        fetch.round_elements[word_round.at(address / 4)].push_back(address);
-    };
-    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            place_element(mma_a_address(config_, command.a_base, m0 + mi, k0 + kk));
-    for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-            place_element(mma_b_address(config_, command.b_base, k0 + kk, n0 + ni));
-    const uint32_t total_steps = blocks_per_k * (config_.mma_k / config_.mma_core_k);
-    fetch.last_step = command.next_step + 1 == total_steps;
+    for (const auto address : elements) fetch.round_elements[word_round.at(address / 4)].push_back(address);
     ++command.next_step;
+    ++command.outstanding_results; // retires at its tmem write
     sanitizer_.record_mma_fetch_start(command.id);
-    trace_->mma_input(cycle_, command.id, rounds, command.next_step - 1);
-    mma.fetch = std::move(fetch);
-    serve_mma_fetch_round(mma);
-    if (mma.fetch->next_round == mma.fetch->round_words.size()) complete_mma_fetch(mma, w);
+    trace_->mma_input(cycle_, command.id, rounds, command.next_step - 1, step.reload_a);
+    return fetch;
 }
 
-// One port-B bank round: captures the operand halves this round reads, from
-// shmem as it was at the start of the cycle (a same-word write reaching the
-// RAM in this cycle lands at the clock edge: READ_FIRST, rfc12 section 1).
-void Machine::serve_mma_fetch_round(MmaPipeline& mma) {
+// Port B grants the step in service its next round.
+Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
     auto& fetch = *mma.fetch;
-    for (const auto address : fetch.round_elements.at(fetch.next_round)) {
+    MmaRead read;
+    read.step = fetch.step;
+    read.elements = fetch.round_elements.at(fetch.next_round);
+    ++fetch.next_round;
+    read.last_round = fetch.next_round == fetch.round_elements.size();
+    return read;
+}
+
+// A round at the RAM reads its elements from shmem as it is now, before this
+// cycle's writes land at the clock edge (READ_FIRST, rfc12 section 1). The
+// command's last step's last round is its final physical operand read: the
+// operands are consumed and its depbar clears here.
+void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
+    for (const auto address : read.elements) {
         if (static_cast<uint64_t>(address) + 2 > shmem_.size())
             throw SimError("MMA operand footprint is outside shmem");
         uint16_t bits = 0;
         std::memcpy(&bits, shmem_.data() + address, 2);
-        fetch.captured[address] = bits;
+        read.values.emplace_back(address, bits);
     }
-    ++fetch.next_round;
+    if (!read.last_round || !read.step.last_step) return;
+    const auto id = read.step.command;
+    auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
+        [id](const auto& candidate) { return candidate.id == id; });
+    if (command == mma.queue.end()) throw SimError("internal MMA read lost its command");
+    command->operands_consumed = true;
+    sanitizer_.record_mma_operands_consumed(command->id); // final operand read
+    record_depbar_completion(w, command->warp, command->depbar, "internal MMA depbar underflow");
 }
 
-// Fetch completion is core entry: the accumulator input is read, the step's
-// result is scheduled one pipeline latency later, and the last step's
-// operand-consumed depbar clears here, at the final physical read.
-void Machine::complete_mma_fetch(MmaPipeline& mma, Wires& w) {
-    const auto fetch = std::move(*mma.fetch);
-    mma.fetch.reset();
-    const auto id = fetch.command;
-    auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(),
-        [id](const auto& candidate) { return candidate.id == id; });
-    if (command_it == mma.queue.end()) throw SimError("internal MMA fetch lost its command");
-    auto& command = *command_it;
-    const auto& acc = kernel_.accumulators.at(fetch.accumulator);
-    const auto captured = [&](uint32_t address) {
-        const auto value = fetch.captured.find(address);
-        if (value == fetch.captured.end())
-            throw SimError("internal MMA operand was not captured by its round");
-        return value->second;
+// A step's operands are all at the port output: it enters the core. A
+// reloading step's A block replaces the held one; the others use it. C is
+// read from tmem now; the result is written result_latency cycles later.
+void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
+    std::map<uint32_t, uint16_t> latch(mma.arriving.begin(), mma.arriving.end());
+    const auto value = [&](uint32_t address) {
+        const auto found = latch.find(address);
+        if (found == latch.end()) throw SimError("internal MMA operand did not arrive with its step");
+        return found->second;
     };
-    MmaResult result;
-    result.ready_cycle = cycle_ + config_.mma_result_latency_cycles;
-    result.command = command.id;
-    result.accumulator = fetch.accumulator;
-    result.m0 = fetch.m0;
-    result.n0 = fetch.n0;
-    result.values.resize(config_.mma_core_m * config_.mma_core_n);
-    // Gather raw operands once per step, not via map lookups per product.
+    const auto& acc = kernel_.accumulators.at(step.accumulator);
+    if (step.reload_a) {
+        mma.a_held.assign(config_.mma_core_m * config_.mma_core_k, 0);
+        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+                mma.a_held[mi * config_.mma_core_k + kk] =
+                    value(mma_a_address(config_, step.a_base, step.m0 + mi, step.k0 + kk));
+    }
+    if (mma.a_held.size() != config_.mma_core_m * config_.mma_core_k)
+        throw SimError("internal MMA step found no held A block");
     // B is transposed here only in the simulator's local operand snapshot.
-    std::vector<uint16_t> a(config_.mma_core_m * config_.mma_core_k);
     std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
-    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            a[mi * config_.mma_core_k + kk] = captured(
-                mma_a_address(config_, fetch.a_base, fetch.m0 + mi, fetch.k0 + kk));
     for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
         for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            b[ni * config_.mma_core_k + kk] = captured(
-                mma_b_address(config_, fetch.b_base, fetch.k0 + kk, fetch.n0 + ni));
+            b[ni * config_.mma_core_k + kk] =
+                value(mma_b_address(config_, step.b_base, step.k0 + kk, step.n0 + ni));
+    MmaResult result;
+    result.ready_cycle = cycle_ + config_.mma_result_latency_cycles;
+    result.command = step.command;
+    result.accumulator = step.accumulator;
+    result.m0 = step.m0;
+    result.n0 = step.n0;
+    result.values.resize(config_.mma_core_m * config_.mma_core_n);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            const uint32_t c = fetch.init_step ? 0u : tmem_[acc.bank][
-                tmem_word_index(acc, fetch.m0 + mi, fetch.n0 + ni)];
+            const uint32_t c = step.init_step ? 0u : tmem_[acc.bank][
+                tmem_word_index(acc, step.m0 + mi, step.n0 + ni)];
             result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
-                std::span<const uint16_t>(a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
+                std::span<const uint16_t>(mma.a_held).subspan(mi * config_.mma_core_k, config_.mma_core_k),
                 std::span<const uint16_t>(b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
         }
     }
     mma.results.push_back(std::move(result));
-    ++command.outstanding_results;
-    if (fetch.last_step) {
-        command.operands_consumed = true;
-        sanitizer_.record_mma_operands_consumed(command.id); // final operand read
-        record_depbar_completion(w, command.warp, command.depbar, "internal MMA depbar underflow");
-    }
 }
 
 std::size_t Machine::tmem_word_index(

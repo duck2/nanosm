@@ -179,10 +179,12 @@ void validate_device_profile(const DeviceProfile& p) {
         p.mma_k % p.mma_core_k != 0) {
         throw ProfileError("device profile: invalid MMA shape, timing, or queue capacity");
     }
+    // The xor64 layout keeps a 4-row block's 16-byte rows in distinct banks,
+    // which holds for a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
     if (p.mma_xor_layout &&
-        (p.mma_m != 64 || p.mma_n != 64 || p.mma_k != 8 ||
-         p.mma_core_m != 4 || p.mma_core_n != 4 || p.mma_core_k != 4)) {
-        throw ProfileError("device profile: xor64 MMA layout only supports 64x64x8 with a 4x4x4 core");
+        (p.mma_m != 64 || p.mma_n != 64 || p.mma_k != 8 || p.mma_core_m != 4 || p.mma_core_n != 4 ||
+         (p.mma_core_k != 4 && p.mma_core_k != 8))) {
+        throw ProfileError("device profile: xor64 MMA layout only supports 64x64x8 with a 4x4x4 or 4x4x8 core");
     }
     if (p.tma_sector_credits >= p.gmem_queue_sectors) {
         throw ProfileError("device profile: tma sector credits must be smaller than gmem queue");

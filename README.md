@@ -96,16 +96,20 @@ select the maximum nonzero term's raw exponent (operand exponent sums for produc
 to a quantum of `2^(maximum - 25)` with magnitude truncation, sum signed integer units, and
 normalize/truncate once to FP32. Subnormal operands are preserved; exact zero and underflowed
 zero become +0, generated NaNs are `0x7fffffff`, and overflow produces signed infinity.
-Only FP32 survives between steps. The canonical core fuses four products, not the whole MMA
-instruction. There are no numerical tuning knobs or host floating-point operations in this path.
+Only FP32 survives between steps. The canonical core is 4x4x8 (trash/rfc11.md section 0): each
+step fuses eight products and C, which with K = 8 is one group per command, not the whole MMA
+instruction across commands. The walker holds one 4x8 A block and streams the 8x4 B blocks across
+N, reading each A block once per command; port B's reads have port A's depth and read latency.
+There are no numerical tuning knobs or host floating-point operations in this path.
 
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
 at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
 [third_party/tcgen05-LICENSE](third_party/tcgen05-LICENSE). This borrows the measured arithmetic
 rules, not B200's fusion extent, and does not claim whole-instruction B200 equivalence.
 Tests include frozen B200 FP16 vectors, an upstream-derived 20,000-case regression digest,
-all FP16 encodings, and physical fusion-boundary checks. FA separately checks a logical dot4
-reference and double-precision attention. Older profiles must name the new model and regenerate
+all FP16 encodings, and physical fusion-boundary checks. FA separately checks a logical
+eight-product-group reference (the same arithmetic, so it checks the flow, not the numerics) and
+double-precision attention. Older profiles must name the new model and regenerate
 their fingerprinted artifacts; serial scalar-FMA MMA arithmetic is no longer supported.
 
 A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,

@@ -31,7 +31,7 @@
     "k": 8,
     "core_m": 4,
     "core_n": 4,
-    "core_k": 4,
+    "core_k": 8,
     "queue_commands": 2,
     "result_latency_cycles": 8,
     "layout": "xor64",

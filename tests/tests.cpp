@@ -2410,8 +2410,13 @@ void test_tma_xor64_feeds_mma_orientations() {
         const auto& summary = machine.trace().summary();
         require(summary.tma_commands == 4 && summary.tma_command_completions == 4,
             "TMA-fed MMA proof did not complete all operand commands");
-        require(summary.mma_commands == 2 && summary.mma_shmem_rounds == summary.mma_input_steps,
-            "TMA-authored operands did not retain one combined MMA bank round per step");
+        // Hold A / stream B on a 4x4x8 core: the step that reads an A block
+        // reads A and B (two bank rounds), the other fifteen read one B block
+        // (one round), and each of the 16 A blocks is read once per command.
+        require(summary.mma_commands == 2 && summary.mma_input_steps == 2 * 256 &&
+                summary.mma_a_block_reads == 2 * 16 &&
+                summary.mma_shmem_rounds == summary.mma_input_steps + summary.mma_a_block_reads,
+            "TMA-authored operands did not keep one bank round per B block and per A block");
     }
 }
 
@@ -3799,10 +3804,13 @@ void test_autonomous_mma_gemm_and_commit() {
     require(machine.read_mbar_state(4096).phase,
         "mma.commit did not publish the result-ready mbar after final tmem writes");
     const auto& summary = machine.trace().summary();
-    require(summary.mma_commands == 64 && summary.mma_input_steps == 32768 &&
-            summary.mma_result_steps == 32768 && summary.mma_shmem_rounds == 32768 &&
-            summary.mma_recurrence_stalls == 0,
-        "canonical MMA trace did not prove one-round pipelined physical steps");
+    // 4x4x8 core: 256 steps per command; each command reads its 16 A blocks
+    // once, each with its first B block (two rounds), and 240 B-only steps
+    // (one round each): 16 x 17 = 272 rounds per command.
+    require(summary.mma_commands == 64 && summary.mma_input_steps == 64 * 256 &&
+            summary.mma_result_steps == 64 * 256 && summary.mma_a_block_reads == 64 * 16 &&
+            summary.mma_shmem_rounds == 64 * 272 && summary.mma_recurrence_stalls == 0,
+        "canonical MMA trace did not show hold-A / stream-B steps at one round per B block");
     uint64_t second_admission = std::numeric_limits<uint64_t>::max();
     uint64_t first_last_write = 0;
     for (const auto& event : machine.trace().events()) {
@@ -4223,10 +4231,14 @@ void test_mma_bare_transfer_race_panics() {
 }
 
 void test_mma_multi_round_fetch_timing() {
-    // Case 03/05/06: one bank makes every 4x4x4 step a 16-round fetch. A step
-    // fetching at t completes (enters the core) at t+15, its result lands at
-    // t+15+latency, the next fetch starts at t+16, and the operand-consumed
-    // depbar clears at the LAST PHYSICAL READ of the final step.
+    // Case 03/05/06: one bank makes every 4x4x4 step a 16-round fetch (with
+    // one N block every step reads its A block too). A step granted its first
+    // round at t is granted its last at t+15; that round reaches the RAM at
+    // t+15+D and the port output at t+15+D+Lb, where the step enters the core
+    // (the port-B read pipeline has port A's D and Lb); its result lands at
+    // entry + latency; the next step's first round is granted at t+16; and the
+    // operand-consumed depbar clears at the LAST PHYSICAL READ of the final
+    // step: its last round's RAM sample.
     const auto profile = dense_one_bank_profile(12);
     const std::string source = R"(
         .acc C, 0, 0, 16, 4
@@ -4274,10 +4286,12 @@ void test_mma_multi_round_fetch_timing() {
     for (std::size_t i = 0; i < inputs.size(); ++i)
         require(inputs[i] == inputs[0] + 16 * i,
             "16-round fetches did not serialize the port at one round per cycle");
-    require(first_result == inputs[0] + 15 + 12,
-        "the result did not launch from fetch completion plus the pipeline latency");
-    require(depbar_cleared == inputs[7] + 15,
-        "operand-consumed depbar did not clear at the final physical read");
+    const auto d = profile.shmem_port_a_depth;
+    const auto lb = profile.shmem_read_latency_cycles;
+    require(first_result == inputs[0] + 15 + d + lb + 12,
+        "the result did not launch from core entry (last round + D + Lb) plus the pipeline latency");
+    require(depbar_cleared == inputs[7] + 15 + d,
+        "operand-consumed depbar did not clear at the final physical read (the last round's sample)");
     require(machine.trace().summary().mma_recurrence_stalls == 0,
         "16-round spacing already covers the result latency; no bubbles expected");
     for (uint32_t lane = 0; lane < profile.lanes; ++lane)
@@ -4321,7 +4335,7 @@ void test_mma_varying_round_service() {
         if (event.name != "MMA input step") continue;
         inputs.emplace_back(event.start_cycle, std::stoull(event.detail.substr(7)));
     }
-    require(inputs.size() == 512, "one canonical-shape command is 512 core steps");
+    require(inputs.size() == 256, "one canonical-shape command is 256 core steps (4x4x8 core)");
     uint64_t served = 0;
     std::set<uint64_t> distinct;
     for (std::size_t i = 0; i + 1 < inputs.size(); ++i) {
@@ -4338,6 +4352,139 @@ void test_mma_varying_round_service() {
     for (uint32_t lane = 0; lane < profile.lanes; ++lane)
         require(machine.read_reg(0, lane, 10) == nanosm::float_bits(8.0f),
             "varying-round service changed the numerical result");
+}
+
+// ---- I7: tensor core 4x4x8, hold A / stream B (trash/rfc11.md section 0) ----
+
+// Canonical xor64 operand addresses, restated independently of the
+// production helper: A element (m, k) and B element (k, n) of 64x64x8 tiles
+// at 0 and 1024.
+uint32_t i7_a_address(uint32_t m, uint32_t k) {
+    return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
+}
+uint32_t i7_b_address(uint32_t k, uint32_t n) {
+    return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1) ^ 2)) + 2 * (k & 1);
+}
+
+// One 64x64x8 tile pair (A = a_k on every row, B = b_k on every column) and
+// `commands` MMA commands into one accumulator, then commit, wait, acc.ld.
+std::unique_ptr<nanosm::Machine> i7_machine(const std::array<uint16_t, 8>& a,
+    const std::array<uint16_t, 8>& b, uint32_t commands) {
+    const auto& profile = canonical_profile();
+    std::ostringstream qtx;
+    qtx << ".acc C, 0, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\nmov r8, 0\nmov r9, 0\n"
+        << "mbar.init [r4], 1\nmma.async.init C, [r0], [r1]\n";
+    for (uint32_t command = 1; command < commands; ++command) qtx << "mma.async C, [r0], [r1]\n";
+    qtx << "mma.commit [r4]\nwait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\n"
+        << "acc.ld r10, C, r8\nhalt\n";
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    for (uint32_t m = 0; m < 64; ++m)
+        for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, i7_a_address(m, k), a[k]);
+    for (uint32_t k = 0; k < 8; ++k)
+        for (uint32_t n = 0; n < 64; ++n) write_u16(shmem, i7_b_address(k, n), b[k]);
+    return std::make_unique<nanosm::Machine>(profile, compile(qtx.str(), profile), std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+}
+
+// A 4x4x8 step is ONE fused group of eight products plus C (rfc11 section 0),
+// not two successive four-product groups. These eight products tell them
+// apart: 4096 * 4096 + 1 * 1 is 2^24 + 1, which a four-product group
+// truncates to 2^24 in FP32 before the second group's -2^24 cancels it (0);
+// one eight-product group keeps the unit (1.0).
+void test_i7_dot8_group_boundary() {
+    const std::array<uint16_t, 8> a{0x6c00, 0x3c00, 0, 0, 0xec00, 0, 0, 0}; // 4096, 1, 0, 0, -4096, 0...
+    const std::array<uint16_t, 8> b{0x6c00, 0x3c00, 0, 0, 0x6c00, 0, 0, 0}; // 4096, 1, 0, 0, 4096, 0...
+    const auto eight = nanosm::mma_dot_f16(a, b, 0);
+    const auto first_four = nanosm::mma_dot_f16(std::span(a).first(4), std::span(b).first(4), 0);
+    const auto two_fours = nanosm::mma_dot_f16(std::span(a).last(4), std::span(b).last(4), first_four);
+    require(eight == 0x3f800000u && first_four == 0x4b800000u && two_fours == 0,
+        "the eight-product group and two four-product groups do not differ as derived");
+    require(canonical_profile().mma_core_k == 8, "the canonical MMA core is not 4x4x8");
+    auto machine = i7_machine(a, b, 1);
+    machine->run(20000);
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        require(machine->read_reg(0, lane, 10) == 0x3f800000u,
+            "the canonical 4x4x8 core did not compute one eight-product group");
+}
+
+// One canonical command, step by step. Hold A / stream B: for each of the
+// 16 A blocks (m0 = 4i), every B block (n0 = 4j) in order; the step with
+// j = 0 reads its A block and its B block (2 bank rounds), the other 15 read
+// one B block (1 round) and use the held A block. Port B grants one round
+// per cycle and a step its first round the cycle after the previous step's
+// last, so step s + 1 starts rounds(s) cycles after step s. A step whose
+// last round is granted at g enters the core at g + D + Lb and writes tmem
+// result_latency later.
+void test_i7_hold_a_stream_b_walker() {
+    const auto& profile = canonical_profile();
+    std::array<uint16_t, 8> a{}, b{};
+    a.fill(0x3c00); // 1
+    b.fill(0x4000); // 2
+    auto machine = i7_machine(a, b, 1);
+    machine->run(20000);
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        require(machine->read_reg(0, lane, 10) == nanosm::float_bits(16.0f),
+            "hold-A walker computed the wrong value");
+    std::vector<const nanosm::TimelineEvent*> inputs, writes;
+    for (const auto& event : machine->trace().events()) {
+        if (event.name == "MMA input step") inputs.push_back(&event);
+        if (event.name == "MMA tmem write") writes.push_back(&event);
+    }
+    require(inputs.size() == 256 && writes.size() == 256, "one 64x64x8 command is 256 4x4x8 steps");
+    const auto d = profile.shmem_port_a_depth;
+    const auto lb = profile.shmem_read_latency_cycles;
+    for (uint32_t s = 0; s < 256; ++s) {
+        const bool reads_a = s % 16 == 0;
+        const uint32_t rounds = reads_a ? 2 : 1;
+        require(static_cast<uint32_t>(inputs[s]->value) == s &&
+                inputs[s]->detail == (reads_a ? "rounds=2, reads A" : "rounds=1"),
+            "step " + std::to_string(s) + " read its A block at the wrong step: " + inputs[s]->detail);
+        if (s + 1 < 256)
+            require(inputs[s + 1]->start_cycle == inputs[s]->start_cycle + rounds,
+                "step " + std::to_string(s + 1) + " did not start the cycle after the previous step's last round");
+        const uint32_t tile = 64 * (4 * (s / 16)) + 4 * (s % 16); // m0 * 64 + n0, n fastest
+        require(static_cast<uint32_t>(writes[s]->value) == tile,
+            "step " + std::to_string(s) + " wrote tile " + std::to_string(writes[s]->value) +
+                ", not the hold-A / stream-B order's " + std::to_string(tile));
+        require(writes[s]->start_cycle == inputs[s]->start_cycle + (rounds - 1) + d + lb +
+                profile.mma_result_latency_cycles,
+            "step " + std::to_string(s) + ": tmem write is not last round + D + Lb + result latency");
+    }
+    const auto& summary = machine->trace().summary();
+    require(summary.mma_a_block_reads == 16 && summary.mma_shmem_rounds == 16 * 17,
+        "one command did not read 16 A blocks in 16 x 17 bank rounds");
+}
+
+// Back-to-back commands into one accumulator: the next command's first step
+// is granted the cycle after the previous command's last round, so N
+// commands take 272 N rounds = 272 N cycles of port B from the first input
+// step: 256 steps per 272 cycles, 16/17 of one step per cycle (the rfc11
+// section 0 ceiling, here measured, with no recurrence or transfer stalls).
+void test_i7_back_to_back_throughput() {
+    constexpr uint32_t commands = 8;
+    std::array<uint16_t, 8> a{}, b{};
+    a.fill(0x3c00);
+    b.fill(0x3c00);
+    auto machine = i7_machine(a, b, commands);
+    machine->run(100000);
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        require(machine->read_reg(0, lane, 10) == nanosm::float_bits(8.0f * commands),
+            "back-to-back commands accumulated the wrong value");
+    uint64_t first = std::numeric_limits<uint64_t>::max(), last = 0, steps = 0;
+    for (const auto& event : machine->trace().events()) {
+        if (event.name != "MMA input step") continue;
+        first = std::min(first, event.start_cycle);
+        last = std::max(last, event.start_cycle);
+        ++steps;
+    }
+    require(steps == 256 * commands, "back-to-back commands lost steps");
+    // The last step reads one round, so port B is busy through `last`.
+    require(last - first + 1 == 272 * commands,
+        "back-to-back commands did not keep port B busy one round per cycle: " +
+            std::to_string(last - first + 1) + " cycles for " + std::to_string(272 * commands) + " rounds");
+    require(machine->trace().summary().mma_recurrence_stalls == 0, "back-to-back commands hit recurrence stalls");
 }
 
 // ---- Race sanitizer: shmem range ownership and tmem ownership ----
@@ -8202,8 +8349,9 @@ void test_i2_profile_fields() {
 // of the A words the fetch sampled -- one bank, so the sts's lane w writes
 // word w in round w, and steps 0 and 4 read row 0's words 0, 1 and 2, 3 in
 // their first two rounds. A word is new iff its sts round reached the RAM in
-// an earlier cycle than the fetch round reading it (the same cycle is
-// READ_FIRST: old). The sweep must cross that boundary, a tie included.
+// an earlier cycle than the fetch round's RAM sample (the same cycle is
+// READ_FIRST: old). I7: that sample is the round's grant + D. The sweep must
+// cross that boundary, a tie included.
 // I4 (rfc12 sections 10 and 11): the MMA sweep issues the sts and then the
 // mma.async.init reading its words with NO fence.sh -- a deliberate missing
 // fence, kept to measure READ_FIRST. The hardware is unchanged, so with the
@@ -8248,18 +8396,30 @@ void test_i2_read_first_across_services() {
     }
     require(sides == std::set<std::string>{"before", "tie", "after"}, "the sweep did not cross the same-cycle grant");
 
-    const auto dense = dense_one_bank_profile(4);
+    // I7: port B now has port A's depth, so a store round and a fetch round
+    // reach the RAM in grant order and meet there only when granted in one
+    // cycle. A program-order sweep alone (the sts, then pads, then the MMA)
+    // never granted the fetch first. A host event's RMW now pauses the sts in
+    // its slot until w + 1 (w = D + Lb + C; Lb 41 makes w + 1 later than the
+    // first pads' fetch) while the pads move the fetch across that grant.
+    auto dense = dense_one_bank_profile(4);
+    dense.shmem_read_latency_cycles = 41;
+    nanosm::validate_device_profile(dense);
     const uint64_t depth = dense.shmem_port_a_depth;
+    const uint64_t paused_until = depth + dense.shmem_read_latency_cycles + dense.shmem_rmw_compute_cycles;
+    constexpr uint32_t event_mbar = 960;
     std::set<uint32_t> outcomes;
     bool tie = false;
     uint32_t panicked = 0;
     uint32_t clean = 0;
-    // I4: up to 20 pads (was 8): the sixteen-round sts reaches the RAM in full
-    // only around pad 17, so the sanitizer build sees both outcomes.
-    for (uint32_t pad = 0; pad <= 20; ++pad) {
+    // I4: up to 20 pads (was 8); I7: up to 40, so the sanitizer build sees
+    // the paused sixteen-round sts reach the RAM in full before an accept.
+    for (uint32_t pad = 0; pad <= 40; ++pad) {
         std::ostringstream qtx;
+        // I7: the commit mbar is in the image (an mbar.init would be an RMW
+        // behind the host's, ordering the sts after its long write).
         qtx << ".acc C, 0, 0, 16, 4\n"
-            << "mov r0, 0\nmov r1, 512\nmov r4, 896\nmbar.init [r4], 1\n"
+            << "mov r0, 0\nmov r1, 512\nmov r4, 896\n"
             << "sread r20, LANE_ID\nshli r20, r20, 2\n"
             << "mov r21, 16384\nshli r22, r21, 16\nor r21, r21, r22\n" // two fp16 2.0 halves
             << "sts [r20], r21\n";
@@ -8272,8 +8432,19 @@ void test_i2_read_first_across_services() {
         auto& shmem = image_bytes(launch.shmem_image, 1024);
         for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
         for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+        nanosm::MbarState event;
+        event.valid = true;
+        event.expected = 1;
+        event.tx_bytes = 64;
+        write_u64(shmem, event_mbar, nanosm::encode_mbar_state(event));
+        nanosm::MbarState commit;
+        commit.valid = true;
+        commit.expected = 1;
+        commit.remaining = 1;
+        write_u64(shmem, 896, nanosm::encode_mbar_state(commit));
         nanosm::Machine mma(dense, compile(qtx.str(), dense), std::move(launch),
             nanosm::TraceOptions{.timeline = true, .debug = true});
+        mma.complete_mbar_tx(event_mbar, 64, 0); // the RMW that pauses the sts
         std::optional<std::string> panic;
         try {
             mma.run(4000);
@@ -8282,7 +8453,7 @@ void test_i2_read_first_across_services() {
         }
 #if NANOSM_SANITIZER
         {
-            // The MMA's accept: its dispatch (I6a: its issue, pc = 8 * (10 + pad), +
+            // The MMA's accept: its dispatch (I6a: its issue, pc = 8 * (9 + pad), +
             // issue_to_dispatch), or the PANIC it raised there.
             std::vector<I2Grant> stores;
             for (const auto& grant : i2_grants(mma, "A-write")) {
@@ -8291,7 +8462,7 @@ void test_i2_read_first_across_services() {
             const auto what = "pad " + std::to_string(pad) + ":" + describe(stores);
             const uint64_t accept = panic.has_value()
                 ? std::stoull(panic->substr(panic->find("cycle=") + 6))
-                : issued_at(mma, 8 * (10 + pad)).at(0) + nanosm::issue_to_dispatch(dense);
+                : issued_at(mma, 8 * (9 + pad)).at(0) + nanosm::issue_to_dispatch(dense);
             const bool in_flight = stores.size() < 16 || stores.back().cycle + depth > accept;
             require(panic.has_value() == in_flight, what + ": accepted at c" + std::to_string(accept) +
                 (panic.has_value() ? " with every store round at the RAM, yet: " + *panic
@@ -8312,12 +8483,16 @@ void test_i2_read_first_across_services() {
         for (const auto& event : mma.trace().events()) {
             if (event.name == "MMA input step") step_start[event.value] = event.start_cycle;
         }
-        const std::array<uint64_t, 4> sampled{step_start.at(0), step_start.at(0) + 1, step_start.at(4), step_start.at(4) + 1};
+        // I7: a port-B round granted at g samples the RAM at g + D (the read
+        // pipeline has port A's depth); before I7 it read the RAM at g.
+        const std::array<uint64_t, 4> sampled{step_start.at(0) + depth, step_start.at(0) + 1 + depth,
+            step_start.at(4) + depth, step_start.at(4) + 1 + depth};
         std::vector<I2Grant> stores;
         for (const auto& grant : i2_grants(mma, "A-write")) {
             if (grant.client == "simt") stores.push_back(grant);
         }
-        require(stores.size() == 16, "the sts was not sixteen rounds:" + describe(stores));
+        require(stores.size() == 16 && stores[0].cycle == paused_until + 1,
+            "the sts was not sixteen rounds granted from w + 1:" + describe(stores));
         float expected = 0.0f;
         for (uint32_t word = 0; word < 4; ++word) {
             const auto landed = stores[word].cycle + depth; // its bytes land at this cycle's clock edge
@@ -12900,6 +13075,9 @@ int main() {
         {"MMA bare transfer race panics", test_mma_bare_transfer_race_panics},
         {"MMA multi-round fetch timing", test_mma_multi_round_fetch_timing},
         {"MMA varying round service", test_mma_varying_round_service},
+        {"I7: one eight-product group at the 4x4x8 boundary", test_i7_dot8_group_boundary},
+        {"I7: hold A / stream B walker", test_i7_hold_a_stream_b_walker},
+        {"I7: back-to-back MMA throughput", test_i7_back_to_back_throughput},
         {"sanitizer: sts into TMA store source", test_sanitizer_sts_into_tma_store_source},
         {"sanitizer: sts into MMA operand stage", test_sanitizer_sts_into_mma_operand_stage},
         {"sanitizer: lds from TMA load destination", test_sanitizer_lds_from_tma_load_destination},

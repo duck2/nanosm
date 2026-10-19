@@ -168,6 +168,7 @@ struct TraceSummary {
     uint64_t mma_result_steps = 0;
     uint64_t mma_recurrence_stalls = 0;
     uint64_t mma_shmem_rounds = 0;
+    uint64_t mma_a_block_reads = 0;   // steps that read their A block (the rest use the held one)
     uint64_t sfu_ops = 0;
     uint64_t sfu_busy_cycles = 0;
     uint64_t sfu_unit_stalls = 0;
@@ -266,7 +267,7 @@ public:
     void tmem_beat(
         uint64_t cycle, uint32_t warp, uint32_t bank, bool load, uint32_t column);
     void mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init);
-    void mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step);
+    void mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step, bool reads_a);
     void mma_result(uint64_t cycle, uint64_t command, uint32_t step);
     void mma_recurrence_stall();
 

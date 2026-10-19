@@ -518,23 +518,39 @@ private:
         std::vector<uint32_t> values;
     };
 
-    // One in-flight operand fetch. The port serves one bank round per cycle
-    // and values are captured in the cycle their round actually reads them;
-    // fetch completion is core entry, one event with three names (case 05).
-    struct MmaFetch {
+    // One core step: which tile, which K block, and whether it reloads the
+    // held A block (rfc11 section 0: hold the 4x8 A block, stream the 8x4 B
+    // blocks across N; A is read again only when the walker moves to the
+    // next A block). It travels with the step's rounds through port B.
+    struct MmaStep {
         uint64_t command = 0;
         uint8_t accumulator = 0;
-        bool last_step = false;
-        bool init_step = false;
+        bool last_step = false;  // the command's last step: its final sample frees the operands
+        bool init_step = false;  // C = 0 instead of the tmem value
+        bool reload_a = false;   // this step reads its A block (n block 0); otherwise the held one
         uint32_t m0 = 0;
         uint32_t n0 = 0;
         uint32_t k0 = 0;
         uint32_t a_base = 0;
         uint32_t b_base = 0;
+    };
+
+    // The step whose port-B rounds are being granted: one round per cycle,
+    // from its first round to its last (no preemption).
+    struct MmaFetch {
+        MmaStep step;
         uint32_t next_round = 0;
-        std::vector<std::vector<uint32_t>> round_words;
-        std::vector<std::vector<uint32_t>> round_elements;
-        std::map<uint32_t, uint16_t> captured;
+        std::vector<std::vector<uint32_t>> round_elements; // fp16 element byte addresses, per round
+    };
+
+    // One granted port-B read round, in the read pipeline: D stages to the
+    // RAM sample, then Lb stages to the port output (the same D and Lb as
+    // port A, rfc10 section 5). Its element values are read at the sample.
+    struct MmaRead {
+        MmaStep step;
+        bool last_round = false;
+        std::vector<uint32_t> elements;                       // fp16 element byte addresses
+        std::vector<std::pair<uint32_t, uint16_t>> values;    // (address, bits), read at the RAM sample
     };
 
     // What the RMW engine does with the word(s) it reads: an mbar operation
@@ -1037,7 +1053,14 @@ private:
     // result list. (Its event register is separate.)
     struct MmaPipeline {
         std::deque<MmaCommand> queue;   // mma.queue_commands; issue pushes at the back
-        std::optional<MmaFetch> fetch;  // the operand fetch in port-B service
+        std::optional<MmaFetch> fetch;  // the step whose rounds port B is granting
+        std::vector<std::optional<MmaRead>> reads; // the port-B read pipeline: D + Lb stages
+        // The core's operand latch: the values of the step whose rounds are
+        // arriving at the port output (A + B of one step: at most 128 B).
+        std::vector<std::pair<uint32_t, uint16_t>> arriving;
+        // The held A block: core_m x core_k fp16 (64 B at 4x8), written when a
+        // reloading step enters the core, used by the steps after it.
+        std::vector<uint16_t> a_held;
         std::deque<MmaResult> results;  // computed steps waiting for their tmem write
     };
 
@@ -1752,8 +1775,10 @@ private:
     [[nodiscard]] bool mma_bank_busy(const MmaPipeline& mma, uint8_t bank) const;
     [[nodiscard]] bool acc_slot_available(const Wires& w, uint8_t bank, bool load) const;
     void advance_mma(MmaPipeline& mma, Wires& w);
-    void serve_mma_fetch_round(MmaPipeline& mma);
-    void complete_mma_fetch(MmaPipeline& mma, Wires& w);
+    [[nodiscard]] std::optional<MmaFetch> next_mma_step(MmaPipeline& mma, Wires& w);
+    [[nodiscard]] MmaRead grant_mma_round(MmaPipeline& mma);
+    void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
+    void enter_mma_core(MmaPipeline& mma, const MmaStep& step);
     [[nodiscard]] std::size_t tmem_word_index(
         const Kernel::Accumulator& acc, uint32_t row, uint32_t col) const;
     void execute_arithmetic(ArithmeticRead& pending, Wires& w);
