@@ -70,8 +70,10 @@ The current control-flow slice supports labels, unconditional `bra`, per-lane pr
 predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
 Qtx conservatively drains live depbars and fixed-latency writes at every branch.
 
-Each warp issues from its own instruction FIFO (`core.instruction_buffer_words`, 3), filled by one
-instruction-memory read per cycle (a fixed one-cycle read), round-robin over the warps with room.
+Each warp issues from its own instruction FIFO of fetch packets (`core.instruction_buffer_packets`,
+2; a packet is the two instruction words at an aligned 16-byte address), filled by one
+instruction-memory read of one packet per cycle (a fixed one-cycle read), round-robin over the warps
+with room. A branch into a packet's second half starts there.
 A branch resolves one cycle after it issues -- a conditional `bra.uni` reads its predicate then --
 and nothing after it issues before that: a not-taken branch continues with the words already
 fetched, a taken one clears its warp's FIFO and fetches the target (`src/rf.hpp` has the cycles).

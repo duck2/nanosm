@@ -199,15 +199,19 @@ public:
     // entry. Never used by launches or kernels.
     void test_set_active_mask(uint32_t warp, uint64_t mask);
     // Test seams (Q, between ticks): a warp's front end -- its FIFO's valid
-    // words, its pc (the head's) and fetch pc -- and the warp whose word is
-    // at the instruction memory's output now (a read in flight), if any.
-    [[nodiscard]] std::size_t instruction_fifo_words(uint32_t warp) const { return front_end_.cur().at(warp).fifo.size(); }
+    // packets, its pc (the next instruction's) and fetch pc (the next packet
+    // to read) -- and the warp whose packet is at the instruction memory's
+    // output now (a read in flight), if any.
+    [[nodiscard]] std::size_t instruction_fifo_packets(uint32_t warp) const { return front_end_.cur().at(warp).fifo.size(); }
     [[nodiscard]] uint32_t warp_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
     [[nodiscard]] uint32_t warp_fetch_pc(uint32_t warp) const { return front_end_.cur().at(warp).fetch_pc; }
     [[nodiscard]] std::optional<uint32_t> fetch_in_flight() const {
         const auto& read = fetch_read_.cur();
         return read.has_value() ? std::optional<uint32_t>(read->warp) : std::nullopt;
     }
+    // Test seam (between ticks): overwrite a warp's fetch pc, to show that the
+    // front end's consistency check (step_front_end) catches a broken state.
+    void test_set_fetch_pc(uint32_t warp, uint32_t pc);
     // Test seams (Q, between ticks): the RF write decision's state per bank.
     [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
@@ -285,28 +289,37 @@ private:
         std::array<std::vector<uint8_t>, 7> predicates;
     };
 
-    // One warp slot's front end (trash/front-end-2026-10-18.md), one of
-    // core.warps. Its instruction FIFO is a shift FIFO of
-    // core.instruction_buffer_words 64-bit words: only valid entries are held,
-    // head first (the valid bits are a thermometer, fifo.size() is the
-    // occupancy). An issue pops the head and a landing fetch appends, in one
-    // next-state update; the accepted word is captured by the issue register
-    // at that same edge. Consecutive entries are consecutive words: fetch is
-    // sequential and a taken branch clears the FIFO. Byte PCs (32 bits; the
-    // instruction memory's address width in hardware).
+    // One warp slot's front end (trash/front-end-packets-2026-10-18.md), one
+    // of core.warps. Its instruction FIFO is a shift FIFO of
+    // core.instruction_buffer_packets fetch packets: a packet is the two
+    // 64-bit words at an aligned 16-byte address, read together. Only valid
+    // entries are held, head first (the valid bits are a thermometer,
+    // fifo.size() is the occupancy). The warp's next instruction is the head
+    // packet's word that pc names: pc bit 3 selects the half, so no other
+    // per-warp state says which half is next (a branch into a packet's second
+    // half starts there; its first half is never used). Issuing the head's
+    // second half pops the packet; a landing fetch appends; both in one
+    // next-state update, with the accepted word captured by the issue
+    // register at that same edge. Consecutive entries are consecutive
+    // packets: fetch is sequential and a taken branch clears the FIFO. Byte
+    // PCs (32 bits; the instruction memory's address width in hardware).
+    // While the warp runs, fetch_pc = pc rounded down to 16 + 16 x (valid
+    // packets + its read in flight): step_front_end checks it every cycle.
+    using FetchPacket = std::array<uint64_t, 2>;
     struct WarpFrontEnd {
-        std::vector<uint64_t> fifo; // fetched words, head first
-        uint32_t pc = 0;            // the head's pc: the warp's next instruction
-        uint32_t fetch_pc = 0;      // the next word to fetch
-        bool halted = false;        // a halt was accepted (or the slot was not launched): no fetch, no issue
+        std::vector<FetchPacket> fifo; // fetched packets, head first
+        uint32_t pc = 0;               // the warp's next instruction (in the head packet when it is valid)
+        uint32_t fetch_pc = 0;         // the next packet to read (a multiple of 16)
+        bool halted = false;           // a halt was accepted (or the slot was not launched): no fetch, no issue
         bool operator==(const WarpFrontEnd&) const = default;
     };
 
     // The instruction memory's read in flight (instruction_read_cycles = 1,
-    // src/rf.hpp): the address it sampled at the grant's edge, and the tag
-    // beside it -- the warp the word is for (valid + 4 bits at 16 warps). The
-    // word is at the memory output in the cycle this register holds it. No
-    // stage stalls: the credit check guarantees its FIFO has room.
+    // src/rf.hpp): the packet address it sampled at the grant's edge, and the
+    // tag beside it -- the warp the packet is for (valid + 4 bits at 16
+    // warps). The packet is at the memory output (128 bits) in the cycle this
+    // register holds it. No stage stalls: the credit check guarantees its
+    // FIFO has room.
     struct FetchRead {
         uint32_t warp = 0;
         uint32_t pc = 0; // the address sampled (32-bit byte pc)
@@ -1279,12 +1292,12 @@ private:
     // the branch in the issue register resolved.
     struct FetchGrant {
         std::optional<uint32_t> warp; // granted now: the memory samples its fetch_pc at this edge
-        uint32_t pc = 0;
+        uint32_t pc = 0;              // the packet's address (a multiple of 16)
         uint32_t cursor_after = 0;
     };
-    struct FetchedWord {
+    struct FetchedPacket {
         uint32_t warp = 0;
-        uint64_t word = 0;            // the memory output (zero past the kernel's words)
+        FetchPacket words{};          // the memory output (zero past the kernel's words)
     };
     struct BranchResolution {
         uint32_t warp = 0;
@@ -1339,7 +1352,7 @@ private:
     struct Wires {
         // The front end, from Q only.
         FetchGrant fetch;
-        std::optional<FetchedWord> fetched;
+        std::optional<FetchedPacket> fetched;
         std::optional<BranchResolution> branch;
         // The RF write port: async grants and SIMT inhibition.
         RfWriteDecision rf_write;
@@ -1530,7 +1543,7 @@ private:
 
     // ---- the front end, from Q only: fetch, the memory output, the branch ----
     [[nodiscard]] FetchGrant decide_fetch() const;
-    [[nodiscard]] std::optional<FetchedWord> instruction_memory_output() const;
+    [[nodiscard]] std::optional<FetchedPacket> instruction_memory_output() const;
     [[nodiscard]] std::optional<BranchResolution> resolve_branch() const;
     // After issue: every warp's front end after this cycle (pop, landing,
     // halt, redirect, fetch pc), and its trace.

@@ -55,13 +55,20 @@
 // same way and reaches its unit at DISPATCH, c0 + 1 + Lr, when its operands
 // exist.
 //
-// The front end (trash/front-end-2026-10-18.md): every warp issues from its
-// instruction FIFO's head. One instruction-memory read per cycle, fixed at
-// one cycle (HUMAN 10-18): a fetch granted at f (its address sampled at f's
-// edge) has its word at the memory output at f + 1, written into the warp's
-// FIFO at that edge, and can issue from f + 2. Fetch decides from registered
-// state only (the FIFO's valid entries and the fetches in flight), so a slot
-// freed by an issue at t is refilled by a fetch at t + 1 at the earliest.
+// The front end (trash/front-end-2026-10-18.md; two-word packets since
+// trash/front-end-packets-2026-10-18.md): every warp issues from its
+// instruction FIFO's head packet, the half its pc names. One instruction-
+// memory read per cycle, one packet (the two words at an aligned 16-byte
+// address), fixed at one cycle (HUMAN 10-18): a fetch granted at f (its
+// address sampled at f's edge) has its packet at the memory output at f + 1,
+// written into the warp's FIFO at that edge, and its words can issue from
+// f + 2. Fetch decides from registered state only (the FIFO's valid packets
+// and the fetches in flight), so a packet popped by the issue of its second
+// word at t is refilled by a fetch at t + 1 at the earliest. A packet is a
+// credit that goes round in fetch_to_issue + 2 cycles carrying two words, so
+// a lone warp of independent instructions issues min(1, packets / 2) per
+// cycle: one packet entry, two issues in four cycles; two or more, one per
+// cycle.
 //
 // Branches (HUMAN 10-18: "it can be one cycle later ... long latency is
 // ok"): nothing after a branch issues until it resolves, and it resolves in

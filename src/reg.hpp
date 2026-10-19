@@ -13,9 +13,12 @@
 // RegisterFile::commit() clocks all of them at the end of Machine::tick(), so
 // a forgotten commit cannot happen.
 //
-// "D was written this tick" (the optional's engaged bit) is mechanism: commit
-// needs it, so it exists with the sanitizer compiled out. The writer tags and
-// the duplicate-write PANIC are sanitizer bookkeeping
+// "D was written this tick" (the optional's engaged bit) is simulator
+// bookkeeping that implements the register's hold / update: commit takes D if
+// it was written and keeps Q otherwise, so it exists with the sanitizer
+// compiled out. It is not a hardware state bit or a detection circuit: in
+// hardware it is the register's enable (D = enable ? new value : Q). The
+// writer tags and the duplicate-write PANIC are sanitizer bookkeeping
 // (Sanitizer::record_register_write / check_register_rewrite); with
 // NANOSM_SANITIZER=0 they compile to nothing and a second write would simply
 // replace D. Correct code never writes twice, so both builds compute the same.

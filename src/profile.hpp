@@ -24,10 +24,12 @@ struct DeviceProfile {
     // per-warp state is sized by it, and a launch may not ask for more warps
     // (the RF rows must fit too). Canonical 16 (HUMAN 10-17). 1..64.
     uint32_t core_warps = 16;
-    // Instruction FIFO entries per warp (core.instruction_buffer_words): 64-bit
-    // instruction words fetched ahead of issue (trash/front-end-2026-10-18.md).
-    // Canonical 3 (HUMAN 10-18: three entries per warp, configurable). 1..16.
-    uint32_t core_instruction_buffer_words = 3;
+    // Instruction FIFO entries per warp (core.instruction_buffer_packets): each
+    // entry is one fetch packet, two 64-bit instruction words read together
+    // from an aligned 16-byte address (trash/front-end-packets-2026-10-18.md).
+    // Canonical 2 (HUMAN 10-18: two packet entries per warp, configurable,
+    // down to one). 1..16.
+    uint32_t core_instruction_buffer_packets = 2;
     // One row of one bank holds one lane-wide register (lanes x 4 B). A
     // launch fits when active warps x the kernel's rows in every bank fit
     // (and the warps fit core.warps). Canonical 352: 3 x 352 x 64 B = 66 KiB,

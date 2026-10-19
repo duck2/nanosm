@@ -657,6 +657,12 @@ void Machine::test_set_active_mask(uint32_t warp, uint64_t mask) {
     warps_[warp].active_mask = mask;
 }
 
+void Machine::test_set_fetch_pc(uint32_t warp, uint32_t pc) {
+    auto front_end = front_end_.cur();
+    front_end.at(warp).fetch_pc = pc;
+    front_end_.poke(std::move(front_end));
+}
+
 uint32_t Machine::read_reg(
     uint32_t warp, uint32_t lane, uint32_t reg) const {
     if (warp >= warps_.size() || lane >= config_.lanes || reg >= kernel_.register_count) {
@@ -666,15 +672,17 @@ uint32_t Machine::read_reg(
 }
 
 // ===========================================================================
-// The front end (trash/front-end-2026-10-18.md; the cycles in src/rf.hpp).
-// Every decision here reads registers only (tick() (i)).
+// The front end (trash/front-end-2026-10-18.md, two-word packets since
+// trash/front-end-packets-2026-10-18.md; the cycles in src/rf.hpp). Every
+// decision here reads registers only (tick() (i)).
 // ===========================================================================
 
-// One instruction-memory read per cycle. A warp asks for one when it has not
-// halted, its next pc is known (no branch of its in the issue register) and
-// its FIFO has room: valid words + its read in flight < the FIFO's depth (a
-// read in flight owns its entry until it lands or is dropped, so two reads
-// never count on one free entry, and a landing always finds room).
+// One instruction-memory read per cycle: one packet, the two words at an
+// aligned 16-byte address. A warp asks for one when it has not halted, its
+// next pc is known (no branch of its in the issue register) and its FIFO has
+// room: valid packets + its read in flight < the FIFO's depth (a read in
+// flight owns its entry until it lands or is dropped, so two reads never
+// count on one free entry, and a landing always finds room).
 // Round-robin over the askers (round_robin_grant, its own cursor). Whether
 // the warp could issue does not matter: prefetch goes on through stall
 // counts, depbars, probes, wait slots and refused heads.
@@ -688,7 +696,7 @@ Machine::FetchGrant Machine::decide_fetch() const {
         const std::size_t in_flight = read.has_value() && read->warp == warp ? 1 : 0;
         const bool branch_unresolved = branch.has_value() && branch->warp == warp;
         has_space[warp] = !slot.halted && !branch_unresolved &&
-            slot.fifo.size() + in_flight < config_.core_instruction_buffer_words ? 1 : 0;
+            slot.fifo.size() + in_flight < config_.core_instruction_buffer_packets ? 1 : 0;
     }
     const auto choice = round_robin_grant(has_space, fetch_cursor_.cur(), 1);
     FetchGrant grant;
@@ -700,16 +708,21 @@ Machine::FetchGrant Machine::decide_fetch() const {
     return grant;
 }
 
-// The word at the instruction memory's output now, for the read in flight:
-// the kernel's word at its address, zero past the kernel's words (whatever
-// the memory holds there, no such word may have an effect unless it reaches
-// issue, which reports it: head_instruction). Whether it enters its warp's
-// FIFO is step_front_end's choice.
-std::optional<Machine::FetchedWord> Machine::instruction_memory_output() const {
+// The packet at the instruction memory's output now, for the read in
+// flight: the kernel's two words at its address, zero past the kernel's
+// words (whatever the memory holds there, no such word may have an effect
+// unless it reaches issue, which reports it: head_instruction). Whether it
+// enters its warp's FIFO is step_front_end's choice.
+std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() const {
     const auto& read = fetch_read_.cur();
     if (!read.has_value()) return std::nullopt;
-    const auto index = read->pc / 8;
-    return FetchedWord{read->warp, index < kernel_.words.size() ? kernel_.words[index] : 0};
+    FetchedPacket packet;
+    packet.warp = read->warp;
+    for (uint32_t half = 0; half < 2; ++half) {
+        const auto index = read->pc / 8 + half;
+        packet.words[half] = index < kernel_.words.size() ? kernel_.words[index] : 0;
+    }
+    return packet;
 }
 
 // The branch in the issue register (accepted last cycle) resolves now
@@ -749,53 +762,72 @@ std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
 // Every warp's front end after this cycle, in one calculation per warp
 // (src/rf.hpp for the cycles), from Q, this cycle's front-end wires and
 // issue's acceptance:
-//   - pop: issue accepted the warp's head (captured into the issue register
-//     at this edge); the warp's pc moves to the next word;
-//   - landing: the word at the instruction memory's output joins the FIFO
-//     behind the valid words ([A, B, C] with A accepted and D landing ->
-//     [B, C, D]), unless a redirect or a halt clears the FIFO now, or the
-//     warp halted earlier (its read was granted in the halt's cycle);
+//   - issue: issue accepted the warp's next instruction (captured into the
+//     issue register at this edge); pc moves to the next word, and the head
+//     packet pops if that instruction was its second half;
+//   - landing: the packet at the instruction memory's output joins the FIFO
+//     behind the valid packets ([A, B] with A's last word accepted and C
+//     landing -> [B, C]), unless a redirect or a halt clears the FIFO now, or
+//     the warp halted earlier (its read was granted in the halt's cycle);
 //   - halt accepted now: the FIFO is cleared and the warp stops;
-//   - redirect (a taken branch resolves now): the FIFO is cleared, the word
-//     landing now is dropped, pc and fetch pc take the target. A not-taken
-//     branch changes nothing: its buffered fall-through stays;
-//   - fetch granted now: the fetch pc moves to the next word.
+//   - redirect (a taken branch resolves now): the FIFO is cleared, the packet
+//     landing now is dropped, pc takes the target and fetch pc the target's
+//     packet (the target rounded down to 16: a target in a packet's second
+//     half starts there). A not-taken branch changes nothing: its buffered
+//     fall-through stays;
+//   - fetch granted now: the fetch pc moves to the next packet.
 // No fetch is granted to a warp whose branch is in the issue register, so a
 // redirect and a grant never meet in one warp; a halt and a grant may (that
 // read is dropped as it lands). The credit check guarantees the FIFO never
-// holds more than its depth (an internal error otherwise). The trace counts
-// the fetch and the words dropped.
+// holds more than its depth, and while the warp runs its fetch pc is always
+// pc rounded down to 16 + 16 x (valid packets + its read in flight); either
+// failing is an internal error. The trace counts the fetch and the fetched
+// words dropped without issuing.
 void Machine::step_front_end(Wires& w) {
     const auto& cur = front_end_.cur();
     w.front_end_next = cur;
+    // Fetched words not yet issued: every valid packet's two, less the head's
+    // first half when pc has moved past it.
+    const auto unissued_words = [](const WarpFrontEnd& slot) -> uint64_t {
+        if (slot.fifo.empty()) return 0;
+        return 2 * slot.fifo.size() - (slot.pc % 16 == 8 ? 1 : 0);
+    };
     uint64_t discarded = 0;
     for (uint32_t warp = 0; warp < cur.size(); ++warp) {
         auto& slot = w.front_end_next[warp];
-        const bool popped = w.issue.popped == warp;
-        const bool halting = popped && w.issue.halt;
+        const bool issued = w.issue.popped == warp;
+        const bool halting = issued && w.issue.halt;
         const bool redirect = w.branch.has_value() && w.branch->warp == warp && w.branch->taken;
         const bool landing = w.fetched.has_value() && w.fetched->warp == warp;
-        if (popped) {
-            slot.fifo.erase(slot.fifo.begin());
+        if (issued) {
+            if (slot.pc % 16 == 8) slot.fifo.erase(slot.fifo.begin());
             slot.pc += 8;
         }
         if (halting || redirect) {
-            discarded += slot.fifo.size() + (landing ? 1 : 0);
+            discarded += unissued_words(slot) + (landing ? 2 : 0);
             slot.fifo.clear();
         } else if (landing && cur[warp].halted) {
-            ++discarded;
+            discarded += 2;
         } else if (landing) {
-            slot.fifo.push_back(w.fetched->word);
+            slot.fifo.push_back(w.fetched->words);
         }
         if (halting) slot.halted = true;
         if (redirect) {
             slot.pc = w.branch->target;
-            slot.fetch_pc = w.branch->target;
+            slot.fetch_pc = w.branch->target / 16 * 16;
         }
-        if (w.fetch.warp == warp) slot.fetch_pc += 8;
-        if (slot.fifo.size() > config_.core_instruction_buffer_words) {
+        if (w.fetch.warp == warp) slot.fetch_pc += 16;
+        if (slot.fifo.size() > config_.core_instruction_buffer_packets) {
             throw SimError("internal: warp " + std::to_string(warp) + "'s instruction FIFO overflowed at cycle " +
                 std::to_string(cycle_));
+        }
+        if (!slot.halted) {
+            const auto packets = static_cast<uint32_t>(slot.fifo.size()) + (w.fetch.warp == warp ? 1u : 0u);
+            if (slot.fetch_pc != slot.pc / 16 * 16 + 16 * packets) {
+                throw SimError("internal: warp " + std::to_string(warp) + "'s front end is inconsistent at cycle " +
+                    std::to_string(cycle_) + ": fetch pc " + std::to_string(slot.fetch_pc) + ", pc " +
+                    std::to_string(slot.pc) + ", " + std::to_string(packets) + " packets held or in flight");
+            }
         }
     }
     if (w.fetch.warp.has_value()) trace_->fetch(cycle_, *w.fetch.warp, w.fetch.pc);
@@ -3168,20 +3200,38 @@ void Machine::mark_tma_data_complete(TmaCommand& command) {
 // Issue: the scheduler, after the units and the dispatch pipeline's end
 // ===========================================================================
 
-// The scheduler: from the cursor, the first warp whose FIFO head can be
-// accepted issues (one per cycle); every warp's state is traced. The heads
-// are the FIFOs' Q: a word landing now is a candidate from the next cycle.
+// The scheduler: from the cursor, the first warp whose next instruction can
+// be accepted issues (one per cycle). The heads are the FIFOs' Q: a packet
+// landing now is a candidate from the next cycle.
+//
+// Every warp's trace state comes from its own registers whether or not the
+// scheduler reached it: halted, its own waits (probe, wait slot, stall
+// count), then instruction supply (branch unresolved, FIFO empty). A warp
+// past all of those is either tried (issued, or the reason it was refused)
+// or, once another warp has issued this cycle, "not examined" -- never shown
+// as ready, because nothing checked its depbars or resources. The FIFO-empty
+// count is a separate observation over every running warp: an empty FIFO is
+// not by itself a lost issue (another warp may issue, or the warp may be
+// waiting anyway). Both are trace bookkeeping, not modeled hardware.
 void Machine::decide_issue(Wires& w) {
     struct State {
-        WarpState state = WarpState::not_selected;
+        WarpState state = WarpState::not_examined;
         std::string detail;
     };
     const auto& front_end = front_end_.cur();
     const auto& branch = issue_branch_.cur();
     std::vector<State> states(warps_.size());
     bool issued = false;
+    uint64_t fifo_empty = 0;
+    for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
+        if (!front_end[warp].halted && front_end[warp].fifo.empty()) ++fifo_empty;
+    }
+    trace_->instruction_fifo_empty(fifo_empty);
+    // The scan keeps going past the winner (for the trace), so it walks from
+    // the cursor as it was at the start of the cycle.
+    const auto cursor = scheduler_cursor_;
     for (uint32_t offset = 0; offset < warps_.size(); ++offset) {
-        const auto index = (scheduler_cursor_ + offset) % static_cast<uint32_t>(warps_.size());
+        const auto index = (cursor + offset) % static_cast<uint32_t>(warps_.size());
         auto& warp = warps_[index];
         if (front_end[index].halted) {
             states[index].state = WarpState::halted;
@@ -3208,12 +3258,16 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::no_instruction, "instruction FIFO empty"};
             continue;
         }
+        if (issued) {
+            states[index] = {WarpState::not_examined, {}};
+            continue;
+        }
         const auto attempt = try_issue(warp, w);
         if (attempt.issued) {
             states[index] = {WarpState::issued, {}};
             scheduler_cursor_ = (index + 1) % static_cast<uint32_t>(warps_.size());
             issued = true;
-            break;
+            continue;
         }
         states[index] = {attempt.state, attempt.reason};
     }
@@ -3225,9 +3279,6 @@ void Machine::decide_issue(Wires& w) {
         trace_->scheduler_idle(draining);
     }
     for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
-        if (states[warp].state == WarpState::not_selected && front_end[warp].halted) {
-            states[warp].state = WarpState::halted;
-        }
         trace_->warp_state(cycle_, warp, states[warp].state, std::move(states[warp].detail));
     }
 }
@@ -4895,6 +4946,7 @@ void Machine::drive_lsu_read_pipe(const Wires& w) {
 // Helpers
 // ===========================================================================
 
+// The word pc names in the head packet: pc bit 3 selects its half.
 Instruction Machine::head_instruction(const Warp& warp) const {
     const auto& slot = front_end_.cur().at(warp.id);
     if (slot.pc % 8 != 0) throw SimError("unaligned PC in warp " + std::to_string(warp.id));
@@ -4903,7 +4955,7 @@ Instruction Machine::head_instruction(const Warp& warp) const {
             "warp " + std::to_string(warp.id) + " fell off kernel at pc " +
             std::to_string(slot.pc));
     }
-    return decode(slot.fifo.front());
+    return decode(slot.fifo.front()[slot.pc / 8 % 2]);
 }
 
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {

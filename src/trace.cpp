@@ -58,7 +58,7 @@ double percent(uint64_t part, uint64_t whole) {
 
 std::string warp_state_name(WarpState state) {
     switch (state) {
-    case WarpState::not_selected: return "ready / not selected";
+    case WarpState::not_examined: return "not examined (another warp issued)";
     case WarpState::issued: return "issued";
     case WarpState::stall_count: return "stall count";
     case WarpState::depbar: return "depbar";
@@ -625,7 +625,8 @@ std::string TraceRecorder::summary_text() const {
     out << "front end: fetches=" << summary_.fetches
         << " discarded=" << summary_.fetches_discarded
         << " waiting_for_instruction="
-        << summary_.warp_cycles[static_cast<std::size_t>(WarpState::no_instruction)] << '\n';
+        << summary_.warp_cycles[static_cast<std::size_t>(WarpState::no_instruction)]
+        << " fifo_empty=" << summary_.instruction_fifo_empty << '\n';
     if (truncated()) out << "timeline events dropped        " << summary_.timeline_events_dropped << '\n';
     return out.str();
 }
