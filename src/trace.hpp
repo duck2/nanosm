@@ -264,8 +264,9 @@ public:
     void tma_depths(
         uint64_t cycle, std::size_t command_depth, std::size_t credit_depth,
         std::size_t return_depth);
-    void tmem_beat(
-        uint64_t cycle, uint32_t warp, uint32_t bank, bool load, uint32_t column);
+    // One beat of the acc.ld engine (a tmem read) or the acc.st engine (a tmem
+    // write), on that engine's track.
+    void tmem_beat(uint64_t cycle, uint32_t warp, bool load, uint32_t column);
     void mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init);
     void mma_input(uint64_t cycle, uint64_t command, uint32_t rounds, uint32_t step, bool reads_a);
     void mma_result(uint64_t cycle, uint64_t command, uint32_t step);

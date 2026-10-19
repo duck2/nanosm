@@ -235,14 +235,14 @@ public:
         const IssueSite& site, uint8_t accumulator, bool load,
         uint32_t row, uint32_t col, uint32_t width) const;
     void record_acc_transfer_accept(
-        const IssueSite& site, uint8_t bank, bool load, uint8_t accumulator,
+        const IssueSite& site, bool load, uint8_t accumulator,
         uint32_t row, uint32_t col, uint32_t width, uint8_t depbar);
-    // The transfer in slot [bank][load ? 0 : 1] made its final tmem access:
+    // The transfer in the acc.ld (load) or acc.st engine made its final tmem access:
     // its tmem ownership ends now -- a store's at its final tmem write, a
     // load's at its final tmem READ (hardware truth: the values are in its
     // pipeline). A load's destination registers stay not-ready until each
     // beat's RF write (record_reg_ready), a separate lifetime.
-    void record_acc_transfer_final_beat(uint8_t bank, bool load);
+    void record_acc_transfer_final_beat(bool load);
 
     // ---- clocked registers (src/reg.hpp): at most one write per tick ----
     // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
@@ -391,7 +391,11 @@ private:
     std::map<uint32_t, int32_t> mbar_tx_;
     std::vector<TmemOwner> tmem_owners_;
     uint64_t next_acc_transfer_id_ = 0;
-    std::vector<std::array<std::optional<uint64_t>, 2>> acc_transfer_in_slot_; // [bank][0 load, 1 store]
+    // The tmem owner ids of the transfers each engine has accepted and not yet
+    // finished, oldest first ([0] acc.ld, [1] acc.st). An acc.ld engine takes
+    // its next transfer at its previous one's last launch, before that one's
+    // last tmem sample, so its finishes come in acceptance order.
+    std::array<std::deque<uint64_t>, 2> acc_transfer_in_engine_;
     std::vector<WarpHazards> warps_;
     // The issue attempt in progress (record_issue_attempt) and whether
     // admission has accepted it.

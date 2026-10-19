@@ -309,22 +309,20 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
         }
         if (clean.starts_with(".acc")) {
             const auto args = operands(trim(clean.substr(4)));
-            expect_count(args, 5, line_number);
+            expect_count(args, 4, line_number);
             static const std::regex name_pattern(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
             if (!std::regex_match(args[0], name_pattern) || accumulator_ids.contains(args[0])) {
                 throw SimError("line " + std::to_string(line_number) + ": bad or duplicate accumulator name");
             }
             Kernel::Accumulator acc;
             acc.name = args[0];
-            const auto bank = parse_value(args[1], constants, line_number);
-            const auto base = parse_value(args[2], constants, line_number);
-            const auto rows = parse_value(args[3], constants, line_number);
-            const auto cols = parse_value(args[4], constants, line_number);
-            if (bank < 0 || bank > 255 || base < 0 || rows <= 0 || rows > 65535 ||
+            const auto base = parse_value(args[1], constants, line_number);
+            const auto rows = parse_value(args[2], constants, line_number);
+            const auto cols = parse_value(args[3], constants, line_number);
+            if (base < 0 || rows <= 0 || rows > 65535 ||
                 cols <= 0 || cols > 65535 || program.accumulators.size() >= 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator field out of range");
             }
-            acc.bank = static_cast<uint8_t>(bank);
             acc.base_word = static_cast<uint32_t>(base);
             acc.rows = static_cast<uint16_t>(rows);
             acc.cols = static_cast<uint16_t>(cols);
@@ -887,6 +885,14 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     std::array<bool, 6> live{};
     std::array<std::optional<uint8_t>, 256> pending_register{};
     std::array<uint8_t, 256> pending_async_read_mask{};
+    // tmem order between one warp's transfers (trash/rfc11.md section 0: the
+    // acc.ld and acc.st engines run side by side, nothing orders them): per
+    // accumulator, the depbars of its acc.st and acc.ld still in flight. A
+    // transfer after an acc.st of the same accumulator waits for it (RAW,
+    // WAW); an acc.st after an acc.ld waits for that (WAR). Whole-accumulator
+    // granularity: the coordinates are registers.
+    std::array<uint8_t, 256> acc_store_mask{};
+    std::array<uint8_t, 256> acc_load_mask{};
     std::optional<uint8_t> store_barrier;
     std::optional<uint8_t> mma_barrier;
 
@@ -950,6 +956,13 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 wait_mask |= pending_async_read_mask[*dst + j];
             }
         }
+        if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
+            inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
+            const bool load = inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8;
+            const auto accumulator = load ? inst.src0 : inst.dst;
+            wait_mask |= acc_store_mask[accumulator];
+            if (!load) wait_mask |= acc_load_mask[accumulator];
+        }
         if (inst.opcode == Opcode::mbar_arrive && store_barrier.has_value()) {
             // Pinned worker publication sequence: an ordinary arrival following
             // async stores is not allowed to publish until their counted
@@ -968,6 +981,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 if (pending.has_value() && (wait_mask & (1u << *pending)) != 0) pending.reset();
             }
             for (auto& mask : pending_async_read_mask) mask &= static_cast<uint8_t>(~wait_mask);
+            for (auto& mask : acc_store_mask) mask &= static_cast<uint8_t>(~wait_mask);
+            for (auto& mask : acc_load_mask) mask &= static_cast<uint8_t>(~wait_mask);
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if ((wait_mask & (1u << bar)) != 0) live[bar] = false;
             }
@@ -1013,9 +1028,11 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::acc_ld_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
+            acc_load_mask[inst.src0] |= static_cast<uint8_t>(1u << bar);
         } else if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
             if (!store_barrier.has_value()) store_barrier = allocate();
             inst.control.set_depbar = *store_barrier;
+            acc_store_mask[inst.dst] |= static_cast<uint8_t>(1u << *store_barrier);
             const auto width = inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j)
                 pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
@@ -1042,6 +1059,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             live.fill(false);
             pending_register.fill(std::nullopt);
             pending_async_read_mask.fill(0);
+            acc_store_mask.fill(0);
+            acc_load_mask.fill(0);
             store_barrier.reset();
             mma_barrier.reset();
             timeline.reset();
@@ -1073,8 +1092,7 @@ std::string emit_asm(const AssemblyProgram& program) {
     }
     if (!program.constants.empty()) out << '\n';
     for (const auto& acc : program.accumulators) {
-        out << ".acc " << acc.name << ", " << static_cast<unsigned>(acc.bank) << ", "
-            << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
+        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
     }
     if (!program.accumulators.empty()) out << '\n';
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
@@ -1101,11 +1119,12 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     for (std::size_t i = 0; i < program.accumulators.size(); ++i) {
         const auto& acc = program.accumulators[i];
         const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
-        if (acc.bank >= profile.tmem_banks || acc.base_word % profile.tmem_fine_banks != 0 ||
+        if (acc.base_word % profile.tmem_fine_banks != 0 ||
             acc.rows < profile.lanes || acc.rows % 4 != 0 || acc.cols % 4 != 0 ||
-            static_cast<uint64_t>(acc.base_word) + words > profile.tmem_words_per_bank) {
+            static_cast<uint64_t>(acc.base_word) + words >
+                static_cast<uint64_t>(profile.tmem_fine_banks) * profile.tmem_words_per_fine_bank) {
             throw SimError("accumulator '" + acc.name +
-                "' must fit one tmem bank, align to the fine-bank count, cover one warp, "
+                "' must fit tmem, align to the fine-bank count, cover one warp, "
                 "and have dimensions divisible by four");
         }
         for (std::size_t j = 0; j < i; ++j) {
@@ -1113,7 +1132,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             const uint64_t other_end = static_cast<uint64_t>(other.base_word) +
                 static_cast<uint64_t>(other.rows) * other.cols;
             const uint64_t end = static_cast<uint64_t>(acc.base_word) + words;
-            if (acc.bank == other.bank && acc.base_word < other_end && other.base_word < end) {
+            if (acc.base_word < other_end && other.base_word < end) {
                 throw SimError("overlapping tmem accumulators '" + other.name + "' and '" + acc.name + "'");
             }
         }
@@ -1216,8 +1235,7 @@ std::string emit_hex(const Kernel& kernel) {
         << format_profile_fingerprint(kernel.profile_fingerprint) << '\n';
     out << ".registers " << kernel.register_count << '\n';
     for (const auto& acc : kernel.accumulators) {
-        out << ".acc " << acc.name << ", " << static_cast<unsigned>(acc.bank) << ", "
-            << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
+        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
     }
     for (const auto word : kernel.words) {
         out << std::hex << std::setw(16) << std::setfill('0') << word
@@ -1273,18 +1291,16 @@ Kernel load_hex(std::string_view source) {
         }
         if (clean.starts_with(".acc")) {
             const auto args = operands(trim(clean.substr(4)));
-            expect_count(args, 5, line);
+            expect_count(args, 4, line);
             Kernel::Accumulator acc;
             acc.name = args[0];
             try {
-                const auto bank = std::stoul(args[1], nullptr, 0);
-                const auto base = std::stoul(args[2], nullptr, 0);
-                const auto rows = std::stoul(args[3], nullptr, 0);
-                const auto cols = std::stoul(args[4], nullptr, 0);
-                if (bank > 255 || rows == 0 || rows > 65535 || cols == 0 || cols > 65535 ||
+                const auto base = std::stoul(args[1], nullptr, 0);
+                const auto rows = std::stoul(args[2], nullptr, 0);
+                const auto cols = std::stoul(args[3], nullptr, 0);
+                if (rows == 0 || rows > 65535 || cols == 0 || cols > 65535 ||
                     kernel.accumulators.size() >= 256) throw std::invalid_argument("range");
-                acc.bank = static_cast<uint8_t>(bank);
-                acc.base_word = base;
+                acc.base_word = static_cast<uint32_t>(base);
                 acc.rows = static_cast<uint16_t>(rows);
                 acc.cols = static_cast<uint16_t>(cols);
             } catch (const std::exception&) {

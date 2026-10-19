@@ -57,7 +57,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         accumulator_names_.push_back(acc.name);
         accumulator_shapes_.emplace_back(acc.rows, acc.cols);
     }
-    acc_transfer_in_slot_.resize(config.tmem_banks);
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
     for (auto& warp : warps_) {
@@ -727,10 +726,10 @@ void Sanitizer::check_acc_transfer_vs_mma(const IssueSite& site, uint8_t accumul
 void Sanitizer::check_acc_transfer_overlap(
     const IssueSite& site, uint8_t accumulator, bool load,
     uint32_t row, uint32_t col, uint32_t width) const {
-    // Transfer vs transfer (store vs load, store vs store), checked after the
-    // structural slot stall: whole-transfer (non-duplex) slots structurally
-    // order same-bank transfers, so only a duplex profile can admit an
-    // overlapping pair.
+    // Transfer vs transfer: an acc.ld and an acc.st run in their own engines
+    // at the same time, so a load over a store still in flight (or the other
+    // way round) is a race. Two stores never overlap in time (one acc.st
+    // engine); two loads only read.
     TmemOwner region;
     region.accumulator = accumulator;
     region.row_begin = row;
@@ -751,7 +750,7 @@ void Sanitizer::check_acc_transfer_overlap(
 }
 
 void Sanitizer::record_acc_transfer_accept(
-    const IssueSite& site, uint8_t bank, bool load, uint8_t accumulator,
+    const IssueSite& site, bool load, uint8_t accumulator,
     uint32_t row, uint32_t col, uint32_t width, uint8_t depbar) {
     // Conflicts were checked at admission (check_acc_transfer_*).
     TmemOwner owner;
@@ -767,14 +766,14 @@ void Sanitizer::record_acc_transfer_accept(
     owner.issue_cycle = site.cycle;
     owner.depbar = depbar;
     tmem_owners_.push_back(owner);
-    acc_transfer_in_slot_.at(bank)[load ? 0 : 1] = owner.id;
+    acc_transfer_in_engine_[load ? 0 : 1].push_back(owner.id);
 }
 
-void Sanitizer::record_acc_transfer_final_beat(uint8_t bank, bool load) {
-    auto& slot = acc_transfer_in_slot_.at(bank)[load ? 0 : 1];
-    if (!slot.has_value()) throw SimError("internal sanitizer: acc transfer slot has no owner");
-    const auto id = *slot;
-    slot.reset();
+void Sanitizer::record_acc_transfer_final_beat(bool load) {
+    auto& engine = acc_transfer_in_engine_[load ? 0 : 1];
+    if (engine.empty()) throw SimError("internal sanitizer: acc transfer engine has no owner");
+    const auto id = engine.front();
+    engine.pop_front();
     // An acc.ld's final tmem read / an acc.st's final tmem write.
     release_tmem_owner(load ? TmemOwnerKind::acc_ld : TmemOwnerKind::acc_st, id);
 }

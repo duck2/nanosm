@@ -19,11 +19,11 @@
     "rmw_compute_cycles": 2
   },
   "tmem": {
-    "banks": 2,
-    "words_per_bank": 4096,
     "fine_banks": 16,
+    "words_per_fine_bank": 512,
     "max_vector_width": 8,
-    "simt_read_write_duplex": false
+    "port_depth": 2,
+    "read_latency_cycles": 2
   },
   "mma": {
     "m": 64,

@@ -68,13 +68,21 @@ struct DeviceProfile {
     // read's words at the port output to the update ready for its write. The
     // mbar update and the uniform atomics (trash/rfc13.md) use it. >= 1.
     uint32_t shmem_rmw_compute_cycles = 2;
-    uint32_t tmem_banks = 0;
-    uint32_t tmem_words_per_bank = 0;
+    // tmem (trash/rfc11.md section 0): fine_banks word-wide banks of
+    // words_per_fine_bank 32-bit words each. Every fine bank has two read and
+    // two write services per cycle: one read and one write for the MMA's
+    // accumulator, one read for the acc.ld engine and one write for the
+    // acc.st engine. Nobody arbitrates for them.
     uint32_t tmem_fine_banks = 0;
+    uint32_t tmem_words_per_fine_bank = 0;
     uint32_t tmem_max_vector_width = 0;
-    // False: one whole SIMT transfer owns a coarse bank. True: one load and
-    // one store may independently use its read/write sides.
-    bool tmem_simt_read_write_duplex = false;
+    // The tmem RAM's own depths (trash/rfc10.md section 5): register stages
+    // from a request leaving its producer to the RAM -- a read's sample, a
+    // write's edge, the same for reads and writes -- and from a read's sample
+    // to its words at the output. Nothing waits after a request leaves its
+    // producer. >= 1.
+    uint32_t tmem_port_depth = 2;
+    uint32_t tmem_read_latency_cycles = 2;
     uint32_t mma_m = 0;
     uint32_t mma_n = 0;
     uint32_t mma_k = 0;

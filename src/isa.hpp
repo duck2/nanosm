@@ -127,9 +127,10 @@ struct Instruction {
 };
 
 struct Kernel {
+    // A declared accumulator region: rows x cols FP32 words from base_word, a
+    // word address in the one tmem (word w is in fine bank w % fine_banks).
     struct Accumulator {
         std::string name;
-        uint8_t bank = 0;
         uint32_t base_word = 0;
         uint16_t rows = 0;
         uint16_t cols = 0;

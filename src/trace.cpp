@@ -26,6 +26,8 @@ constexpr uint32_t tma_return_depth_track = 1013;
 constexpr uint32_t shmem_a_write_track = 1004;
 constexpr uint32_t shmem_b_write_track = 1005;
 constexpr uint32_t mbar_rmw_track = 1006;
+constexpr uint32_t acc_ld_engine_track = 1020;
+constexpr uint32_t acc_st_engine_track = 1021;
 
 uint32_t shmem_track(ShmemService service) {
     switch (service) {
@@ -204,14 +206,12 @@ void TraceRecorder::depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t 
     });
 }
 
-void TraceRecorder::tmem_beat(
-    uint64_t cycle, uint32_t warp, uint32_t bank, bool load, uint32_t column) {
+void TraceRecorder::tmem_beat(uint64_t cycle, uint32_t warp, bool load, uint32_t column) {
     if (load) ++summary_.tmem_load_beats;
     else ++summary_.tmem_store_beats;
     add({TraceEventKind::instant, TraceCategory::tmem, load ? "acc.ld beat" : "acc.st beat",
-        "warp=" + std::to_string(warp) + ", bank=" + std::to_string(bank) +
-            ", column=" + std::to_string(column),
-        1020 + bank, cycle, 0, static_cast<int64_t>(column)});
+        "warp=" + std::to_string(warp) + ", column=" + std::to_string(column),
+        load ? acc_ld_engine_track : acc_st_engine_track, cycle, 0, static_cast<int64_t>(column)});
 }
 
 void TraceRecorder::mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init) {
@@ -656,6 +656,8 @@ std::string TraceRecorder::perfetto_json() const {
     metadata(shmem_a_write_track, "shmem A-write");
     metadata(shmem_b_write_track, "shmem B-write");
     metadata(mbar_rmw_track, "mbar RMW engine");
+    metadata(acc_ld_engine_track, "acc.ld engine");
+    metadata(acc_st_engine_track, "acc.st engine");
     metadata(gmem_bus_track, "gmem bus");
     metadata(gmem_command_track, "gmem commands");
     metadata(gmem_queue_track, "gmem queue");

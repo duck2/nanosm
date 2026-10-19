@@ -246,7 +246,7 @@ std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePl
     if (is_mbar_try_wait(opcode) && !view.wait_slot_free) return Refusal::wait_slots_full;
     if (is_tma(opcode) && !view.tma_queue_room) return Refusal::tma_queue_full;
     if (is_mma_command(opcode) && !view.mma_queue_room) return Refusal::mma_queue_full;
-    if (is_acc_transfer(opcode) && !view.acc_slot_free) return Refusal::tmem_bank_busy;
+    if (is_acc_transfer(opcode) && !view.acc_engine_free) return Refusal::acc_engine_busy;
     if (opcode == Opcode::fence_sh && !view.own_shmem_at_ram) return Refusal::shmem_fence;
     if (uses_shmem(opcode)) {
         if (const auto refusal = shmem_refusal(opcode, view); refusal.has_value()) return refusal;
@@ -318,9 +318,10 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     }
     for (const auto& acc : kernel_.accumulators) {
         const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
-        if (acc.bank >= config_.tmem_banks || acc.base_word % config_.tmem_fine_banks != 0 ||
+        if (acc.base_word % config_.tmem_fine_banks != 0 ||
             acc.rows < config_.lanes || acc.rows % 4 != 0 || acc.cols % 4 != 0 ||
-            static_cast<uint64_t>(acc.base_word) + words > config_.tmem_words_per_bank) {
+            static_cast<uint64_t>(acc.base_word) + words >
+                static_cast<uint64_t>(config_.tmem_fine_banks) * config_.tmem_words_per_fine_bank) {
             throw SimError("invalid accumulator metadata for '" + acc.name + "'");
         }
     }
@@ -337,10 +338,9 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     try {
         shmem_.assign(config_.shmem_bytes, 0);
         gmem_.assign(static_cast<std::size_t>(config_.gmem_bytes), 0);
-        tmem_.assign(config_.tmem_banks, std::vector<uint32_t>(config_.tmem_words_per_bank, 0));
-        acc_transfers_.poke(AccSlots(config_.tmem_banks));
-        acc_ld_pipes_.poke(AccLdPipelines(
-            config_.tmem_banks, std::vector<std::optional<AccLdBeat>>(acc_ld_read_stages)));
+        tmem_.assign(static_cast<std::size_t>(config_.tmem_fine_banks) * config_.tmem_words_per_fine_bank, 0);
+        acc_engines_.poke(AccEngines{});
+        acc_ld_pipe_.poke(AccLdPipeline(config_.tmem_port_depth + config_.tmem_read_latency_cycles));
         for (uint32_t index = 0; index < config_.shmem_load_slots; ++index) {
             load_slots_.emplace_back(registers_, "load slot " + std::to_string(index));
         }
@@ -557,6 +557,7 @@ void Machine::tick() {
     for (const auto& write : w.shmem.writes) {
         std::memcpy(shmem_.data() + write.address, write.bytes.data(), write.bytes.size());
     }
+    for (const auto& [word, value] : w.tmem_writes) tmem_[word] = value;
     land_rf_writes(w);
     ++cycle_;
     // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
@@ -581,7 +582,7 @@ bool Machine::done() const {
         waits.begin(), waits.end(), [](const auto& slot) { return !slot.has_value(); });
     const auto& tma = tma_.cur();
     const auto& mma = mma_.cur();
-    const auto& acc = acc_transfers_.cur();
+    const auto& acc = acc_engines_.cur();
     const auto empty = [](const auto& reg) { return !reg.cur().has_value(); };
     const auto drained = [](const auto& pipe) {
         return std::all_of(pipe.begin(), pipe.end(), [](const auto& stage) { return !stage.has_value(); });
@@ -595,11 +596,7 @@ bool Machine::done() const {
         !rmw_.cur().active.has_value() && drained(rmw_.cur().alu) && drained(a_read_pipe_.cur()) &&
         drained(a_write_pipe_.cur()) && drained(b_write_pipe_.cur()) && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
-    const auto& pipes = acc_ld_pipes_.cur();
-    const bool acc_ld_pipes_empty = std::all_of(pipes.begin(), pipes.end(), [](const auto& pipe) {
-        return std::all_of(pipe.begin(), pipe.end(), [](const auto& stage) { return !stage.has_value(); });
-    });
-    return warps_halted && wait_slots_empty && shmem_idle && acc_ld_pipes_empty &&
+    return warps_halted && wait_slots_empty && shmem_idle && drained(acc_ld_pipe_.cur()) &&
         !tma_mbar_event_.cur().has_value() && !mma_mbar_event_.cur().has_value() && gmem_queue_.empty() &&
         !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.cur().empty() &&
         read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
@@ -609,9 +606,7 @@ bool Machine::done() const {
         dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() &&
         mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
         mma.arriving.empty() &&
-        std::all_of(acc.begin(), acc.end(), [](const auto& slots) {
-            return !slots[0].has_value() && !slots[1].has_value();
-        });
+        !acc[0].has_value() && !acc[1].has_value();
 }
 
 uint32_t Machine::read_shmem_u32(uint32_t byte_address) const {
@@ -937,14 +932,10 @@ std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
     for (uint32_t index = 0; index < staging_.size(); ++index) {
         holders.push_back(lsu_presented == index ? assembly_rf_write(index) : std::nullopt);
     }
-    const auto& pipes = acc_ld_pipes_.cur();
-    for (uint32_t bank = 0; bank < pipes.size(); ++bank) {
-        const auto& output = pipes[bank].back();
-        if (output.has_value()) {
-            holders.push_back(AsyncWrite{AsyncWriter::acc_ld, bank, output->warp, output->reg});
-        } else {
-            holders.emplace_back();
-        }
+    if (const auto& output = acc_ld_pipe_.cur().back(); output.has_value()) {
+        holders.push_back(AsyncWrite{AsyncWriter::acc_ld, 0, output->warp, output->reg});
+    } else {
+        holders.emplace_back();
     }
     return holders;
 }
@@ -1022,12 +1013,12 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         return writeback;
     }
     case AsyncWriter::acc_ld: {
-        const auto& beat = *acc_ld_pipes_.cur().at(write.index).back();
+        const auto& beat = *acc_ld_pipe_.cur().back();
         writeback.values = beat.values;
         writeback.reason = "acc.ld";
         writeback.visible_regs = {write.reg};
-        // (Its tmem read-ownership ended at the transfer's last tmem read,
-        // launch_acc_ld_beat; the destination stays not-ready until this
+        // (Its tmem read-ownership ended at the transfer's last tmem sample,
+        // sample_acc_ld_beat; the destination stays not-ready until this
         // write lands.)
         if (beat.last) writeback.clear_depbar = beat.depbar;
         return writeback;
@@ -1144,26 +1135,23 @@ void Machine::land_rf_writes(const Wires& w) {
 // this cycle (resource_view), so the issue register leaves that bank free
 // next cycle: the hole the denied reader is owed. Reads already accepted are
 // never stopped. The readers granted (round-robin from the bank's cursor)
-// sample the RF now: an acc.st beat reaches tmem Lr + tmem_port_stages
-// later, the LSU's beat fills its assembly register Lr later. A denied
+// sample the RF now: an acc.st beat is at the RF output Lr later and at the
+// tmem RAM tmem.port_depth after that; the LSU's beat fills its assembly
+// register Lr later. A denied
 // reader holds (an acc.st keeps its beat, the LSU its candidate; a source
 // stays read-owned). The owed bit and cursor change in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     RfReadDecision decision;
-    const auto& transfers = acc_transfers_.cur();
-    for (uint32_t bank = 0; bank < transfers.size(); ++bank) {
-        const auto& slot = transfers[bank][1];
-        if (slot.has_value() && slot->next_column < slot->width) {
-            decision.holders.push_back(RfReadRequest{RfReader::acc_st, bank, slot->warp,
-                static_cast<uint8_t>(slot->rf_base + slot->next_column), 0, 0});
-        } else {
-            decision.holders.emplace_back();
-        }
+    const auto& store_engine = acc_engines_.cur()[1];
+    if (store_engine.has_value() && store_engine->next_column < store_engine->width) {
+        decision.holders.push_back(RfReadRequest{RfReader::acc_st, 0, store_engine->warp,
+            static_cast<uint8_t>(store_engine->rf_base + store_engine->next_column), 0, 0});
+    } else {
+        decision.holders.emplace_back();
     }
     decision.holders.push_back(lsu_store_read_request(w));
     decision.granted.assign(decision.holders.size(), 0);
     decision.banks.resize(config_.rf_banks);
-    w.acc_st_reads.assign(transfers.size(), std::nullopt);
     const auto& policy = rf_read_policy_.cur();
     const auto& simt_read_now = issue_read_banks_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
@@ -1195,10 +1183,9 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         trace_->rf_read(cycle_, warp.id, read->reg, read->reg % config_.rf_banks);
         auto values = lane_values(warp, read->reg);
         if (read->reader == RfReader::acc_st) {
-            const auto& slot = *transfers[read->index][1];
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::acc_st);
-            w.acc_st_reads[read->index] = AccStBeat{slot.next_column,
-                cycle_ + config_.rf_read_latency_cycles + tmem_port_stages, std::move(values)};
+            w.acc_st_read = AccStBeat{store_engine->next_column,
+                cycle_ + config_.rf_read_latency_cycles + config_.tmem_port_depth, std::move(values)};
         } else {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::stg_v8);
             probe(LsuEdge::rf_read_beat, read->lsu_command, read->reg, config_.lanes * 4);
@@ -2352,30 +2339,19 @@ uint32_t mma_b_address(const Config& config, uint32_t base, uint32_t k, uint32_t
 
 } // namespace
 
-bool Machine::acc_slot_available(const Wires& w, uint8_t bank, bool load) const {
-    // As this cycle leaves the MMA and the transfer slots (look-ahead (c)).
-    if (mma_bank_busy(w.mma_next, bank)) return false;
-    const auto& slots = w.acc_next.at(bank);
-    if (slots[load ? 0 : 1].has_value()) return false;
-    return config_.tmem_simt_read_write_duplex ||
-        (!slots[0].has_value() && !slots[1].has_value());
-}
-
-bool Machine::mma_bank_busy(const MmaPipeline& mma, uint8_t bank) const {
-    for (const auto& command : mma.queue) {
-        if (!command.commit && (command.next_step != 0 || command.operands_consumed) &&
-            kernel_.accumulators.at(command.accumulator).bank == bank) return true;
-    }
-    for (const auto& result : mma.results)
-        if (kernel_.accumulators.at(result.accumulator).bank == bank) return true;
-    return false;
+// The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
+// (c)): free if it runs no transfer. The MMA never matters here -- it has
+// tmem services of its own (trash/rfc11.md section 0); a transfer racing MMA
+// work is the sanitizer's business.
+bool Machine::acc_engine_available(const Wires& w, bool load) const {
+    return !w.acc_next[load ? 0 : 1].has_value();
 }
 
 // The MMA engine's cycle, computed on a copy of its queue and pipeline:
-// issue looks ahead at the queue entries and tmem banks it frees (c), so the
-// next state is a wire; drive_mma commits it with issue's new command.
-// tmem is the MMA's memory here (its banks are exclusive with acc transfers):
-// results retire into it before this cycle's accumulator read (f).
+// issue looks ahead at the queue entries it frees (c), so the next state is a
+// wire; drive_mma commits it with issue's new command. Its tmem reads (C) and
+// writes (results) use its own tmem services; the writes land at this
+// cycle's edge (w.tmem_writes).
 void Machine::step_mma(Wires& w) {
     auto mma = mma_.cur();
     advance_mma(mma, w);
@@ -2383,7 +2359,10 @@ void Machine::step_mma(Wires& w) {
 }
 
 // One cycle of the MMA engine, applied to `mma` (a copy of its Q):
-//   1. results due now write tmem; retired commands leave the queue head;
+//   1. the steps in the core: one whose C is at the tmem RAM now samples it
+//      and computes its result; one whose result is at the tmem RAM now
+//      writes it (at this cycle's edge) and retires; retired commands leave
+//      the queue head;
 //   2. the port-B read pipeline: the round at the RAM samples its elements;
 //      the round at the port output adds them to the core's operand latch,
 //      and a step's last round enters the core (C is read from tmem then);
@@ -2394,12 +2373,14 @@ void Machine::step_mma(Wires& w) {
 // at g + D + Lb (the same D and Lb as port A, rfc10 section 5).
 void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
     for (auto it = mma.results.begin(); it != mma.results.end();) {
-        if (it->ready_cycle > cycle_) { ++it; continue; }
+        if (!it->c_sampled && it->c_sample_cycle == cycle_) sample_mma_c(*it);
+        if (it->land_cycle != cycle_) { ++it; continue; }
+        if (!it->c_sampled) throw SimError("internal MMA result lands before its C sample");
         const auto& acc = kernel_.accumulators.at(it->accumulator);
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-                tmem_[acc.bank][tmem_word_index(acc, it->m0 + mi, it->n0 + ni)] =
-                    it->values[mi * config_.mma_core_n + ni];
+                w.tmem_writes.emplace_back(static_cast<uint32_t>(tmem_word_index(acc, it->m0 + mi, it->n0 + ni)),
+                    it->values[mi * config_.mma_core_n + ni]);
         trace_->mma_result(cycle_, it->command, it->m0 * config_.mma_n + it->n0);
         const auto id = it->command;
         auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
@@ -2461,13 +2442,6 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
         mma.queue.pop_front();
         return std::nullopt;
     }
-    // The bank's acc transfers: one in a slot, or one admission has secured
-    // a slot for (in the dispatch pipeline), goes first.
-    const auto& acc = kernel_.accumulators.at(command.accumulator);
-    const auto& transfers = acc_transfers_.cur().at(acc.bank);
-    if (transfers[0].has_value() || transfers[1].has_value()) return std::nullopt;
-    const auto claims = dispatch_claims();
-    if (claims.acc.at(acc.bank)[0] != 0 || claims.acc.at(acc.bank)[1] != 0) return std::nullopt;
     MmaStep step;
     const uint32_t k_block = command.next_step / blocks_per_k;
     const uint32_t block = command.next_step % blocks_per_k;
@@ -2483,8 +2457,8 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     step.init_step = command.init && step.k0 == 0;
     step.reload_a = n_block == 0;
     step.last_step = command.next_step + 1 == total_steps;
-    // A step whose tile is still on its way to tmem (a short sweep) waits:
-    // its C must be the earlier step's result.
+    // A step whose tile is still in the core or on its way to tmem (a short
+    // sweep) waits: its C must be the earlier step's result.
     const auto same_tile = [&](uint8_t accumulator, uint32_t m0, uint32_t n0) {
         return accumulator == step.accumulator && m0 == step.m0 && n0 == step.n0;
     };
@@ -2566,8 +2540,10 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
 }
 
 // A step's operands are all at the port output: it enters the core. A
-// reloading step's A block replaces the held one; the others use it. C is
-// read from tmem now; the result is written result_latency cycles later.
+// reloading step's A block replaces the held one; the others use it. Its C
+// read leaves for tmem now (sampled tmem.port_depth later, sample_mma_c);
+// its result leaves the core result_latency after entry and lands in tmem
+// tmem.port_depth after that.
 void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
     std::map<uint32_t, uint16_t> latch(mma.arriving.begin(), mma.arriving.end());
     const auto value = [&](uint32_t address) {
@@ -2575,7 +2551,6 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
         if (found == latch.end()) throw SimError("internal MMA operand did not arrive with its step");
         return found->second;
     };
-    const auto& acc = kernel_.accumulators.at(step.accumulator);
     if (step.reload_a) {
         mma.a_held.assign(config_.mma_core_m * config_.mma_core_k, 0);
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
@@ -2592,22 +2567,36 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
             b[ni * config_.mma_core_k + kk] =
                 value(mma_b_address(config_, step.b_base, step.k0 + kk, step.n0 + ni));
     MmaResult result;
-    result.ready_cycle = cycle_ + config_.mma_result_latency_cycles;
+    result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
+    result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
     result.command = step.command;
     result.accumulator = step.accumulator;
     result.m0 = step.m0;
     result.n0 = step.n0;
+    result.init_step = step.init_step;
+    result.a = mma.a_held;
+    result.b = std::move(b);
+    mma.results.push_back(std::move(result));
+}
+
+// A step's C is at the tmem RAM now: its sixteen words are sampled (one
+// round of the MMA's tmem read service; READ_FIRST, before this cycle's
+// writes land) and the fused dot-plus-C result is computed. It arrives in the
+// core tmem.read_latency_cycles later, before the core's last stage (profile
+// validation: result_latency >= port_depth + read_latency).
+void Machine::sample_mma_c(MmaResult& result) {
+    const auto& acc = kernel_.accumulators.at(result.accumulator);
     result.values.resize(config_.mma_core_m * config_.mma_core_n);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            const uint32_t c = step.init_step ? 0u : tmem_[acc.bank][
-                tmem_word_index(acc, step.m0 + mi, step.n0 + ni)];
+            const uint32_t c = result.init_step ? 0u : tmem_[
+                tmem_word_index(acc, result.m0 + mi, result.n0 + ni)];
             result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
-                std::span<const uint16_t>(mma.a_held).subspan(mi * config_.mma_core_k, config_.mma_core_k),
-                std::span<const uint16_t>(b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
+                std::span<const uint16_t>(result.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
+                std::span<const uint16_t>(result.b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
         }
     }
-    mma.results.push_back(std::move(result));
+    result.c_sampled = true;
 }
 
 std::size_t Machine::tmem_word_index(
@@ -2619,91 +2608,103 @@ std::size_t Machine::tmem_word_index(
     const uint64_t bank_address = static_cast<uint64_t>(row / 4) * macro_columns + col / 4;
     const uint64_t offset = bank_address * config_.tmem_fine_banks + fine_bank;
     const uint64_t index = static_cast<uint64_t>(acc.base_word) + offset;
-    if (index >= tmem_.at(acc.bank).size()) throw SimError("internal tmem layout overflow");
+    if (index >= tmem_.size()) throw SimError("internal tmem layout overflow");
     return static_cast<std::size_t>(index);
 }
 
-// The accumulator transfers of every tmem bank, computed on copies of their
-// registers: issue looks ahead at the slots (c) and may reallocate one freed
-// now (d). Banks in order, the acc.ld pipeline before the acc.st beat.
+// The two accumulator transfer engines (trash/rfc11.md section 0: one acc.ld
+// engine, one acc.st engine for the whole machine, each with its own tmem
+// service in every fine bank), computed on copies of their registers: issue
+// looks ahead at them (c) and may give a freed engine its next transfer now
+// (d). The acc.ld pipeline before the acc.st beat.
 void Machine::step_acc_transfers(Wires& w) {
-    auto slots = acc_transfers_.cur();
-    auto pipes = acc_ld_pipes_.cur();
-    for (uint32_t bank = 0; bank < slots.size(); ++bank) {
-        step_acc_ld(bank, slots[bank][0], pipes[bank], w);
-        step_acc_st(bank, slots[bank][1], w);
-    }
-    w.acc_next = std::move(slots);
-    w.acc_ld_next = std::move(pipes);
+    auto engines = acc_engines_.cur();
+    auto pipe = acc_ld_pipe_.cur();
+    step_acc_ld(engines[0], pipe, w);
+    step_acc_st(engines[1], w);
+    w.acc_next = std::move(engines);
+    w.acc_ld_next = std::move(pipe);
 }
 
-// One tmem bank's acc.ld transfer pipeline (trash/rfc10.md section 2,
-// "Accumulator transfers"). Its output asks the RF write decision for
-// service; this cycle's grant was decided at the top of the cycle.
+// The acc.ld engine's pipeline (trash/rfc10.md section 2, "Accumulator
+// transfers"). The beat at the tmem RAM stage samples its words now (once).
+// Its output asks the RF write decision for service; this cycle's grant was
+// decided at the top of the cycle.
 //   output empty, or granted -> advance: every stage moves one toward the
-//                               output; stage 0 takes a new tmem read if the
-//                               transfer has a beat left, else stays empty
+//                               output; stage 0 takes the engine's next read
+//                               if its transfer has a beat left, else stays
+//                               empty
 //   output valid and denied  -> hold: no stage moves, nothing launches
 // A granted beat belongs to the RF write path from its grant on.
-void Machine::step_acc_ld(uint32_t bank, std::optional<AccTransfer>& slot,
-    std::vector<std::optional<AccLdBeat>>& pipe, const Wires& w) {
+void Machine::step_acc_ld(std::optional<AccTransfer>& engine, AccLdPipeline& pipe, const Wires& w) {
+    if (auto& at_ram = pipe.at(config_.tmem_port_depth - 1); at_ram.has_value() && !at_ram->sampled) {
+        sample_acc_ld_beat(*at_ram);
+    }
     const bool output_valid = pipe.back().has_value();
-    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, bank)) return;
+    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, 0)) return;
     for (std::size_t stage = pipe.size() - 1; stage > 0; --stage) pipe[stage] = std::move(pipe[stage - 1]);
-    pipe.front() = launch_acc_ld_beat(bank, slot);
+    pipe.front() = launch_acc_ld_beat(engine);
 }
 
-// The tmem read of the transfer's next column, all lanes, now. The transfer
-// slot -- the bank's coarse ownership -- frees with its last read, as before
-// the pipeline existed; each beat carries its own destination and context.
-std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(uint32_t bank, std::optional<AccTransfer>& slot) {
-    if (!slot.has_value()) return std::nullopt;
-    auto& transfer = *slot;
-    const auto& acc = kernel_.accumulators.at(transfer.accumulator);
+// The engine's next read leaves for tmem now: the transfer's next column, all
+// lanes. The engine frees with its last read's launch; each beat carries its
+// own destination and context down the pipeline.
+std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(std::optional<AccTransfer>& engine) {
+    if (!engine.has_value()) return std::nullopt;
+    auto& transfer = *engine;
     AccLdBeat beat;
     beat.warp = transfer.warp;
     beat.reg = static_cast<uint8_t>(transfer.rf_base + transfer.next_column);
-    beat.values.resize(config_.lanes);
-    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        beat.values[lane] = tmem_[bank][tmem_word_index(
-            acc, transfer.row_base + lane, transfer.col_base + transfer.next_column)];
-    }
+    beat.accumulator = transfer.accumulator;
+    beat.row_base = transfer.row_base;
+    beat.column = transfer.col_base + transfer.next_column;
     beat.last = transfer.next_column + 1 == transfer.width;
     beat.depbar = transfer.depbar;
-    trace_->tmem_beat(cycle_, transfer.warp, bank, true, transfer.next_column);
     ++transfer.next_column;
-    if (beat.last) {
-        sanitizer_.record_acc_transfer_final_beat(static_cast<uint8_t>(bank), true);
-        slot.reset();
-    }
+    if (beat.last) engine.reset();
     return beat;
 }
 
-// One tmem bank's acc.st transfer: its beats are read from the RF one per
-// cycle when the RF read decision grants them (decide_rf_reads: sampled at
-// the grant, at the RF output Lr later); a beat is written into tmem
-// tmem_port_stages after that, here. The last beat's tmem write ends the
-// transfer: its depbar clears, its tmem write-ownership ends and the slot --
-// the bank's coarse ownership -- frees.
-void Machine::step_acc_st(uint32_t bank, std::optional<AccTransfer>& slot, Wires& w) {
-    if (!slot.has_value()) return;
-    auto& transfer = *slot;
+// A beat at the tmem RAM: its sixteen words (sixteen distinct fine banks) are
+// read now, as tmem is before this cycle's writes land (READ_FIRST). The
+// transfer's last sample ends its tmem read-ownership.
+void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
+    const auto& acc = kernel_.accumulators.at(beat.accumulator);
+    beat.values.resize(config_.lanes);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        beat.values[lane] = tmem_[tmem_word_index(acc, beat.row_base + lane, beat.column)];
+    }
+    beat.sampled = true;
+    trace_->tmem_beat(cycle_, beat.warp, true, beat.column);
+    if (beat.last) sanitizer_.record_acc_transfer_final_beat(true);
+}
+
+// The acc.st engine's transfer: its beats are read from the RF one per cycle
+// when the RF read decision grants them (decide_rf_reads: sampled at the
+// grant, at the RF output Lr later, at the tmem RAM tmem.port_depth after
+// that); a beat at the tmem RAM now is written at this cycle's edge. The last
+// beat's write ends the transfer: its depbar clears, its tmem write-ownership
+// ends and the engine frees.
+void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
+    if (!engine.has_value()) return;
+    auto& transfer = *engine;
     const auto& acc = kernel_.accumulators.at(transfer.accumulator);
     while (!transfer.in_flight.empty() && transfer.in_flight.front().land_cycle == cycle_) {
         const auto& beat = transfer.in_flight.front();
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            tmem_[bank][tmem_word_index(acc, transfer.row_base + lane, transfer.col_base + beat.column)] =
-                beat.values[lane];
+            w.tmem_writes.emplace_back(
+                static_cast<uint32_t>(tmem_word_index(acc, transfer.row_base + lane, transfer.col_base + beat.column)),
+                beat.values[lane]);
         }
-        trace_->tmem_beat(cycle_, transfer.warp, bank, false, beat.column);
+        trace_->tmem_beat(cycle_, transfer.warp, false, beat.column);
         transfer.in_flight.pop_front();
         ++transfer.landed;
     }
     if (transfer.landed != transfer.width) return;
     record_depbar_completion(w, transfer.warp, transfer.depbar, "internal acc.st depbar underflow");
     // final tmem write: write-ownership ends
-    sanitizer_.record_acc_transfer_final_beat(static_cast<uint8_t>(bank), false);
-    slot.reset();
+    sanitizer_.record_acc_transfer_final_beat(false);
+    engine.reset();
 }
 
 // ===========================================================================
@@ -3457,10 +3458,7 @@ ResourceView Machine::resource_view(
     view.mma_queue_room = w.mma_next.queue.size() + claims.mma_commands < config_.mma_queue_commands;
     if (is_acc_transfer(inst.opcode)) {
         const bool load = is_acc_load(inst.opcode);
-        const auto bank = kernel_.accumulators.at(load ? inst.src0 : inst.dst).bank;
-        const auto& claimed = claims.acc.at(bank);
-        view.acc_slot_free = acc_slot_available(w, bank, load) && claimed[load ? 0 : 1] == 0 &&
-            (config_.tmem_simt_read_write_duplex || claimed[load ? 1 : 0] == 0);
+        view.acc_engine_free = acc_engine_available(w, load) && claims.acc[load ? 0 : 1] == 0;
     }
     view.no_active_lanes = warp.active_mask == 0;
     view.unserviced_read = warp_unserviced_read(w, warp.id);
@@ -3494,7 +3492,7 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     case Refusal::wait_slots_full: return {false, WarpState::mbar_wait_slot, "mbar wait slots full"};
     case Refusal::tma_queue_full: return {false, WarpState::structural, "tma command queue full"};
     case Refusal::mma_queue_full: return {false, WarpState::structural, "MMA command queue full"};
-    case Refusal::tmem_bank_busy: return {false, WarpState::structural, "tmem bank transfer busy"};
+    case Refusal::acc_engine_busy: return {false, WarpState::structural, "acc transfer engine busy"};
     case Refusal::shmem_ordered:
         trace_->shmem_order_wait();
         return {false, WarpState::shmem_order, "ordered behind own access"};
@@ -3653,7 +3651,6 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
 // units: the claims every later admission subtracts from the space it sees.
 Machine::DispatchClaims Machine::dispatch_claims() const {
     DispatchClaims claims;
-    claims.acc.assign(config_.tmem_banks, {0, 0});
     for (const auto& op : dispatch_pipe_.cur()) {
         const auto opcode = op.instruction.opcode;
         if (is_shared_load(opcode) || is_atomic(opcode)) ++claims.load_slots;
@@ -3664,11 +3661,7 @@ Machine::DispatchClaims Machine::dispatch_claims() const {
         if (is_lsu_opcode(opcode)) ++claims.lsu_commands;
         if (is_tma(opcode)) ++claims.tma_commands;
         if (is_mma_command(opcode)) ++claims.mma_commands;
-        if (is_acc_transfer(opcode)) {
-            const bool load = is_acc_load(opcode);
-            const auto bank = kernel_.accumulators.at(load ? op.instruction.src0 : op.instruction.dst).bank;
-            ++claims.acc.at(bank)[load ? 0 : 1];
-        }
+        if (is_acc_transfer(opcode)) ++claims.acc[is_acc_load(opcode) ? 0 : 1];
     }
     return claims;
 }
@@ -3778,7 +3771,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
 }
 
 // acc.ld / acc.st: the coordinates arrive now; the transfer runs one beat per
-// column from its slot (step_acc_transfers, and decide_rf_reads for acc.st).
+// column in its engine (step_acc_transfers, and decide_rf_reads for acc.st).
 void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool load = is_acc_load(inst.opcode);
@@ -3808,9 +3801,9 @@ void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     transfer.row_base = row;
     transfer.col_base = col;
     transfer.width = width;
-    sanitizer_.record_acc_transfer_accept(site(op), acc.bank, load, acc_id,
+    sanitizer_.record_acc_transfer_accept(site(op), load, acc_id,
         row, col, width, inst.control.set_depbar);
-    w.dispatch.acc = DispatchDecision::AccAdmission{acc.bank, load, std::move(transfer)};
+    w.dispatch.acc = DispatchDecision::AccAdmission{load, std::move(transfer)};
 }
 
 // lds / lds.uni (trash/rfc10.md section 2, rfc12 section 3): the address
@@ -4350,7 +4343,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_mma_event,
         &Machine::drive_mma,
         &Machine::drive_acc_transfers,
-        &Machine::drive_acc_ld_pipes,
+        &Machine::drive_acc_ld_pipe,
         &Machine::drive_tma_queue,
         &Machine::drive_tma_transactions,
         &Machine::drive_tma_sector,
@@ -4610,33 +4603,30 @@ void Machine::drive_mma(const Wires& w) {
     mma_.set_next(std::move(next), "drive_mma");
 }
 
-// The acc transfer slots: step_acc_transfers' result, plus issue's new
-// transfer (into a slot freed this cycle, possibly).
-// The acc transfer slots: step_acc_transfers' result (acc.ld launches, acc.st
-// landings), plus this cycle's acc.st RF reads (a beat joins its slot's
-// in-flight list) and dispatch's new transfer.
+// The two acc transfer engines: step_acc_transfers' result (acc.ld launches,
+// acc.st landings), plus this cycle's acc.st RF read (the beat joins the
+// acc.st transfer's in-flight list) and dispatch's new transfer (into an
+// engine freed this cycle, possibly).
 void Machine::drive_acc_transfers(const Wires& w) {
     auto next = w.acc_next;
-    for (uint32_t bank = 0; bank < w.acc_st_reads.size(); ++bank) {
-        const auto& beat = w.acc_st_reads[bank];
-        if (!beat.has_value()) continue;
-        auto& slot = next.at(bank)[1];
-        if (!slot.has_value()) throw SimError("internal acc.st beat read for an empty slot");
-        slot->in_flight.push_back(*beat);
-        ++slot->next_column;
+    if (const auto& beat = w.acc_st_read; beat.has_value()) {
+        auto& engine = next[1];
+        if (!engine.has_value()) throw SimError("internal acc.st beat read with no acc.st transfer");
+        engine->in_flight.push_back(*beat);
+        ++engine->next_column;
     }
     if (const auto& admission = w.dispatch.acc; admission.has_value()) {
-        auto& slot = next.at(admission->bank)[admission->load ? 0 : 1];
-        if (slot.has_value()) throw SimError("internal acc transfer slot allocated twice");
-        slot = admission->transfer;
+        auto& engine = next[admission->load ? 0 : 1];
+        if (engine.has_value()) throw SimError("internal acc transfer engine given two transfers");
+        engine = admission->transfer;
     }
-    acc_transfers_.set_next(std::move(next), "drive_acc_transfers");
+    acc_engines_.set_next(std::move(next), "drive_acc_transfers");
 }
 
-// The acc.ld pipelines: step_acc_transfers' advance or hold, per tmem bank.
-void Machine::drive_acc_ld_pipes(const Wires& w) {
-    if (w.acc_ld_next == acc_ld_pipes_.cur()) return;
-    acc_ld_pipes_.set_next(w.acc_ld_next, "drive_acc_ld_pipes");
+// The acc.ld pipeline: step_acc_transfers' advance or hold.
+void Machine::drive_acc_ld_pipe(const Wires& w) {
+    if (w.acc_ld_next == acc_ld_pipe_.cur()) return;
+    acc_ld_pipe_.set_next(w.acc_ld_next, "drive_acc_ld_pipe");
 }
 
 // The RF write decision's state, per bank (trash/rfc10.md section 3):

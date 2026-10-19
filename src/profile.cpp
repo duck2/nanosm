@@ -37,11 +37,11 @@ json profile_json(const DeviceProfile& p) {
             {"rmw_compute_cycles", p.shmem_rmw_compute_cycles},
         }},
         {"tmem", {
-            {"banks", p.tmem_banks},
-            {"words_per_bank", p.tmem_words_per_bank},
             {"fine_banks", p.tmem_fine_banks},
+            {"words_per_fine_bank", p.tmem_words_per_fine_bank},
             {"max_vector_width", p.tmem_max_vector_width},
-            {"simt_read_write_duplex", p.tmem_simt_read_write_duplex},
+            {"port_depth", p.tmem_port_depth},
+            {"read_latency_cycles", p.tmem_read_latency_cycles},
         }},
         {"mma", {
             {"m", p.mma_m}, {"n", p.mma_n}, {"k", p.mma_k},
@@ -155,8 +155,8 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     if (p.lanes == 0 || p.rf_banks == 0 || p.rf_rows_per_bank == 0 ||
         p.rf_read_ports_per_bank == 0 || p.rf_write_ports_per_bank == 0 ||
-        p.shmem_bytes == 0 || p.shmem_banks == 0 || p.tmem_banks != 2 ||
-        p.tmem_words_per_bank == 0 || p.tmem_fine_banks != 16 ||
+        p.shmem_bytes == 0 || p.shmem_banks == 0 ||
+        p.tmem_words_per_fine_bank == 0 || p.tmem_fine_banks != 16 ||
         p.tmem_max_vector_width == 0 || p.tmem_max_vector_width > 8 || p.gmem_bytes == 0 ||
         p.timing.alu == 0 || p.timing.fadd == 0 || p.core_clock_hz == 0 ||
         p.dram_clock_hz == 0 || p.gmem_sector_bytes == 0 ||
@@ -178,6 +178,18 @@ void validate_device_profile(const DeviceProfile& p) {
         p.mma_m % p.mma_core_m != 0 || p.mma_n % p.mma_core_n != 0 ||
         p.mma_k % p.mma_core_k != 0) {
         throw ProfileError("device profile: invalid MMA shape, timing, or queue capacity");
+    }
+    // tmem's own depths: nonzero register stages.
+    if (p.tmem_port_depth == 0 || p.tmem_port_depth > 64 ||
+        p.tmem_read_latency_cycles == 0 || p.tmem_read_latency_cycles > 64) {
+        throw ProfileError("device profile: tmem port_depth and read_latency_cycles must be in 1..64 "
+            "register stages");
+    }
+    // A step's C is read from tmem as the step enters the core and is added in
+    // the core's last stage, so the core's result latency must cover that read.
+    if (p.mma_result_latency_cycles < p.tmem_port_depth + p.tmem_read_latency_cycles) {
+        throw ProfileError("device profile: mma result_latency_cycles must cover the accumulator read "
+            "(tmem port_depth + read_latency_cycles)");
     }
     // The xor64 layout keeps a 4-row block's 16-byte rows in distinct banks,
     // which holds for a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
@@ -235,13 +247,6 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.rf_rows_per_bank = field<uint32_t>(rf, "rows_per_bank");
     p.rf_read_ports_per_bank = field<uint32_t>(rf, "read_ports_per_bank");
     p.rf_write_ports_per_bank = field<uint32_t>(rf, "write_ports_per_bank");
-    // Removed (trash/rfc14.md section 3): every instruction reads its operands
-    // in one round, so there is no read window to size. A profile that still
-    // names one is refused rather than silently read differently.
-    if (rf.contains("arithmetic_read_cycles")) {
-        throw ProfileError("device profile: rf.arithmetic_read_cycles was removed (every instruction reads "
-            "its operands in one round); delete the field");
-    }
     // Optional (absent: the canonical 2); present: an integer in 1..8.
     const auto optional_rf = [&](const char* name, uint32_t& out) {
         if (!rf.contains(name)) return;
@@ -273,11 +278,20 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_shmem("read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
     optional_shmem("rmw_compute_cycles", 1, 64, p.shmem_rmw_compute_cycles);
     const auto& tmem = document.at("tmem");
-    p.tmem_banks = field<uint32_t>(tmem, "banks");
-    p.tmem_words_per_bank = field<uint32_t>(tmem, "words_per_bank");
     p.tmem_fine_banks = field<uint32_t>(tmem, "fine_banks");
+    p.tmem_words_per_fine_bank = field<uint32_t>(tmem, "words_per_fine_bank");
     p.tmem_max_vector_width = field<uint32_t>(tmem, "max_vector_width");
-    p.tmem_simt_read_write_duplex = field<bool>(tmem, "simt_read_write_duplex");
+    // Optional (absent: the canonical 2); present: an integer in 1..64.
+    const auto optional_tmem = [&](const char* name, uint32_t& out) {
+        if (!tmem.contains(name)) return;
+        const auto& value = tmem.at(name);
+        if (!value.is_number_unsigned() || value < 1 || value > 64) {
+            throw ProfileError(std::string("device profile: tmem ") + name + " must be an integer in 1..64");
+        }
+        out = value.get<uint32_t>();
+    };
+    optional_tmem("port_depth", p.tmem_port_depth);
+    optional_tmem("read_latency_cycles", p.tmem_read_latency_cycles);
     const auto& mma = document.at("mma");
     p.mma_m = field<uint32_t>(mma, "m");
     p.mma_n = field<uint32_t>(mma, "n");

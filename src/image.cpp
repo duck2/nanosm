@@ -188,7 +188,7 @@ std::string emit_launch_image(const LaunchImage& image) {
     for (const auto word : image.kernel.words) words.push_back(hex_u64(word));
     auto accumulators = json::array();
     for (const auto& acc : image.kernel.accumulators) {
-        accumulators.push_back({{"name", acc.name}, {"bank", acc.bank},
+        accumulators.push_back({{"name", acc.name},
             {"base_word", acc.base_word}, {"rows", acc.rows}, {"cols", acc.cols}});
     }
     json document = {
@@ -232,7 +232,6 @@ LaunchImage load_launch_image(std::string_view source) {
             for (const auto& item : accumulators) {
                 Kernel::Accumulator acc;
                 acc.name = item.at("name").get<std::string>();
-                acc.bank = item.at("bank").get<uint8_t>();
                 acc.base_word = item.at("base_word").get<uint32_t>();
                 acc.rows = item.at("rows").get<uint16_t>();
                 acc.cols = item.at("cols").get<uint16_t>();

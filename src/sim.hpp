@@ -96,7 +96,7 @@ struct ResourceView {
     bool wait_slot_free = false;     // an mbar wait slot
     bool tma_queue_room = false;
     bool mma_queue_room = false;
-    bool acc_slot_free = false;      // the accumulator's tmem bank takes this transfer
+    bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
     // shmem (trash/rfc12.md sections 3, 4 and 6), as this cycle's grants leave it:
     bool no_active_lanes = false;    // the warp's active mask is empty: its lds / sts is absent (no slot)
     bool unserviced_read = false;    // the warp holds a load slot with rounds not yet granted
@@ -118,7 +118,7 @@ enum class Refusal : uint8_t {
     wait_slots_full,
     tma_queue_full,
     mma_queue_full,
-    tmem_bank_busy,
+    acc_engine_busy,
     shmem_ordered,
     shmem_fence,
     load_slots_full,
@@ -221,20 +221,27 @@ public:
     [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_read_cursor(uint32_t bank) const { return rf_read_policy_.cur().cursor.at(bank); }
     [[nodiscard]] uint32_t issue_read_bank_use(uint32_t bank) const { return issue_read_banks_.cur().at(bank); }
-    // Test seam (Q, between ticks): stage `stage` of tmem bank `bank`'s acc.ld
-    // pipeline (the last stage is its output): (destination register, lane
-    // values, last beat), or none when the stage is empty.
+    // Test seam (Q, between ticks): stage `stage` of the acc.ld engine's
+    // pipeline (tmem.port_depth stages to the tmem sample, then
+    // tmem.read_latency_cycles to the output, its last stage): (destination
+    // register, lane values -- empty until the beat's tmem sample -- last
+    // beat), or none when the stage is empty.
     struct AccLdStageView {
         uint8_t reg = 0;
         std::vector<uint32_t> values;
         bool last = false;
     };
-    [[nodiscard]] std::optional<AccLdStageView> acc_ld_stage(uint32_t bank, uint32_t stage) const {
-        const auto& beat = acc_ld_pipes_.cur().at(bank).at(stage);
+    [[nodiscard]] std::optional<AccLdStageView> acc_ld_stage(uint32_t stage) const {
+        const auto& beat = acc_ld_pipe_.cur().at(stage);
         if (!beat.has_value()) return std::nullopt;
         return AccLdStageView{beat->reg, beat->values, beat->last};
     }
-    [[nodiscard]] static constexpr uint32_t acc_ld_pipeline_stages() { return acc_ld_read_stages; }
+    [[nodiscard]] uint32_t acc_ld_pipeline_stages() const {
+        return config_.tmem_port_depth + config_.tmem_read_latency_cycles;
+    }
+    // Test seam (between ticks): tmem word `word` (word w is in fine bank
+    // w % tmem.fine_banks).
+    [[nodiscard]] uint32_t tmem_word(uint32_t word) const { return tmem_.at(word); }
 
     void tick();
     void run(uint64_t cycle_limit = 100000);
@@ -447,36 +454,39 @@ private:
         uint8_t depbar = 0;
     };
 
-    // One beat in an acc.ld transfer pipeline: the tmem column read at its
-    // launch, travelling with its destination and completion context.
+    // One beat in the acc.ld engine's pipeline: one column of the transfer
+    // (sixteen rows, one word per lane, sixteen distinct fine banks), with its
+    // destination and completion context. Its tmem words are sampled when it
+    // reaches the RAM stage (stage tmem.port_depth - 1), once.
     struct AccLdBeat {
         uint32_t warp = 0;
         uint8_t reg = 0;
-        std::vector<uint32_t> values;
-        bool last = false;    // the transfer's final beat: its write clears the depbar
+        uint8_t accumulator = 0;
+        uint32_t row_base = 0;
+        uint32_t column = 0;          // the accumulator column this beat reads
+        bool sampled = false;
+        std::vector<uint32_t> values; // the words, from the tmem sample on
+        bool last = false;    // the transfer's final beat: its sample ends the read, its RF write clears the depbar
         uint8_t depbar = 0;
         bool operator==(const AccLdBeat&) const = default;
     };
-    // [tmem bank][stage]: stage 0 takes the launched read, the last stage is
-    // the output that asks the RF write decision for service.
-    using AccLdPipelines = std::vector<std::vector<std::optional<AccLdBeat>>>;
-    // Today's implicit tmem read latency (audit H7): a beat read at t is the
-    // output at t+1. I6 turns it into tmem.read_latency_cycles.
-    static constexpr uint32_t acc_ld_read_stages = 1;
+    // The acc.ld engine's pipeline: tmem.port_depth stages to the tmem sample,
+    // then tmem.read_latency_cycles stages to the output, which asks the RF
+    // write decision for service. Stage 0 takes the launched read.
+    using AccLdPipeline = std::vector<std::optional<AccLdBeat>>;
 
     // One acc.st beat between its RF read and its tmem write: read (sampled)
-    // at its grant, at the RF output Lr cycles later, written into tmem
-    // tmem_port_stages after that (land_cycle).
+    // at its grant, at the RF output Lr cycles later (where it leaves for
+    // tmem), at the tmem RAM tmem.port_depth after that (land_cycle: written
+    // at that cycle's edge).
     struct AccStBeat {
         uint32_t column = 0;
         uint64_t land_cycle = 0;
         std::vector<uint32_t> values;
     };
-    // Today's implicit tmem write depth: an acc.st beat at the RF output at t
-    // is written into tmem at t + 1. I8 replaces it with tmem.port_depth.
-    static constexpr uint32_t tmem_port_stages = 1;
 
-    // The sanitizer keys its tmem owner by the slot [bank][direction].
+    // The transfer an engine is running. The sanitizer keys its tmem owner by
+    // the engine (acc.ld or acc.st).
     struct AccTransfer {
         bool load = false;
         uint32_t warp = 0;
@@ -488,8 +498,7 @@ private:
         uint32_t width = 1;
         uint32_t next_column = 0;   // beats launched (acc.ld: tmem reads; acc.st: RF reads)
         // acc.st: its beats in flight to tmem, oldest first, and how many
-        // landed. The slot -- the bank's coarse ownership -- frees when the
-        // last one lands.
+        // landed. The acc.st engine frees when the last one lands.
         std::deque<AccStBeat> in_flight;
         uint32_t landed = 0;
     };
@@ -509,13 +518,24 @@ private:
         bool operands_consumed = false;
     };
 
+    // One step in the core, from its entry to its result's tmem write. C (its
+    // tile's sixteen accumulator words, one round of the MMA's tmem read
+    // service) is requested as the step enters and sampled tmem.port_depth
+    // later; the fused dot-plus-C result leaves the core result_latency after
+    // entry and reaches the tmem RAM tmem.port_depth after that (land_cycle:
+    // written at that cycle's edge). The command's result retires there.
     struct MmaResult {
-        uint64_t ready_cycle = 0;
+        uint64_t c_sample_cycle = 0;
+        uint64_t land_cycle = 0;
         uint64_t command = 0;
         uint8_t accumulator = 0;
         uint32_t m0 = 0;
         uint32_t n0 = 0;
-        std::vector<uint32_t> values;
+        bool init_step = false;          // C = 0 instead of the tmem words
+        std::vector<uint16_t> a;         // the step's A block, core_m x core_k fp16
+        std::vector<uint16_t> b;         // its B block, core_n x core_k fp16 (transposed snapshot)
+        bool c_sampled = false;
+        std::vector<uint32_t> values;    // the result, computed at the C sample
     };
 
     // One core step: which tile, which K block, and whether it reloads the
@@ -1046,7 +1066,7 @@ private:
 
     using WaitSlots = std::vector<std::optional<MbarWaitSlot>>;
     using DepbarCounters = std::vector<std::array<uint32_t, 6>>;             // [warp][sb]
-    using AccSlots = std::vector<std::array<std::optional<AccTransfer>, 2>>; // [tmem bank][0 load, 1 store]
+    using AccEngines = std::array<std::optional<AccTransfer>, 2>; // [0 the acc.ld engine, 1 the acc.st engine]
 
     // The MMA engine's queue and pipeline. One group: a command's next_step
     // and operands_consumed track the fetch, its outstanding_results the
@@ -1061,7 +1081,7 @@ private:
         // The held A block: core_m x core_k fp16 (64 B at 4x8), written when a
         // reloading step enters the core, used by the steps after it.
         std::vector<uint16_t> a_held;
-        std::deque<MmaResult> results;  // computed steps waiting for their tmem write
+        std::deque<MmaResult> results;  // steps in the core and in the tmem write pipeline
     };
 
     // The TMA engine's command queue and walker bookkeeping. One group:
@@ -1089,11 +1109,11 @@ private:
 
     // The async RF writers (rfc10 section 3): holders of a complete result
     // vector that waits for its bank's write port. Round-robin order: load
-    // slots, then assembly registers, then the acc.ld pipelines (tmem bank 0, 1).
+    // slots, then assembly registers, then the acc.ld engine's pipeline output.
     enum class AsyncWriter : uint8_t { load_slot, assembly, acc_ld };
     struct AsyncWrite {
         AsyncWriter writer = AsyncWriter::load_slot;
-        uint32_t index = 0;   // load slot / assembly register / tmem bank
+        uint32_t index = 0;   // load slot / assembly register / 0 (the acc.ld engine)
         uint32_t warp = 0;
         uint8_t reg = 0;
     };
@@ -1116,12 +1136,12 @@ private:
     // The async RF readers (rfc10 section 3, mirrored): each wants a read
     // port of one bank in the CURRENT cycle, where the issue register's
     // instruction owns the ports it samples (trash/rfc14.md section 4).
-    // Round-robin order: each tmem bank's acc.st transfer, then the LSU's
+    // Round-robin order: the acc.st engine's next beat, then the LSU's
     // store-data read (vector stores).
     enum class RfReader : uint8_t { acc_st, lsu_store };
     struct RfReadRequest {
         RfReader reader = RfReader::acc_st;
-        uint32_t index = 0;          // tmem bank (acc.st)
+        uint32_t index = 0;          // 0 (the acc.st engine)
         uint32_t warp = 0;
         uint8_t reg = 0;
         uint64_t lsu_command = 0;    // lsu_store
@@ -1347,7 +1367,7 @@ private:
         std::optional<MbarReadRequest> mbar_probe;
         std::optional<std::pair<uint32_t, MbarWaitSlot>> wait_slot; // try-wait: (slot, record)
         std::optional<MmaCommand> mma;
-        struct AccAdmission { uint8_t bank = 0; bool load = false; AccTransfer transfer; };
+        struct AccAdmission { bool load = false; AccTransfer transfer; };
         std::optional<AccAdmission> acc;
         struct LsuAdmission {
             LsuCommand command;
@@ -1368,7 +1388,7 @@ private:
         uint32_t lsu_commands = 0;
         uint32_t tma_commands = 0;
         uint32_t mma_commands = 0;
-        std::vector<std::array<uint32_t, 2>> acc; // [tmem bank][0 load, 1 store]
+        std::array<uint32_t, 2> acc{}; // [0 acc.ld, 1 acc.st]
     };
 
     // All of a cycle's wires, in the order tick() computes them.
@@ -1383,6 +1403,10 @@ private:
         // The RF and predicate writes at the RAM now: they land at this
         // cycle's clock edge (after every read of this cycle).
         std::vector<Writeback> rf_landings;
+        // The tmem writes at the RAM now (MMA results, acc.st beats): they
+        // land at this cycle's clock edge, after every tmem read of this
+        // cycle (READ_FIRST, as shmem). (word address, value)
+        std::vector<std::pair<uint32_t, uint32_t>> tmem_writes;
         // Collected as they happen, from several steps below.
         std::vector<DepbarEvent> depbar_completions;  // in the order they happened
         std::vector<uint32_t> completed_waits;        // try-wait slots completed this cycle
@@ -1397,8 +1421,8 @@ private:
         // drivers, with issue's additions).
         MmaPipeline mma_next;
         std::optional<MbarRmwRequest> mma_present;    // a commit presented into the MMA's event register
-        AccSlots acc_next;
-        AccLdPipelines acc_ld_next;
+        AccEngines acc_next;
+        AccLdPipeline acc_ld_next;
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
@@ -1407,7 +1431,7 @@ private:
         DispatchDecision dispatch;
         // The async RF readers (the read ports the issue register leaves free now), before issue.
         RfReadDecision rf_read;
-        std::vector<std::optional<AccStBeat>> acc_st_reads; // per tmem bank: the beat read now
+        std::optional<AccStBeat> acc_st_read;               // the acc.st engine's beat read now
         LsuRfRead lsu_rf_read;                              // the LSU store-data beat read now
         // Issue.
         IssueDecision issue;
@@ -1435,7 +1459,10 @@ private:
     std::vector<Warp> warps_;                     // + RF and predicate files (write-first)
     std::vector<uint8_t> shmem_;                  // writes land at the clock edge of the cycle they reach the RAM
     std::vector<uint8_t> gmem_;                   // the controller's
-    std::vector<std::vector<uint32_t>> tmem_;     // MMA results / acc beats, banks exclusive
+    // tmem: fine_banks x words_per_fine_bank words; word w is in fine bank
+    // w % fine_banks. Each fine bank's two read and two write services belong
+    // to the MMA (C read, result write) and to the acc.ld and acc.st engines.
+    std::vector<uint32_t> tmem_;
 
     // ---- Registers: the declared storage boundaries ----
     // The front end (trash/front-end-2026-10-18.md): per warp slot its FIFO,
@@ -1478,8 +1505,8 @@ private:
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
     // MMA and accumulator transfers.
     Reg<MmaPipeline> mma_{registers_, "MMA queue and pipeline"};
-    Reg<AccSlots> acc_transfers_{registers_, "acc transfer slots"};
-    Reg<AccLdPipelines> acc_ld_pipes_{registers_, "acc.ld transfer pipelines"};
+    Reg<AccEngines> acc_engines_{registers_, "acc transfer engines"};
+    Reg<AccLdPipeline> acc_ld_pipe_{registers_, "acc.ld pipeline"};
     // TMA.
     Reg<TmaQueue> tma_{registers_, "TMA command queue"};
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
@@ -1609,10 +1636,10 @@ private:
     // ---- units whose next state issue looks ahead at ----
     void step_mma(Wires& w);
     void step_acc_transfers(Wires& w);
-    void step_acc_ld(uint32_t bank, std::optional<AccTransfer>& slot,
-        std::vector<std::optional<AccLdBeat>>& pipe, const Wires& w);
-    std::optional<AccLdBeat> launch_acc_ld_beat(uint32_t bank, std::optional<AccTransfer>& slot);
-    void step_acc_st(uint32_t bank, std::optional<AccTransfer>& slot, Wires& w);
+    void step_acc_ld(std::optional<AccTransfer>& engine, AccLdPipeline& pipe, const Wires& w);
+    std::optional<AccLdBeat> launch_acc_ld_beat(std::optional<AccTransfer>& engine);
+    void sample_acc_ld_beat(AccLdBeat& beat);
+    void step_acc_st(std::optional<AccTransfer>& engine, Wires& w);
     void decide_mbar_timeouts(Wires& w);
     IngressPluck decide_ingress(const Wires& w);
     void step_gmem_controller(Wires& w);
@@ -1684,7 +1711,7 @@ private:
     void drive_free_id_tags(const Wires& w);
     void drive_writebacks(const Wires& w);
     void drive_load_slots(const Wires& w);
-    void drive_acc_ld_pipes(const Wires& w);
+    void drive_acc_ld_pipe(const Wires& w);
     void drive_rf_write_policy(const Wires& w);
     void drive_rf_read_policy(const Wires& w);
     void drive_issue_read_banks(const Wires& w);
@@ -1772,13 +1799,13 @@ private:
     void wake_mbar_waiters(Wires& w, uint32_t byte_address, uint8_t new_phase);
 
     // MMA, acc.
-    [[nodiscard]] bool mma_bank_busy(const MmaPipeline& mma, uint8_t bank) const;
-    [[nodiscard]] bool acc_slot_available(const Wires& w, uint8_t bank, bool load) const;
+    [[nodiscard]] bool acc_engine_available(const Wires& w, bool load) const;
     void advance_mma(MmaPipeline& mma, Wires& w);
     [[nodiscard]] std::optional<MmaFetch> next_mma_step(MmaPipeline& mma, Wires& w);
     [[nodiscard]] MmaRead grant_mma_round(MmaPipeline& mma);
     void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
     void enter_mma_core(MmaPipeline& mma, const MmaStep& step);
+    void sample_mma_c(MmaResult& result);
     [[nodiscard]] std::size_t tmem_word_index(
         const Kernel::Accumulator& acc, uint32_t row, uint32_t col) const;
     void execute_arithmetic(ArithmeticRead& pending, Wires& w);

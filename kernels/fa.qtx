@@ -11,8 +11,8 @@
 ; addresses (even/odd columns), r32/r33 TMEM row/column, r34 score-ready,
 ; r35 workers-done, r37 PV-done (OUTPUT_DONE, the PV commit barrier).
 
-.acc S, 0, 0, 64, 64
-.acc O, 1, 0, 64, 64
+.acc S, 0, 64, 64
+.acc O, 4096, 64, 64
 ; Double-buffered K/V stage sets (roofline E3): TMA fills set 1 on port A
 ; while MMA reads set 0 on port B — the two async engines finally overlap.
 .equ QBUF,       0
