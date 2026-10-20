@@ -174,7 +174,10 @@ struct TraceSummary {
     uint64_t sfu_unit_stalls = 0;
     // The front end: instruction-memory reads (one packet each, one per cycle
     // at most), and fetched words that never issued -- dropped as they came
-    // out of the memory, or cleared from a FIFO, by a taken branch or a halt.
+    // out of the memory, or cleared from a FIFO, by a taken branch or a halt,
+    // or the first half of a packet fetched for a second-half branch target,
+    // skipped as it landed. Once the run is done (every warp halted, no read
+    // in flight): 2 x fetches = instructions + fetches_discarded.
     // The warp-cycles with no instruction to offer are
     // warp_cycles[no_instruction] (the warp's state: its own waits come
     // first). instruction_fifo_empty counts every running warp's cycles with

@@ -781,12 +781,15 @@ std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
 // holds more than its depth, and while the warp runs its fetch pc is always
 // pc rounded down to 16 + 16 x (valid packets + its read in flight); either
 // failing is an internal error. The trace counts the fetch and the fetched
-// words dropped without issuing.
+// words that never issue: those a redirect or a halt clears or drops, and the
+// first half of a packet fetched for a second-half target, skipped as it
+// lands.
 void Machine::step_front_end(Wires& w) {
     const auto& cur = front_end_.cur();
     w.front_end_next = cur;
-    // Fetched words not yet issued: every valid packet's two, less the head's
-    // first half when pc has moved past it.
+    // Fetched words not yet issued or counted: every valid packet's two, less
+    // the head's first half when pc has moved past it (issued, or skipped and
+    // counted as it landed).
     const auto unissued_words = [](const WarpFrontEnd& slot) -> uint64_t {
         if (slot.fifo.empty()) return 0;
         return 2 * slot.fifo.size() - (slot.pc % 16 == 8 ? 1 : 0);
@@ -808,6 +811,10 @@ void Machine::step_front_end(Wires& w) {
         } else if (landing && cur[warp].halted) {
             discarded += 2;
         } else if (landing) {
+            // Into an empty FIFO with pc at a second half: the packet was
+            // fetched for a second-half branch target; its first half never
+            // issues.
+            if (slot.fifo.empty() && slot.pc % 16 == 8) ++discarded;
             slot.fifo.push_back(w.fetched->words);
         }
         if (halting) slot.halted = true;

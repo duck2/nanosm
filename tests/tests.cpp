@@ -12914,10 +12914,13 @@ void test_i6b2_warp_slots_and_profile_fields() {
 // scenario): launch c0..c1 FIFO empty, t + 1 branch unresolved, t + 2 .. t + 3
 // FIFO empty: 5 warp-cycles waiting. The FIFO itself is empty at c0, c1,
 // t + 2, t + 3 but not at t + 1 (packet 48 is cleared at t + 1's edge): 4.
-// Words discarded: at the redirect, packet 48's unissued second half (1) and
-// the landing packet 64 (2); at the halt (the first half of packet 80, at
-// t + 5) its unissued second half (1), and packet 96, granted in the halt's
-// cycle and dropped as it lands (2): 6.
+// Words discarded (the fetched words that never issue): at the redirect,
+// packet 48's unissued second half (1) and the landing packet 64 (2); packet
+// 64 read again for the target (its second half), its first half (mov r7)
+// skipped as it lands at t + 3 (1); at the halt (the first half of packet 80,
+// at t + 5) its unissued second half (1), and packet 96, granted in the
+// halt's cycle and dropped as it lands (2): 7. The same from the totals: 8
+// fetches (packets 0, 16, 32, 48, 64, 64, 80, 96) of 16 words, 9 issued.
 void test_i6b2_trace_supply_state() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
@@ -12949,16 +12952,18 @@ void test_i6b2_trace_supply_state() {
     require(waits == expected, "the supply waits were not traced as launch, branch, refill");
     const auto& summary = machine->trace().summary();
     const auto supply = summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::no_instruction)];
-    require(supply == 5 && summary.instruction_fifo_empty == 4 && summary.fetches_discarded == 6,
+    require(supply == 5 && summary.instruction_fifo_empty == 4 && summary.fetches_discarded == 7 &&
+            summary.fetches == 8 && summary.instructions == 9,
         "the supply counters: waiting " + std::to_string(supply) + ", FIFO empty " +
             std::to_string(summary.instruction_fifo_empty) + ", discarded " +
-            std::to_string(summary.fetches_discarded));
+            std::to_string(summary.fetches_discarded) + ", fetches " + std::to_string(summary.fetches) +
+            ", issued " + std::to_string(summary.instructions));
     require(nanosm::warp_state_name(nanosm::WarpState::no_instruction) == "waiting for instruction",
         "the state's name");
     const auto text = machine->trace().summary_text();
     require(text.find("  waiting for instruction    5\n") != std::string::npos &&
-            text.find("front end: fetches=" + std::to_string(summary.fetches) +
-                " discarded=6 waiting_for_instruction=5 fifo_empty=4\n") != std::string::npos,
+            text.find("front end: fetches=8 discarded=7 waiting_for_instruction=5 fifo_empty=4\n") !=
+                std::string::npos,
         "the summary text lacks the supply state or the front-end line:\n" + text);
 }
 
@@ -12996,7 +13001,51 @@ void test_i6b2_trace_counts_every_warp() {
             summary.instruction_fifo_empty == 5 &&
             summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::not_examined)] == 4,
         "the summary undercounts the warps past the winner");
+    // Its summary line: the name is wider than the column, a space still
+    // separates it from the count (Codex's packet review, backlog D13).
+    const auto text = machine->trace().summary_text();
+    require(text.find("\n  not examined (another warp issued) 4\n") != std::string::npos,
+        "the summary's not-examined line has no space before its count:\n" + text);
     require(machine->read_reg(1, 0, 1) == 2, "data");
+}
+
+// Discarded words are the fetched words that never issue (Codex's packet
+// review, backlog D13), including the first half of a packet fetched for a
+// second-half branch target, skipped as it lands. `bra target`, `target:
+// halt`: the target is word 1, packet 0's second half. Packet 0 is fetched at
+// c0 and packet 16 at c1; the bra issues at t = c2 (packet 16 lands behind
+// packet 0) and its redirect at t + 1 clears packet 0's second half and
+// packet 16 (3). Packet 0 is read again at t + 2 and packet 16 at t + 3;
+// packet 0 lands at t + 3 and its first half (the bra) is skipped (1); the
+// halt issues at t + 4 and packet 16 is dropped as it lands (2): 6, as the
+// totals say: 4 fetches of 8 words, 2 issued. With a mov before the target
+// (word 2, packet 16's first half) nothing is skipped: the redirect clears 3,
+// packet 16 is read again at t + 2 and packet 32 at t + 3, the halt issues
+// at t + 4 with its packet's second half unissued (1) and packet 32 is
+// dropped as it lands (2): 6 as well.
+void test_i6b2_skipped_first_half_is_discarded() {
+    const auto& profile = canonical_profile();
+    const uint64_t t = nanosm::fetch_to_issue;
+    for (const auto& [body, target_packet, what] : std::vector<std::tuple<std::string, uint32_t, std::string>>{
+             {"bra target\ntarget: halt\n", 0, "second-half target: "},
+             {"bra target\nmov r0, 0\ntarget: halt\n", 16, "first-half target: "}}) {
+        auto machine = i6b2_machine(profile, body);
+        machine->run();
+        const std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> fetches{
+            {0, 0, 0}, {1, 0, 16}, {t + 2, 0, target_packet}, {t + 3, 0, target_packet + 16}};
+        require(i6b2_fetches(*machine) == fetches, what + "the fetches were not packets 0, 16, then the target's two");
+        const auto issues = i6b2_issues(*machine);
+        require(issues.size() == 2 && std::get<0>(issues[0]) == t &&
+                std::get<0>(issues[1]) == t + nanosm::branch_taken_interval,
+            what + "the bra did not issue at t and the halt at t + 4:" + issue_log(*machine));
+        const auto& summary = machine->trace().summary();
+        require(summary.fetches == 4 && summary.instructions == 2 && summary.fetches_discarded == 6 &&
+                2 * summary.fetches == summary.instructions + summary.fetches_discarded,
+            what + "fetches " + std::to_string(summary.fetches) + ", issued " +
+                std::to_string(summary.instructions) + ", discarded " + std::to_string(summary.fetches_discarded));
+        require(machine->trace().summary_text().find("front end: fetches=4 discarded=6 ") != std::string::npos,
+            what + "the summary's front-end line");
+    }
 }
 
 // Two warps, the same code, alternating one issue per cycle from c2 (warp w's
@@ -13684,6 +13733,7 @@ int main() {
         {"I6b-2: warp slots and profile fields", test_i6b2_warp_slots_and_profile_fields},
         {"I6b-2: trace supply state", test_i6b2_trace_supply_state},
         {"I6b-2: trace counts every warp", test_i6b2_trace_counts_every_warp},
+        {"I6b-2: a second-half target's skipped first half is discarded", test_i6b2_skipped_first_half_is_discarded},
         {"I6b-2: redirects across warps", test_i6b2_redirects_across_warps},
         {"I6b-2: redirect behind many fetchers", test_i6b2_redirect_behind_many_fetchers},
         {"I6b-2: front-end consistency check", test_i6b2_front_end_consistency_check},

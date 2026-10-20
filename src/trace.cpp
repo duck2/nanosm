@@ -538,9 +538,11 @@ std::string TraceRecorder::summary_text() const {
     out << "  no eligible warp             " << summary_.scheduler_idle_cycles << '\n';
     out << "  draining                     " << summary_.scheduler_draining_cycles << '\n';
     out << "warp cycles (total " << warp_total << "):\n";
+    // At least one space after a state's name, however long ("not examined
+    // (another warp issued)" is wider than the column).
     for (std::size_t i = 0; i < static_cast<std::size_t>(WarpState::count); ++i) {
         const auto state = static_cast<WarpState>(i);
-        out << "  " << std::left << std::setw(27) << warp_state_name(state) << std::right
+        out << "  " << std::left << std::setw(26) << warp_state_name(state) << ' ' << std::right
             << summary_.warp_cycles[i] << '\n';
     }
     out << "shmem: requests=" << summary_.shmem_requests
