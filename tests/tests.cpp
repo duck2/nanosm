@@ -2371,10 +2371,10 @@ void test_tma_xor64_feeds_mma_orientations() {
             @!p0 bra.uni wait3
             mov r10, 1024
             mov r11, 2048
-            mma.async.init C, [r10], [r11]
+            mma.async.init.m64n64k8 C, [r10], [r11]
             mov r10, 3072
             mov r11, 4096
-            mma.async C, [r10], [r11]
+            mma.async.m64n64k8 C, [r10], [r11]
             mov r4, 544
             mma.commit [r4]
         wait_commit:
@@ -3718,7 +3718,7 @@ void test_mma_fusion_boundaries() {
         profile.mma_core_k = core_k;
         const auto scheduled = nanosm::compile_qtx(
             ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\nmov r8, 0\n"
-            "mbar.init [r4], 1\nmma.async.init C, [r0], [r1]\nmma.commit [r4]\n"
+            "mbar.init [r4], 1\nmma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\n"
             "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nacc.ld r10, C, r8\nhalt\n", profile);
         const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile);
         nanosm::Launch launch;
@@ -3749,9 +3749,9 @@ void test_autonomous_mma_gemm_and_commit() {
     qtx << ".acc C, 0, 64, 64\n"
         << "mov r0, 0\nmov r1, 1024\nmov r4, 4096\nmov r8, 0\nmov r9, 0\n"
         << "mbar.init [r4], 1\n"
-        << "mma.async.init C, [r0], [r1]\n";
+        << "mma.async.init.m64n64k8 C, [r0], [r1]\n";
     for (uint32_t chunk = 1; chunk < 64; ++chunk)
-        qtx << "mma.async C, [r0], [r1]\n";
+        qtx << "mma.async.m64n64k8 C, [r0], [r1]\n";
     // The GEMM proof passes because of the protocol: the commit mbar is
     // explicitly observed before any transfer touches C (cases 01/13).
     qtx << "mma.commit [r4]\n"
@@ -3764,7 +3764,7 @@ void test_autonomous_mma_gemm_and_commit() {
             scheduled.instructions[7].control.set_depbar < 6,
         "qtxc did not allocate MMA operand-consumed depbars");
     const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile);
-    require(nanosm::decode(kernel.words[6]).opcode == nanosm::Opcode::mma_async_init &&
+    require(nanosm::decode(kernel.words[6]).opcode == nanosm::mma_opcode(0, true) && // m64n64k8, init
             nanosm::decode(kernel.words[70]).opcode == nanosm::Opcode::mma_commit,
         "MMA opcodes did not survive assembly encoding");
 
@@ -3887,9 +3887,9 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
         mov r0, 0
         mov r1, 1024
         mov r4, 4096
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         mma.commit [r4]
-        mma.async C, [r0], [r1]
+        mma.async.m64n64k8 C, [r0], [r1]
         halt
     )");
     const auto make_launch = [&] {
@@ -4042,12 +4042,12 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
         std::ostringstream qtx;
         qtx << ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
             << "mov r8, 0\nmov r9, 0\nmov r10, 0\n"
-            << "mma.async.init C, [r0], [r1]\nmma.commit [r4]\n";
+            << "mma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\n";
         if (delay.has_value()) {
             for (uint32_t i = 0; i < *delay; ++i) qtx << "mov r" << 12 + i % 8 << ", " << i << '\n';
             qtx << "tma.async [" << descriptor_address << "], r8\n";
         }
-        qtx << "mma.async C, [r0], [r1]\nhalt\n";
+        qtx << "mma.async.m64n64k8 C, [r0], [r1]\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 8192);
@@ -4114,32 +4114,54 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     require(aligned, "no delay made the TMA completion and the commit present in one cycle");
 }
 
+void require_mentions(
+    const std::string& message, std::initializer_list<std::string_view> needles, const std::string& what);
+
 void test_mma_dense_profile_recurrence_bubbles() {
+    // D15: a shape with k > core_k must revisit each accumulator block late
+    // enough to hide the accumulator latency, so a profile whose result
+    // latency outruns one command's sweep is refused (m32n64k8 on a 4x4x4
+    // core: 128 steps between visits). Recurrence bubbles remain for
+    // back-to-back COMMANDS on one accumulator: the second command's first
+    // step waits for the first command's result of the same block. Here
+    // m32n64k8 on a 4x4x8 core (k = core_k: one visit per command), the
+    // dense layout (B's k rows share a bank pair: about 8 rounds a step, so
+    // one command's 128 steps take about 1100 cycles), a 4000-cycle result
+    // latency, init then accumulate.
+    auto too_slow = canonical_profile();
+    too_slow.mma_shapes = {{32, 64, 8}};
+    too_slow.mma_core_k = 4;
+    too_slow.mma_xor_layout = false;
+    too_slow.mma_result_latency_cycles = 1000;
+    try {
+        nanosm::validate_device_profile(too_slow);
+        throw std::runtime_error("a k > core_k shape that cannot hide its accumulator latency was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"m32n64k8", "revisited every 128 steps", "needs at least 1006"},
+            "the latency rule's message");
+    }
     auto profile = canonical_profile();
-    profile.mma_m = 16;
-    profile.mma_n = 4;
-    profile.mma_k = 8;
-    profile.mma_core_m = 4;
-    profile.mma_core_n = 4;
-    profile.mma_core_k = 4;
+    profile.mma_shapes = {{32, 64, 8}};
     profile.mma_xor_layout = false;
-    profile.mma_result_latency_cycles = 12;
+    profile.mma_result_latency_cycles = 4000;
     nanosm::validate_device_profile(profile);
     auto unsupported = profile;
     unsupported.mma_xor_layout = true;
+    unsupported.mma_core_n = 2; // xor64 keeps a 4x4 block's rows apart: a 4x4x4 or 4x4x8 core only
     try {
         nanosm::validate_device_profile(unsupported);
         throw std::runtime_error("unsupported generalized XOR MMA layout was accepted");
     } catch (const nanosm::ProfileError&) {}
     const auto kernel = compile(R"(
-        .acc C, 0, 16, 4
+        .acc C, 0, 32, 64
         mov r0, 0
-        mov r1, 512
+        mov r1, 1024
         mov r4, 896
         mbar.init [r4], 1
         mov r8, 0
         mov r9, 0
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m32n64k8 C, [r0], [r1]
+        mma.async.m32n64k8 C, [r0], [r1]
         mma.commit [r4]
     wait_done:
         mbar.try_wait p0, [r4], 0
@@ -4149,27 +4171,29 @@ void test_mma_dense_profile_recurrence_bubbles() {
     )", profile);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 1024);
-    for (uint32_t m = 0; m < 16; ++m)
+    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    for (uint32_t m = 0; m < 32; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, 2 * (m * 8 + k), 0x3c00);
     for (uint32_t k = 0; k < 8; ++k)
-        for (uint32_t n = 0; n < 4; ++n) write_u16(shmem, 512 + 2 * (k * 4 + n), 0x3c00);
+        for (uint32_t n = 0; n < 64; ++n) write_u16(shmem, 1024 + 2 * (k * 64 + n), 0x3c00);
     nanosm::Machine machine(profile, kernel, std::move(launch), {.timeline = true});
-    machine.run(1000);
-    require(machine.read_reg(0, 0, 10) == nanosm::float_bits(8.0f),
-        "dense diagnostic MMA profile produced the wrong result");
+    machine.run(40000);
+    require(machine.read_reg(0, 0, 10) == nanosm::float_bits(16.0f),
+        "dense diagnostic MMA profile produced the wrong result (8 + 8 ones)");
     require(machine.trace().summary().mma_recurrence_stalls > 0,
-        "small dense MMA profile did not expose its recurrence bubbles");
+        "back-to-back commands on one accumulator did not expose their recurrence bubbles");
     require(machine.trace().summary().mma_shmem_rounds >
             machine.trace().summary().mma_input_steps,
         "dense diagnostic footprint did not charge its shmem bank conflicts");
 }
 
+// The smallest ISA shape (m32n64k8: A 512 B, B 1024 B) on a 4x4x4 core,
+// dense layout, one shmem bank: every port-B round is one word, so a step
+// that reloads A is sixteen rounds (eight A words, eight B words) and every
+// other step eight.
 nanosm::DeviceProfile dense_one_bank_profile(uint32_t result_latency) {
     auto profile = canonical_profile();
-    profile.mma_m = 16;
-    profile.mma_n = 4;
-    profile.mma_k = 8;
+    profile.mma_shapes = {{32, 64, 8}};
     profile.mma_core_m = 4;
     profile.mma_core_n = 4;
     profile.mma_core_k = 4;
@@ -4188,18 +4212,18 @@ void test_mma_bare_transfer_race_panics() {
     // 2 + read latency 2.)
     const auto profile = dense_one_bank_profile(4);
     const auto kernel = compile(R"(
-        .acc C, 0, 16, 4
+        .acc C, 0, 32, 64
         mov r4, 14000
         mbar.init [r4], 1
         mov r0, 0
         mov r1, 2048
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m32n64k8 C, [r0], [r1]
         mov r0, 4096
         mov r1, 6144
-        mma.async C, [r0], [r1]
+        mma.async.m32n64k8 C, [r0], [r1]
         mov r0, 8192
         mov r1, 10240
-        mma.async C, [r0], [r1]
+        mma.async.m32n64k8 C, [r0], [r1]
         mma.commit [r4]
         mov r8, 0
         mov r9, 0
@@ -4219,25 +4243,27 @@ void test_mma_bare_transfer_race_panics() {
 }
 
 void test_mma_multi_round_fetch_timing() {
-    // Case 03/05/06: one bank makes every 4x4x4 step a 16-round fetch (with
-    // one N block every step reads its A block too). A step granted its first
-    // round at t is granted its last at t+15; that round reaches the RAM at
-    // t+15+D and the port output at t+15+D+Lb, where the step enters the core
-    // (the port-B read pipeline has port A's D and Lb); its result leaves the
-    // core at entry + latency and lands in tmem tmem.port_depth later (I8);
-    // the next step's first round is granted at t+16; and the
-    // operand-consumed depbar clears at the LAST PHYSICAL READ of the final
-    // step: its last round's RAM sample.
+    // Case 03/05/06 (I9: the m32n64k8 shape): one bank makes every port-B
+    // round one word. Steps run k block, then the 8 m blocks, then the 16 n
+    // blocks; a step at n block 0 reloads A (eight A words + eight B words =
+    // 16 rounds), every other step reads B only (8 rounds). A step granted its
+    // first round at t is granted its last at t + rounds - 1; that round
+    // reaches the RAM D later and the port output D + Lb later, where the step
+    // enters the core (the port-B read pipeline has port A's D and Lb); its
+    // result leaves the core at entry + latency and lands in tmem
+    // tmem.port_depth later (I8); the next step's first round is granted at
+    // t + rounds; and the operand-consumed depbar clears at the LAST PHYSICAL
+    // READ of the final step: its last round's RAM sample.
     const auto profile = dense_one_bank_profile(12);
     const std::string source = R"(
-        .acc C, 0, 16, 4
+        .acc C, 0, 32, 64
         mov r0, 0
-        mov r1, 512
+        mov r1, 1024
         mov r4, 896
         mbar.init [r4], 1
         mov r8, 0
         mov r9, 0
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m32n64k8 C, [r0], [r1]
         mma.commit [r4]
     wait_done:
         mbar.try_wait p0, [r4], 0
@@ -4246,20 +4272,20 @@ void test_mma_multi_round_fetch_timing() {
         halt
     )";
     const auto scheduled = nanosm::compile_qtx(source, profile);
-    require(scheduled.instructions[6].opcode == nanosm::Opcode::mma_async_init,
+    require(scheduled.instructions[6].opcode == nanosm::mma_opcode(0, true), // m32n64k8 (its only shape), init
         "multi-round timing test instruction index changed unexpectedly");
     const auto bar = scheduled.instructions[6].control.set_depbar;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 1024);
-    for (uint32_t m = 0; m < 16; ++m)
+    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    for (uint32_t m = 0; m < 32; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, 2 * (m * 8 + k), 0x3c00);
     for (uint32_t k = 0; k < 8; ++k)
-        for (uint32_t n = 0; n < 4; ++n) write_u16(shmem, 512 + 2 * (k * 4 + n), 0x3c00);
+        for (uint32_t n = 0; n < 64; ++n) write_u16(shmem, 1024 + 2 * (k * 64 + n), 0x3c00);
     nanosm::Machine machine(profile,
         nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile),
         std::move(launch), {.timeline = true, .debug = true});
-    machine.run(4000);
+    machine.run(8000);
     std::vector<uint64_t> inputs;
     uint64_t first_result = 0;
     uint64_t depbar_cleared = 0;
@@ -4271,19 +4297,21 @@ void test_mma_multi_round_fetch_timing() {
             depbar_cleared = event.start_cycle;
         }
     }
-    require(inputs.size() == 8, "one dense 16x4x8 command is eight core steps");
-    for (std::size_t i = 0; i < inputs.size(); ++i)
-        require(inputs[i] == inputs[0] + 16 * i,
-            "16-round fetches did not serialize the port at one round per cycle");
+    // 8 m blocks x 16 n blocks x 2 k blocks; a step's rounds: 16 at n block 0.
+    const auto rounds = [](std::size_t step) -> uint64_t { return step % 16 == 0 ? 16 : 8; };
+    require(inputs.size() == 256, "one dense m32n64k8 command on a 4x4x4 core is 256 core steps");
+    for (std::size_t i = 1; i < inputs.size(); ++i)
+        require(inputs[i] == inputs[i - 1] + rounds(i - 1),
+            "step " + std::to_string(i) + ": the fetches did not serialize the port at one round per cycle");
     const auto d = profile.shmem_port_a_depth;
     const auto lb = profile.shmem_read_latency_cycles;
     require(first_result == inputs[0] + 15 + d + lb + 12 + profile.tmem_port_depth,
         "the result did not land at core entry (last round + D + Lb) plus the pipeline latency plus the "
         "tmem port depth");
-    require(depbar_cleared == inputs[7] + 15 + d,
+    require(depbar_cleared == inputs[255] + rounds(255) - 1 + d,
         "operand-consumed depbar did not clear at the final physical read (the last round's sample)");
     require(machine.trace().summary().mma_recurrence_stalls == 0,
-        "16-round spacing already covers the result latency; no bubbles expected");
+        "a tile is revisited 128 steps (over a thousand rounds) later; no bubbles expected");
     for (uint32_t lane = 0; lane < profile.lanes; ++lane)
         require(machine.read_reg(0, lane, 10) == nanosm::float_bits(8.0f),
             "per-round operand capture changed the numerical result");
@@ -4305,7 +4333,7 @@ void test_mma_varying_round_service() {
         mbar.init [r4], 1
         mov r8, 0
         mov r9, 0
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         mma.commit [r4]
     wait_done:
         mbar.try_wait p0, [r4], 0
@@ -4363,8 +4391,8 @@ std::unique_ptr<nanosm::Machine> i7_machine(const std::array<uint16_t, 8>& a,
     const auto& profile = canonical_profile();
     std::ostringstream qtx;
     qtx << ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\nmov r8, 0\nmov r9, 0\n"
-        << "mbar.init [r4], 1\nmma.async.init C, [r0], [r1]\n";
-    for (uint32_t command = 1; command < commands; ++command) qtx << "mma.async C, [r0], [r1]\n";
+        << "mbar.init [r4], 1\nmma.async.init.m64n64k8 C, [r0], [r1]\n";
+    for (uint32_t command = 1; command < commands; ++command) qtx << "mma.async.m64n64k8 C, [r0], [r1]\n";
     qtx << "mma.commit [r4]\nwait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\n"
         << "acc.ld r10, C, r8\nhalt\n";
     nanosm::Launch launch;
@@ -4533,6 +4561,718 @@ void write_count_mbar(std::vector<uint8_t>& shmem, uint32_t address, uint16_t co
     write_u64(shmem, address, nanosm::encode_mbar_state(state));
 }
 
+// ---- I9: MMA shapes as opcodes, the profile's shape list, the 32x64 tile ----
+// (trash/chan.txt 2026-10-19; trash/i9-32x64-tile-proposal-fable-2026-10-19.md)
+
+// Independent restatements (not the production helpers): xor64 operand
+// element addresses for objects at any 64-byte-aligned base (a row is 16 B;
+// rows past 31 simply continue, so a 64-row object is two stacked 32-row
+// ones), the tmem word of an accumulator element (16 fine banks, 4x4
+// macro-tiles row-major), and small exact FP16 integers.
+uint32_t i9_a_address(uint32_t base, uint32_t m, uint32_t k) {
+    return base + 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
+}
+uint32_t i9_b_address(uint32_t base, uint32_t k, uint32_t n) {
+    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1) ^ 2)) + 2 * (k & 1);
+}
+uint32_t i9_tmem_word(uint32_t base, uint32_t cols, uint32_t row, uint32_t col) {
+    return base + ((row / 4) * (cols / 4) + col / 4) * 16 + 4 * (row % 4) + ((col % 4) ^ ((row / 4) % 4));
+}
+uint16_t i9_fp16(uint32_t value) {
+    static constexpr std::array<uint16_t, 5> bits{0x0000, 0x3c00, 0x4000, 0x4200, 0x4400}; // 0..4
+    return bits.at(value);
+}
+// A(m, k) and B(k, n): small integers, so every dot product is exact in FP32.
+uint32_t i9_a(uint32_t m, uint32_t k) { return (m + 3 * k) % 5; }
+uint32_t i9_b(uint32_t k, uint32_t n) { return (2 * k + n) % 3; }
+float i9_reference(uint32_t m, uint32_t n) {
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < 8; ++k) sum += static_cast<float>(i9_a(m, k) * i9_b(k, n));
+    return sum;
+}
+
+// A 64-row A object at 0 and a B object at 2048, both from i9_a / i9_b.
+void i9_write_operands(nanosm::Launch& launch) {
+    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    for (uint32_t m = 0; m < 64; ++m)
+        for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, i9_a_address(0, m, k), i9_fp16(i9_a(m, k)));
+    for (uint32_t k = 0; k < 8; ++k)
+        for (uint32_t n = 0; n < 64; ++n) write_u16(shmem, i9_b_address(2048, k, n), i9_fp16(i9_b(k, n)));
+}
+
+// D15 (trash/chan.txt 2026-10-22): the mma.async block. Shape i of the
+// profile's list is opcode 0x70 + 2i (accumulate) and 0x70 + 2i + 1 (init);
+// names follow the profile, and without one an opcode is named by its place
+// in the block. A lossless encoding; the text qtxc and the hand assembler
+// parse; shape names parsed strictly; the shape-less spellings are not
+// instructions.
+void test_i9_mma_opcodes() {
+    const auto& profile = canonical_profile();
+    struct Expected {
+        uint32_t index;
+        bool init;
+        uint8_t number;
+        const char* name;
+        nanosm::MmaShape shape;
+    };
+    const std::array<Expected, 4> expected{{
+        {0, false, 0x70, "mma.async.m64n64k8", {64, 64, 8}},
+        {0, true, 0x71, "mma.async.init.m64n64k8", {64, 64, 8}},
+        {1, false, 0x72, "mma.async.m32n64k8", {32, 64, 8}},
+        {1, true, 0x73, "mma.async.init.m32n64k8", {32, 64, 8}},
+    }};
+    for (const auto& e : expected) {
+        const auto opcode = nanosm::mma_opcode(e.index, e.init);
+        const auto slot = std::string(e.init ? "mma.async.init.slot" : "mma.async.slot") + std::to_string(e.index);
+        require(static_cast<uint8_t>(opcode) == e.number && nanosm::is_mma_async(opcode) &&
+                nanosm::is_mma_init(opcode) == e.init && nanosm::mma_shape_index(opcode) == e.index &&
+                nanosm::mma_shape_of(profile, opcode) == e.shape &&
+                nanosm::opcode_name(opcode, &profile.mma_shapes) == e.name && nanosm::opcode_name(opcode) == slot,
+            std::string(e.name) + ": opcode, init, shape or name");
+        nanosm::Instruction inst;
+        inst.opcode = opcode;
+        inst.dst = 3;
+        inst.src0 = 7;
+        inst.src1 = 11;
+        inst.control.set_depbar = 2;
+        const auto decoded = nanosm::decode(nanosm::encode(inst));
+        require(decoded.opcode == opcode && decoded.dst == 3 && decoded.src0 == 7 && decoded.src1 == 11 &&
+                nanosm::format_instruction(decoded, false, &profile.mma_shapes) ==
+                    std::string(e.name) + " ACC3, [r7], [r11]",
+            std::string(e.name) + ": encode / decode / text: " +
+                nanosm::format_instruction(decoded, false, &profile.mma_shapes));
+    }
+    require(nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x70)) &&
+            nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x7f)) &&
+            !nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x6f)) &&
+            !nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x80)) &&
+            !nanosm::is_mma_async(nanosm::Opcode::mma_commit),
+        "the mma.async block is 0x70..0x7f, and mma.commit is not in it");
+    require(!nanosm::mma_shape_of(profile, nanosm::mma_opcode(2, false)).has_value() &&
+            !nanosm::mma_shape_of(profile, nanosm::Opcode::mma_commit).has_value(),
+        "an opcode past the profile's list, or outside the block, has a shape");
+    require(nanosm::parse_mma_shape_name("m128n32k16") == nanosm::MmaShape{128, 32, 16} &&
+            !nanosm::parse_mma_shape_name("m64n64").has_value() &&
+            !nanosm::parse_mma_shape_name("m0n64k8").has_value() &&
+            !nanosm::parse_mma_shape_name("m64n64k8x").has_value() &&
+            !nanosm::parse_mma_shape_name("M64N64K8").has_value() &&
+            !nanosm::parse_mma_shape_name("m-4n64k8").has_value(),
+        "shape names are parsed strictly");
+    for (const auto& e : expected) {
+        const auto rows = e.shape.m;
+        const auto source = ".acc C, 0, " + std::to_string(rows) + ", 64\nmov r0, 0\nmov r1, 2048\n" +
+            std::string(e.name) + " C, [r0], [r1]\nhalt\n";
+        const auto scheduled = nanosm::compile_qtx(source, profile);
+        const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile);
+        require(nanosm::decode(kernel.words.at(2)).opcode == nanosm::mma_opcode(e.index, e.init),
+            std::string(e.name) + ": qtxc and the hand assembler did not produce the opcode");
+        require(nanosm::emit_hex(kernel, &profile.mma_shapes).find(std::string(e.name) + " ACC0") != std::string::npos,
+            std::string(e.name) + ": the hex comment does not name the shape");
+    }
+    for (const auto* old : {"mma.async C, [r0], [r1]", "mma.async.init C, [r0], [r1]"}) {
+        try {
+            (void)nanosm::compile_qtx(std::string(".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 2048\n") + old + "\nhalt\n",
+                profile);
+            throw std::runtime_error(std::string("the shape-less '") + old + "' was accepted");
+        } catch (const nanosm::SimError&) {}
+    }
+}
+
+// The profile lists its MMA shapes by name (D15: any shape that follows the
+// rules, each once): m, n, k whole multiples of the core; an accumulator of
+// at least `lanes` rows that fits in tmem; k > core_k only with enough
+// blocks per K block to hide the accumulator latency; at most eight shapes
+// (the opcode block). The list is fingerprinted, so its ORDER (which assigns
+// the opcodes) is too. A kernel using a shape or an opcode the profile does
+// not define, or an accumulator whose rows x columns differ from its MMA's
+// shape, is refused by qtxc, by the hand assembler and at kernel load.
+void test_i9_profile_shapes_and_refusals() {
+    const auto& profile = canonical_profile();
+    require(profile.mma_shapes == std::vector<nanosm::MmaShape>{{64, 64, 8}, {32, 64, 8}},
+        "the canonical profile does not list m64n64k8 and m32n64k8");
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    const auto refused = [&](const nlohmann::json& shapes, const std::string& what) {
+        auto changed = document;
+        if (shapes.is_null()) changed["mma"].erase("shapes");
+        else changed["mma"]["shapes"] = shapes;
+        try {
+            (void)nanosm::parse_device_profile(changed.dump());
+            throw std::runtime_error(what + " was accepted");
+        } catch (const nanosm::ProfileError&) {}
+    };
+    refused(nullptr, "a profile without mma.shapes");
+    refused(nlohmann::json::array(), "an empty shape list");
+    refused("m64n64k8", "a shape name that is not a list");
+    refused(nlohmann::json::array({"m64n64k8", "m64n64k8"}), "a shape listed twice");
+    refused(nlohmann::json::array({64}), "a shape that is not a name");
+    refused(nlohmann::json::array({"m64n64"}), "a malformed shape name");
+    const auto rule = [&](const char* shape, const std::string& expected, const std::string& what) {
+        auto changed = document;
+        changed["mma"]["shapes"] = nlohmann::json::array({"m64n64k8", shape});
+        try {
+            (void)nanosm::parse_device_profile(changed.dump());
+            throw std::runtime_error(what + " was accepted");
+        } catch (const nanosm::ProfileError& error) {
+            require_mentions(error.what(), {std::string("mma shape ") + shape, expected}, what);
+        }
+    };
+    // Every dimension is a power of two (HUMAN 2026-10-22), checked first.
+    rule("m6n64k8", "m, n and k must be powers of two (m is 6)", "an m that is not a power of two");
+    rule("m48n64k8", "m, n and k must be powers of two (m is 48)", "m = 48");
+    rule("m64n12k8", "m, n and k must be powers of two (n is 12)", "n = 12");
+    rule("m64n64k12", "m, n and k must be powers of two (k is 12)", "k = 12");
+    // Powers of two that are not whole core blocks.
+    rule("m64n2k8", "multiples of the core's 4x4x8", "an n smaller than core_n");
+    rule("m64n64k4", "multiples of the core's 4x4x8", "a k smaller than core_k");
+    rule("m8n64k8", "an accumulator needs at least 16", "an accumulator smaller than a lane each");
+    rule("m128n128k8", "does not fit in tmem", "an accumulator larger than tmem");
+    // The latency rule at canonical timing: D 2 + Lb 2 + result latency 8 +
+    // tmem port depth 2 = 14 steps between visits of one accumulator block.
+    require(nanosm::mma_min_blocks_per_k(profile) == 14, "the canonical latency bound is 2 + 2 + 8 + 2");
+    rule("m16n8k16", "revisited every 8 steps", "a k > core_k shape revisiting its blocks too soon");
+    // (With every dimension a power of two, the blocks per K block come in
+    // powers of two too: 8 is short of 14, 16 is enough.)
+    rule("m16n12k16", "m, n and k must be powers of two (n is 12)", "a k > core_k shape with n = 12");
+    auto nine = document;
+    nine["mma"]["shapes"] = nlohmann::json::array();
+    for (const char* shape : {"m16n4k8", "m16n8k8", "m16n16k8", "m16n32k8", "m16n64k8", "m16n128k8",
+             "m32n4k8", "m32n8k8", "m32n16k8"})
+        nine["mma"]["shapes"].push_back(shape);
+    try {
+        (void)nanosm::parse_device_profile(nine.dump());
+        throw std::runtime_error("nine shapes were accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"lists 9 shapes", "holds 8"}, "nine shapes");
+    }
+    auto wider = document;
+    wider["mma"]["shapes"] = nlohmann::json::array({"m64n64k8", "m16n16k16", "m16n64k32", "m128n64k8"});
+    const auto accepted = nanosm::parse_device_profile(wider.dump()); // 16 blocks per K block >= 14
+    require(accepted.mma_shapes.size() == 4 && accepted.mma_shapes[1] == nanosm::MmaShape{16, 16, 16},
+        "legal shapes (k > core_k with 16 and 64 blocks per K block, a 128-row shape) were refused");
+    auto only_m64 = document;
+    only_m64["mma"]["shapes"] = nlohmann::json::array({"m64n64k8"});
+    const auto restricted = nanosm::parse_device_profile(only_m64.dump());
+    require(restricted.mma_shapes == std::vector<nanosm::MmaShape>{{64, 64, 8}} &&
+            nanosm::device_profile_fingerprint(restricted) != nanosm::device_profile_fingerprint(profile),
+        "the shape list is not parsed or not fingerprinted");
+    auto odd_core = profile;
+    odd_core.mma_xor_layout = false;
+    odd_core.mma_core_m = 3; // 32 and 64 rows are not whole 3-row blocks
+    try {
+        nanosm::validate_device_profile(odd_core);
+        throw std::runtime_error("a shape that is not whole core blocks was accepted");
+    } catch (const nanosm::ProfileError&) {}
+
+    const std::string m32 = ".acc T, 4096, 32, 64\nmov r0, 0\nmov r1, 2048\nmma.async.init.m32n64k8 T, [r0], [r1]\nhalt\n";
+    // qtxc: the profile does not list m32n64k8.
+    try {
+        (void)nanosm::compile_qtx(m32, restricted);
+        throw std::runtime_error("qtxc accepted an unsupported shape");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"line 4", "mma.async.init.m32n64k8: shape m32n64k8 is not one of this "
+            "device profile's mma shapes"}, "qtxc unsupported shape");
+    }
+    // The hand assembler: an m64 kernel assembled for the restricted profile,
+    // its mnemonic changed to m32 in the text.
+    auto text = nanosm::emit_asm(nanosm::compile_qtx(
+        ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 2048\nmma.async.init.m64n64k8 C, [r0], [r1]\nhalt\n", restricted));
+    text.replace(text.find("mma.async.init.m64n64k8"), 23, "mma.async.init.m32n64k8");
+    try {
+        (void)nanosm::assemble_asm(text, restricted);
+        throw std::runtime_error("the hand assembler accepted an unsupported shape");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"shape m32n64k8 is not one of this device profile's mma shapes"},
+            "hand assembler unsupported shape");
+    }
+    // Kernel load: a canonical m32 kernel relabelled for the restricted profile.
+    auto relabelled = compile(m32, profile);
+    relabelled.profile_fingerprint = nanosm::device_profile_fingerprint(restricted);
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        nanosm::Machine machine(restricted, relabelled, std::move(launch));
+        throw std::runtime_error("kernel load accepted an unsupported shape");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"kernel pc 16",
+            "mma.async.init.slot1: this device profile defines no mma shape for it (its list has 1 shapes)"},
+            "kernel load: an opcode past the profile's shape list");
+    }
+    // The shape list's order assigns the opcodes and is fingerprinted: a
+    // kernel built for one order does not load on a profile with another.
+    auto reordered = document;
+    reordered["mma"]["shapes"] = nlohmann::json::array({"m32n64k8", "m64n64k8"});
+    const auto swapped = nanosm::parse_device_profile(reordered.dump());
+    require(nanosm::device_profile_fingerprint(swapped) != nanosm::device_profile_fingerprint(profile),
+        "the shape list's order is not fingerprinted");
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        nanosm::Machine machine(swapped, compile(m32, profile), std::move(launch));
+        throw std::runtime_error("a kernel built for one shape order loaded on another");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"does not match simulator"}, "reordered shape list at load");
+    }
+    // Shape / accumulator mismatch: qtxc, the hand assembler, kernel load.
+    const std::string mismatch =
+        ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 2048\nmma.async.init.m32n64k8 C, [r0], [r1]\nhalt\n";
+    try {
+        (void)nanosm::compile_qtx(mismatch, profile);
+        throw std::runtime_error("qtxc accepted an m32 MMA on a 64-row accumulator");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"mma.async.init.m32n64k8 needs a 32x64 accumulator; 'C' is 64x64"},
+            "qtxc shape mismatch");
+    }
+    text = nanosm::emit_asm(nanosm::compile_qtx(m32, profile));
+    text.replace(text.find(".acc T, 4096, 32, 64"), 20, ".acc T, 4096, 64, 64");
+    try {
+        (void)nanosm::assemble_asm(text, profile);
+        throw std::runtime_error("the hand assembler accepted an m32 MMA on a 64-row accumulator");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"needs a 32x64 accumulator; 'T' is 64x64"}, "hand assembler shape mismatch");
+    }
+    auto widened = compile(m32, profile);
+    widened.accumulators.at(0).rows = 64;
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        nanosm::Machine machine(profile, widened, std::move(launch));
+        throw std::runtime_error("kernel load accepted an m32 MMA on a 64-row accumulator");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"kernel pc 16", "needs a 32x64 accumulator; 'T' is 64x64"},
+            "kernel load shape mismatch");
+    }
+}
+
+// The full bank census for both shapes, from the restated layout: at every
+// 64-byte-aligned A base in the first 4 KiB, a step's A block (4 rows x 8 k)
+// and B block (8 k x 4 columns) are each 16 distinct words in 16 distinct
+// banks, together two rounds; so a step that reloads A is 2 rounds and every
+// other step 1, for m32 exactly as for m64 (no layout change needed).
+void test_i9_bank_census() {
+    for (const uint32_t rows : {32u, 64u}) {
+        for (uint32_t a_base = 0; a_base < 4096; a_base += 64) {
+            for (uint32_t m0 = 0; m0 < rows; m0 += 4) {
+                for (uint32_t n0 = 0; n0 < 64; n0 += 4) {
+                    std::map<uint32_t, std::set<uint32_t>> words_by_bank;
+                    const bool reload = n0 == 0;
+                    if (reload) {
+                        for (uint32_t m = m0; m < m0 + 4; ++m)
+                            for (uint32_t k = 0; k < 8; ++k) {
+                                const auto word = i9_a_address(a_base, m, k) / 4;
+                                words_by_bank[word % 16].insert(word);
+                            }
+                    }
+                    for (uint32_t k = 0; k < 8; ++k)
+                        for (uint32_t n = n0; n < n0 + 4; ++n) {
+                            const auto word = i9_b_address(8192, k, n) / 4;
+                            words_by_bank[word % 16].insert(word);
+                        }
+                    std::size_t rounds = 0;
+                    for (const auto& [bank, words] : words_by_bank) rounds = std::max(rounds, words.size());
+                    require(words_by_bank.size() == 16 && rounds == (reload ? 2u : 1u),
+                        "census: m" + std::to_string(rows) + " A base " + std::to_string(a_base) + " m0 " +
+                            std::to_string(m0) + " n0 " + std::to_string(n0) + " takes " +
+                            std::to_string(rounds) + " rounds");
+                }
+            }
+        }
+    }
+}
+
+// One m32n64k8 command on the BOTTOM half of a 64-row A object (base 512):
+// 8 A blocks x 16 B blocks = 128 steps, the step at n block 0 reading A and B
+// (2 rounds), the other 15 B only (1 round); 8 A reloads and 136 port-B
+// rounds; tiles in hold-A order; each result written at last round + D + Lb
+// + result latency + tmem port depth; every element equal to the logical
+// reference of rows 32..63.
+void test_i9_m32_walker() {
+    const auto& profile = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    i9_write_operands(launch);
+    nanosm::Machine machine(profile, compile(R"(
+        .acc T, 4096, 32, 64
+        mov r0, 512
+        mov r1, 2048
+        mov r4, 8192
+        mbar.init [r4], 1
+        mma.async.init.m32n64k8 T, [r0], [r1]
+        mma.commit [r4]
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        halt
+    )", profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
+    machine.run(20000);
+    std::vector<const nanosm::TimelineEvent*> inputs, writes;
+    for (const auto& event : machine.trace().events()) {
+        if (event.name == "MMA input step") inputs.push_back(&event);
+        if (event.name == "MMA tmem write") writes.push_back(&event);
+    }
+    require(inputs.size() == 128 && writes.size() == 128, "one m32n64k8 command is 128 4x4x8 steps");
+    const auto d = profile.shmem_port_a_depth;
+    const auto lb = profile.shmem_read_latency_cycles;
+    for (uint32_t s = 0; s < 128; ++s) {
+        const bool reads_a = s % 16 == 0;
+        const uint32_t rounds = reads_a ? 2 : 1;
+        require(static_cast<uint32_t>(inputs[s]->value) == s &&
+                inputs[s]->detail == (reads_a ? "rounds=2, reads A" : "rounds=1"),
+            "m32 step " + std::to_string(s) + ": " + inputs[s]->detail);
+        if (s + 1 < 128)
+            require(inputs[s + 1]->start_cycle == inputs[s]->start_cycle + rounds,
+                "m32 step " + std::to_string(s + 1) + " did not start the cycle after the previous step's last round");
+        const uint32_t tile = 64 * (4 * (s / 16)) + 4 * (s % 16); // m0 * 64 + n0
+        require(static_cast<uint32_t>(writes[s]->value) == tile &&
+                writes[s]->start_cycle == inputs[s]->start_cycle + (rounds - 1) + d + lb +
+                    profile.mma_result_latency_cycles + profile.tmem_port_depth,
+            "m32 step " + std::to_string(s) + ": tile or tmem write cycle");
+    }
+    const auto& summary = machine.trace().summary();
+    require(summary.mma_a_block_reads == 8 && summary.mma_shmem_rounds == 136,
+        "one m32 command did not read 8 A blocks in 136 bank rounds");
+    for (uint32_t row = 0; row < 32; ++row)
+        for (uint32_t col = 0; col < 64; ++col)
+            require(nanosm::bits_float(machine.tmem_word(i9_tmem_word(4096, 64, row, col))) ==
+                    i9_reference(32 + row, col),
+                "m32 on the bottom half: element (" + std::to_string(row) + ", " + std::to_string(col) + ")");
+}
+
+// The same 64-row A object as one m64 command and as two m32 commands on its
+// halves (bases 0 and 512): the halves equal the m64 result bit for bit, and
+// both equal the logical reference. Then two m32 commands back to back keep
+// port B busy exactly 2 x 136 = 272 cycles from the first input step.
+void test_i9_two_m32_halves_equal_one_m64() {
+    const auto& profile = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    i9_write_operands(launch);
+    nanosm::Machine machine(profile, compile(R"(
+        .acc F, 0, 64, 64
+        .acc T, 4096, 32, 64
+        .acc L, 6144, 32, 64
+        mov r0, 0
+        mov r2, 512
+        mov r1, 2048
+        mov r4, 8192
+        mbar.init [r4], 1
+        mma.async.init.m64n64k8 F, [r0], [r1]
+        mma.async.init.m32n64k8 T, [r0], [r1]
+        mma.async.init.m32n64k8 L, [r2], [r1]
+        mma.commit [r4]
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        halt
+    )", profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
+    machine.run(40000);
+    for (uint32_t row = 0; row < 64; ++row) {
+        for (uint32_t col = 0; col < 64; ++col) {
+            const auto full = machine.tmem_word(i9_tmem_word(0, 64, row, col));
+            const auto half = machine.tmem_word(i9_tmem_word(row < 32 ? 4096 : 6144, 64, row % 32, col));
+            require(full == half && nanosm::bits_float(full) == i9_reference(row, col),
+                "row " + std::to_string(row) + " col " + std::to_string(col) + ": m64 " +
+                    std::to_string(nanosm::bits_float(full)) + ", m32 half " + std::to_string(nanosm::bits_float(half)));
+        }
+    }
+    std::vector<uint64_t> starts;
+    for (const auto& event : machine.trace().events())
+        if (event.name == "MMA input step") starts.push_back(event.start_cycle);
+    const auto& summary = machine.trace().summary();
+    require(starts.size() == 256 + 128 + 128 && summary.mma_shmem_rounds == 272 + 136 + 136 &&
+            summary.mma_a_block_reads == 16 + 8 + 8,
+        "m64 + two m32 commands: steps, rounds or A reloads");
+    // The two m32 commands (steps 256..511) run back to back: the last step
+    // reads one round, so port B is busy through its start.
+    require(starts.back() - starts.at(256) + 1 == 272,
+        "two m32 commands did not keep port B busy 272 cycles: " + std::to_string(starts.back() - starts.at(256) + 1));
+    require(summary.mma_recurrence_stalls == 0, "independent accumulators hit recurrence stalls");
+}
+
+// A mixed queue: m64 init into F, m32 init into T (top half), m64 adding into
+// F, m32 init into L (bottom half). F holds twice the m64 product, T and L
+// the halves once; 768 steps, 816 rounds.
+void test_i9_mixed_queue() {
+    const auto& profile = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    i9_write_operands(launch);
+    nanosm::Machine machine(profile, compile(R"(
+        .acc F, 0, 64, 64
+        .acc T, 4096, 32, 64
+        .acc L, 6144, 32, 64
+        mov r0, 0
+        mov r2, 512
+        mov r1, 2048
+        mov r4, 8192
+        mbar.init [r4], 1
+        mma.async.init.m64n64k8 F, [r0], [r1]
+        mma.async.init.m32n64k8 T, [r0], [r1]
+        mma.async.m64n64k8 F, [r0], [r1]
+        mma.async.init.m32n64k8 L, [r2], [r1]
+        mma.commit [r4]
+    wait:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni wait
+        halt
+    )", profile), std::move(launch), nanosm::TraceOptions{.timeline = true});
+    machine.run(40000);
+    for (uint32_t row = 0; row < 64; ++row) {
+        for (uint32_t col = 0; col < 64; ++col) {
+            require(nanosm::bits_float(machine.tmem_word(i9_tmem_word(0, 64, row, col))) == 2.0f * i9_reference(row, col),
+                "mixed queue: F row " + std::to_string(row) + " col " + std::to_string(col));
+            require(nanosm::bits_float(machine.tmem_word(i9_tmem_word(row < 32 ? 4096 : 6144, 64, row % 32, col))) ==
+                    i9_reference(row, col),
+                "mixed queue: half row " + std::to_string(row) + " col " + std::to_string(col));
+        }
+    }
+    const auto& summary = machine.trace().summary();
+    require(summary.mma_input_steps == 768 && summary.mma_shmem_rounds == 816 && summary.mma_a_block_reads == 48,
+        "mixed queue: steps, rounds or A reloads");
+}
+
+// Four 8 KiB (32x64) accumulators fill tmem (4 x 2048 words). acc.st.v8 and
+// acc.ld.v8 at row bases 0 and 16 of each: the kernel chooses the row base,
+// nothing in hardware ties rows to warps. Every stored word lands at its
+// restated tmem word and loads back.
+void test_i9_four_8k_accumulators() {
+    const auto& profile = canonical_profile();
+    require(profile.tmem_fine_banks * profile.tmem_words_per_fine_bank == 4 * 2048,
+        "tmem is not four 32x64 FP32 accumulators");
+    std::ostringstream qtx;
+    const std::array<const char*, 4> names{"S0", "S1", "O0", "O1"};
+    for (uint32_t region = 0; region < 4; ++region)
+        qtx << ".acc " << names[region] << ", " << 2048 * region << ", 32, 64\n";
+    qtx << "sread r30, LANE_ID\nshli r32, r30, 3\nshli r33, r30, 1\nadd r31, r32, r33\nmov r9, 0\n"; // r31 = 10 * lane
+    for (uint32_t region = 0; region < 4; ++region) {
+        for (const uint32_t row_base : {0u, 16u}) {
+            const uint32_t base_value = 10000 * region + 1000 * (row_base / 16);
+            qtx << "mov r8, " << row_base << "\n";
+            for (uint32_t j = 0; j < 8; ++j) qtx << "addi r" << 16 + j << ", r31, " << base_value + j << "\n";
+            qtx << "acc.st.v8 " << names[region] << ", r8, r16\n";
+        }
+    }
+    for (uint32_t region = 0; region < 4; ++region)
+        qtx << "mov r8, 16\nacc.ld.v8 r" << 40 + 8 * region << ", " << names[region] << ", r8\n";
+    qtx << "halt\n";
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    nanosm::Machine machine(profile, compile(qtx.str(), profile), std::move(launch));
+    machine.run(20000);
+    for (uint32_t region = 0; region < 4; ++region) {
+        for (const uint32_t row_base : {0u, 16u}) {
+            for (uint32_t lane = 0; lane < 16; ++lane) {
+                for (uint32_t j = 0; j < 8; ++j) {
+                    const uint32_t value = 10000 * region + 1000 * (row_base / 16) + 10 * lane + j;
+                    require(machine.tmem_word(i9_tmem_word(2048 * region, 64, row_base + lane, j)) == value,
+                        std::string(names[region]) + " row " + std::to_string(row_base + lane) + " col " +
+                            std::to_string(j));
+                    if (row_base == 16) {
+                        require(machine.read_reg(0, lane, static_cast<uint8_t>(40 + 8 * region + j)) == value,
+                            std::string(names[region]) + ": acc.ld.v8 at row base 16, lane " + std::to_string(lane));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// SANITIZER. The sanitizer's MMA operand spans come from the command's shape: an m32
+// command on A at 0 read-owns [0, 512), so an sts into the other half of a
+// 64-row object ([512, 1024)) is quiet while one inside its span PANICs.
+void test_i9_operand_span_follows_the_shape() {
+    const auto& profile = canonical_profile();
+    const auto program = [](uint32_t sts_base) {
+        return ".acc T, 4096, 32, 64\nmov r0, 0\nmov r1, 2048\nmov r4, 8192\nmbar.init [r4], 1\n"
+               "sread r20, LANE_ID\nshli r20, r20, 2\nmov r21, 0\n"
+               "mma.async.init.m32n64k8 T, [r0], [r1]\n"
+               "sts [r20 + " + std::to_string(sts_base) + "], r21\n"
+               "mma.commit [r4]\nwait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n";
+    };
+    nanosm::Launch quiet_launch;
+    quiet_launch.active_warps = 1;
+    i9_write_operands(quiet_launch);
+    nanosm::Machine quiet(profile, compile(program(512), profile), std::move(quiet_launch));
+    quiet.run(20000);
+    nanosm::Launch race_launch;
+    race_launch.active_warps = 1;
+    i9_write_operands(race_launch);
+    const auto message = run_expecting_panic(profile, compile(program(256), profile), std::move(race_launch),
+        "an sts into an m32 command's A rows");
+    require_mentions(message, {"mma.async #1", "A operand [0, 512)"}, "m32 operand span");
+}
+
+// ---- D15: MMA shapes configurable from the profile (trash/chan.txt 2026-10-22) ----
+
+// Independent restatement of the operand layout for any k: each 8-deep K
+// block is a whole xor64 object of (rows x 16 B), stacked from the base.
+uint32_t d15_a_address(uint32_t base, uint32_t rows, uint32_t m, uint32_t k) {
+    return i9_a_address(base + 16 * rows * (k / 8), m, k % 8);
+}
+uint32_t d15_b_address(uint32_t base, uint32_t cols, uint32_t k, uint32_t n) {
+    return i9_b_address(base + 16 * cols * (k / 8), k % 8, n);
+}
+float d15_reference(uint32_t m, uint32_t n, uint32_t depth) {
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < depth; ++k) sum += static_cast<float>(i9_a(m, k) * i9_b(k, n));
+    return sum;
+}
+
+// One mma.async.init of `shape` on `profile` (which lists it): A at 0, B at
+// the next 1 KiB boundary, the accumulator at tmem word 0. Every element is
+// checked against the logical reference; the machine is returned for its
+// trace.
+std::unique_ptr<nanosm::Machine> d15_run_shape(const nanosm::DeviceProfile& profile, const nanosm::MmaShape& shape) {
+    const auto name = nanosm::mma_shape_name(shape);
+    const uint32_t a_bytes = shape.m * shape.k * 2;
+    const uint32_t b_base = (a_bytes + 1023) / 1024 * 1024;
+    const uint32_t b_bytes = shape.k * shape.n * 2;
+    const uint32_t mbar = 16384;
+    std::ostringstream source;
+    source << ".acc C, 0, " << shape.m << ", " << shape.n << "\n"
+           << "mov r0, 0\nmov r1, " << b_base << "\nmov r4, " << mbar << "\nmbar.init [r4], 1\n"
+           << "mma.async.init." << name << " C, [r0], [r1]\nmma.commit [r4]\n"
+           << "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n";
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, b_base + b_bytes);
+    for (uint32_t m = 0; m < shape.m; ++m)
+        for (uint32_t k = 0; k < shape.k; ++k)
+            write_u16(shmem, d15_a_address(0, shape.m, m, k), i9_fp16(i9_a(m, k)));
+    for (uint32_t k = 0; k < shape.k; ++k)
+        for (uint32_t n = 0; n < shape.n; ++n)
+            write_u16(shmem, d15_b_address(b_base, shape.n, k, n), i9_fp16(i9_b(k, n)));
+    auto machine = std::make_unique<nanosm::Machine>(profile, compile(source.str(), profile), std::move(launch),
+        nanosm::TraceOptions{.timeline = true, .debug = true});
+    machine->run(200000);
+    for (uint32_t row = 0; row < shape.m; ++row)
+        for (uint32_t col = 0; col < shape.n; ++col)
+            require(nanosm::bits_float(machine->tmem_word(i9_tmem_word(0, shape.n, row, col))) ==
+                    d15_reference(row, col, shape.k),
+                name + ": element (" + std::to_string(row) + ", " + std::to_string(col) + ")");
+    return machine;
+}
+
+nanosm::DeviceProfile d15_profile(std::vector<nanosm::MmaShape> shapes, uint32_t result_latency = 8) {
+    auto profile = canonical_profile();
+    profile.mma_shapes = std::move(shapes);
+    profile.mma_result_latency_cycles = result_latency;
+    nanosm::validate_device_profile(profile);
+    return profile;
+}
+
+// Legal shapes beyond the canonical two run correctly against the logical
+// reference: a k > core_k shape over four K blocks, a short 16-row shape and
+// a 128-row shape that fills tmem. Steps and port-B rounds follow the walk:
+// per K block every (m, n) block, A read once per m block (two rounds), and
+// no step of one command ever waits on its own accumulator.
+void test_d15_more_shapes_run() {
+    const auto profile = d15_profile({{64, 64, 8}, {16, 64, 32}, {16, 64, 8}, {128, 64, 8}});
+    for (const nanosm::MmaShape shape : {nanosm::MmaShape{16, 64, 32}, nanosm::MmaShape{16, 64, 8},
+             nanosm::MmaShape{128, 64, 8}}) {
+        const auto machine = d15_run_shape(profile, shape);
+        const auto& summary = machine->trace().summary();
+        const uint32_t blocks_m = shape.m / 4;
+        const uint32_t steps = blocks_m * (shape.n / 4) * (shape.k / 8);
+        const uint32_t a_reads = blocks_m * (shape.k / 8);
+        require(summary.mma_input_steps == steps && summary.mma_a_block_reads == a_reads &&
+                summary.mma_shmem_rounds == steps + a_reads && summary.mma_recurrence_stalls == 0,
+            nanosm::mma_shape_name(shape) + ": steps " + std::to_string(summary.mma_input_steps) + ", A reads " +
+                std::to_string(summary.mma_a_block_reads) + ", rounds " + std::to_string(summary.mma_shmem_rounds) +
+                ", recurrence stalls " + std::to_string(summary.mma_recurrence_stalls));
+    }
+}
+
+// The latency bound at equality. With result latency 10 the bound is
+// D 2 + Lb 2 + 10 + Dt 2 = 16, and m16n16k16 revisits each block every
+// (16 / 4) x (16 / 4) = 16 steps: accepted, and it never stalls. The step
+// that revisits a block starts its operand rounds no earlier than the cycle
+// the block's previous result lands. That slack is exactly what the
+// derivation says: the 16 steps between the visits take 16 + 4 rounds
+// (each m block's A reload is one more), so a visit that is itself a reload
+// (2 rounds) leaves 4 - 1 = 3 cycles and any other leaves 4: the validated
+// bound counts one round per step and is short of exact by the reloads.
+// With result latency 11 the bound is 17 and the shape is refused.
+void test_d15_latency_bound() {
+    const nanosm::MmaShape shape{16, 16, 16};
+    const auto profile = d15_profile({{64, 64, 8}, shape}, 10);
+    require(nanosm::mma_min_blocks_per_k(profile) == 16 && nanosm::mma_blocks_per_k(profile, shape) == 16,
+        "the bound or the blocks per K block");
+    const auto machine = d15_run_shape(profile, shape);
+    std::vector<const nanosm::TimelineEvent*> inputs, writes;
+    for (const auto& event : machine->trace().events()) {
+        if (event.name == "MMA input step") inputs.push_back(&event);
+        if (event.name == "MMA tmem write") writes.push_back(&event);
+    }
+    require(inputs.size() == 32 && writes.size() == 32 && machine->trace().summary().mma_recurrence_stalls == 0,
+        "m16n16k16 is 32 steps with no recurrence stall");
+    int64_t least = std::numeric_limits<int64_t>::max();
+    for (uint32_t s = 0; s < 16; ++s) {
+        const auto slack = static_cast<int64_t>(inputs[s + 16]->start_cycle) -
+            static_cast<int64_t>(writes[s]->start_cycle);
+        const bool reload = s % 4 == 0;
+        require(slack == (reload ? 3 : 4), "step " + std::to_string(s + 16) + " revisits its block with slack " +
+            std::to_string(slack) + " (expected " + std::to_string(reload ? 3 : 4) + ")");
+        least = std::min(least, slack);
+    }
+    require(least == 3, "the least slack is the reloads' extra rounds less one");
+    auto slower = profile;
+    slower.mma_result_latency_cycles = 11;
+    try {
+        nanosm::validate_device_profile(slower);
+        throw std::runtime_error("m16n16k16 was accepted with a bound of 17");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"m16n16k16", "revisited every 16 steps", "needs at least 17"},
+            "the bound one past equality");
+    }
+}
+
+
+// D15 follow-ups (trash/chan.txt 2026-10-22). On a 4x4x4 core, m16n16k4 is
+// legal (every dimension a power of two and whole core blocks) but fills
+// only 4 of the 8 fp16 in each xor64 operand row: a warning, not an error,
+// and the operand's storage is still whole 16-byte rows (16 x 16 B = 256 B
+// for A), so MMA admission must count 256 B, not 16 x 4 x 2 = 128 B. Codex's
+// reproducer puts A at 65536 - 128: before the fix it passed admission and
+// failed during the operand reads; now it is refused at admission. At
+// 65536 - 256 it runs. k = 12 is not a power of two: refused at load.
+void test_d15_partial_k_block_footprint_and_warning() {
+    auto profile = canonical_profile();
+    profile.mma_core_k = 4;
+    profile.mma_shapes = {{16, 16, 4}};
+    nanosm::validate_device_profile(profile);
+    const auto warnings = nanosm::device_profile_warnings(profile);
+    require(warnings.size() == 1, "one partial-K-block warning for m16n16k4");
+    require_mentions(warnings[0], {"mma shape m16n16k4", "fills only 4 of the 8 fp16", "50%"},
+        "the partial-K-block warning");
+    require(nanosm::device_profile_warnings(canonical_profile()).empty(), "the canonical profile warns");
+    auto twelve = profile;
+    twelve.mma_shapes = {{16, 16, 12}};
+    try {
+        nanosm::validate_device_profile(twelve);
+        throw std::runtime_error("m16n16k12 was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"m16n16k12", "powers of two (k is 12)"}, "k = 12 at load");
+    }
+    const auto run = [&](uint32_t a_base) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        const auto source = ".acc C, 0, 16, 16\nmov r0, " + std::to_string(a_base) +
+            "\nmov r1, 0\nmma.async.init.m16n16k4 C, [r0], [r1]\nhalt\n";
+        nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
+        machine.run(10000);
+    };
+    try {
+        run(65536 - 128);
+        throw std::runtime_error("an A operand whose storage runs past shmem was admitted");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"MMA operand alignment or footprint is outside shmem"},
+            "the partly filled A object at 65408");
+    }
+    run(65536 - 256); // the whole 256-byte object fits: admitted and run
+}
+
 void test_sanitizer_sts_into_tma_store_source() {
     // tma-out break (1): the issuer fires the store before the workers finished
     // staging. The store read-owns its source from accept until its last source
@@ -4598,9 +5338,9 @@ void test_sanitizer_sts_into_mma_operand_stage() {
             mov r2, 2048
             mov r3, 3072
             mov r4, 8192
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
             mma.commit [r4]
-            mma.async C, [r2], [r3]
+            mma.async.m64n64k8 C, [r2], [r3]
             sread r20, LANE_ID
             shli r20, r20, 2
             addi r20, r20, )") + (queued ? "2048" : "0") + R"(
@@ -4704,8 +5444,8 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
             mov r8, 0
             mov r9, 0
             mov r10, 0
-            mma.async.init C, [r0], [r1]
-            mma.async C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
+            mma.async.m64n64k8 C, [r0], [r1]
             tma.async [4096], r8
             halt
         )"), std::move(launch), "engine complete_tx into an MMA operand stage");
@@ -4737,7 +5477,7 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r8, 0
         mov r9, 0
         mov r10, 0
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         tma.async [4096], r8
         halt
     )"), launch_with(false), "TMA load over an active MMA operand");
@@ -4753,7 +5493,7 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r9, 0
         mov r10, 0
         tma.async [4224], r8
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         halt
     )"), launch_with(false), "MMA over a pending TMA load destination");
     require_mentions(message, {"shmem race: mma.async #1 B operand bytes [1024, 2048)",
@@ -4778,7 +5518,7 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r8, 0
         mov r9, 0
         mov r10, 0
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         tma.async [4224], r8
     wait:
         mbar.try_wait p0, [r4], 0
@@ -4808,7 +5548,7 @@ void test_sanitizer_tmem_ownership_both_directions() {
     // is still writing tmem.
     auto message = run_expecting_panic(profile, compile(header + R"(
         acc.st.v8 C, r8, r16
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.st");
     require_mentions(message, {"tmem race: mma.async #1 on 'C'",
@@ -4819,14 +5559,14 @@ void test_sanitizer_tmem_ownership_both_directions() {
     // sample), not the final RF write.
     message = run_expecting_panic(profile, compile(header + R"(
         acc.ld.v8 r24, C, r8
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.ld");
     require_mentions(message, {"tmem race: mma.async #1 on 'C'", "acc.ld #0",
         "read-owner of 'C' rows [0, 16) cols [0, 8) until its final tmem read"}, "MMA vs acc.ld");
     // Existing direction, same text plus the owner.
     message = run_expecting_panic(profile, compile(header + R"(
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         acc.ld.v8 r24, C, r8
         halt
     )"), one_warp(), "acc.ld over accepted MMA work");
@@ -4905,7 +5645,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L0
             mov r0, 0
             mov r1, 1024
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
             mbar.arrive.expect_tx [r3], 2048
             tma.async [4224], r8
             tma.async [4288], r8
@@ -4914,7 +5654,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L1
             mov r0, 2048
             mov r1, 3072
-            mma.async C, [r0], [r1]
+            mma.async.m64n64k8 C, [r0], [r1]
             mbar.arrive.expect_tx [r2], 2048
             tma.async [4096], r8
             tma.async [4160], r8
@@ -4923,7 +5663,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L2
             mov r0, 0
             mov r1, 1024
-            mma.async C, [r0], [r1]
+            mma.async.m64n64k8 C, [r0], [r1]
             mma.commit [r4]
         L3:
             mbar.try_wait p1, [r4], 0
@@ -5003,7 +5743,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         READY0:
             mbar.try_wait p1, [r10], 0
             @!p1 bra.uni READY0
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
             mma.commit [r11]
         WAIT0:
             mbar.try_wait p1, [r11], 0
@@ -5011,7 +5751,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         READY1:
             mbar.try_wait p1, [r10], 1
             @!p1 bra.uni READY1
-            mma.async C, [r0], [r1]
+            mma.async.m64n64k8 C, [r0], [r1]
             mma.commit [r11]
         WAIT1:
             mbar.try_wait p1, [r11], 1
@@ -5971,7 +6711,7 @@ void test_mbar_engine_events_visible_next_cycle() {
     std::string text = ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
         "mov r8, 0\nmov r9, 0\nmov r10, 0\ntma.async [6144], r8\n";
     for (uint32_t i = 0; i < 300; ++i) text += "mov r" + std::to_string(12 + i % 8) + ", " + std::to_string(i) + "\n";
-    text += "mma.async.init C, [r0], [r1]\nmma.commit [r4]\nhalt\n";
+    text += "mma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
     std::optional<uint64_t> tma_presented;
     std::optional<uint64_t> mma_presented;
@@ -6058,9 +6798,9 @@ void test_simultaneous_full_queue_pop_and_push() {
         .acc C, 0, 64, 64
         mov r0, 0
         mov r1, 1024
-        mma.async.init C, [r0], [r1]
-        mma.async C, [r0], [r1]
-        mma.async C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
+        mma.async.m64n64k8 C, [r0], [r1]
+        mma.async.m64n64k8 C, [r0], [r1]
         halt
     )"), std::move(launch), {.timeline = true});
     std::map<uint64_t, std::size_t> depth_after;
@@ -6205,10 +6945,10 @@ void test_driver_shuffle_unit_kernels() {
             mov r8, 0
             mov r9, 0
             mov r10, 0
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
             mma.commit [r4]
             tma.async [6144], r8
-            mma.async C, [r0], [r1]
+            mma.async.m64n64k8 C, [r0], [r1]
             halt
         )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
     };
@@ -8245,7 +8985,7 @@ void test_i2_tma_placement_on_port_b() {
         mov r1, 1024
         mov r4, 4096
         mbar.init [r4], 1
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [r0], [r1]
         mma.commit [r4]
         mov r8, 0
         mov r9, 0
@@ -8502,20 +9242,20 @@ void test_i2_read_first_across_services() {
         std::ostringstream qtx;
         // I7: the commit mbar is in the image (an mbar.init would be an RMW
         // behind the host's, ordering the sts after its long write).
-        qtx << ".acc C, 0, 16, 4\n"
-            << "mov r0, 0\nmov r1, 512\nmov r4, 896\n"
+        qtx << ".acc C, 0, 32, 64\n"
+            << "mov r0, 0\nmov r1, 1024\nmov r4, 896\n"
             << "sread r20, LANE_ID\nshli r20, r20, 2\n"
             << "mov r21, 16384\nshli r22, r21, 16\nor r21, r21, r22\n" // two fp16 2.0 halves
             << "sts [r20], r21\n";
         for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
-        qtx << "mma.async.init C, [r0], [r1]\nmma.commit [r4]\n"
+        qtx << "mma.async.init.m32n64k8 C, [r0], [r1]\nmma.commit [r4]\n"
             << "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\n"
             << "mov r8, 0\nmov r9, 0\nacc.ld r10, C, r8\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 1024);
-        for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
-        for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+        auto& shmem = image_bytes(launch.shmem_image, 2048);
+        for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
+        for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
         nanosm::MbarState event;
         event.valid = true;
         event.expected = 1;
@@ -8531,7 +9271,7 @@ void test_i2_read_first_across_services() {
         mma.complete_mbar_tx(event_mbar, 64, 0); // the RMW that pauses the sts
         std::optional<std::string> panic;
         try {
-            mma.run(4000);
+            mma.run(10000);
         } catch (const nanosm::SimError& error) {
             panic = error.what();
         }
@@ -8568,9 +9308,11 @@ void test_i2_read_first_across_services() {
             if (event.name == "MMA input step") step_start[event.value] = event.start_cycle;
         }
         // I7: a port-B round granted at g samples the RAM at g + D (the read
-        // pipeline has port A's depth); before I7 it read the RAM at g.
+        // pipeline has port A's depth); before I7 it read the RAM at g. Row 0's
+        // four A words: words 0, 1 are rounds 0, 1 of step 0 (k block 0), words
+        // 2, 3 rounds 0, 1 of step 128 (k block 1: 8 m x 16 n blocks later).
         const std::array<uint64_t, 4> sampled{step_start.at(0) + depth, step_start.at(0) + 1 + depth,
-            step_start.at(4) + depth, step_start.at(4) + 1 + depth};
+            step_start.at(128) + depth, step_start.at(128) + 1 + depth};
         std::vector<I2Grant> stores;
         for (const auto& grant : i2_grants(mma, "A-write")) {
             if (grant.client == "simt") stores.push_back(grant);
@@ -9164,7 +9906,7 @@ void test_i21_acc_ld_read_ownership() {
         // would issue in pairs five cycles apart).
         for (uint32_t i = 0; i < gap; ++i) body += "setp.eq p" + std::to_string(1 + i % 6) + ", r0, 0\n";
         body += R"(
-            mma.async.init C, [r1], [r2] {pred=PT, stall=0, set=sb1, wait=-}
+            mma.async.init.m64n64k8 C, [r1], [r2] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )";
         return body;
@@ -10089,14 +10831,14 @@ void test_i4_missing_fence_panics() {
     const auto mma_machine = [&](bool fence) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 1024);
-        for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
-        for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+        auto& shmem = image_bytes(launch.shmem_image, 2048);
+        for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
+        for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
         write_count_mbar(shmem, 896, 1);
         return std::make_unique<nanosm::Machine>(dense, compile(std::string(R"(
-            .acc C, 0, 16, 4
+            .acc C, 0, 32, 64
             mov r0, 0
-            mov r1, 512
+            mov r1, 1024
             mov r4, 896
             sread r20, LANE_ID
             shli r20, r20, 2
@@ -10105,7 +10847,7 @@ void test_i4_missing_fence_panics() {
             or r21, r21, r22
             sts [r20], r21
         )") + (fence ? "fence.sh\n" : "") + R"(
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m32n64k8 C, [r0], [r1]
             mma.commit [r4]
         wait:
             mbar.try_wait p0, [r4], 0
@@ -10118,9 +10860,9 @@ void test_i4_missing_fence_panics() {
     };
     message = i4_panic(*mma_machine(false), "sts -> mma.async");
     require_mentions(message, {"reason=missing fence.sh: mma.async #1 A operand bytes [0, 64) overlap this warp's earlier "
-        "sts [r20], r21", "inst='mma.async.init ACC0, [r0], [r1]"}, "sts -> mma.async");
+        "sts [r20], r21", "inst='mma.async.init.m32n64k8 ACC0, [r0], [r1]"}, "sts -> mma.async");
     auto mma = mma_machine(true);
-    mma->run(4000);
+    mma->run(10000);
     require(nanosm::bits_float(mma->read_reg(0, 0, 10)) == 16.0f, "the fenced MMA did not read the stored 2.0 halves");
 
     // lds -> TMA load over the words it reads.
@@ -10239,19 +10981,19 @@ void test_i4_read_read_overlap_is_clean() {
     const auto dense = dense_one_bank_profile(4);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 1024);
-    for (uint32_t i = 0; i < 128; ++i) write_u16(shmem, 2 * i, 0x3c00);       // A: 1.0
-    for (uint32_t i = 0; i < 32; ++i) write_u16(shmem, 512 + 2 * i, 0x3c00);  // B: 1.0
+    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
+    for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
     write_count_mbar(shmem, 896, 1);
     nanosm::Machine mma(dense, compile(R"(
-        .acc C, 0, 16, 4
+        .acc C, 0, 32, 64
         mov r0, 0
-        mov r1, 512
+        mov r1, 1024
         mov r4, 896
         sread r20, LANE_ID
         shli r20, r20, 2
         lds r21, [r20]
-        mma.async.init C, [r0], [r1]
+        mma.async.init.m32n64k8 C, [r0], [r1]
         mma.commit [r4]
     wait:
         mbar.try_wait p0, [r4], 0
@@ -10261,7 +11003,7 @@ void test_i4_read_read_overlap_is_clean() {
         acc.ld r10, C, r8
         halt
     )", dense), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    mma.run(4000);
+    mma.run(10000);
     const auto reads = i2_grants(mma, "A-read");
     const auto accept = issued_at(mma, 6 * 8);
     require(reads.size() >= 16 && accept.size() == 1 && reads[15].cycle + dense.shmem_port_a_depth > accept.front(),
@@ -11072,8 +11814,12 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
         {"atom.add.uni", "mov r0, 0\nmov r1, 1\natom.add.uni r2, [r0], r1\nhalt\n"},
         {"tma.async", "mov r8, 0\nmov r9, 0\nmov r10, 0\nmov r4, 4104\ntma.async [5120], r8\n"
                       "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n"},
-        {"mma.async.init", ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async.init C, [r0], [r1]\n" + mma_tail},
-        {"mma.async", ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async C, [r0], [r1]\n" + mma_tail},
+        {"mma.async.init.m64n64k8",
+         ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async.init.m64n64k8 C, [r0], [r1]\n" + mma_tail},
+        {"mma.async.m64n64k8", ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async.m64n64k8 C, [r0], [r1]\n" + mma_tail},
+        {"mma.async.init.m32n64k8",
+         ".acc C, 0, 32, 64\nmov r0, 0\nmov r1, 1024\nmma.async.init.m32n64k8 C, [r0], [r1]\n" + mma_tail},
+        {"mma.async.m32n64k8", ".acc C, 0, 32, 64\nmov r0, 0\nmov r1, 1024\nmma.async.m32n64k8 C, [r0], [r1]\n" + mma_tail},
         {"mma.commit", "mov r4, 4096\nmma.commit [r4]\nhalt\n"},
         {"acc.ld", ".acc C, 0, 64, 64\nmov r8, 0\nmov r9, 0\nacc.ld r10, C, r8\nhalt\n"},
         {"acc.st.v8", ".acc C, 0, 64, 64\nmov r8, 0\nmov r9, 0\nmov r0, 1\nacc.st.v8 C, r8, r0\nhalt\n"},
@@ -11933,7 +12679,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
         {"mbar.arrive.expect_tx [r3], r6", "r3 and r6", &canonical},
         {"mbar.test_wait p0, [r3], r6", "r3 and r6", &canonical},
         {"mbar.try_wait p0, [r3], r6", "r3 and r6", &canonical},
-        {"mma.async C, [r3], [r6]", "r3 and r6", &canonical},
+        {"mma.async.m64n64k8 C, [r3], [r6]", "r3 and r6", &canonical},
         {"tma.async [1024], r0", "r0 and r2", &two_banks},
     };
     const auto mentions = [](const std::string& message, const std::string& where, const Case& c) {
@@ -13211,8 +13957,8 @@ std::unique_ptr<nanosm::Machine> i8_machine(const nanosm::DeviceProfile& profile
 void test_i8_mma_beside_transfers() {
     const auto& profile = canonical_profile();
     constexpr uint32_t commands = 4;
-    std::string mma = "mma.async.init S, [r0], [r1]\n";
-    for (uint32_t command = 1; command < commands; ++command) mma += "mma.async S, [r0], [r1]\n";
+    std::string mma = "mma.async.init.m64n64k8 S, [r0], [r1]\n";
+    for (uint32_t command = 1; command < commands; ++command) mma += "mma.async.m64n64k8 S, [r0], [r1]\n";
     const std::string body = R"(
         .acc S, 0, 64, 64
         .acc O, 4096, 64, 64
@@ -13415,7 +14161,7 @@ void test_i8_tmem_depths() {
             mov r1, 1024
             mov r4, 4096
             mbar.init [r4], 1
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
             mma.commit [r4]
         WAIT:
             mbar.try_wait p0, [r4], 0
@@ -13499,7 +14245,7 @@ void test_i8_transfer_racing_mma_is_quiet_without_the_sanitizer() {
             mov r1, 1024
             mov r8, 0
             mov r9, 0
-            mma.async.init C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [r0], [r1]
         )" + transfer + "halt\n", 1, 0x3c00, 0x3c00);
 #if NANOSM_SANITIZER
         require_mentions(i4_panic(*machine, "transfer racing an MMA"),
@@ -13742,6 +14488,17 @@ int main() {
         {"I8: tmem depths (Dt/Lt 1/1, 2/2, 3/1)", test_i8_tmem_depths},
         {"I8: same word, same cycle (READ_FIRST)", test_i8_read_first_same_word},
         {"I8: a transfer racing an MMA is quiet without the sanitizer", test_i8_transfer_racing_mma_is_quiet_without_the_sanitizer},
+        {"I9: MMA opcodes per shape and init", test_i9_mma_opcodes},
+        {"I9: profile shape list; unsupported shape and accumulator mismatch refused", test_i9_profile_shapes_and_refusals},
+        {"I9: bank census for both shapes", test_i9_bank_census},
+        {"I9: m32n64k8 walker", test_i9_m32_walker},
+        {"I9: two m32 halves equal one m64", test_i9_two_m32_halves_equal_one_m64},
+        {"I9: mixed m64 / m32 queue", test_i9_mixed_queue},
+        {"I9: four 8 KiB accumulators, row bases 0 and 16", test_i9_four_8k_accumulators},
+        {"I9: sanitizer operand span follows the shape", test_i9_operand_span_follows_the_shape},
+        {"D15: more MMA shapes run (k > core_k, 16 and 128 rows)", test_d15_more_shapes_run},
+        {"D15: the accumulator latency bound at equality", test_d15_latency_bound},
+        {"D15: a partly filled K block warns and counts its whole storage", test_d15_partial_k_block_footprint_and_warning},
     };
     // Tests that deliberately provoke a sanitizer PANIC (src/sanitizer.hpp).
     // A NANOSM_SANITIZER=0 build compiles the sanitizer to no-ops, so it skips
@@ -13782,6 +14539,8 @@ int main() {
         // with it.)
         "I5: atom.*.uni non-uniform address or operand PANIC",
         "I5: atomic sanitizer: C10, race, missing fence",
+        // I9: an MMA operand span (the command's shape) is a sanitizer ownership check.
+        "I9: sanitizer operand span follows the shape",
     };
     for (const auto& name : expects_sanitizer_panic) {
         if (std::none_of(tests.begin(), tests.end(), [&](const auto& test) { return test.first == name; })) {

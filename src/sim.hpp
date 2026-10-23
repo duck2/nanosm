@@ -507,6 +507,7 @@ private:
         uint64_t id = 0;
         bool commit = false;
         bool init = false;
+        MmaShape shape;          // from the opcode (m 32 or 64, n 64, k 8)
         uint32_t warp = 0;
         uint8_t accumulator = 0;
         uint8_t depbar = 0;
@@ -553,6 +554,7 @@ private:
         uint32_t k0 = 0;
         uint32_t a_base = 0;
         uint32_t b_base = 0;
+        MmaShape shape;          // the command's: the dense layout's strides follow it
     };
 
     // The step whose port-B rounds are being granted: one round per cycle,
@@ -1730,7 +1732,7 @@ private:
         const std::vector<std::vector<LaneAccess>>& rounds);
     [[nodiscard]] std::vector<uint32_t> lane_values(const Warp& warp, uint8_t reg) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
-        uint32_t base, bool a_operand) const;
+        uint32_t base, bool a_operand, const MmaShape& shape) const;
     [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
     [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> tma_descriptor_at_accept(
         uint32_t address, const Wires& w) const;

@@ -108,8 +108,8 @@ void TraceRecorder::issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Inst
     add({
         TraceEventKind::instant,
         TraceCategory::instruction,
-        opcode_name(instruction.opcode),
-        "warp=" + std::to_string(warp) + ", " + format_instruction(instruction),
+        opcode_name(instruction.opcode, &mma_shapes_),
+        "warp=" + std::to_string(warp) + ", " + format_instruction(instruction, true, &mma_shapes_),
         scheduler_track,
         cycle,
         0,

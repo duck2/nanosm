@@ -115,7 +115,7 @@ bool is_lsu_opcode(Opcode opcode) {
 }
 
 bool is_mma_command(Opcode opcode) {
-    return opcode == Opcode::mma_async || opcode == Opcode::mma_async_init || opcode == Opcode::mma_commit;
+    return is_mma_async(opcode) || opcode == Opcode::mma_commit;
 }
 
 bool is_acc_load(Opcode opcode) {
@@ -309,6 +309,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // Distinct sources beyond a bank's read ports are a property of the
     // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
+    // An mma.async's shape is one the profile lists and its accumulator's.
+    check_mma_shapes(kernel_, config_);
     if (launch.active_warps == 0) throw SimError("active warp count is zero");
     // The SM's warp slots (core.warps): the scheduler's and the front end's
     // per-warp state exists for that many warps, whatever the RF could hold.
@@ -403,6 +405,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     }
     trace_.emplace(
         launch.active_warps, config_.core_clock_hz, config_.dram_clock_hz, trace_options);
+    trace_->set_mma_shapes(config_.mma_shapes);
     apply_image(shmem_, launch.shmem_image, "shmem");
     apply_image(gmem_, launch.gmem_image, "gmem");
     // The mbars the launch declares (initialized by the host in the shmem
@@ -2334,14 +2337,39 @@ void Machine::decide_mbar_timeouts(Wires& w) {
 
 namespace {
 
-uint32_t mma_a_address(const Config& config, uint32_t base, uint32_t m, uint32_t k) {
-    if (!config.mma_xor_layout) return base + 2 * (m * config.mma_k + k);
-    return xor64_operand_address(base, m, k, 0);
+// An operand element's byte address. xor64 keeps 8 fp16 of k in each row's
+// 16 bytes and depends on the row (m or n) only, so a 32-row A object is the
+// top half of a 64-row one for k = 8. A shape with k > 8 stacks its 8-deep K
+// blocks as whole objects of (rows x 16 B), the compact object of its shape
+// (1024 B for 64 rows, the TMA's spacing). The dense diagnostic layout is
+// row-major in the command's shape.
+constexpr uint32_t xor64_row_elements = 8;
+
+uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t m, uint32_t k) {
+    if (!config.mma_xor_layout) return base + 2 * (m * shape.k + k);
+    const uint32_t object = base + 16 * shape.m * (k / xor64_row_elements);
+    return xor64_operand_address(object, m, k % xor64_row_elements, 0);
 }
 
-uint32_t mma_b_address(const Config& config, uint32_t base, uint32_t k, uint32_t n) {
-    if (!config.mma_xor_layout) return base + 2 * (k * config.mma_n + n);
-    return xor64_operand_address(base, n, k, 2);
+uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t k, uint32_t n) {
+    if (!config.mma_xor_layout) return base + 2 * (k * shape.n + n);
+    const uint32_t object = base + 16 * shape.n * (k / xor64_row_elements);
+    return xor64_operand_address(object, n, k % xor64_row_elements, 2);
+}
+
+// The shared-memory storage an operand of `shape` occupies from its base:
+// under xor64 every 8-deep K block is a whole object of 16-byte rows, even
+// when the shape's k leaves the last one partly empty (its unused bytes are
+// still the layout's); the dense layout is exactly rows x k fp16.
+uint64_t mma_operand_footprint(const Config& config, const MmaShape& shape, bool a_operand) {
+    const uint64_t rows = a_operand ? shape.m : shape.n;
+    if (!config.mma_xor_layout) return rows * shape.k * 2;
+    const uint64_t k_blocks = (shape.k + xor64_row_elements - 1) / xor64_row_elements;
+    return 16 * rows * k_blocks;
+}
+
+uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
+    return (shape.m / config.mma_core_m) * (shape.n / config.mma_core_n) * (shape.k / config.mma_core_k);
 }
 
 } // namespace
@@ -2388,7 +2416,7 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
             for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
                 w.tmem_writes.emplace_back(static_cast<uint32_t>(tmem_word_index(acc, it->m0 + mi, it->n0 + ni)),
                     it->values[mi * config_.mma_core_n + ni]);
-        trace_->mma_result(cycle_, it->command, it->m0 * config_.mma_n + it->n0);
+        trace_->mma_result(cycle_, it->command, it->m0 * acc.cols + it->n0);
         const auto id = it->command;
         auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
             [id](const auto& candidate) { return candidate.id == id; });
@@ -2429,12 +2457,9 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
 // held A block. A command's steps may start once the previous command's last
 // step has been granted (commands overlap in the pipelines).
 std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires& w) {
-    const uint32_t blocks_m = config_.mma_m / config_.mma_core_m;
-    const uint32_t blocks_n = config_.mma_n / config_.mma_core_n;
-    const uint32_t blocks_per_k = blocks_m * blocks_n;
-    const uint32_t total_steps = blocks_per_k * (config_.mma_k / config_.mma_core_k);
-    auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(),
-        [total_steps](const auto& command) { return command.commit || command.next_step < total_steps; });
+    auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(), [this](const auto& command) {
+        return command.commit || command.next_step < mma_total_steps(config_, command.shape);
+    });
     if (command_it == mma.queue.end()) return std::nullopt;
     auto& command = *command_it;
     if (command.commit) {
@@ -2449,6 +2474,11 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
         mma.queue.pop_front();
         return std::nullopt;
     }
+    // The command's shape sets the walk: rows in core_m blocks (8 for m32,
+    // 16 for m64), the n span in core_n blocks, k in core_k steps.
+    const uint32_t blocks_n = command.shape.n / config_.mma_core_n;
+    const uint32_t blocks_per_k = (command.shape.m / config_.mma_core_m) * blocks_n;
+    const uint32_t total_steps = mma_total_steps(config_, command.shape);
     MmaStep step;
     const uint32_t k_block = command.next_step / blocks_per_k;
     const uint32_t block = command.next_step % blocks_per_k;
@@ -2461,6 +2491,7 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     step.k0 = k_block * config_.mma_core_k;
     step.a_base = command.a_base;
     step.b_base = command.b_base;
+    step.shape = command.shape;
     step.init_step = command.init && step.k0 == 0;
     step.reload_a = n_block == 0;
     step.last_step = command.next_step + 1 == total_steps;
@@ -2484,11 +2515,11 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     if (step.reload_a) {
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                elements.push_back(mma_a_address(config_, step.a_base, step.m0 + mi, step.k0 + kk));
+                elements.push_back(mma_a_address(config_, step.shape, step.a_base, step.m0 + mi, step.k0 + kk));
     }
     for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-            elements.push_back(mma_b_address(config_, step.b_base, step.k0 + kk, step.n0 + ni));
+            elements.push_back(mma_b_address(config_, step.shape, step.b_base, step.k0 + kk, step.n0 + ni));
     // Bank rounds: round r reads every bank's r-th distinct word.
     std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
     for (const auto address : elements) {
@@ -2563,7 +2594,7 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
                 mma.a_held[mi * config_.mma_core_k + kk] =
-                    value(mma_a_address(config_, step.a_base, step.m0 + mi, step.k0 + kk));
+                    value(mma_a_address(config_, step.shape, step.a_base, step.m0 + mi, step.k0 + kk));
     }
     if (mma.a_held.size() != config_.mma_core_m * config_.mma_core_k)
         throw SimError("internal MMA step found no held A block");
@@ -2572,7 +2603,7 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
     for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
         for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
             b[ni * config_.mma_core_k + kk] =
-                value(mma_b_address(config_, step.b_base, step.k0 + kk, step.n0 + ni));
+                value(mma_b_address(config_, step.shape, step.b_base, step.k0 + kk, step.n0 + ni));
     MmaResult result;
     result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
     result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
@@ -3615,11 +3646,10 @@ bool Machine::needs_dispatch(const Instruction& inst, uint64_t active_mask) {
 void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     const auto opcode = inst.opcode;
     const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_lsu_opcode(opcode) ||
-        is_acc_transfer(opcode) || opcode == Opcode::mma_async || opcode == Opcode::mma_async_init ||
-        is_atomic(opcode);
+        is_acc_transfer(opcode) || is_mma_async(opcode) || is_atomic(opcode);
     if (sets_depbar && inst.control.set_depbar >= 6) {
-        if (opcode == Opcode::mma_async || opcode == Opcode::mma_async_init) {
-            panic(warp, inst, "mma.async has no operand-consumed depbar");
+        if (is_mma_async(opcode)) {
+            panic(warp, inst, opcode_name(opcode, &config_.mma_shapes) + " has no operand-consumed depbar");
         }
         if (is_acc_transfer(opcode)) panic(warp, inst, "accumulator transfer has no depbar");
         if (is_lsu_opcode(opcode)) panic(warp, inst, "global memory operation has no depbar");
@@ -3687,9 +3717,11 @@ void Machine::dispatch_issued(Wires& w) {
 }
 
 void Machine::hand_over(const DispatchEntry& op, Wires& w) {
+    if (is_mma_async(op.instruction.opcode)) {
+        dispatch_mma(op, w);
+        return;
+    }
     switch (op.instruction.opcode) {
-    case Opcode::mma_async:
-    case Opcode::mma_async_init:
     case Opcode::mma_commit:
         dispatch_mma(op, w);
         break;
@@ -3751,29 +3783,32 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
         w.dispatch.mma = std::move(command);
         return;
     }
-    if (inst.dst >= kernel_.accumulators.size()) panic(op, "accumulator id out of range");
-    const auto& acc = kernel_.accumulators[inst.dst];
-    if (acc.rows != config_.mma_m || acc.cols != config_.mma_n)
-        panic(op, "MMA accumulator shape does not match the device profile");
+    // The shape is the profile's (its list gives each opcode pair a shape);
+    // its existence and its accumulator's match were checked at kernel load
+    // (check_mma_shapes).
+    const auto shape = *mma_shape_of(config_, inst.opcode);
     const auto a = uniform_reg(op, inst.src0, "MMA A address");
     const auto b = uniform_reg(op, inst.src1, "MMA B address");
-    const uint64_t a_bytes = static_cast<uint64_t>(config_.mma_m) * config_.mma_k * 2;
-    const uint64_t b_bytes = static_cast<uint64_t>(config_.mma_k) * config_.mma_n * 2;
+    // The layout's actual storage, not the element count (a partly filled
+    // xor64 K block is still whole 16-byte rows).
+    const uint64_t a_bytes = mma_operand_footprint(config_, shape, true);
+    const uint64_t b_bytes = mma_operand_footprint(config_, shape, false);
     if ((config_.mma_xor_layout && ((a | b) & 63u) != 0) ||
         static_cast<uint64_t>(a) + a_bytes > shmem_.size() ||
         static_cast<uint64_t>(b) + b_bytes > shmem_.size())
         panic(op, "MMA operand alignment or footprint is outside shmem");
     MmaCommand command;
     command.id = next_mma_command_id_++;
-    command.init = inst.opcode == Opcode::mma_async_init;
+    command.init = is_mma_init(inst.opcode);
+    command.shape = shape;
     command.warp = op.warp;
     command.accumulator = inst.dst;
     command.depbar = inst.control.set_depbar;
     command.a_base = a;
     command.b_base = b;
     sanitizer_.record_mma_accept(site(op), command.id, command.accumulator,
-        command.depbar, mma_operand_span(a, true), mma_operand_span(b, false));
-    trace_->mma_command(cycle_, command.id, op.warp, inst.opcode == Opcode::mma_async_init);
+        command.depbar, mma_operand_span(a, true, shape), mma_operand_span(b, false, shape));
+    trace_->mma_command(cycle_, command.id, op.warp, command.init);
     w.dispatch.mma = std::move(command);
 }
 
@@ -4097,7 +4132,7 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     const auto& inst = pending.instruction;
     // A panic names the instruction's own pc (the warp's has moved on).
     const auto fail = [&](const std::string& reason) {
-        throw_issue_panic(IssueSite{cycle_, pending.warp, pending.pc, inst}, reason);
+        throw_issue_panic(IssueSite{cycle_, pending.warp, pending.pc, inst, &config_.mma_shapes}, reason);
     };
     std::vector<uint32_t> result(config_.lanes, 0);
     // The round holds each source register once; duplicated operand slots
@@ -4993,6 +5028,7 @@ Instruction Machine::head_instruction(const Warp& warp) const {
 }
 
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
+    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::fadd:
@@ -5064,8 +5100,6 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::mma_async:
-    case Opcode::mma_async_init: return {inst.src0, inst.src1};
     case Opcode::mma_commit: return {inst.src0};
     default: return {};
     }
@@ -5296,12 +5330,12 @@ void Machine::apply_image(
 
 // An issuing warp's site: its FIFO head's pc.
 IssueSite Machine::site(const Warp& warp, const Instruction& inst) const {
-    return IssueSite{cycle_, warp.id, head_pc(warp.id), inst};
+    return IssueSite{cycle_, warp.id, head_pc(warp.id), inst, &config_.mma_shapes};
 }
 
 // A dispatched instruction's site: the dispatch cycle, its issue's pc.
 IssueSite Machine::site(const DispatchEntry& op) const {
-    return IssueSite{cycle_, op.warp, op.pc, op.instruction};
+    return IssueSite{cycle_, op.warp, op.pc, op.instruction, &config_.mma_shapes};
 }
 
 std::vector<uint32_t> Machine::access_addresses(
@@ -5320,17 +5354,17 @@ std::vector<uint32_t> Machine::lane_values(const Warp& warp, uint8_t reg) const 
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
-    uint32_t base, bool a_operand) const {
+    uint32_t base, bool a_operand, const MmaShape& shape) const {
     // Ask the operand geometry itself (the same functions the fetch uses):
-    // the hull of every element address of the profile-static shape.
+    // the hull of every element address of the command's shape.
     uint64_t first = std::numeric_limits<uint64_t>::max();
     uint64_t last = 0;
-    const uint32_t outer = a_operand ? config_.mma_m : config_.mma_n;
+    const uint32_t outer = a_operand ? shape.m : shape.n;
     for (uint32_t i = 0; i < outer; ++i) {
-        for (uint32_t k = 0; k < config_.mma_k; ++k) {
+        for (uint32_t k = 0; k < shape.k; ++k) {
             const uint64_t address = a_operand
-                ? mma_a_address(config_, base, i, k)
-                : mma_b_address(config_, base, k, i);
+                ? mma_a_address(config_, shape, base, i, k)
+                : mma_b_address(config_, shape, base, k, i);
             first = std::min(first, address);
             last = std::max(last, address + 2);
         }

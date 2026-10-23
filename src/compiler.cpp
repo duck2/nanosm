@@ -108,6 +108,26 @@ bool is_mbar_predicate_writer(Opcode opcode) {
     return is_mbar_test_wait(opcode) || is_mbar_try_wait(opcode);
 }
 
+// "mma.async.m64n64k8", "mma.async.init.m32n64k8", ...: the mma.async
+// block's opcode for that shape on this profile (src/isa.hpp: the shape's
+// place in the profile's list). nullopt for a mnemonic that is not an
+// mma.async; a shape the profile does not list is an error.
+std::optional<Opcode> mma_async_opcode(const std::string& op, const DeviceProfile& profile, uint32_t line) {
+    static const std::string plain = "mma.async.";
+    static const std::string init = "mma.async.init.";
+    const bool is_init = op.starts_with(init);
+    if (!is_init && !op.starts_with(plain)) return std::nullopt;
+    const auto suffix = op.substr(is_init ? init.size() : plain.size());
+    const auto shape = parse_mma_shape_name(suffix);
+    if (!shape.has_value()) return std::nullopt;
+    const auto found = std::find(profile.mma_shapes.begin(), profile.mma_shapes.end(), *shape);
+    if (found == profile.mma_shapes.end()) {
+        throw SimError("line " + std::to_string(line) + ": " + op + ": shape " + suffix +
+            " is not one of this device profile's mma shapes");
+    }
+    return mma_opcode(static_cast<uint32_t>(found - profile.mma_shapes.begin()), is_init);
+}
+
 Opcode parse_setp_opcode(std::string op, bool immediate, uint32_t line) {
     if (op.ends_with(".u32")) op.resize(op.size() - 4);
     if (op == "setp.eq") return immediate ? Opcode::setpi_eq : Opcode::setp_eq;
@@ -242,7 +262,7 @@ Control parse_control(const std::string& text, uint32_t line) {
     return control;
 }
 
-AssemblyProgram parse_program(std::string_view source, bool allow_control) {
+AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile) {
     AssemblyProgram program;
     std::unordered_map<std::string, int32_t> constants;
     std::unordered_map<std::string, std::size_t> labels;
@@ -580,12 +600,12 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
             if (inst.src0 > 254 || static_cast<unsigned>(inst.src1) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
-        } else if (op == "mma.async" || op == "mma.async.init") {
+        } else if (const auto mma = mma_async_opcode(op, profile, line_number); mma.has_value()) {
             expect_count(args, 3, line_number);
             const auto acc = accumulator_ids.find(args[0]);
             if (acc == accumulator_ids.end())
                 throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
-            inst.opcode = op == "mma.async" ? Opcode::mma_async : Opcode::mma_async_init;
+            inst.opcode = *mma;
             inst.dst = acc->second;
             inst.src0 = parse_mbar_address(args[1], line_number);
             inst.src1 = parse_mbar_address(args[2], line_number);
@@ -635,6 +655,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control) {
 }
 
 std::vector<uint8_t> sources(const Instruction& inst) {
+    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::and_:
@@ -704,8 +725,6 @@ std::vector<uint8_t> sources(const Instruction& inst) {
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::mma_async:
-    case Opcode::mma_async_init: return {inst.src0, inst.src1};
     case Opcode::mma_commit: return {inst.src0};
     default: return {};
     }
@@ -795,6 +814,29 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
     }
 }
 
+// An mma.async names a shape the profile lists, and its accumulator is that
+// shape's rows x columns: a property of the instruction, so refused at
+// assembly and at kernel load (both builds). `where` is "line N" or "pc N".
+void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumulator>& accumulators,
+    const DeviceProfile& profile, const std::string& where) {
+    if (!is_mma_async(inst.opcode)) return;
+    const auto shape = mma_shape_of(profile, inst.opcode);
+    const auto name = opcode_name(inst.opcode, &profile.mma_shapes);
+    if (!shape.has_value()) {
+        throw SimError(where + ": " + name + ": this device profile defines no mma shape for it (its list has " +
+            std::to_string(profile.mma_shapes.size()) + " shapes)");
+    }
+    if (inst.dst >= accumulators.size()) {
+        throw SimError(where + ": " + name + ": accumulator id out of range");
+    }
+    const auto& acc = accumulators[inst.dst];
+    if (acc.rows != shape->m || acc.cols != shape->n) {
+        throw SimError(where + ": " + name + " needs a " + std::to_string(shape->m) + "x" +
+            std::to_string(shape->n) + " accumulator; '" + acc.name + "' is " + std::to_string(acc.rows) + "x" +
+            std::to_string(acc.cols));
+    }
+}
+
 // The fixed-latency part of the virtual issue timeline (vtime: a warp's issue
 // cycles, relative). Every distance comes from src/rf.hpp, the helper the
 // simulator and the sanitizer use:
@@ -878,7 +920,7 @@ struct FixedTimeline {
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile) {
     validate_device_profile(profile);
-    auto program = parse_program(source, false);
+    auto program = parse_program(source, false, profile);
     program.register_count = register_count(program);
     program.profile_name = profile.name;
     program.profile_fingerprint = device_profile_fingerprint(profile);
@@ -928,8 +970,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 "line " + std::to_string(inst.line) +
                 ": tma.async is unsupported by this device profile");
         }
-        if ((inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init ||
-             inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
+        if ((is_mma_async(inst.opcode) || inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
             throw SimError("line " + std::to_string(inst.line) + ": MMA is unsupported by this device profile");
         }
         if (inst.opcode == Opcode::bra &&
@@ -994,6 +1035,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
 
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
+        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
         const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (previous == nullptr) {
@@ -1036,7 +1078,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             const auto width = inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j)
                 pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
-        } else if (inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init) {
+        } else if (is_mma_async(inst.opcode)) {
             if (!mma_barrier.has_value()) mma_barrier = allocate();
             inst.control.set_depbar = *mma_barrier;
         }
@@ -1107,7 +1149,7 @@ std::string emit_asm(const AssemblyProgram& program) {
 
 Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     validate_device_profile(profile);
-    const auto program = parse_program(source, true);
+    const auto program = parse_program(source, true, profile);
     const auto expected = device_profile_fingerprint(profile);
     if (program.profile_name.empty()) throw SimError("assembly has no .profile directive");
     if (program.profile_name != profile.name || program.profile_fingerprint != expected) {
@@ -1151,8 +1193,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
              inst.opcode == Opcode::ldg_uni || inst.opcode == Opcode::lds_uni ||
              inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
              inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 ||
-             inst.opcode == Opcode::mma_async || inst.opcode == Opcode::mma_async_init ||
-             is_atomic(inst.opcode)) && inst.control.set_depbar >= 6) {
+             is_mma_async(inst.opcode) || is_atomic(inst.opcode)) && inst.control.set_depbar >= 6) {
             throw SimError("line " + std::to_string(inst.line) + ": memory operation requires set=sb0..sb5");
         }
         if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
@@ -1161,8 +1202,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::lds_uni &&
             inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
             inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
-            inst.opcode != Opcode::mma_async && inst.opcode != Opcode::mma_async_init &&
-            !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
+            !is_mma_async(inst.opcode) && !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
             throw SimError("line " + std::to_string(inst.line) + ": this opcode cannot set a depbar");
         }
         if (is_setp(inst.opcode) && inst.dst >= 7) {
@@ -1220,6 +1260,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             }
         }
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
+        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
         kernel.words.push_back(encode(inst));
     }
     return kernel;
@@ -1229,7 +1270,7 @@ Kernel assemble_asm_file(const std::string& path, const DeviceProfile& profile) 
     return assemble_asm(read_file(path), profile);
 }
 
-std::string emit_hex(const Kernel& kernel) {
+std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shapes) {
     std::ostringstream out;
     out << ".profile " << kernel.profile_name << ", 0x"
         << format_profile_fingerprint(kernel.profile_fingerprint) << '\n';
@@ -1239,7 +1280,7 @@ std::string emit_hex(const Kernel& kernel) {
     }
     for (const auto word : kernel.words) {
         out << std::hex << std::setw(16) << std::setfill('0') << word
-            << " ; " << format_instruction(decode(word)) << '\n';
+            << " ; " << format_instruction(decode(word), true, mma_shapes) << '\n';
     }
     return out.str();
 }
@@ -1337,6 +1378,13 @@ void validate_kernel(const Kernel& kernel) {
 
 Kernel load_hex_file(const std::string& path) {
     return load_hex(read_file(path));
+}
+
+void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        check_mma_shape(decode(kernel.words[index]), kernel.accumulators, profile,
+            "kernel pc " + std::to_string(8 * index));
+    }
 }
 
 void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile) {

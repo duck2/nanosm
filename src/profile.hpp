@@ -4,8 +4,10 @@
 
 #include <stdint.h>
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace nanosm {
 
@@ -83,9 +85,12 @@ struct DeviceProfile {
     // producer. >= 1.
     uint32_t tmem_port_depth = 2;
     uint32_t tmem_read_latency_cycles = 2;
-    uint32_t mma_m = 0;
-    uint32_t mma_n = 0;
-    uint32_t mma_k = 0;
+    // The logical MMA shapes this device runs (trash/chan.txt 2026-10-22:
+    // configurable, not hardcoded). Shape i is the mma.async block's opcode
+    // pair i (src/isa.hpp: mma_block_first + 2i, + 2i + 1 for init); a
+    // kernel using an opcode or a shape the list lacks is refused at assembly
+    // and at load. validate_device_profile states the rules a shape follows.
+    std::vector<MmaShape> mma_shapes;
     uint32_t mma_core_m = 0;
     uint32_t mma_core_n = 0;
     uint32_t mma_core_k = 0;
@@ -154,5 +159,24 @@ DeviceProfile parse_device_profile(std::string_view source);
 uint64_t device_profile_fingerprint(const DeviceProfile& profile);
 std::string format_profile_fingerprint(uint64_t fingerprint);
 void validate_device_profile(const DeviceProfile& profile);
+
+// The shape an mma.async opcode means on this profile; nullopt for any other
+// opcode, or for an opcode of the block past the end of the shape list.
+std::optional<MmaShape> mma_shape_of(const DeviceProfile& profile, Opcode opcode);
+
+// Steps of one K block a command of `shape` walks before it visits the same
+// accumulator block again: (m / core_m) x (n / core_n).
+uint32_t mma_blocks_per_k(const DeviceProfile& profile, const MmaShape& shape);
+// The fewest such steps that keep a shape with k > core_k from stalling on
+// its own accumulator (validate_device_profile explains the bound):
+// shmem port_a_depth + read_latency + mma result_latency + tmem port_depth.
+uint32_t mma_min_blocks_per_k(const DeviceProfile& profile);
+
+// Legal but wasteful profile choices (e.g. an MMA shape that leaves the last
+// 8-deep xor64 K block of its operands partly empty). Warnings, not errors.
+std::vector<std::string> device_profile_warnings(const DeviceProfile& profile);
+// Prints each distinct warning to stderr once per process; parse_device_profile
+// calls it after validation.
+void report_profile_warnings(const DeviceProfile& profile);
 
 } // namespace nanosm

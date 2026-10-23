@@ -51,6 +51,13 @@ uint64_t encode(const Instruction& inst) {
         (static_cast<uint64_t>(inst.control.set_depbar) << encoding::set_depbar_shift) |
         (static_cast<uint64_t>(inst.control.wait_mask) << encoding::wait_mask_shift);
     const auto immediate = static_cast<uint32_t>(inst.imm) & encoding::immediate_mask;
+    if (is_mma_async(inst.opcode)) {
+        // ACC id, A and B base registers (the block's opcodes share one form).
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        return word;
+    }
     switch (inst.opcode) {
     case Opcode::sread:
     case Opcode::mov:
@@ -141,8 +148,6 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::acc_ld_v8:
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
-    case Opcode::mma_async:
-    case Opcode::mma_async_init:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
@@ -196,6 +201,12 @@ Instruction decode(uint64_t word) {
     auto immediate = static_cast<uint32_t>(word & encoding::immediate_mask);
     if ((immediate & (1u << 21)) != 0) {
         immediate |= ~static_cast<uint32_t>(encoding::immediate_mask);
+    }
+    if (is_mma_async(inst.opcode)) {
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        return inst;
     }
     switch (inst.opcode) {
     case Opcode::sread:
@@ -287,8 +298,6 @@ Instruction decode(uint64_t word) {
     case Opcode::acc_ld_v8:
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
-    case Opcode::mma_async:
-    case Opcode::mma_async_init:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
@@ -326,7 +335,40 @@ Instruction decode(uint64_t word) {
     return inst;
 }
 
-std::string opcode_name(Opcode opcode) {
+std::string mma_shape_name(const MmaShape& shape) {
+    return "m" + std::to_string(shape.m) + "n" + std::to_string(shape.n) + "k" + std::to_string(shape.k);
+}
+
+std::optional<MmaShape> parse_mma_shape_name(const std::string& name) {
+    MmaShape shape;
+    std::size_t at = 0;
+    for (const auto [letter, field] : {std::pair{'m', &shape.m}, std::pair{'n', &shape.n}, std::pair{'k', &shape.k}}) {
+        if (at >= name.size() || name[at] != letter) return std::nullopt;
+        ++at;
+        const auto digits = at;
+        uint64_t value = 0;
+        while (at < name.size() && name[at] >= '0' && name[at] <= '9' && at - digits < 6) {
+            value = value * 10 + static_cast<uint64_t>(name[at] - '0');
+            ++at;
+        }
+        if (at == digits || value == 0 || (at < name.size() && name[at] >= '0' && name[at] <= '9')) {
+            return std::nullopt;
+        }
+        *field = static_cast<uint32_t>(value);
+    }
+    if (at != name.size()) return std::nullopt;
+    return shape;
+}
+
+std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) {
+    if (is_mma_async(opcode)) {
+        const auto index = mma_shape_index(opcode);
+        const std::string family = is_mma_init(opcode) ? "mma.async.init." : "mma.async.";
+        if (mma_shapes != nullptr && index < mma_shapes->size()) {
+            return family + mma_shape_name((*mma_shapes)[index]);
+        }
+        return family + "slot" + std::to_string(index);
+    }
     switch (opcode) {
     case Opcode::sread: return "sread";
     case Opcode::mov: return "mov";
@@ -376,8 +418,6 @@ std::string opcode_name(Opcode opcode) {
     case Opcode::acc_ld_v8: return "acc.ld.v8";
     case Opcode::acc_st: return "acc.st";
     case Opcode::acc_st_v8: return "acc.st.v8";
-    case Opcode::mma_async: return "mma.async";
-    case Opcode::mma_async_init: return "mma.async.init";
     case Opcode::mma_commit: return "mma.commit";
     case Opcode::lds: return "lds";
     case Opcode::sts: return "sts";
@@ -427,9 +467,16 @@ std::string format_control(const Control& control) {
     return out.str();
 }
 
-std::string format_instruction(const Instruction& inst, bool include_control) {
+std::string format_instruction(
+    const Instruction& inst, bool include_control, const std::vector<MmaShape>* mma_shapes) {
     std::ostringstream out;
-    out << opcode_name(inst.opcode);
+    out << opcode_name(inst.opcode, mma_shapes);
+    if (is_mma_async(inst.opcode)) {
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
+            << "], [" << reg(inst.src1) << ']';
+        if (include_control) out << ' ' << format_control(inst.control);
+        return out.str();
+    }
     switch (inst.opcode) {
     case Opcode::sread:
         out << ' ' << reg(inst.dst) << ", " << special_name(inst.imm);
@@ -514,11 +561,6 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
         out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
             << ", " << reg(inst.src1);
         break;
-    case Opcode::mma_async:
-    case Opcode::mma_async_init:
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
-            << "], [" << reg(inst.src1) << ']';
-        break;
     case Opcode::mma_commit:
         out << " [" << reg(inst.src0) << ']';
         break;
@@ -563,6 +605,7 @@ std::string format_instruction(const Instruction& inst, bool include_control) {
 }
 
 uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
+    if (is_mma_async(inst.opcode)) return 0; // asynchronous: its depbar clears at the last operand read
     switch (inst.opcode) {
     case Opcode::sread:
     case Opcode::mov:
@@ -629,8 +672,6 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::acc_ld_v8:
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
-    case Opcode::mma_async:
-    case Opcode::mma_async_init:
     case Opcode::mma_commit:
     case Opcode::fence_sh:
     case Opcode::atom_add_uni:

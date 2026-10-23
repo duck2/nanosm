@@ -39,7 +39,9 @@ std::string emit_asm(const AssemblyProgram& program);
 
 Kernel assemble_asm(std::string_view source, const DeviceProfile& profile);
 Kernel assemble_asm_file(const std::string& path, const DeviceProfile& profile);
-std::string emit_hex(const Kernel& kernel);
+// The hex text; each word's comment names its instruction, an mma.async by
+// its shape when the profile's shape list is given.
+std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shapes = nullptr);
 Kernel load_hex(std::string_view source);
 Kernel load_hex_file(const std::string& path);
 void validate_kernel(const Kernel& kernel);
@@ -48,6 +50,10 @@ void validate_kernel(const Kernel& kernel);
 // instruction and the registers. qtxc and the assembler apply the same rule
 // per source line.
 void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: every mma.async names a shape the profile lists, and its
+// accumulator has that shape's rows and columns (qtxc and the assembler
+// apply the same rule per source line).
+void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);

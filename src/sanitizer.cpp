@@ -15,7 +15,7 @@ namespace nanosm {
     throw SimError(
         "PANIC cycle=" + std::to_string(site.cycle) + " warp=" + std::to_string(site.warp) +
         " pc=" + std::to_string(site.pc) + " reason=" + reason + " inst='" +
-        format_instruction(site.inst) + "'");
+        format_instruction(site.inst, true, site.mma_shapes) + "'");
 }
 
 [[noreturn]] void throw_mbar_rmw_panic(
@@ -25,7 +25,7 @@ namespace nanosm {
     if (requester != nullptr) {
         message += " warp=" + std::to_string(requester->warp) +
             " pc=" + std::to_string(requester->pc) +
-            " inst='" + format_instruction(requester->inst) + "'";
+            " inst='" + format_instruction(requester->inst, true, requester->mma_shapes) + "'";
     } else {
         message += " source=engine";
     }
@@ -178,7 +178,8 @@ void Sanitizer::check_warp_uniform(
 
 void Sanitizer::check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const {
     if (active_mask != full_mask) {
-        throw_issue_panic(site, opcode_name(site.inst.opcode) + " is a uniform operation under a partial active mask");
+        throw_issue_panic(site, opcode_name(site.inst.opcode, site.mma_shapes) +
+            " is a uniform operation under a partial active mask");
     }
 }
 

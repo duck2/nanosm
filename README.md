@@ -102,6 +102,21 @@ instruction across commands. The walker holds one 4x8 A block and streams the 8x
 N, reading each A block once per command; port B's reads have port A's depth and read latency.
 There are no numerical tuning knobs or host floating-point operations in this path.
 
+Each MMA shape is its own instruction, `mma.async.mXnYkZ` and `mma.async.init.mXnYkZ` (`init`
+starts the accumulator at zero), and the shapes come from the profile: `mma.shapes` lists them
+(canonical: `m64n64k8`, `m32n64k8`), and shape i of the list is opcode `0x70 + 2i` (and `+ 1` for
+init) in the MMA opcode block 0x70..0x7f, so the list's order is part of the profile's fingerprint.
+A shape's m, n and k are powers of two and multiples of the core's; its accumulator has at least one row per lane
+and fits in tmem; and a shape with k above the core's must revisit each accumulator block late
+enough to hide the accumulator latency: (m / core_m) x (n / core_n) >= port-A depth + read
+latency + MMA result latency + tmem port depth (14 on the canonical profile). A kernel using a
+shape the profile lacks, or an accumulator whose rows x columns differ from its MMA's shape, is
+refused by qtxc, the assembler and kernel load. In the xor64 layout each 8-deep K block is a
+whole (rows x 16 B) object, so a 32-row A object is the top half of a 64-row one when k is 8 and
+the two halves of one 64-row tile can feed two m32 commands. A shape whose k is not a multiple of 8
+(k = 4 on a 4x4x4 core) leaves its last K block partly empty: legal, but the profile prints a
+warning when it loads, and the operand's footprint still counts the whole block.
+
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
 at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
 [third_party/tcgen05-LICENSE](third_party/tcgen05-LICENSE). This borrows the measured arithmetic

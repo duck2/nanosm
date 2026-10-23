@@ -201,7 +201,8 @@ inline std::optional<std::string> rf_read_port_conflict(
                 ("r" + std::to_string(banks[bank][i]));
         }
         const auto ports = profile.rf_read_ports_per_bank;
-        return "malformed instruction '" + format_instruction(inst, false) + "': its distinct sources " +
+        return "malformed instruction '" + format_instruction(inst, false, &profile.mma_shapes) +
+            "': its distinct sources " +
             registers + " are in one RF bank (" + std::to_string(bank) + "), which has " +
             std::to_string(ports) + (ports == 1 ? " read port" : " read ports");
     }

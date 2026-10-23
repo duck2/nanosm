@@ -26,9 +26,7 @@
     "read_latency_cycles": 2
   },
   "mma": {
-    "m": 64,
-    "n": 64,
-    "k": 8,
+    "shapes": ["m64n64k8", "m32n64k8"],
     "core_m": 4,
     "core_n": 4,
     "core_k": 8,

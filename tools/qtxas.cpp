@@ -13,7 +13,7 @@ int main(int argc, char** argv) {
         const auto kernel = nanosm::assemble_asm_file(argv[2], profile);
         std::ofstream output(argv[3]);
         if (!output) nanosm::die("cannot create output hex '{}'", argv[3]);
-        output << nanosm::emit_hex(kernel);
+        output << nanosm::emit_hex(kernel, &profile.mma_shapes);
         return 0;
     });
 }

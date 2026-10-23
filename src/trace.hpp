@@ -8,6 +8,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nanosm {
@@ -197,6 +198,9 @@ public:
         uint64_t dram_clock_hz,
         TraceOptions options = {});
 
+    // The profile's MMA shape list, so an issued mma.async is named by its
+    // shape (src/isa.hpp opcode_name).
+    void set_mma_shapes(std::vector<MmaShape> shapes) { mma_shapes_ = std::move(shapes); }
     void issue(uint64_t cycle, uint32_t warp, uint32_t pc, const Instruction& instruction);
     // A fetch granted (debug traces: an instant on the warp's track; its id
     // is the pc read), and fetched words discarded without issuing.
@@ -306,6 +310,7 @@ private:
     uint64_t dram_clock_hz_ = 0;
     TraceOptions options_;
     TraceSummary summary_;
+    std::vector<MmaShape> mma_shapes_;
     std::vector<TimelineEvent> events_;
     std::vector<WarpInterval> warp_intervals_;
     std::array<std::optional<OpenSlice>, 3> shmem_slices_; // per ShmemService

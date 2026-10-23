@@ -273,28 +273,28 @@ IN0:
 
         mov   r0, QBUF
         mov   r1, KBUF0
-        mma.async.init S, [r0], [r1]
+        mma.async.init.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         mma.commit [r3]
 W0:
         mbar.try_wait p1, [r4], 0
@@ -302,28 +302,28 @@ W0:
 
         mov   r0, PBUF
         mov   r1, VBUF0
-        mma.async.init O, [r0], [r1]
+        mma.async.init.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         mma.commit [r5]
 ; Block 1: data long since prefetched; QK(1) queues behind PV(0)'s commit
 ; fence and the engine flows through with no issuer round trip.
@@ -332,56 +332,56 @@ IN1:
 @!p1    bra.uni IN1
         mov   r0, QBUF
         mov   r1, KBUF1
-        mma.async.init S, [r0], [r1]
+        mma.async.init.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async S, [r0], [r1]
+        mma.async.m64n64k8 S, [r0], [r1]
         mma.commit [r3]
 W1:
         mbar.try_wait p1, [r4], 1
 @!p1    bra.uni W1
         mov   r0, PBUF
         mov   r1, VBUF1
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         addi r0, r0, 1024
         addi r1, r1, 1024
-        mma.async O, [r0], [r1]
+        mma.async.m64n64k8 O, [r0], [r1]
         mma.commit [r5]
 ; Epilogue: the four workers stage normalized O (16 KiB) into OSTAGE; one TMA
 ; store writes it to gmem. The store's mbar certifies that the shmem source

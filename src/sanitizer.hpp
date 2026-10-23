@@ -49,11 +49,13 @@
 namespace nanosm {
 
 // The issuing warp and instruction a check is about (PANIC text only).
+// mma_shapes, the profile's shape list, names an mma.async by its shape.
 struct IssueSite {
     uint64_t cycle = 0;
     uint32_t warp = 0;
     uint32_t pc = 0;
     const Instruction& inst;
+    const std::vector<MmaShape>* mma_shapes = nullptr;
 };
 
 // PANIC text shared by Machine and Sanitizer, so a moved check keeps its

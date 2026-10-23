@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -83,9 +84,9 @@ enum class Opcode : uint8_t {
     acc_ld_v8 = 0x51,
     acc_st = 0x52,
     acc_st_v8 = 0x53,
-    mma_async = 0x60,
-    mma_async_init = 0x61,
     mma_commit = 0x62,
+    // 0x70..0x7f: the mma.async block (mma_block_first below). The profile's
+    // shape list says what each of these opcodes means.
     halt  = 0xff,
 };
 
@@ -188,6 +189,47 @@ inline constexpr unsigned reg3_shift = 6; // fma's rc, in RRR reserved bits
 
 } // namespace encoding
 
+// A logical MMA shape: an m x k A times a k x n B into an m x n accumulator.
+struct MmaShape {
+    uint32_t m = 0;
+    uint32_t n = 0;
+    uint32_t k = 0;
+    bool operator==(const MmaShape&) const = default;
+};
+
+// The mma.async block (trash/chan.txt 2026-10-22: shapes are not hardcoded).
+// One opcode per shape and per init variant -- the shape is never an
+// instruction field -- but which shape an opcode means is the profile's:
+// shape i of its mma.shapes list is mma_block_first + 2i (accumulate:
+// C += A x B) and mma_block_first + 2i + 1 (init: C = A x B). The block holds
+// mma_block_shapes shapes.
+inline constexpr uint8_t mma_block_first = 0x70;
+inline constexpr uint32_t mma_block_shapes = 8;
+
+inline bool is_mma_async(Opcode opcode) {
+    const auto value = static_cast<uint8_t>(opcode);
+    return value >= mma_block_first && value < mma_block_first + 2 * mma_block_shapes;
+}
+
+inline bool is_mma_init(Opcode opcode) {
+    return is_mma_async(opcode) && ((static_cast<uint8_t>(opcode) - mma_block_first) & 1u) != 0;
+}
+
+// Which entry of the profile's shape list an mma.async opcode names.
+inline uint32_t mma_shape_index(Opcode opcode) {
+    return (static_cast<uint8_t>(opcode) - mma_block_first) / 2u;
+}
+
+inline Opcode mma_opcode(uint32_t shape_index, bool init) {
+    return static_cast<Opcode>(mma_block_first + 2 * shape_index + (init ? 1 : 0));
+}
+
+// "m64n64k8": the mnemonic suffix, also the profile's spelling of a shape.
+std::string mma_shape_name(const MmaShape& shape);
+// The inverse: "m32n64k8" -> {32, 64, 8}; nullopt unless the text is exactly
+// m<digits>n<digits>k<digits> with nonzero values.
+std::optional<MmaShape> parse_mma_shape_name(const std::string& name);
+
 // The uniform shared atomics (trash/rfc13.md): atom.add/and/xor/exch.uni.
 inline bool is_atomic(Opcode opcode) {
     return opcode == Opcode::atom_add_uni || opcode == Opcode::atom_and_uni ||
@@ -196,9 +238,13 @@ inline bool is_atomic(Opcode opcode) {
 
 uint64_t encode(const Instruction& instruction);
 Instruction decode(uint64_t word);
-std::string format_instruction(const Instruction& instruction, bool include_control = true);
+// Names. An mma.async opcode's shape is the profile's: given its shape list
+// (`mma_shapes`), it is named "mma.async[.init].m64n64k8"; without one, or
+// past the list's end, by its place in the block ("mma.async.slot0").
+std::string format_instruction(const Instruction& instruction, bool include_control = true,
+    const std::vector<MmaShape>* mma_shapes = nullptr);
 std::string format_control(const Control& control);
-std::string opcode_name(Opcode opcode);
+std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes = nullptr);
 uint8_t fixed_latency(const Instruction& instruction, const Timing& timing);
 
 } // namespace nanosm

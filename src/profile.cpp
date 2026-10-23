@@ -5,15 +5,26 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <fstream>
+#include <iostream>
+#include <mutex>
+#include <set>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace nanosm {
 namespace {
 
 using json = nlohmann::json;
+
+std::vector<std::string> mma_shape_names(const std::vector<MmaShape>& shapes) {
+    std::vector<std::string> names;
+    for (const auto& shape : shapes) names.push_back(mma_shape_name(shape));
+    return names;
+}
 
 json profile_json(const DeviceProfile& p) {
     return {
@@ -44,7 +55,7 @@ json profile_json(const DeviceProfile& p) {
             {"read_latency_cycles", p.tmem_read_latency_cycles},
         }},
         {"mma", {
-            {"m", p.mma_m}, {"n", p.mma_n}, {"k", p.mma_k},
+            {"shapes", mma_shape_names(p.mma_shapes)},
             {"core_m", p.mma_core_m}, {"core_n", p.mma_core_n}, {"core_k", p.mma_core_k},
             {"queue_commands", p.mma_queue_commands},
             {"result_latency_cycles", p.mma_result_latency_cycles},
@@ -172,12 +183,76 @@ void validate_device_profile(const DeviceProfile& p) {
         throw ProfileError(
             "device profile: tma command queue and sector credits must both be zero or nonzero");
     }
-    if (p.mma_m == 0 || p.mma_n == 0 || p.mma_k == 0 || p.mma_core_m == 0 ||
-        p.mma_core_n == 0 || p.mma_core_k == 0 || p.mma_queue_commands == 0 ||
-        p.mma_result_latency_cycles == 0 ||
-        p.mma_m % p.mma_core_m != 0 || p.mma_n % p.mma_core_n != 0 ||
-        p.mma_k % p.mma_core_k != 0) {
-        throw ProfileError("device profile: invalid MMA shape, timing, or queue capacity");
+    if (p.mma_core_m == 0 || p.mma_core_n == 0 || p.mma_core_k == 0 || p.mma_queue_commands == 0 ||
+        p.mma_result_latency_cycles == 0) {
+        throw ProfileError("device profile: invalid MMA core, timing, or queue capacity");
+    }
+    // The MMA shapes (trash/chan.txt 2026-10-22, HUMAN: "m,n,k need to be a
+    // multiple of core m,n,k and if mma k is more than core k, mma m/n needs
+    // to be large enough to hide the accumulator latency"). Each listed shape
+    // takes one opcode pair of the mma.async block, in list order.
+    if (p.mma_shapes.empty()) throw ProfileError("device profile: mma shapes must list at least one shape");
+    if (p.mma_shapes.size() > mma_block_shapes) {
+        throw ProfileError("device profile: mma shapes lists " + std::to_string(p.mma_shapes.size()) +
+            " shapes; the mma.async opcode block holds " + std::to_string(mma_block_shapes));
+    }
+    for (std::size_t i = 0; i < p.mma_shapes.size(); ++i) {
+        const auto& shape = p.mma_shapes[i];
+        const auto name = "device profile: mma shape " + mma_shape_name(shape);
+        if (std::find(p.mma_shapes.begin(), p.mma_shapes.begin() + static_cast<std::ptrdiff_t>(i), shape) !=
+            p.mma_shapes.begin() + static_cast<std::ptrdiff_t>(i)) {
+            throw ProfileError(name + " is listed twice");
+        }
+        // Every dimension is a power of two (HUMAN 2026-10-22: "K also needs to
+        // be a power of 2"; "m and n can get that rule too ... it needs to
+        // somehow line up with lanes and shmem width").
+        for (const auto& [letter, size] :
+             std::initializer_list<std::pair<char, uint32_t>>{{'m', shape.m}, {'n', shape.n}, {'k', shape.k}}) {
+            if (!std::has_single_bit(size)) {
+                throw ProfileError(name + ": m, n and k must be powers of two (" + letter + " is " +
+                    std::to_string(size) + ")");
+            }
+        }
+        // The walker covers m in core_m blocks, n in core_n blocks and k in
+        // core_k steps, each step one fused group of core_k products plus C.
+        if (shape.m % p.mma_core_m != 0 || shape.n % p.mma_core_n != 0 || shape.k % p.mma_core_k != 0) {
+            throw ProfileError(name + ": m, n and k must be multiples of the core's " +
+                std::to_string(p.mma_core_m) + "x" + std::to_string(p.mma_core_n) + "x" +
+                std::to_string(p.mma_core_k));
+        }
+        // The accumulator: one row per lane in each acc.ld / acc.st beat, so
+        // an accumulator holds at least `lanes` rows (the .acc rule), and it
+        // fits in tmem.
+        if (shape.m < p.lanes) {
+            throw ProfileError(name + ": its accumulator has " + std::to_string(shape.m) +
+                " rows; acc.ld / acc.st move one row per lane, so an accumulator needs at least " +
+                std::to_string(p.lanes));
+        }
+        if (static_cast<uint64_t>(shape.m) * shape.n >
+            static_cast<uint64_t>(p.tmem_fine_banks) * p.tmem_words_per_fine_bank) {
+            throw ProfileError(name + ": its accumulator (" + std::to_string(uint64_t{shape.m} * shape.n) +
+                " words) does not fit in tmem");
+        }
+        // k > core_k: the command visits each accumulator block once per K
+        // block, mma_blocks_per_k steps apart. A step's operand rounds start at
+        // f and end at f + r - 1; it enters the core D + Lb later, its C is
+        // sampled tmem.port_depth (Dt) after entry, and its result lands
+        // result_latency (R) + Dt after entry (written at that cycle's edge;
+        // READ_FIRST). The walker starts a step only when no earlier step of
+        // the same block is still in the read pipeline or the core, i.e. from
+        // that landing cycle on. Steps of one command start back to back, one
+        // per operand round (at least one each), so the next visit starts at
+        // f + r + (blocks - 1) or later: no stall iff
+        //   blocks >= D + Lb + R + Dt   (mma_min_blocks_per_k).
+        // The bound holds for any layout; under xor64 each A reload takes one
+        // more round, which only adds slack.
+        if (shape.k > p.mma_core_k && mma_blocks_per_k(p, shape) < mma_min_blocks_per_k(p)) {
+            throw ProfileError(name + ": k " + std::to_string(shape.k) + " is more than the core's " +
+                std::to_string(p.mma_core_k) + ", so each accumulator block is revisited every " +
+                std::to_string(mma_blocks_per_k(p, shape)) + " steps (m / core_m x n / core_n); hiding the " +
+                "accumulator latency needs at least " + std::to_string(mma_min_blocks_per_k(p)) +
+                " (shmem port_a_depth + read_latency_cycles + mma result_latency_cycles + tmem port_depth)");
+        }
     }
     // tmem's own depths: nonzero register stages.
     if (p.tmem_port_depth == 0 || p.tmem_port_depth > 64 ||
@@ -192,11 +267,13 @@ void validate_device_profile(const DeviceProfile& p) {
             "(tmem port_depth + read_latency_cycles)");
     }
     // The xor64 layout keeps a 4-row block's 16-byte rows in distinct banks,
-    // which holds for a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
-    if (p.mma_xor_layout &&
-        (p.mma_m != 64 || p.mma_n != 64 || p.mma_k != 8 || p.mma_core_m != 4 || p.mma_core_n != 4 ||
-         (p.mma_core_k != 4 && p.mma_core_k != 8))) {
-        throw ProfileError("device profile: xor64 MMA layout only supports 64x64x8 with a 4x4x4 or 4x4x8 core");
+    // which holds for a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8). It
+    // depends on the row only, so any m and n in whole core blocks read one
+    // bank round per block; a shape with k > 8 stacks its 8-deep K blocks as
+    // whole (rows x 16 B) objects (src/sim.cpp mma_a_address).
+    if (p.mma_xor_layout && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
+                             (p.mma_core_k != 4 && p.mma_core_k != 8))) {
+        throw ProfileError("device profile: xor64 MMA layout needs a 4x4x4 or 4x4x8 core");
     }
     if (p.tma_sector_credits >= p.gmem_queue_sectors) {
         throw ProfileError("device profile: tma sector credits must be smaller than gmem queue");
@@ -293,9 +370,17 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_tmem("port_depth", p.tmem_port_depth);
     optional_tmem("read_latency_cycles", p.tmem_read_latency_cycles);
     const auto& mma = document.at("mma");
-    p.mma_m = field<uint32_t>(mma, "m");
-    p.mma_n = field<uint32_t>(mma, "n");
-    p.mma_k = field<uint32_t>(mma, "k");
+    if (!mma.contains("shapes") || !mma.at("shapes").is_array()) {
+        throw ProfileError("device profile: mma shapes must be an array of shape names");
+    }
+    for (const auto& name : mma.at("shapes")) {
+        const auto shape = name.is_string() ? parse_mma_shape_name(name.get<std::string>()) : std::nullopt;
+        if (!shape.has_value()) {
+            throw ProfileError("device profile: mma shape " + name.dump() +
+                " is not written m<rows>n<columns>k<depth> (e.g. \"m64n64k8\")");
+        }
+        p.mma_shapes.push_back(*shape);
+    }
     p.mma_core_m = field<uint32_t>(mma, "core_m");
     p.mma_core_n = field<uint32_t>(mma, "core_n");
     p.mma_core_k = field<uint32_t>(mma, "core_k");
@@ -369,6 +454,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.lsu_ingress_latency_cycles = field<uint32_t>(lsu, "ingress_latency_cycles");
     p.lsu_egress_latency_cycles = field<uint32_t>(lsu, "egress_latency_cycles");
     validate_device_profile(p);
+    report_profile_warnings(p);
     return p;
 }
 
@@ -389,6 +475,54 @@ std::string format_profile_fingerprint(uint64_t fingerprint) {
     std::ostringstream out;
     out << std::hex << std::setw(16) << std::setfill('0') << fingerprint;
     return out.str();
+}
+
+std::optional<MmaShape> mma_shape_of(const DeviceProfile& profile, Opcode opcode) {
+    if (!is_mma_async(opcode)) return std::nullopt;
+    const auto index = mma_shape_index(opcode);
+    if (index >= profile.mma_shapes.size()) return std::nullopt;
+    return profile.mma_shapes[index];
+}
+
+uint32_t mma_blocks_per_k(const DeviceProfile& profile, const MmaShape& shape) {
+    return (shape.m / profile.mma_core_m) * (shape.n / profile.mma_core_n);
+}
+
+uint32_t mma_min_blocks_per_k(const DeviceProfile& profile) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
+        profile.mma_result_latency_cycles + profile.tmem_port_depth;
+}
+
+std::vector<std::string> device_profile_warnings(const DeviceProfile& profile) {
+    std::vector<std::string> warnings;
+    // The xor64 layout keeps 8 fp16 of k in each operand row's 16 bytes, so
+    // a shape whose k is not a multiple of 8 leaves the last 8-deep K block
+    // of each operand partly empty (HUMAN 2026-10-22: "it should warn you if
+    // there is a partially occupied storage block"). The storage is still
+    // the whole block: footprints and bounds count it.
+    if (profile.mma_xor_layout) {
+        for (const auto& shape : profile.mma_shapes) {
+            const uint32_t used = shape.k % 8;
+            if (used == 0) continue;
+            const uint32_t blocks = shape.k / 8 + 1;
+            const uint32_t unused_percent = 100 * (8 - used) / (8 * blocks);
+            warnings.push_back("device profile: mma shape " + mma_shape_name(shape) + " fills only " +
+                std::to_string(used) + " of the 8 fp16 in each operand row of its last xor64 K block; " +
+                std::to_string(unused_percent) + "% of its operands' shared-memory storage is unused");
+        }
+    }
+    return warnings;
+}
+
+void report_profile_warnings(const DeviceProfile& profile) {
+    // Once per distinct warning per process: tests and tools load profiles
+    // many times.
+    static std::mutex mutex;
+    static std::set<std::string> reported;
+    for (const auto& warning : device_profile_warnings(profile)) {
+        const std::lock_guard lock(mutex);
+        if (reported.insert(warning).second) std::cerr << "warning: " << warning << '\n';
+    }
 }
 
 } // namespace nanosm
