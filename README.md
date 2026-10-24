@@ -32,6 +32,19 @@ CMake performs those steps automatically for both vadd and pipeline under `build
 On this Windows checkout, `scripts/build.ps1` locates the installed CMake, Ninja and MinGW tools
 and runs the same configure/build/test flow.
 
+Running tests. The unit tests are GoogleTest (vendored in `third_party/googletest`), one file
+per area in `tests/` with shared helpers in `tests/test_support.hpp`; every test is its own
+ctest entry, so ctest runs them in parallel. Suites ending in `Slow`, the FA launch and the two
+identity checks (driver shuffle, sanitizer ON/OFF) carry the ctest label `slow`.
+
+```sh
+powershell -File scripts/build.ps1          # build and run every test (the verification gate)
+powershell -File scripts/build.ps1 -Fast    # build and run the fast set only (ctest -LE slow)
+build/nanosm_tests --gtest_filter=Rf.*      # one suite (or Suite.name for one test), from the repo root
+```
+
+`scripts/build_nosan.ps1` takes the same `-Fast` switch for the sanitizer-OFF build.
+
 Launch demos are ordinary Python files next to their kernels. They build sparse initial memory,
 invoke qtx compilation and simulation in-process through `libnanosm_capi`, inspect the result, and
 can optionally write a Perfetto trace:

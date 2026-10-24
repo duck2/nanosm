@@ -8,7 +8,7 @@ C API runs them (and the two independent request generators) in a random
 order every cycle. Every launch's stdout and Perfetto trace must then be
 byte-identical to the unshuffled run.
 
-    python -B scripts/driver_shuffle_check.py --lib LIB [--seed N]
+    python -B scripts/driver_shuffle_check.py --lib LIB [--seed N] [--jobs N]
 
 A regression guard, not a proof: it catches a driver that reads another
 register's D or state another driver writes, but only where these launches
@@ -18,6 +18,7 @@ exercise it.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -62,15 +63,22 @@ def main() -> int:
     parser.add_argument("--lib", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20261008,
                         help="base seed; launch i uses seed + i")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                        help="launches run at once (each has its own trace file)")
     args = parser.parse_args()
 
     failures: list[str] = []
-    with tempfile.TemporaryDirectory() as scratch_name:
+    with tempfile.TemporaryDirectory() as scratch_name, ThreadPoolExecutor(max_workers=args.jobs) as pool:
         scratch = Path(scratch_name)
+        runs = []
         for index, (name, script, arguments) in enumerate(LAUNCHES):
             seed = args.seed + index
-            reference = run_launch(args.lib, script, arguments, scratch / "reference.json", None)
-            shuffled = run_launch(args.lib, script, arguments, scratch / "shuffled.json", seed)
+            reference = pool.submit(run_launch, args.lib, script, arguments, scratch / f"{name}.reference.json", None)
+            shuffled = pool.submit(run_launch, args.lib, script, arguments, scratch / f"{name}.shuffled.json", seed)
+            runs.append((name, seed, reference, shuffled))
+        for name, seed, reference_future, shuffled_future in runs:
+            reference = reference_future.result()
+            shuffled = shuffled_future.result()
             for label, (code, _, stderr, trace) in (("unshuffled", reference), ("shuffled", shuffled)):
                 if code != 0:
                     failures.append(f"{name} ({label}) exited {code}: {stderr.decode('utf-8', 'replace')[-2000:]}")

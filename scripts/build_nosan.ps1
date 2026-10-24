@@ -1,9 +1,13 @@
 # The sanitizer-OFF configuration in its own build dir (build_nosan):
 # NANOSM_SANITIZER=OFF compiles src/sanitizer.hpp's Sanitizer to no-ops.
-# Its ctest runs the 7 ordinary targets against the OFF library; nanosm_tests
-# skips (and counts) the tests that expect a sanitizer panic. The default
+# Its ctest runs the ordinary targets against the OFF library; the unit tests
+# that expect a sanitizer panic are skipped (GTEST_SKIP). The default
 # build (scripts/build.ps1) already builds an OFF twin and proves it
 # byte-identical; this script exists to exercise the option itself.
+
+# -Fast: run only the fast tests (ctest -LE slow) for iteration inside a
+# task. The default runs every test: it is the verification gate.
+param([switch]$Fast)
 
 $ErrorActionPreference = 'Stop'
 
@@ -43,5 +47,9 @@ if ($LASTEXITCODE -ne 0) { throw 'cmake configure failed' }
 & $cmake --build build_nosan
 if ($LASTEXITCODE -ne 0) { throw 'cmake build failed' }
 
-& $cmake --build build_nosan --target test
+# Every unit test is its own ctest entry, so the run spreads over the cores.
+$ctest = Join-Path (Split-Path -Parent $cmake) 'ctest.exe'
+$ctestArgs = @('--test-dir', 'build_nosan', '-j', [Environment]::ProcessorCount, '--output-on-failure')
+if ($Fast) { $ctestArgs += @('-LE', 'slow') }
+& $ctest @ctestArgs
 if ($LASTEXITCODE -ne 0) { throw 'tests failed' }

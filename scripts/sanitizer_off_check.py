@@ -5,7 +5,8 @@ happened and may ask it to check, but nothing the machine computes may depend
 on sanitizer state. Compiling the Sanitizer to no-ops (NANOSM_SANITIZER=0)
 is the mechanical proof: every launch must print byte-identical stdout and
 write a byte-identical Perfetto trace, and every unit test that does not
-deliberately expect a sanitizer panic must pass with identical output.
+deliberately expect a sanitizer panic must pass with identical output
+(GoogleTest's lines per test; the OFF build skips the panic tests).
 
     python -B scripts/sanitizer_off_check.py --on-lib ON.dll --off-lib OFF.dll
         [--on-tests ON.exe --off-tests OFF.exe] [--save DIR]
@@ -19,6 +20,7 @@ manual comparison (e.g. a pre-refactor baseline).
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 from pathlib import Path
@@ -43,14 +45,18 @@ LAUNCHES = [
     ("vadd_warps16", "kernels/vadd.launch.py", ["--warps", "16"]),
 ]
 
-SKIP_PREFIX = "SKIP "
-SKIP_REASON = " (expects a sanitizer panic"  # tests/tests.cpp main()
+# GoogleTest output (tests/*_test.cpp): a test runs between "[ RUN      ] X"
+# and "[       OK ] X"; a test that expects a sanitizer panic is skipped in the
+# OFF build ("[  SKIPPED ] X"). Times are switched off so the output compares.
+TEST_ARGUMENTS = ["--gtest_print_time=0", "--gtest_color=no"]
+RUN_PREFIX = "[ RUN      ] "
+END_PREFIXES = ("[       OK ] ", "[  FAILED  ] ", "[  SKIPPED ] ")
+SKIP_PREFIX = "[  SKIPPED ] "
 
 
-def run_launch(library: Path, script: str, arguments: list[str], scratch: Path):
+def run_launch(library: Path, script: str, arguments: list[str], trace_path: Path):
     env = dict(os.environ)
     env["NANOSM_LIBRARY"] = str(library)
-    trace_path = scratch / "trace.json"
     command = [sys.executable, "-B", "-m", "nanosm", script, *arguments, "--trace", str(trace_path)]
     if trace_path.exists():
         trace_path.unlink()
@@ -60,7 +66,7 @@ def run_launch(library: Path, script: str, arguments: list[str], scratch: Path):
 
 
 def run_tests(executable: Path):
-    done = subprocess.run([str(executable)], cwd=ROOT, capture_output=True)
+    done = subprocess.run([str(executable), *TEST_ARGUMENTS], cwd=ROOT, capture_output=True)
     return done.returncode, done.stdout, done.stderr
 
 
@@ -68,25 +74,35 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def comparable_test_lines(stdout: bytes, skipped: set[str]) -> list[str]:
-    """PASS lines of tests that ran in both builds; the count line is dropped
-    (it differs by the skip note)."""
-    lines = []
+def test_blocks(stdout: bytes) -> list[tuple[str, list[str]]]:
+    """(test name, its lines from RUN through OK / FAILED / SKIPPED) in order."""
+    blocks = []
+    current = None
     for line in stdout.decode("utf-8", "replace").splitlines():
-        if line.startswith(SKIP_PREFIX) or "tests passed" in line:
+        if line.startswith(RUN_PREFIX):
+            current = (line[len(RUN_PREFIX):].strip(), [line])
             continue
-        if line.startswith("PASS ") and line[5:] in skipped:
+        if current is None:
             continue
-        lines.append(line)
+        current[1].append(line)
+        if line.startswith(END_PREFIXES) and line.endswith(current[0]):
+            blocks.append(current)
+            current = None
+    return blocks
+
+
+def comparable_test_lines(stdout: bytes, skipped: set[str]) -> list[str]:
+    """The lines of every test that ran in both builds (gtest's summary lines
+    differ by the skip list and are dropped)."""
+    lines = []
+    for name, block in test_blocks(stdout):
+        if name not in skipped:
+            lines.extend(block)
     return lines
 
 
 def skipped_names(stdout: bytes) -> set[str]:
-    names = set()
-    for line in stdout.decode("utf-8", "replace").splitlines():
-        if line.startswith(SKIP_PREFIX):
-            names.add(line[len(SKIP_PREFIX):].rsplit(SKIP_REASON, 1)[0])
-    return names
+    return {name for name, block in test_blocks(stdout) if block[-1].startswith(SKIP_PREFIX)}
 
 
 def main() -> int:
@@ -96,6 +112,8 @@ def main() -> int:
     parser.add_argument("--on-tests", type=Path)
     parser.add_argument("--off-tests", type=Path)
     parser.add_argument("--save", type=Path)
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                        help="runs at once (each launch has its own trace file)")
     args = parser.parse_args()
 
     variants = [(label, lib) for label, lib in (("on", args.on_lib), ("off", args.off_lib)) if lib]
@@ -111,12 +129,20 @@ def main() -> int:
         args.save.mkdir(parents=True, exist_ok=True)
         (args.save / name).write_bytes(data)
 
-    with tempfile.TemporaryDirectory() as scratch_name:
+    with tempfile.TemporaryDirectory() as scratch_name, ThreadPoolExecutor(max_workers=args.jobs) as pool:
         scratch = Path(scratch_name)
+        # Every run has its own trace file, so they can all run at once; the
+        # comparison below waits for each in the fixed order.
+        launch_runs = []
         for name, script, arguments in LAUNCHES:
+            futures = {label: pool.submit(run_launch, library, script, arguments, scratch / f"{name}.{label}.json")
+                       for label, library in variants}
+            launch_runs.append((name, futures))
+        test_futures = {label: pool.submit(run_tests, executable) for label, executable in test_variants}
+        for name, futures in launch_runs:
             results = {}
-            for label, library in variants:
-                code, stdout, stderr, trace_bytes = run_launch(library, script, arguments, scratch)
+            for label, _ in variants:
+                code, stdout, stderr, trace_bytes = futures[label].result()
                 results[label] = (code, stdout, trace_bytes)
                 save(f"{name}.{label}.stdout.txt", stdout)
                 manifest.append(
@@ -132,14 +158,14 @@ def main() -> int:
                 if results["on"][2] != results["off"][2]:
                     failures.append(f"{name}: Perfetto trace differs between sanitizer ON and OFF")
 
-    test_results = {}
-    for label, executable in test_variants:
-        code, stdout, stderr = run_tests(executable)
-        test_results[label] = (code, stdout)
-        save(f"tests.{label}.stdout.txt", stdout)
-        manifest.append(f"tests.{label}: exit={code} stdout_sha256={sha(stdout)} stdout_bytes={len(stdout)}")
-        if code != 0:
-            failures.append(f"tests ({label}) exited {code}: {stderr.decode('utf-8', 'replace')[-2000:]}")
+        test_results = {}
+        for label, _ in test_variants:
+            code, stdout, stderr = test_futures[label].result()
+            test_results[label] = (code, stdout)
+            save(f"tests.{label}.stdout.txt", stdout)
+            manifest.append(f"tests.{label}: exit={code} stdout_sha256={sha(stdout)} stdout_bytes={len(stdout)}")
+            if code != 0:
+                failures.append(f"tests ({label}) exited {code}: {stderr.decode('utf-8', 'replace')[-2000:]}")
     if len(test_results) == 2:
         skipped = skipped_names(test_results["off"][1])
         if skipped_names(test_results["on"][1]):

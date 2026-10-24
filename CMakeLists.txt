@@ -107,9 +107,36 @@ add_executable(nanosm_run src/main.cpp)
 target_link_libraries(nanosm_run PRIVATE nanosm)
 add_dependencies(nanosm_run launch_images)
 
-add_executable(nanosm_tests tests/tests.cpp)
-target_link_libraries(nanosm_tests PRIVATE nanosm)
-target_include_directories(nanosm_tests PRIVATE third_party)
+# GoogleTest, vendored (third_party/googletest/VENDORED.md): no network at
+# build time.
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/googletest EXCLUDE_FROM_ALL)
+
+# The unit tests, one file per area; tests/test_support.hpp holds the shared
+# helpers. Suites ending in "Slow" are the slow ones (label slow, see below).
+set(NANOSM_TEST_SOURCES
+    tests/basics_test.cpp
+    tests/lsu_test.cpp
+    tests/tma_test.cpp
+    tests/machine_test.cpp
+    tests/rf_test.cpp
+    tests/mma_test.cpp
+    tests/sanitizer_test.cpp
+    tests/alu_test.cpp
+    tests/stepping_test.cpp
+    tests/shmem_test.cpp
+    tests/rmw_test.cpp
+    tests/frontend_test.cpp
+)
+
+function(add_nanosm_tests NAME LIBRARY)
+    add_executable(${NAME} ${NANOSM_TEST_SOURCES})
+    target_link_libraries(${NAME} PRIVATE ${LIBRARY} GTest::gtest_main)
+    target_include_directories(${NAME} PRIVATE third_party tests)
+endfunction()
+
+add_nanosm_tests(nanosm_tests nanosm)
 
 add_executable(nanosm_capi_tests tests/capi_tests.cpp)
 target_link_libraries(nanosm_capi_tests PRIVATE nanosm_capi)
@@ -118,9 +145,7 @@ if(NANOSM_SANITIZER)
     # The sanitizer-OFF twin, for the regression guard below.
     add_nanosm_library(nanosm_nosan 0)
     add_nanosm_capi(nanosm_capi_nosan nanosm_nosan)
-    add_executable(nanosm_tests_nosan tests/tests.cpp)
-    target_link_libraries(nanosm_tests_nosan PRIVATE nanosm_nosan)
-    target_include_directories(nanosm_tests_nosan PRIVATE third_party)
+    add_nanosm_tests(nanosm_tests_nosan nanosm_nosan)
 endif()
 
 enable_testing()
@@ -128,8 +153,27 @@ enable_testing()
 # file, launches write a trace only under --trace, and the sanitizer check
 # passes --trace into its own temp dir. So the targets need no RESOURCE_LOCK
 # under ctest -j, and build/ and build_nosan/ may run their tests at once.
-add_test(NAME nanosm_tests COMMAND nanosm_tests)
-set_tests_properties(nanosm_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+#
+# Every unit test is its own ctest entry (gtest_discover_tests, listed when
+# ctest runs), so ctest -j spreads them over the cores. Labels: "unit" for
+# the fast unit tests, "slow" for suites ending in "Slow" and for the heavy
+# targets below; `ctest -LE slow` is the fast set (scripts/build.ps1 -Fast).
+include(GoogleTest)
+function(discover_nanosm_tests NAME PREFIX)
+    gtest_discover_tests(${NAME}
+        TEST_PREFIX "${PREFIX}"
+        TEST_FILTER "-*Slow.*"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES LABELS "unit")
+    gtest_discover_tests(${NAME}
+        TEST_PREFIX "${PREFIX}"
+        TEST_FILTER "*Slow.*"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES LABELS slow)
+endfunction()
+discover_nanosm_tests(nanosm_tests "")
 add_test(NAME nanosm_capi_tests COMMAND nanosm_capi_tests)
 set_tests_properties(nanosm_capi_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
@@ -163,7 +207,7 @@ if(Python3_Interpreter_FOUND)
             "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
             ${Python3_EXECUTABLE} -B -m nanosm kernels/fa.launch.py
     )
-    set_tests_properties(nanosm_python_fa PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(nanosm_python_fa PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
     add_test(
         NAME nanosm_python_vadd
         COMMAND ${CMAKE_COMMAND} -E env
@@ -179,14 +223,13 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/driver_shuffle_check.py
             --lib $<TARGET_FILE:nanosm_capi>
     )
-    set_tests_properties(nanosm_driver_shuffle_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(nanosm_driver_shuffle_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
 endif()
 
 if(NANOSM_SANITIZER)
     # Sanitizer OFF: every test that does not expect a sanitizer panic passes
-    # (those are skipped and counted).
-    add_test(NAME nanosm_tests_nosan COMMAND nanosm_tests_nosan)
-    set_tests_properties(nanosm_tests_nosan PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # (those are skipped: GTEST_SKIP, reported by ctest as not run).
+    discover_nanosm_tests(nanosm_tests_nosan "nosan.")
     if(Python3_Interpreter_FOUND)
         # Sanitizer ON vs OFF: every launch's stdout and Perfetto trace and the
         # unit-test output must be byte-identical. Computation that depends on
@@ -197,7 +240,7 @@ if(NANOSM_SANITIZER)
                 --on-lib $<TARGET_FILE:nanosm_capi> --off-lib $<TARGET_FILE:nanosm_capi_nosan>
                 --on-tests $<TARGET_FILE:nanosm_tests> --off-tests $<TARGET_FILE:nanosm_tests_nosan>
         )
-        set_tests_properties(nanosm_sanitizer_off_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        set_tests_properties(nanosm_sanitizer_off_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
     endif()
 endif()
 
