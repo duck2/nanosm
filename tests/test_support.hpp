@@ -303,7 +303,7 @@ inline nanosm::DeviceProfile dense_one_bank_profile(uint32_t result_latency) {
     profile.mma_core_m = 4;
     profile.mma_core_n = 4;
     profile.mma_core_k = 4;
-    profile.mma_xor_layout = false;
+    profile.mma_layout = nanosm::MmaLayout::dense;
     profile.mma_result_latency_cycles = result_latency;
     profile.shmem_banks = 1;
     nanosm::validate_device_profile(profile);

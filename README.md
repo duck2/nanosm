@@ -130,6 +130,14 @@ the two halves of one 64-row tile can feed two m32 commands. A shape whose k is 
 (k = 4 on a 4x4x4 core) leaves its last K block partly empty: legal, but the profile prints a
 warning when it loads, and the operand's footprint still counts the whole block.
 
+`mma.layout` selects a fixed device layout and is included in the profile fingerprint.
+The only supported swizzle is `"xor64"`; `"dense"` is the unswizzled diagnostic baseline.
+MMA and TMA use the same XOR address primitive, with A/B roles choosing its phase.
+The swizzle does not fix the operand's row count or the spacing between K blocks.
+Future swizzles belong here as profile choices for different physical core/bank
+arrangements, with matching TMA placement and SIMT address generation. This does
+not imply hardware that switches between swizzles per instruction.
+
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
 at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
 [third_party/tcgen05-LICENSE](third_party/tcgen05-LICENSE). This borrows the measured arithmetic

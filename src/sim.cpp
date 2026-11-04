@@ -2346,13 +2346,13 @@ namespace {
 constexpr uint32_t xor64_row_elements = 8;
 
 uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t m, uint32_t k) {
-    if (!config.mma_xor_layout) return base + 2 * (m * shape.k + k);
+    if (config.mma_layout == MmaLayout::dense) return base + 2 * (m * shape.k + k);
     const uint32_t object = base + 16 * shape.m * (k / xor64_row_elements);
     return xor64_operand_address(object, m, k % xor64_row_elements, 0);
 }
 
 uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t k, uint32_t n) {
-    if (!config.mma_xor_layout) return base + 2 * (k * shape.n + n);
+    if (config.mma_layout == MmaLayout::dense) return base + 2 * (k * shape.n + n);
     const uint32_t object = base + 16 * shape.n * (k / xor64_row_elements);
     return xor64_operand_address(object, n, k % xor64_row_elements, 2);
 }
@@ -2363,7 +2363,7 @@ uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t bas
 // still the layout's); the dense layout is exactly rows x k fp16.
 uint64_t mma_operand_footprint(const Config& config, const MmaShape& shape, bool a_operand) {
     const uint64_t rows = a_operand ? shape.m : shape.n;
-    if (!config.mma_xor_layout) return rows * shape.k * 2;
+    if (config.mma_layout == MmaLayout::dense) return rows * shape.k * 2;
     const uint64_t k_blocks = (shape.k + xor64_row_elements - 1) / xor64_row_elements;
     return 16 * rows * k_blocks;
 }
@@ -3793,7 +3793,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     // xor64 K block is still whole 16-byte rows).
     const uint64_t a_bytes = mma_operand_footprint(config_, shape, true);
     const uint64_t b_bytes = mma_operand_footprint(config_, shape, false);
-    if ((config_.mma_xor_layout && ((a | b) & 63u) != 0) ||
+    if ((config_.mma_layout == MmaLayout::xor64 && ((a | b) & 63u) != 0) ||
         static_cast<uint64_t>(a) + a_bytes > shmem_.size() ||
         static_cast<uint64_t>(b) + b_bytes > shmem_.size())
         panic(op, "MMA operand alignment or footprint is outside shmem");

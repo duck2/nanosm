@@ -16,6 +16,10 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Fixed for a device, not selected by individual MMA instructions. xor64 is
+// the only supported swizzle; dense is an unswizzled diagnostic baseline.
+enum class MmaLayout { dense, xor64 };
+
 // One profile is consumed by qtxc, qtxas and the simulator. Core quantities are
 // measured in core cycles; controller quantities are measured in DRAM ticks.
 struct DeviceProfile {
@@ -99,8 +103,9 @@ struct DeviceProfile {
     // operands are fetched. Cheaper throughput is declared by smaller core
     // dimensions, not by a stall parameter.
     uint32_t mma_result_latency_cycles = 0;
-    // false is the dense diagnostic baseline; true is RFC05's 64x64x8 XOR layout.
-    bool mma_xor_layout = false;
+    // mma.layout in the profile; shared with TMA through xor64_byte_address.
+    // Plane spacing is derived separately from the operand's row count.
+    MmaLayout mma_layout = MmaLayout::dense;
     // SFU: one separate unit whose throughput is independent of lane count.
     // It serves sfu_lanes lanes per cycle, so one warp op occupies it for
     // ceil(lanes / sfu_lanes) cycles. timing.sfu is derived from these.

@@ -59,7 +59,7 @@ json profile_json(const DeviceProfile& p) {
             {"core_m", p.mma_core_m}, {"core_n", p.mma_core_n}, {"core_k", p.mma_core_k},
             {"queue_commands", p.mma_queue_commands},
             {"result_latency_cycles", p.mma_result_latency_cycles},
-            {"layout", p.mma_xor_layout ? "xor64" : "dense"},
+            {"layout", p.mma_layout == MmaLayout::xor64 ? "xor64" : "dense"},
             {"numeric_model", mma_numeric_model},
         }},
         {"sync", {
@@ -116,6 +116,9 @@ T field(const json& object, const char* name) {
 } // namespace
 
 void validate_device_profile(const DeviceProfile& p) {
+    if (p.mma_layout != MmaLayout::dense && p.mma_layout != MmaLayout::xor64) {
+        throw ProfileError("device profile: unsupported MMA layout");
+    }
     // The RF's own depths (trash/rfc10.md section 5): nonzero register stages.
     if (p.rf_read_latency_cycles == 0 || p.rf_read_latency_cycles > 8 ||
         p.rf_write_depth_cycles == 0 || p.rf_write_depth_cycles > 8) {
@@ -271,7 +274,7 @@ void validate_device_profile(const DeviceProfile& p) {
     // depends on the row only, so any m and n in whole core blocks read one
     // bank round per block; a shape with k > 8 stacks its 8-deep K blocks as
     // whole (rows x 16 B) objects (src/sim.cpp mma_a_address).
-    if (p.mma_xor_layout && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
+    if (p.mma_layout == MmaLayout::xor64 && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
                              (p.mma_core_k != 4 && p.mma_core_k != 8))) {
         throw ProfileError("device profile: xor64 MMA layout needs a 4x4x4 or 4x4x8 core");
     }
@@ -391,7 +394,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
         throw ProfileError("device profile: unsupported MMA numeric_model (expected fp16_raw_window25_rz_v1)");
     if (layout != "dense" && layout != "xor64")
         throw ProfileError("device profile: MMA layout must be 'dense' or 'xor64'");
-    p.mma_xor_layout = layout == "xor64";
+    p.mma_layout = layout == "xor64" ? MmaLayout::xor64 : MmaLayout::dense;
     const auto& sync = document.at("sync");
     p.mbar_wait_slots = field<uint32_t>(sync, "mbar_wait_slots");
     p.mbar_try_wait_timeout_cycles = field<uint32_t>(sync, "mbar_try_wait_timeout_cycles");
@@ -500,7 +503,7 @@ std::vector<std::string> device_profile_warnings(const DeviceProfile& profile) {
     // of each operand partly empty (HUMAN 2026-10-22: "it should warn you if
     // there is a partially occupied storage block"). The storage is still
     // the whole block: footprints and bounds count it.
-    if (profile.mma_xor_layout) {
+    if (profile.mma_layout == MmaLayout::xor64) {
         for (const auto& shape : profile.mma_shapes) {
             const uint32_t used = shape.k % 8;
             if (used == 0) continue;

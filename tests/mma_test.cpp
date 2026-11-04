@@ -256,7 +256,7 @@ void test_mma_fusion_boundaries() {
     // round the first group to FP32 before cancellation in the second group.
     for (const uint32_t core_k : {4u, 8u}) {
         auto profile = canonical_profile();
-        profile.mma_xor_layout = false;
+        profile.mma_layout = nanosm::MmaLayout::dense;
         profile.mma_core_k = core_k;
         const auto scheduled = nanosm::compile_qtx(
             ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\nmov r8, 0\n"
@@ -283,7 +283,7 @@ void test_mma_fusion_boundaries() {
 void test_autonomous_mma_gemm_and_commit() {
     auto profile = canonical_profile();
     auto dense = profile;
-    dense.mma_xor_layout = false;
+    dense.mma_layout = nanosm::MmaLayout::dense;
     require(nanosm::device_profile_fingerprint(profile) != nanosm::device_profile_fingerprint(dense),
         "MMA operand layout was omitted from the profile fingerprint");
 
@@ -647,7 +647,7 @@ void test_mma_dense_profile_recurrence_bubbles() {
     auto too_slow = canonical_profile();
     too_slow.mma_shapes = {{32, 64, 8}};
     too_slow.mma_core_k = 4;
-    too_slow.mma_xor_layout = false;
+    too_slow.mma_layout = nanosm::MmaLayout::dense;
     too_slow.mma_result_latency_cycles = 1000;
     try {
         nanosm::validate_device_profile(too_slow);
@@ -658,11 +658,11 @@ void test_mma_dense_profile_recurrence_bubbles() {
     }
     auto profile = canonical_profile();
     profile.mma_shapes = {{32, 64, 8}};
-    profile.mma_xor_layout = false;
+    profile.mma_layout = nanosm::MmaLayout::dense;
     profile.mma_result_latency_cycles = 4000;
     nanosm::validate_device_profile(profile);
     auto unsupported = profile;
-    unsupported.mma_xor_layout = true;
+    unsupported.mma_layout = nanosm::MmaLayout::xor64;
     unsupported.mma_core_n = 2; // xor64 keeps a 4x4 block's rows apart: a 4x4x4 or 4x4x8 core only
     try {
         nanosm::validate_device_profile(unsupported);
@@ -822,7 +822,7 @@ void test_mma_varying_round_service() {
     // fetch must occupy the port for exactly its own rounds: the span of all
     // input steps equals the sum of served rounds plus counted stalls.
     auto profile = canonical_profile();
-    profile.mma_xor_layout = false;
+    profile.mma_layout = nanosm::MmaLayout::dense;
     nanosm::validate_device_profile(profile);
     const auto kernel = compile(R"(
         .acc C, 0, 64, 64
@@ -1210,7 +1210,7 @@ void test_i9_profile_shapes_and_refusals() {
             nanosm::device_profile_fingerprint(restricted) != nanosm::device_profile_fingerprint(profile),
         "the shape list is not parsed or not fingerprinted");
     auto odd_core = profile;
-    odd_core.mma_xor_layout = false;
+    odd_core.mma_layout = nanosm::MmaLayout::dense;
     odd_core.mma_core_m = 3; // 32 and 64 rows are not whole 3-row blocks
     try {
         nanosm::validate_device_profile(odd_core);
