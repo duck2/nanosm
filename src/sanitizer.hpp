@@ -199,14 +199,15 @@ public:
     // the box (a load's destination is written, a store's source read).
     // descriptor_bytes: what the engine's later A-read will see -- memory as
     // of this cycle's clock edge (anything still in flight PANICked above).
-    // completion_mbar_word: the descriptor's completion mbar as it stands at
-    // accept (none: invalid descriptor). Its phase is recorded for the
-    // command's complete_tx (rfc12 section 8: the hardware reads no mbar at
-    // TMA start; this peek is sanitizer-only metadata).
+    // load / shmem_address / completion_mbar: the instruction's direction and
+    // its address operand (tma.load / tma.store). completion_mbar_word: that
+    // mbar as it stands at accept (none: outside shmem). Its phase is
+    // recorded for the command's complete_tx (rfc12 section 8: the hardware
+    // reads no mbar at TMA start; this peek is sanitizer-only metadata).
     void record_tma_accept(
         const IssueSite& site, uint64_t command, uint32_t descriptor_address,
-        const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes,
-        std::optional<uint64_t> completion_mbar_word);
+        const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, bool load,
+        uint32_t shmem_address, uint32_t completion_mbar, std::optional<uint64_t> completion_mbar_word);
     // A complete_tx reaches its mbar, whose current phase is `phase`: it must
     // be the phase its sender meant -- a TMA command's accept-time peek
     // (tma_command), else the host's stated parity. A mismatch PANICs ("wrong
@@ -218,7 +219,8 @@ public:
     // count must be zero (a missing expect_tx or complete_tx hangs a waiter).
     void record_mbar_tx(uint32_t address, int32_t tx);
     void check_kernel_end(uint64_t cycle) const;
-    void record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded);
+    void record_tma_descriptor_read(
+        uint64_t command, const TmaDescriptor& decoded, uint32_t shmem_address, bool load);
     void record_tma_data_complete(uint64_t command);
     // Panics on a conflict (first the missing-fence / race check of both
     // operand spans, port-B reads), else records the A/B operand and
@@ -284,7 +286,7 @@ private:
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t issue_cycle = 0;
-        std::optional<uint32_t> completion_mbar; // tma; unknown if the descriptor is invalid
+        std::optional<uint32_t> completion_mbar; // tma: the instruction's completion mbar
         uint8_t depbar = 0;                      // mma operand-consumed depbar
         bool fetching = false;                   // mma: its first operand fetch has started
     };

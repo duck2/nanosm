@@ -38,10 +38,8 @@
 .equ OSTORE_DONE,49200
 .equ CONSTANTS,  49216
 .equ QDESC,      49664
-.equ KDESC0,     49728
-.equ VDESC0,     49792
-.equ KDESC1,     49856
-.equ VDESC1,     49920
+.equ KDESC,      49728
+.equ VDESC,      49792
 .equ ODESC,      49984
 .equ STATS,      50176
 
@@ -249,26 +247,52 @@ NORMALIZE:
 
 ; ---- issuer: two unrolled blocks; block 1's inputs prefetch under block 0 ----
 ISSUER:
+; TMA address operands (src/tma.hpp), one per command: the destination / 64
+; in bits 31:16 (the shli by 10 of its 64-byte-aligned address) and the
+; completion mbar / 8 in bits 15:0; in RF bank 1 (register mod 3 == 1) beside
+; the coordinates r8 / r9. The barrier and coordinate movs fill the operand
+; build's dependency gaps; stage set 1's operands and the output store's are
+; built while the prologue lands.
         mov   r2, INPUT_DONE
+        mov   r10, QBUF
+        mov   r13, KBUF0
+        mov   r16, VBUF0
         mov   r3, SCORE_DONE
         mov   r4, WORK_DONE
+        shri  r24, r2, 3
+        shli  r10, r10, 10
+        shli  r13, r13, 10
+        shli  r16, r16, 10
         mov   r5, OUTPUT_DONE
         mov   r8, 0
         mov   r9, 0
-        mov   r10, 0
+        or    r10, r10, r24
+        or    r13, r13, r24
+        or    r16, r16, r24
 ; Prologue: Q and block 0's K/V land together — one barrier round trip.
         mbar.arrive.expect_tx [r2], 24576
-        tma.async [QDESC], r8
-        tma.async [KDESC0], r8
-        tma.async [VDESC0], r8
+        tma.load [QDESC], r8, r10
+        tma.load [KDESC], r8, r13
+        tma.load [VDESC], r8, r16
+        mov   r19, KBUF1
+        mov   r22, VBUF1
+        mov   r25, OSTAGE
+        mov   r26, OSTORE_DONE
+        shli  r19, r19, 10
+        shli  r22, r22, 10
+        shli  r25, r25, 10
+        shri  r26, r26, 3
+        or    r19, r19, r24
+        or    r22, r22, r24
+        or    r25, r25, r26
 IN0:
         mbar.try_wait p1, [r2], 0
 @!p1    bra.uni IN0
 ; Prefetch block 1 into stage set 1: port A fills while MMA reads set 0.
         mov   r9, 64
         mbar.arrive.expect_tx [r2], 16384
-        tma.async [KDESC1], r8
-        tma.async [VDESC1], r8
+        tma.load [KDESC], r8, r19
+        tma.load [VDESC], r8, r22
         mov   r9, 0
 
         mov   r0, QBUF
@@ -392,7 +416,7 @@ STAGED:
 @!p1    bra.uni STAGED
         mov   r7, OSTORE_DONE
         mbar.arrive.expect_tx [r7], 16384
-        tma.async [ODESC], r8
+        tma.store [ODESC], r8, r25
 STORED:
         mbar.try_wait p1, [r7], 0
 @!p1    bra.uni STORED

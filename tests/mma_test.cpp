@@ -530,7 +530,7 @@ void test_mbar_engine_events_alternate_tma_first() {
     require(tx.phase && tx.tx_bytes == 0, "a TMA completion was lost");
 }
 
-// The same-cycle case with a real TMA load. Filler movs before tma.async set
+// The same-cycle case with a real TMA load. Filler movs before tma.load set
 // its issue delay; the sweep moves its completion across cycle r (the commit's
 // presentation) in two-cycle steps (DRAM clock), and the test finds the delay
 // at which both present in cycle r. Each event is visible to the RMW engine
@@ -559,12 +559,16 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     };
     const auto run = [&](std::optional<uint32_t> delay) {
         std::ostringstream qtx;
+        // The TMA's address operand is built after the commit (with the
+        // fillers), so the commit's cycle r -- and its phase against the DRAM
+        // clock -- is the same in every run.
         qtx << ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
             << "mov r8, 0\nmov r9, 0\nmov r10, 0\n"
             << "mma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\n";
         if (delay.has_value()) {
+            qtx << tma_operand_asm(10, tile, tx_mbar);
             for (uint32_t i = 0; i < *delay; ++i) qtx << "mov r" << 12 + i % 8 << ", " << i << '\n';
-            qtx << "tma.async [" << descriptor_address << "], r8\n";
+            qtx << "tma.load [" << descriptor_address << "], r8, r10\n";
         }
         qtx << "mma.async.m64n64k8 C, [r0], [r1]\nhalt\n";
         nanosm::Launch launch;
@@ -575,10 +579,8 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
         write_mbar(shmem, commit_mbar, 1, 0);
         write_mbar(shmem, tx_mbar, 0, 64);
         nanosm::TmaDescriptor descriptor;
-        descriptor.dimensions = {16, 1, 1};
-        descriptor.box = {16, 1, 1};
-        descriptor.shmem_base = tile;
-        descriptor.completion_mbar = tx_mbar;
+        descriptor.dimensions = {16, 1};
+        descriptor.box = {16, 1};
         write_tma_descriptor(shmem, descriptor_address, descriptor);
         nanosm::Machine machine(canonical_profile(), compile(qtx.str()), std::move(launch),
             {.timeline = true});

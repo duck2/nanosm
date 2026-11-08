@@ -25,10 +25,8 @@ FULL0 = 1024
 FULL1 = 1032
 EMPTY0 = 1040
 EMPTY1 = 1048
-ADESC0 = 1152
-BDESC0 = 1216
-ADESC1 = 1280
-BDESC1 = 1344
+ADESC = 1152
+BDESC = 1216
 ELEMENTS = 8 * 64
 
 launch = Launch(
@@ -40,20 +38,14 @@ launch.gmem.f32(A, (float(i) for i in range(ELEMENTS)))
 launch.gmem.f32(B, (float(2 * i) for i in range(ELEMENTS)))
 for address in [FULL0, FULL1, EMPTY0, EMPTY1]:
     launch.shmem.mbar(address, expected=1)
-for address, base, tile in [
-    (ADESC0, A, 0),
-    (BDESC0, B, 256),
-    (ADESC1, A, 512),
-    (BDESC1, B, 768),
-]:
+# One descriptor per tensor; the stage's destination and full barrier are
+# the instruction's address operand (built in the kernel).
+for address, base in [(ADESC, A), (BDESC, B)]:
     launch.shmem.tma_desc(
         address,
-        direction="load",
         gmem_base=base,
         dimensions=(ELEMENTS,),
         box=(64,),
-        shmem_base=tile,
-        completion_mbar=FULL0 if tile < 512 else FULL1,
     )
 
 with launch.run(trace=args.trace) as result:

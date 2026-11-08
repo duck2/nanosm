@@ -147,21 +147,15 @@ int32_t nanosm_mbar_encode(
 
 int32_t nanosm_tma_descriptor_encode(
     uint32_t rank,
-    uint32_t direction,
     uint32_t transpose,
     uint64_t gmem_base,
     uint32_t dim_x,
     uint32_t dim_y,
-    uint32_t dim_z,
     uint32_t row_stride,
-    uint32_t plane_stride,
     uint32_t box_x,
     uint32_t box_y,
-    uint32_t box_z,
     uint32_t element_bytes,
     uint32_t swizzle,
-    uint32_t shmem_base,
-    uint32_t completion_mbar,
     uint8_t* output,
     uint64_t output_size) {
     try {
@@ -170,7 +164,6 @@ int32_t nanosm_tma_descriptor_encode(
             throw nanosm::SimError("tma descriptor output must contain exactly 64 bytes");
         }
         if (rank > UINT8_MAX) throw nanosm::SimError("tma descriptor rank is out of range");
-        if (direction > 1) throw nanosm::SimError("tma descriptor direction is invalid");
         if (transpose > 1) throw nanosm::SimError("tma transpose must be zero or one");
         if (element_bytes > UINT8_MAX) {
             throw nanosm::SimError("tma element size is out of range");
@@ -178,16 +171,13 @@ int32_t nanosm_tma_descriptor_encode(
         if (swizzle > UINT8_MAX) throw nanosm::SimError("tma swizzle is out of range");
         nanosm::TmaDescriptor descriptor;
         descriptor.rank = static_cast<uint8_t>(rank);
-        descriptor.direction = static_cast<nanosm::TmaDirection>(direction);
         descriptor.transpose = transpose != 0;
         descriptor.gmem_base = gmem_base;
-        descriptor.dimensions = {dim_x, dim_y, dim_z};
-        descriptor.strides = {row_stride, plane_stride};
-        descriptor.box = {box_x, box_y, box_z};
+        descriptor.dimensions = {dim_x, dim_y};
+        descriptor.row_stride = row_stride;
+        descriptor.box = {box_x, box_y};
         descriptor.element_bytes = static_cast<uint8_t>(element_bytes);
         descriptor.swizzle = static_cast<uint8_t>(swizzle);
-        descriptor.shmem_base = shmem_base;
-        descriptor.completion_mbar = completion_mbar;
         const auto bytes = nanosm::encode_tma_descriptor(descriptor);
         std::memcpy(output, bytes.data(), bytes.size());
         return NANOSM_OK;

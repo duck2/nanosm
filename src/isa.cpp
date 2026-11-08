@@ -140,8 +140,10 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
         break;
-    case Opcode::tma_async:
+    case Opcode::tma_load:
+    case Opcode::tma_store:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
         word |= immediate;
         break;
     case Opcode::acc_ld:
@@ -290,8 +292,10 @@ Instruction decode(uint64_t word) {
         inst.src0 = reg1;
         inst.src1 = reg2;
         break;
-    case Opcode::tma_async:
+    case Opcode::tma_load:
+    case Opcode::tma_store:
         inst.src0 = reg0;
+        inst.src1 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::acc_ld:
@@ -413,7 +417,8 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::mbar_test_wait_r: return "mbar.test_wait";
     case Opcode::mbar_try_wait_i:
     case Opcode::mbar_try_wait_r: return "mbar.try_wait";
-    case Opcode::tma_async: return "tma.async";
+    case Opcode::tma_load: return "tma.load";
+    case Opcode::tma_store: return "tma.store";
     case Opcode::acc_ld: return "acc.ld";
     case Opcode::acc_ld_v8: return "acc.ld.v8";
     case Opcode::acc_st: return "acc.st";
@@ -548,8 +553,9 @@ std::string format_instruction(
         out << " p" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
             << "], " << reg(inst.src1);
         break;
-    case Opcode::tma_async:
-        out << " [" << inst.imm << "], " << reg(inst.src0);
+    case Opcode::tma_load:
+    case Opcode::tma_store:
+        out << " [" << inst.imm << "], " << reg(inst.src0) << ", " << reg(inst.src1);
         break;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
@@ -667,7 +673,8 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::mbar_arrive_expect_tx_r:
     case Opcode::mbar_try_wait_i:
     case Opcode::mbar_try_wait_r:
-    case Opcode::tma_async:
+    case Opcode::tma_load:
+    case Opcode::tma_store:
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
     case Opcode::acc_st:

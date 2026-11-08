@@ -123,16 +123,18 @@ void test_i3_reads_during_an_rmw() {
     auto& shmem = image_bytes(launch.shmem_image, 8192);
     for (uint32_t word = 0; word < 512; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(i21_mbar(1, 0, 64)));
-    write_rank1_load(shmem, 5120, 0, 16, 2048, 4104);
+    write_rank1_load(shmem, 5120, 0, 16, 4104);
     fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
+    // The TMA's address operand (box at 1024: one mov) takes the first of the
+    // five issue slots before the lds.uni, so the timeline is unchanged.
     nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, R"(
+        mov r10, )" + std::to_string(nanosm::pack_tma_addresses(1024, 4104)) + R"(
         mov r12, 4104
-        mov r24, 0
         mov r25, 0
         mov r26, 0
         mov r27, 0
         lds.uni r3, [r1 + 64] {pred=PT, stall=0, set=sb0, wait=-}
-        tma.async [5120], r8
+        tma.load [5120], r8, r10
         mbar.test_wait p0, [r12], 0
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -150,7 +152,7 @@ void test_i3_reads_during_an_rmw() {
                          {e + 2, "A-read", "tma", 0}, {e + 3, "A-read", "probe", 0}} && reads.back().cycle < w,
         "A-read did not serve an lds, the TMA and a probe between the RMW's read and its write:" + describe(reads));
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine.read_reg(0, lane, 3) == 0x100 + 16, "lds.uni data");
-    for (uint32_t i = 0; i < 16; ++i) require(machine.read_shmem_u32(2048 + 4 * i) == pattern_word(i), "TMA data");
+    for (uint32_t i = 0; i < 16; ++i) require(machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA data");
 }
 
 // rfc12 sections 1 and 6: a read of the mbar that samples in the cycle the
@@ -436,10 +438,10 @@ void test_i3_tma_start_reads_no_mbar() {
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, 8192);
-    write_rank1_load(shmem, 5120, 0, 16, 2048, 4104);
+    write_rank1_load(shmem, 5120, 0, 16, 4104);
     write_u64(shmem, 4104, nanosm::encode_mbar_state(i21_mbar(1, 1)));
     fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
-    std::string program = "mov r12, 4104\ntma.async [5120], r8\n";
+    std::string program = tma_operand_asm(10, 2048, 4104) + "mov r12, 4104\ntma.load [5120], r8, r10\n";
     for (int i = 0; i < 10; ++i) program += "mov r9, 0 {pred=PT, stall=31, set=-, wait=-}\n";
     program += R"(
         mbar.arrive.expect_tx [r12], 64
@@ -505,7 +507,7 @@ void test_i3_tx_range_panics() {
 }
 
 // SANITIZER (rfc12 section 8): the TMA's start-time mbar read is gone; the
-// sanitizer peeks the completion mbar's phase when tma.async is accepted and
+// sanitizer peeks the completion mbar's phase when tma.load is accepted and
 // compares it when the complete_tx reaches the mbar ("wrong phase"). Two ways
 // a TMA's bytes land in a later phase:
 //   plain arrive: the mbar expects one arrival and no bytes; the TMA is
@@ -521,26 +523,27 @@ void test_i3_sanitizer_wrong_phase_complete_tx() {
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 8192);
-        write_rank1_load(shmem, 5120, 0, 16, 2048, 4104);
-        write_rank1_load(shmem, 5184, 0, 16, 2112, 4104);
+        write_rank1_load(shmem, 5120, 0, 16, 4104);
         write_u64(shmem, 4104, nanosm::encode_mbar_state(i21_mbar(1, 1)));
         fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
         return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program), profile),
             std::move(launch));
     };
-    auto plain = machine_for(R"(
+    // Boxes at 2048 and 2112, both completing into 4104.
+    const auto operands = tma_operand_asm(10, 2048, 4104) + tma_operand_asm(13, 2112, 4104);
+    auto plain = machine_for(operands + R"(
         mov r12, 4104
-        tma.async [5120], r8
+        tma.load [5120], r8, r10
         mbar.arrive [r12]
         halt
     )");
     expect_sim_panic(*plain, "wrong phase (tma #0 was accepted in phase 0; the mbar is in phase 1)",
         "a TMA completing after a plain arrive ended its phase");
-    auto reuse = machine_for(R"(
+    auto reuse = machine_for(operands + R"(
         mov r12, 4104
         mbar.arrive.expect_tx [r12], 64
-        tma.async [5120], r8
-        tma.async [5184], r8
+        tma.load [5120], r8, r10
+        tma.load [5120], r8, r13
         halt
     )");
     expect_sim_panic(*reuse, "wrong phase (tma #1 was accepted in phase 0; the mbar is in phase 1)",
@@ -1235,10 +1238,11 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
     const auto setup = [](nanosm::Launch& launch) {
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         write_count_mbar(shmem, 4096, 1);
-        write_tma_descriptor(shmem, 5120, linear_tma(false, 1024, 64, 4104));
+        write_tma_descriptor(shmem, 5120, linear_tma(64));
         write_tx_mbar(shmem, 4104, 64);
         image_bytes(launch.gmem_image, 4096);
     };
+    const auto tma_operand = std::to_string(nanosm::pack_tma_addresses(1024, 4104));
     const std::string mma_tail = "mov r4, 4160\nmbar.init [r4], 1\nmma.commit [r4]\n"
                                  "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n";
     const std::vector<std::pair<std::string, std::string>> cases = {
@@ -1252,7 +1256,9 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
         {"mbar.test_wait", "mov r4, 4096\nmbar.test_wait p0, [r4], 0\nhalt\n"},
         {"mbar.try_wait", "mov r4, 4096\nmbar.try_wait p0, [r4], 0\nhalt\n"},
         {"atom.add.uni", "mov r0, 0\nmov r1, 1\natom.add.uni r2, [r0], r1\nhalt\n"},
-        {"tma.async", "mov r8, 0\nmov r9, 0\nmov r10, 0\nmov r4, 4104\ntma.async [5120], r8\n"
+        {"tma.load", "mov r8, 0\nmov r9, 0\nmov r10, " + tma_operand + "\nmov r4, 4104\ntma.load [5120], r8, r10\n"
+                     "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n"},
+        {"tma.store", "mov r8, 0\nmov r9, 0\nmov r10, " + tma_operand + "\nmov r4, 4104\ntma.store [5120], r8, r10\n"
                       "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\nhalt\n"},
         {"mma.async.init.m64n64k8",
          ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmma.async.init.m64n64k8 C, [r0], [r1]\n" + mma_tail},
@@ -1349,7 +1355,7 @@ void test_d12_1_tma_load_over_a_live_waiter() {
     launch.active_warps = 2;
     auto& shmem = image_bytes(launch.shmem_image, 8192);
     write_count_mbar(shmem, 1032, 1);
-    write_tma_descriptor(shmem, 5120, linear_tma(false, 1024, 64, 4104));
+    write_tma_descriptor(shmem, 5120, linear_tma(64));
     write_tx_mbar(shmem, 4104, 64);
     launch.mbars = {1032};
     auto& gmem = image_bytes(launch.gmem_image, 64);
@@ -1375,9 +1381,9 @@ void test_d12_1_tma_load_over_a_live_waiter() {
         addi r20, r20, 1
         mov r8, 0
         mov r9, 0
-        mov r10, 0
+        mov r10, )" + std::to_string(nanosm::pack_tma_addresses(1024, 4104)) + R"(
         mov r4, 4104
-        tma.async [5120], r8
+        tma.load [5120], r8, r10
     loaded:
         mbar.try_wait p1, [r4], 0
         @!p1 bra.uni loaded
@@ -1455,12 +1461,10 @@ void test_i5_atomic_sanitizer() {
     legal->run();
     require(legal->read_mbar_state(4160).phase, "an arrive on a launch-declared mbar did not complete its phase");
 
-    const auto tma = [](bool store) {
-        return [store](nanosm::Launch& launch) {
-            auto& shmem = launch.shmem_image.at(0).bytes;
-            write_tma_descriptor(shmem, 5120, linear_tma(store, store ? 0 : 1024, 64, 4104));
-            write_tx_mbar(shmem, 4104, 64);
-        };
+    const auto tma = [](nanosm::Launch& launch) {
+        auto& shmem = launch.shmem_image.at(0).bytes;
+        write_tma_descriptor(shmem, 5120, linear_tma(64));
+        write_tx_mbar(shmem, 4104, 64);
     };
     const std::string tail = R"(
     wait:
@@ -1468,18 +1472,22 @@ void test_i5_atomic_sanitizer() {
         @!p0 bra.uni wait
         halt
     )";
-    const std::string prologue = "mov r8, 0\nmov r9, 0\nmov r10, 0\nmov r4, 4104\n";
-    message = i4_panic(*i5_machine(profile, prologue + "tma.async [5120], r8\nmov r20, 1032\nmov r21, 1\n"
-        "atom.add.uni r7, [r20], r21\n" + tail, 1, tma(false), false), "an atomic over a TMA load's destination");
+    // The load's box is at 1024, the store's at 0; both complete into 4104.
+    const auto prologue = [](uint32_t shared) {
+        return "mov r8, 0\nmov r9, 0\nmov r10, " + std::to_string(nanosm::pack_tma_addresses(shared, 4104)) +
+            "\nmov r4, 4104\n";
+    };
+    message = i4_panic(*i5_machine(profile, prologue(1024) + "tma.load [5120], r8, r10\nmov r20, 1032\nmov r21, 1\n"
+        "atom.add.uni r7, [r20], r21\n" + tail, 1, tma, false), "an atomic over a TMA load's destination");
     require_mentions(message, {"reason=shmem race: atom.add.uni writes 1 word, bytes [1032, 1036) owned by tma load #0"},
         "an atomic over a TMA load's destination");
     const std::string atomic = "mov r20, 8\nmov r21, 0x1000\natom.add.uni r7, [r20], r21\n";
-    message = i4_panic(*i5_machine(profile, prologue + atomic + "tma.async [5120], r8\n" + tail, 1, tma(true), false),
+    message = i4_panic(*i5_machine(profile, prologue(0) + atomic + "tma.store [5120], r8, r10\n" + tail, 1, tma, false),
         "a TMA store of an atomic's word without fence.sh");
     require_mentions(message, {"reason=missing fence.sh: tma store #0 source bytes [", "overlap this warp's earlier "
         "atom.add.uni r7, [r20], r21 (pc ", "whose write has not reached the RAM; issue fence.sh between them"},
         "a TMA store of an atomic's word without fence.sh");
-    auto fenced = i5_machine(profile, prologue + atomic + "fence.sh\ntma.async [5120], r8\n" + tail, 1, tma(true), false);
+    auto fenced = i5_machine(profile, prologue(0) + atomic + "fence.sh\ntma.store [5120], r8, r10\n" + tail, 1, tma, false);
     fenced->run();
     for (uint32_t i = 0; i < 16; ++i) {
         require(fenced->read_gmem_u32(4 * i) == (i == 2 ? 0x1102u : 0x100u + i),

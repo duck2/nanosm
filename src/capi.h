@@ -45,23 +45,20 @@ NANOSM_CAPI int32_t nanosm_mbar_encode(
 #define NANOSM_TMA_SWIZZLE_LINEAR UINT32_C(0)
 #define NANOSM_TMA_SWIZZLE_XOR64_A UINT32_C(1)
 #define NANOSM_TMA_SWIZZLE_XOR64_B UINT32_C(2)
+// The descriptor describes the global tensor and the box (rank 1 or 2). The
+// direction, shared address and completion mbar are tma.load / tma.store
+// operands, not descriptor fields.
 NANOSM_CAPI int32_t nanosm_tma_descriptor_encode(
     uint32_t rank,
-    uint32_t direction,
     uint32_t transpose,
     uint64_t gmem_base,
     uint32_t dim_x,
     uint32_t dim_y,
-    uint32_t dim_z,
     uint32_t row_stride,
-    uint32_t plane_stride,
     uint32_t box_x,
     uint32_t box_y,
-    uint32_t box_z,
     uint32_t element_bytes,
     uint32_t swizzle,
-    uint32_t shmem_base,
-    uint32_t completion_mbar,
     uint8_t* output,
     uint64_t output_size);
 

@@ -51,27 +51,27 @@ int main() {
             nanosm_mbar_encode(2, 1, 1, 0, &mbar) == NANOSM_ERROR,
             "C API accepted an invalid mbar phase");
 
+        // rank, transpose, gmem_base, dim_x, dim_y, row_stride, box_x, box_y,
+        // element_bytes, swizzle.
         std::array<uint8_t, 64> descriptor{};
         require(
             nanosm_tma_descriptor_encode(
-                1, 0, 0, 0x1122334455667788ull,
-                16, 1, 1, 0, 0, 16, 1, 1, 4, 0, 256, 128,
+                1, 0, 0x1122334455667788ull, 16, 1, 0, 16, 1, 4, 0,
                 descriptor.data(), descriptor.size()) == NANOSM_OK,
             "C API could not encode a tma descriptor");
         require(
-            descriptor[0] == 1 && descriptor[3] == 4 && descriptor[8] == 0x88 &&
+            descriptor[0] == 1 && descriptor[2] == 4 && descriptor[8] == 0x88 &&
                 descriptor[15] == 0x11,
             "C API tma descriptor bytes are wrong");
         require(
             nanosm_tma_descriptor_encode(
-                2, 0, 1, 0, 64, 64, 1, 64, 0, 64, 8, 1, 2,
-                NANOSM_TMA_SWIZZLE_XOR64_B, 1024, 128,
+                2, 1, 0, 64, 64, 64, 64, 8, 2, NANOSM_TMA_SWIZZLE_XOR64_B,
                 descriptor.data(), descriptor.size()) == NANOSM_OK &&
-                descriptor[2] == 1 && descriptor[4] == NANOSM_TMA_SWIZZLE_XOR64_B,
+                descriptor[1] == 1 && descriptor[3] == NANOSM_TMA_SWIZZLE_XOR64_B,
             "C API could not encode the named xor64 transpose layout");
         require(
             nanosm_tma_descriptor_encode(
-                257, 0, 0, 0, 16, 1, 1, 0, 0, 16, 1, 1, 4, 0, 256, 128,
+                257, 0, 0, 16, 1, 0, 16, 1, 4, 0,
                 descriptor.data(), descriptor.size()) == NANOSM_ERROR,
             "C API truncated an oversized tma rank before validation");
 

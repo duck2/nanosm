@@ -1,66 +1,77 @@
-// TMA descriptors, xor64 placement, ranks, out-of-bounds handling, the profile stamp.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// TMA descriptors and the tma.load / tma.store operands, xor64 placement and
+// its census against the MMA's operand addressing, out-of-bounds handling,
+// the profile stamp. Moved from the original tests/tests.cpp
+// (trash/test-setup-2026-10-22.md); converted to the NVIDIA-style split
+// (trash/tma-nvidia-alignment-2026-11-06.md): the descriptor holds the global
+// tensor and the box, the instruction its direction, shared address and mbar.
 #include "test_support.hpp"
 
 namespace {
 
 using namespace nanosm_test;
 
+std::string encode_error(const nanosm::TmaDescriptor& descriptor) {
+    try {
+        (void)nanosm::encode_tma_descriptor(descriptor);
+        return {};
+    } catch (const nanosm::SimError& error) {
+        return error.what();
+    }
+}
+
 void test_tma_descriptor_encoding() {
     nanosm::TmaDescriptor descriptor;
-    descriptor.rank = 3;
-    descriptor.direction = nanosm::TmaDirection::store;
+    descriptor.rank = 2;
     descriptor.gmem_base = 0x1122334455667788ull;
-    descriptor.dimensions = {17, 19, 23};
-    descriptor.strides = {32, 1024};
-    descriptor.box = {4, 5, 6};
+    descriptor.dimensions = {17, 19};
+    descriptor.row_stride = 32;
+    descriptor.box = {4, 5};
     descriptor.element_bytes = 2;
-    descriptor.shmem_base = 0x200;
-    descriptor.completion_mbar = 0x180;
     const auto bytes = nanosm::encode_tma_descriptor(descriptor);
-    require(bytes[0] == 3 && bytes[1] == 1 && bytes[3] == 2, "tma header bytes changed");
+    require(bytes[0] == 2 && bytes[1] == 0 && bytes[2] == 2 && bytes[3] == 0, "tma header bytes changed");
     require(bytes[8] == 0x88 && bytes[15] == 0x11, "tma gmem base is not little-endian");
+    require(bytes[16] == 17 && bytes[20] == 19 && bytes[24] == 32 && bytes[28] == 4 && bytes[32] == 5,
+        "tma dimension / row stride / box offsets changed");
+    for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
+        if ((offset >= 4 && offset < 8) || offset >= 36) require(bytes[offset] == 0, "a reserved tma byte is not zero");
+    }
     const auto decoded = nanosm::decode_tma_descriptor(bytes.data(), bytes.size());
     require(
-        decoded.rank == descriptor.rank && decoded.direction == descriptor.direction &&
-            decoded.gmem_base == descriptor.gmem_base &&
-            decoded.dimensions == descriptor.dimensions && decoded.strides == descriptor.strides &&
-            decoded.box == descriptor.box && decoded.element_bytes == descriptor.element_bytes &&
-            decoded.shmem_base == descriptor.shmem_base &&
-            decoded.completion_mbar == descriptor.completion_mbar,
+        decoded.rank == descriptor.rank && decoded.transpose == descriptor.transpose &&
+            decoded.gmem_base == descriptor.gmem_base && decoded.dimensions == descriptor.dimensions &&
+            decoded.row_stride == descriptor.row_stride && decoded.box == descriptor.box &&
+            decoded.element_bytes == descriptor.element_bytes && decoded.swizzle == descriptor.swizzle,
         "tma descriptor did not round trip");
 
-    auto corrupt = bytes;
-    corrupt[56] = 1;
+    for (const std::size_t offset : {4u, 7u, 36u, 63u}) {
+        auto corrupt = bytes;
+        corrupt[offset] = 1;
+        try {
+            (void)nanosm::decode_tma_descriptor(corrupt.data(), corrupt.size());
+            throw std::runtime_error("tma decoder accepted a nonzero reserved byte");
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("reserved") != std::string::npos,
+                "reserved tma byte produced the wrong panic");
+        }
+    }
+
+    // Rank 3 is gone: the instruction carries two coordinates (x, y).
+    auto rank3 = bytes;
+    rank3[0] = 3;
     try {
-        (void)nanosm::decode_tma_descriptor(corrupt.data(), corrupt.size());
-        throw std::runtime_error("tma decoder accepted a nonzero reserved byte");
+        (void)nanosm::decode_tma_descriptor(rank3.data(), rank3.size());
+        throw std::runtime_error("tma decoder accepted rank 3");
     } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("reserved tail") != std::string::npos,
-            "reserved tma byte produced the wrong panic");
+        require(std::string(error.what()).find("rank must be 1 or 2") != std::string::npos,
+            "rank 3 produced the wrong panic");
     }
 
     descriptor.transpose = true;
-    try {
-        (void)nanosm::encode_tma_descriptor(descriptor);
-        throw std::runtime_error("v0 tma descriptor accepted transpose");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("transpose") != std::string::npos,
-            "unsupported tma transpose produced the wrong panic");
-    }
+    require(encode_error(descriptor).find("transpose") != std::string::npos,
+        "a linear tma descriptor accepted transpose");
     descriptor.transpose = false;
     descriptor.swizzle = 3;
-    try {
-        (void)nanosm::encode_tma_descriptor(descriptor);
-        throw std::runtime_error("v0 tma descriptor accepted swizzle");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("swizzle") != std::string::npos,
-            "unsupported tma swizzle produced the wrong panic");
-    }
+    require(encode_error(descriptor).find("swizzle") != std::string::npos, "an unknown tma swizzle was accepted");
 
     for (uint8_t layout : {uint8_t{1}, uint8_t{2}}) for (bool transpose : {false, true}) {
         nanosm::TmaDescriptor operand;
@@ -68,13 +79,9 @@ void test_tma_descriptor_encoding() {
         operand.transpose = transpose;
         operand.element_bytes = 2;
         operand.swizzle = layout;
-        operand.dimensions = {96, 96, 1};
-        operand.strides = {101, 0};
-        operand.box = layout == 1
-            ? std::array<uint32_t, 3>{8, 64, 1}
-            : std::array<uint32_t, 3>{64, 8, 1};
-        operand.shmem_base = 1024;
-        operand.completion_mbar = 128;
+        operand.dimensions = {96, 96};
+        operand.row_stride = 101;
+        operand.box = layout == 1 ? std::array<uint32_t, 2>{8, 64} : std::array<uint32_t, 2>{64, 8};
         const auto encoded = nanosm::encode_tma_descriptor(operand);
         const auto round_trip = nanosm::decode_tma_descriptor(encoded.data(), encoded.size());
         require(round_trip.swizzle == layout && round_trip.transpose == transpose &&
@@ -84,22 +91,122 @@ void test_tma_descriptor_encoding() {
 
     nanosm::TmaDescriptor invalid;
     invalid.rank = 2; invalid.element_bytes = 2; invalid.swizzle = 1;
-    invalid.dimensions = {64, 64, 1}; invalid.strides = {64, 0};
-    invalid.box = {8, 63, 1}; invalid.shmem_base = 1024;
-    try {
-        (void)nanosm::encode_tma_descriptor(invalid);
-        throw std::runtime_error("xor64 descriptor accepted the wrong geometry");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("geometry") != std::string::npos,
-            "wrong xor64 geometry produced the wrong panic");
+    invalid.dimensions = {64, 64}; invalid.row_stride = 64;
+    invalid.box = {8, 63};
+    require(encode_error(invalid).find("outer extent") != std::string::npos,
+        "an xor64 box of 63 rows was accepted");
+    invalid.box = {12, 64};
+    require(encode_error(invalid).find("K extent") != std::string::npos,
+        "an xor64 box with K = 12 fp16 was accepted");
+}
+
+// The tma.load / tma.store address operand (src/tma.hpp): the completion
+// mbar / 8 in bits 15:0, the box's shared address / 64 in bits 31:16. Its
+// round trip and reach (past the 64 KiB canonical shmem: 512 KiB of mbars,
+// 4 MiB of boxes), the addresses it cannot hold, the one-mov range (a box
+// below 2 KiB), and on the machine the two range checks: a box that does not
+// fit shmem, an mbar outside it.
+void test_tma_address_operand() {
+    require(nanosm::pack_tma_addresses(0, 0) == 0 && nanosm::pack_tma_addresses(64, 8) == 0x00010001u &&
+            nanosm::pack_tma_addresses(1024, 4104) == (16u << 16 | 513u),
+        "the tma address operand's fields moved");
+    const auto far = nanosm::pack_tma_addresses(4 * 1024 * 1024 - 64, 512 * 1024 - 8);
+    const auto unpacked = nanosm::unpack_tma_addresses(far);
+    require(far == 0xffffffffu && unpacked.shmem == 4 * 1024 * 1024 - 64 && unpacked.mbar == 512 * 1024 - 8,
+        "the tma address operand does not reach 4 MiB of boxes and 512 KiB of mbars");
+    for (const uint32_t shared : {0u, 64u, 1984u, 2048u, 40960u, 65472u}) {
+        for (const uint32_t mbar : {0u, 8u, 4104u, 49184u, 65528u}) {
+            const auto back = nanosm::unpack_tma_addresses(nanosm::pack_tma_addresses(shared, mbar));
+            require(back.shmem == shared && back.mbar == mbar, "the tma address operand did not round trip");
+        }
     }
-    invalid.box = {8, 64, 1}; invalid.shmem_base = 1026;
-    try {
-        (void)nanosm::encode_tma_descriptor(invalid);
-        throw std::runtime_error("xor64 descriptor accepted an unaligned object");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("64-byte") != std::string::npos,
-            "unaligned xor64 object produced the wrong panic");
+    // One mov (a 22-bit signed immediate) holds the operand of any box below 2 KiB.
+    require(nanosm::pack_tma_addresses(1984, 512 * 1024 - 8) == static_cast<uint32_t>(nanosm::encoding::immediate_max) &&
+            nanosm::pack_tma_addresses(2048, 0) == static_cast<uint32_t>(nanosm::encoding::immediate_max) + 1,
+        "the one-mov range of the tma address operand moved");
+    const auto pack_error = [](uint32_t shared, uint32_t mbar) {
+        try {
+            (void)nanosm::pack_tma_addresses(shared, mbar);
+            return std::string();
+        } catch (const nanosm::SimError& error) {
+            return std::string(error.what());
+        }
+    };
+    require(pack_error(32, 8).find("64-byte aligned") != std::string::npos &&
+            pack_error(64, 4).find("8-byte aligned") != std::string::npos &&
+            pack_error(4 * 1024 * 1024, 0).find("below 4 MiB") != std::string::npos &&
+            pack_error(0, 512 * 1024).find("below 512 KiB") != std::string::npos,
+        "an address the operand cannot hold was packed");
+
+    // A `bytes` box at `shared` completing into `mbar`, on the canonical 64 KiB.
+    const auto run = [](uint32_t shared, uint32_t mbar, uint32_t bytes) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 65536);
+        image_bytes(launch.gmem_image, bytes);
+        write_tma_descriptor(shmem, 0, linear_tma(bytes));
+        if (mbar + 8 <= shmem.size()) write_tx_mbar(shmem, mbar, bytes);
+        return std::make_unique<nanosm::Machine>(canonical_profile(),
+            compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, shared, mbar) + "mov r3, " + std::to_string(mbar) +
+                "\ntma.load [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n"),
+            std::move(launch));
+    };
+    // The last box and the last mbar of shmem are in range.
+    auto last_box = run(65536 - 64, 128, 64);
+    last_box->run(20000);
+    auto last_mbar = run(1024, 65536 - 8, 64);
+    last_mbar->run(20000);
+    require(last_box->read_mbar_state(128).phase && last_mbar->read_mbar_state(65536 - 8).phase,
+        "a box or an mbar at the end of shmem did not complete");
+    expect_sim_panic(*run(65536 - 64, 128, 128), "tma logical box does not fit in shmem", "a box ending past shmem");
+    expect_sim_panic(*run(65536, 128, 64), "tma logical box does not fit in shmem", "a box starting past shmem");
+    expect_sim_panic(*run(1024, 65536, 64), "tma completion mbar is outside shmem", "an mbar past shmem");
+}
+
+// The direction is the opcode, and one descriptor (16 fp32 at gmem 0) serves
+// both: a tma.load into [1024, 1088) completing into the mbar at 128, then a
+// tma.store from [2048, 2112) completing into 136. Each command's bytes go to
+// its own mbar, and the two opcodes encode, decode and print apart.
+void test_tma_direction_is_the_opcode() {
+    const auto& profile = canonical_profile();
+    for (const std::string text : {"tma.load [64], r3, r5", "tma.store [64], r3, r5"}) {
+        const auto program = nanosm::compile_qtx(text + "\nhalt\n", profile);
+        require(nanosm::format_instruction(nanosm::decode(nanosm::encode(program.instructions.at(0))), false) == text,
+            "'" + text + "' did not survive encode / decode / print");
+    }
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    for (uint32_t i = 0; i < 16; ++i) {
+        write_u32(gmem, 4 * i, 0x100 + i);
+        write_u32(shmem, 2048 + 4 * i, 0x200 + i);
+    }
+    write_tma_descriptor(shmem, 0, linear_tma(64));
+    write_tx_mbar(shmem, 128, 64);
+    write_tx_mbar(shmem, 136, 64);
+    nanosm::Machine machine(profile, compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, 1024, 128) +
+        tma_operand_asm(5, 2048, 136) + R"(
+        mov r3, 128
+        mov r4, 136
+        tma.load [0], r0, r2
+    loaded:
+        mbar.try_wait p0, [r3], 0
+        @!p0 bra.uni loaded
+        tma.store [0], r0, r5
+    stored:
+        mbar.try_wait p0, [r4], 0
+        @!p0 bra.uni stored
+        halt
+    )"), std::move(launch));
+    machine.run(20000);
+    for (uint32_t i = 0; i < 16; ++i) {
+        require(machine.read_shmem_u32(1024 + 4 * i) == 0x100 + i, "tma.load did not load");
+        require(machine.read_gmem_u32(4 * i) == 0x200 + i, "tma.store did not store");
+    }
+    for (const uint32_t mbar : {128u, 136u}) {
+        const auto state = machine.read_mbar_state(mbar);
+        require(state.phase && state.tx_bytes == 0, "a command's bytes missed its own mbar " + std::to_string(mbar));
     }
 }
 
@@ -112,10 +219,15 @@ uint32_t reference_xor64_address(
         2 * (k & 1);
 }
 
+// One descriptor per layout and transpose, used by a load and then a store.
 void test_tma_xor64_transpose_load_store() {
     constexpr uint32_t mbar_address = 128;
     constexpr uint32_t tile_address = 1024;
     constexpr uint32_t stride = 83;
+    const auto program = [&](const std::string& opcode) {
+        return "mov r0, 3\nmov r1, 2\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) +
+            "\nmov r3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+    };
     for (uint8_t layout : {uint8_t{1}, uint8_t{2}}) {
         const uint32_t box_x = layout == 1 ? 8 : 64;
         const uint32_t box_y = layout == 1 ? 64 : 8;
@@ -129,11 +241,9 @@ void test_tma_xor64_transpose_load_store() {
             descriptor.transpose = transpose;
             descriptor.element_bytes = 2;
             descriptor.swizzle = layout;
-            descriptor.dimensions = {dim_x, dim_y, 1};
-            descriptor.strides = {stride, 0};
-            descriptor.box = {box_x, box_y, 1};
-            descriptor.shmem_base = tile_address;
-            descriptor.completion_mbar = mbar_address;
+            descriptor.dimensions = {dim_x, dim_y};
+            descriptor.row_stride = stride;
+            descriptor.box = {box_x, box_y};
 
             nanosm::Launch launch;
             launch.active_warps = 1;
@@ -146,17 +256,7 @@ void test_tma_xor64_transpose_load_store() {
             write_tma_descriptor(shmem, 0, descriptor);
             nanosm::MbarState mbar{false, true, 1, 0, 1024};
             write_u64(shmem, mbar_address, nanosm::encode_mbar_state(mbar));
-            nanosm::Machine machine(canonical_profile(), compile(R"(
-                mov r0, 3
-                mov r1, 2
-                mov r2, 0
-                mov r3, 128
-                tma.async [0], r0
-            wait:
-                mbar.try_wait p0, [r3], 0
-                @!p0 bra.uni wait
-                halt
-            )"), std::move(launch));
+            nanosm::Machine machine(canonical_profile(), compile(program("tma.load")), std::move(launch));
             machine.run(20000);
             std::set<uint32_t> addresses;
             for (uint32_t v = 0; v < box_y; ++v) for (uint32_t u = 0; u < box_x; ++u) {
@@ -172,7 +272,6 @@ void test_tma_xor64_transpose_load_store() {
             }
             require(addresses.size() == 512, "xor64 map did not cover the operand");
 
-            descriptor.direction = nanosm::TmaDirection::store;
             nanosm::Launch store_launch;
             store_launch.active_warps = 1;
             auto& store_shmem = image_bytes(store_launch.shmem_image, tile_address + 1088);
@@ -183,17 +282,7 @@ void test_tma_xor64_transpose_load_store() {
                     static_cast<uint16_t>(0x400 + 7 * v + 11 * u));
             write_tma_descriptor(store_shmem, 0, descriptor);
             write_u64(store_shmem, mbar_address, nanosm::encode_mbar_state(mbar));
-            nanosm::Machine store_machine(canonical_profile(), compile(R"(
-                mov r0, 3
-                mov r1, 2
-                mov r2, 0
-                mov r3, 128
-                tma.async [0], r0
-            wait:
-                mbar.try_wait p0, [r3], 0
-                @!p0 bra.uni wait
-                halt
-            )"), std::move(store_launch));
+            nanosm::Machine store_machine(canonical_profile(), compile(program("tma.store")), std::move(store_launch));
             store_machine.run(20000);
             for (uint32_t v = 0; v < box_y; ++v) for (uint32_t u = 0; u < box_x; ++u) {
                 const uint32_t gx = 3 + (transpose ? v : u);
@@ -244,45 +333,42 @@ void test_tma_xor64_feeds_mma_orientations() {
                 for (uint32_t n = 0; n < 64; ++n)
                     write_u16(gmem, base_b + 2 * (k * stride_b_pv + n), half_bits(3 * n + k + 1));
         }
-        for (uint32_t chunk = 0; chunk < 2; ++chunk) {
-            nanosm::TmaDescriptor a;
-            a.rank = 2; a.element_bytes = 2; a.swizzle = 1;
-            a.gmem_base = base_a; a.dimensions = {16, 64, 1};
-            a.strides = {stride_a, 0}; a.box = {8, 64, 1};
-            a.shmem_base = 1024 + 2048 * chunk; a.completion_mbar = 512 + 16 * chunk;
-            nanosm::TmaDescriptor b;
-            b.rank = 2; b.element_bytes = 2; b.swizzle = 2; b.gmem_base = base_b;
-            b.box = {64, 8, 1}; b.shmem_base = 2048 + 2048 * chunk;
-            b.completion_mbar = 520 + 16 * chunk;
-            if (!pv) {
-                b.transpose = true; b.dimensions = {16, 64, 1}; b.strides = {stride_b_qk, 0};
-            } else {
-                b.dimensions = {64, 16, 1}; b.strides = {stride_b_pv, 0};
-            }
-            write_tma_descriptor(shmem, 64 * (2 * chunk), a);
-            write_tma_descriptor(shmem, 64 * (2 * chunk + 1), b);
-            nanosm::MbarState ready{false, true, 1, 0, 1024};
-            write_u64(shmem, a.completion_mbar, nanosm::encode_mbar_state(ready));
-            write_u64(shmem, b.completion_mbar, nanosm::encode_mbar_state(ready));
+        // One descriptor per tensor (A at 0, B at 64); each chunk's command
+        // names its stage and mbar: A chunk c at 1024 + 2048c (mbar 512 + 16c),
+        // B chunk c at 2048 + 2048c (mbar 520 + 16c).
+        nanosm::TmaDescriptor a;
+        a.rank = 2; a.element_bytes = 2; a.swizzle = 1;
+        a.gmem_base = base_a; a.dimensions = {16, 64};
+        a.row_stride = stride_a; a.box = {8, 64};
+        nanosm::TmaDescriptor b;
+        b.rank = 2; b.element_bytes = 2; b.swizzle = 2; b.gmem_base = base_b;
+        b.box = {64, 8};
+        if (!pv) {
+            b.transpose = true; b.dimensions = {16, 64}; b.row_stride = stride_b_qk;
+        } else {
+            b.dimensions = {64, 16}; b.row_stride = stride_b_pv;
         }
+        write_tma_descriptor(shmem, 0, a);
+        write_tma_descriptor(shmem, 64, b);
+        nanosm::MbarState ready{false, true, 1, 0, 1024};
+        for (const uint32_t mbar : {512u, 520u, 528u, 536u}) write_u64(shmem, mbar, nanosm::encode_mbar_state(ready));
         nanosm::MbarState commit{false, true, 1, 1, 0};
         write_u64(shmem, 544, nanosm::encode_mbar_state(commit));
         // Chunk 1 origins per rfc07's table: A advances k in global x for both
         // orientations; B advances k in x under QK^T (transpose=1) but in y
-        // under PV (transpose=0) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â V's rows are keys.
+        // under PV (transpose=0) -- V's rows are keys.
         const std::string chunk1_b = pv
-            ? "mov r0, 0\nmov r1, 8\ntma.async [192], r0\n"
-            : "tma.async [192], r0\n";
-        const auto kernel = compile(std::string(R"(
-            .acc C, 0, 64, 64
+            ? "mov r0, 0\nmov r1, 8\ntma.load [64], r0, r17\n"
+            : "tma.load [64], r0, r17\n";
+        const auto kernel = compile(".acc C, 0, 64, 64\n" + tma_operand_asm(2, 1024, 512) +
+            tma_operand_asm(5, 2048, 520) + tma_operand_asm(14, 3072, 528) + tma_operand_asm(17, 4096, 536) + R"(
             mov r0, 0
             mov r1, 0
-            mov r2, 0
-            tma.async [0], r0
-            tma.async [64], r0
+            tma.load [0], r0, r2
+            tma.load [64], r0, r5
             mov r0, 8
-            tma.async [128], r0
-)") + chunk1_b + R"(
+            tma.load [0], r0, r14
+)" + chunk1_b + R"(
             mov r4, 512
         wait0:
             mbar.try_wait p0, [r4], 0
@@ -350,8 +436,147 @@ void test_tma_xor64_feeds_mma_orientations() {
     }
 }
 
-// Independent restatement of the stage-granular map: logical K picks the
-// 1024-byte operand object and the position inside it. Never calls the
+// The census (trash/tma_generalize_proto.py check 3): for every allowed outer
+// extent R (the powers of two 4 .. 128) and every fp16 K extent (8 .. 64),
+// both roles, a TMA load of an R x K box writes exactly the compact object an
+// MMA with m = R (A role) or n = R (B role) and k = K reads: every element
+// where the MMA's own operand addressing (nanosm::mma_operand_address) looks
+// for it, and no byte outside the object's R x K x 2 bytes. The box starts
+// on a 64-byte boundary that is not a 1024-byte one.
+void test_tma_xor64_census_against_mma() {
+    const auto& profile = canonical_profile();
+    constexpr uint32_t base = 1088;
+    constexpr uint32_t mbar_address = 64;
+    constexpr uint32_t shmem_bytes = base + 128 * 64 * 2 + 1024;
+    constexpr uint8_t poison = 0xa5;
+    const auto tag = [](uint32_t outer, uint32_t k) { return static_cast<uint16_t>(0x8000u | outer << 6 | k); };
+    const auto kernel = compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, base, mbar_address) + R"(
+        mov r3, 64
+        tma.load [0], r0, r2
+    wait:
+        mbar.try_wait p0, [r3], 0
+        @!p0 bra.uni wait
+        halt
+    )");
+    uint32_t cases = 0;
+    for (const bool a_role : {true, false}) {
+        for (uint32_t rows = nanosm::tma_xor64_min_outer; rows <= nanosm::tma_xor64_max_outer; rows *= 2) {
+            for (uint32_t k_extent = 8; k_extent <= nanosm::tma_xor64_max_k; k_extent += 8) {
+                const auto what = std::string(a_role ? "A" : "B") + " role, " + std::to_string(rows) + " rows, K " +
+                    std::to_string(k_extent);
+                // Row-major global: A is rows x K (x = k), B is K x n (x = n).
+                nanosm::TmaDescriptor descriptor;
+                descriptor.rank = 2;
+                descriptor.element_bytes = 2;
+                descriptor.swizzle = a_role ? 1 : 2;
+                descriptor.dimensions = a_role ? std::array<uint32_t, 2>{k_extent, rows}
+                                               : std::array<uint32_t, 2>{rows, k_extent};
+                descriptor.row_stride = descriptor.dimensions[0];
+                descriptor.box = descriptor.dimensions;
+                nanosm::Launch launch;
+                launch.active_warps = 1;
+                auto& shmem = image_bytes(launch.shmem_image, shmem_bytes);
+                std::fill(shmem.begin(), shmem.end(), poison);
+                std::fill(shmem.begin(), shmem.begin() + 128, 0);
+                write_tma_descriptor(shmem, 0, descriptor);
+                write_tx_mbar(shmem, mbar_address, rows * k_extent * 2);
+                auto& gmem = image_bytes(launch.gmem_image, rows * k_extent * 2);
+                for (uint32_t outer = 0; outer < rows; ++outer) {
+                    for (uint32_t k = 0; k < k_extent; ++k) {
+                        write_u16(gmem, 2 * (a_role ? outer * k_extent + k : k * rows + outer), tag(outer, k));
+                    }
+                }
+                nanosm::Machine machine(profile, kernel, std::move(launch));
+                machine.run(100000);
+                require(machine.read_mbar_state(mbar_address).phase, what + ": the load did not complete");
+                const nanosm::MmaShape shape = a_role ? nanosm::MmaShape{rows, 16, k_extent}
+                                                      : nanosm::MmaShape{16, rows, k_extent};
+                const auto& bytes = machine.shmem();
+                std::set<uint32_t> addresses;
+                for (uint32_t outer = 0; outer < rows; ++outer) {
+                    for (uint32_t k = 0; k < k_extent; ++k) {
+                        const auto address = nanosm::mma_operand_address(profile, shape, base, a_role, outer, k);
+                        require(address >= base && address + 2 <= base + rows * k_extent * 2,
+                            what + ": the MMA reads outside the box's compact object");
+                        require(addresses.insert(address).second, what + ": the MMA reads one address twice");
+                        uint16_t value = 0;
+                        std::memcpy(&value, bytes.data() + address, sizeof(value));
+                        require(value == tag(outer, k), what + ": the MMA's element (" + std::to_string(outer) + ", " +
+                            std::to_string(k) + ") is not where the TMA put it");
+                    }
+                }
+                for (uint32_t address = 128; address < shmem_bytes; ++address) {
+                    if (address >= base && address < base + rows * k_extent * 2) continue;
+                    require(bytes[address] == poison, what + ": the TMA wrote byte " + std::to_string(address) +
+                        " outside the object");
+                }
+                ++cases;
+            }
+        }
+    }
+    require(cases == 2 * 6 * 8, "the census did not cover every outer extent and K extent");
+}
+
+void test_tma_wide_xor64_validation() {
+    // K (u for A, v for B): a multiple of 8 fp16, at most 64. Outer (v for A,
+    // u for B): a power of two 4 .. 128.
+    nanosm::TmaDescriptor descriptor;
+    descriptor.rank = 2;
+    descriptor.element_bytes = 2;
+    descriptor.dimensions = {128, 128};
+    descriptor.row_stride = 128;
+    const auto rejection = [&](uint8_t swizzle, std::array<uint32_t, 2> box) {
+        descriptor.swizzle = swizzle;
+        descriptor.box = box;
+        return encode_error(descriptor);
+    };
+    for (uint32_t k = 8; k <= 64; k += 8) {
+        require(rejection(1, {k, 64}).empty() && rejection(2, {64, k}).empty(), "an xor64 K extent was rejected");
+    }
+    for (const uint32_t k : {4u, 12u, 60u, 72u}) {
+        require(rejection(1, {k, 64}).find("K extent") != std::string::npos &&
+                rejection(2, {64, k}).find("K extent") != std::string::npos,
+            "xor64 K extent " + std::to_string(k) + " was accepted");
+    }
+    for (uint32_t outer = 1; outer <= 256; ++outer) {
+        const bool allowed = outer >= 4 && outer <= 128 && (outer & (outer - 1)) == 0;
+        require(rejection(1, {16, outer}).empty() == allowed && rejection(2, {outer, 16}).empty() == allowed,
+            "xor64 outer extent " + std::to_string(outer) + " was " + (allowed ? "rejected" : "accepted"));
+        if (!allowed) {
+            require(rejection(1, {16, outer}).find("outer extent") != std::string::npos,
+                "xor64 outer extent " + std::to_string(outer) + " rejected with the wrong diagnostic");
+        }
+    }
+
+    // The span is the compact object, 64 x 64 x 2 = 8192 bytes: at 61440 it
+    // ends past the 64 KiB shmem.
+    nanosm::TmaDescriptor big;
+    big.rank = 2;
+    big.element_bytes = 2;
+    big.swizzle = 1;
+    big.dimensions = {128, 128};
+    big.row_stride = 128;
+    big.box = {64, 64};
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 33032);
+    image_bytes(launch.gmem_image, 65536);
+    write_tma_descriptor(shmem, 0, big);
+    write_u64(shmem, 33024, nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
+    nanosm::Machine machine(canonical_profile(),
+        compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, 61440, 33024) + "tma.load [0], r0, r2\nhalt\n"),
+        std::move(launch));
+    try {
+        machine.run(20000);
+        throw std::runtime_error("oversized xor64 span was accepted");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("does not fit in shmem") != std::string::npos,
+            "oversized xor64 span rejected with the wrong diagnostic");
+    }
+}
+
+// Independent restatement of the 64-row map: logical K picks the 1024-byte
+// slice (16 bytes x 64 rows) and the position inside it. Never calls the
 // production helper.
 uint32_t reference_wide_xor64(uint32_t base, uint8_t layout, uint32_t u, uint32_t v) {
     const uint32_t k = layout == 1 ? u : v;
@@ -362,58 +587,17 @@ uint32_t reference_wide_xor64(uint32_t base, uint8_t layout, uint32_t u, uint32_
         2 * (k % 2);
 }
 
-void test_tma_wide_xor64_validation() {
-    nanosm::TmaDescriptor descriptor;
-    descriptor.rank = 2;
-    descriptor.element_bytes = 2;
-    descriptor.dimensions = {128, 128, 1};
-    descriptor.strides = {128, 0};
-    descriptor.shmem_base = 1024;
-    const auto expect = [&](uint8_t swizzle, std::array<uint32_t, 3> box, bool ok) {
-        descriptor.swizzle = swizzle;
-        descriptor.box = box;
-        bool accepted = true;
-        try {
-            (void)nanosm::encode_tma_descriptor(descriptor);
-        } catch (const nanosm::SimError&) {
-            accepted = false;
-        }
-        require(accepted == ok, "wide xor64 box validation disagreed with the contract");
-    };
-    expect(1, {16, 64, 1}, true);
-    expect(1, {64, 64, 1}, true);
-    expect(2, {64, 16, 1}, true);
-    expect(2, {64, 64, 1}, true);
-    expect(1, {12, 64, 1}, false);
-    expect(1, {72, 64, 1}, false);
-    expect(1, {16, 32, 1}, false);
-    expect(2, {32, 16, 1}, false);
-
-    nanosm::TmaDescriptor big;
-    big.rank = 2;
-    big.element_bytes = 2;
-    big.swizzle = 1;
-    big.dimensions = {128, 128, 1};
-    big.strides = {128, 0};
-    big.box = {64, 64, 1};
-    big.shmem_base = 61440; // 8192-byte span ends past the 64 KiB shmem
-    big.completion_mbar = 33024;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 33032);
-    image_bytes(launch.gmem_image, 65536);
-    write_tma_descriptor(shmem, 0, big);
-    write_u64(shmem, 33024, nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
-    nanosm::Machine machine(canonical_profile(),
-        compile("mov r0, 0\nmov r1, 0\nmov r2, 0\ntma.async [0], r0\nhalt\n"),
-        std::move(launch));
-    try {
-        machine.run(20000);
-        throw std::runtime_error("oversized xor64 span was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("does not fit in shmem") != std::string::npos,
-            "oversized xor64 span rejected with the wrong diagnostic");
+// `commands` loads of a K / commands slab each, one descriptor, their
+// address operands built in turn in r2: command i's box starts at
+// tile + 1024 x (its K / 8) x i.
+std::string xor64_slab_loads(uint32_t commands, uint32_t tile, uint32_t mbar, const std::string& step) {
+    const uint32_t k_extent = 64 / commands;
+    std::string source = "mov r3, " + std::to_string(mbar) + "\n";
+    for (uint32_t i = 0; i < commands; ++i) {
+        if (i != 0) source += step;
+        source += tma_operand_asm(2, tile + 1024 * (k_extent / 8) * i, mbar) + "tma.load [0], r0, r2\n";
     }
+    return source + "wait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
 }
 
 void test_tma_wide_xor64_matches_narrow() {
@@ -438,33 +622,21 @@ void test_tma_wide_xor64_matches_narrow() {
                     write_u16(gmem, 2 * (y * stride + x),
                         static_cast<uint16_t>(0x100 + 3 * y + 5 * x));
             const uint32_t k_extent = 64 / commands;
-            for (uint32_t i = 0; i < commands; ++i) {
-                nanosm::TmaDescriptor descriptor;
-                descriptor.rank = 2;
-                descriptor.transpose = test_case.transpose;
-                descriptor.element_bytes = 2;
-                descriptor.swizzle = test_case.layout;
-                descriptor.dimensions = {dim_x, dim_y, 1};
-                descriptor.strides = {stride, 0};
-                descriptor.box = test_case.layout == 1
-                    ? std::array<uint32_t, 3>{k_extent, 64, 1}
-                    : std::array<uint32_t, 3>{64, k_extent, 1};
-                descriptor.shmem_base = tile_address + 1024 * (k_extent / 8) * i;
-                descriptor.completion_mbar = mbar_address;
-                write_tma_descriptor(shmem, 64 * i, descriptor);
-            }
+            nanosm::TmaDescriptor descriptor;
+            descriptor.rank = 2;
+            descriptor.transpose = test_case.transpose;
+            descriptor.element_bytes = 2;
+            descriptor.swizzle = test_case.layout;
+            descriptor.dimensions = {dim_x, dim_y};
+            descriptor.row_stride = stride;
+            descriptor.box = test_case.layout == 1
+                ? std::array<uint32_t, 2>{k_extent, 64}
+                : std::array<uint32_t, 2>{64, k_extent};
+            write_tma_descriptor(shmem, 0, descriptor);
             write_u64(shmem, mbar_address,
                 nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
-            std::string source = "mov r0, 3\nmov r1, 2\nmov r2, 0\nmov r3, " +
-                std::to_string(mbar_address) + "\n";
-            for (uint32_t i = 0; i < commands; ++i) {
-                if (i != 0) {
-                    source += test_case.step_axis == 'x'
-                        ? "addi r0, r0, 8\n" : "addi r1, r1, 8\n";
-                }
-                source += "tma.async [" + std::to_string(64 * i) + "], r0\n";
-            }
-            source += "wait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+            const std::string source = "mov r0, 3\nmov r1, 2\n" + xor64_slab_loads(commands, tile_address, mbar_address,
+                test_case.step_axis == 'x' ? "addi r0, r0, 8\n" : "addi r1, r1, 8\n");
             nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
             machine.run(200000);
             std::vector<uint32_t> words;
@@ -508,27 +680,18 @@ void test_tma_wide_xor64_sector_economics() {
         for (uint32_t i = 0; i < 4096; ++i)
             write_u16(gmem, 2 * i, static_cast<uint16_t>((i * 2654435761u) >> 16));
         const uint32_t k_extent = 64 / commands;
-        for (uint32_t i = 0; i < commands; ++i) {
-            nanosm::TmaDescriptor descriptor;
-            descriptor.rank = 2;
-            descriptor.transpose = true; // the QK^T orientation on the natural layout
-            descriptor.element_bytes = 2;
-            descriptor.swizzle = 2;
-            descriptor.dimensions = {64, 64, 1};
-            descriptor.strides = {64, 0};
-            descriptor.box = {64, k_extent, 1};
-            descriptor.shmem_base = tile_address + 1024 * (k_extent / 8) * i;
-            descriptor.completion_mbar = mbar_address;
-            write_tma_descriptor(shmem, 64 * i, descriptor);
-        }
+        nanosm::TmaDescriptor descriptor;
+        descriptor.rank = 2;
+        descriptor.transpose = true; // the QK^T orientation on the natural layout
+        descriptor.element_bytes = 2;
+        descriptor.swizzle = 2;
+        descriptor.dimensions = {64, 64};
+        descriptor.row_stride = 64;
+        descriptor.box = {64, k_extent};
+        write_tma_descriptor(shmem, 0, descriptor);
         write_u64(shmem, mbar_address, nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
-        std::string source = "mov r0, 0\nmov r1, 0\nmov r2, 0\nmov r3, " +
-            std::to_string(mbar_address) + "\n";
-        for (uint32_t i = 0; i < commands; ++i) {
-            if (i != 0) source += "addi r0, r0, 8\n";
-            source += "tma.async [" + std::to_string(64 * i) + "], r0\n";
-        }
-        source += "wait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+        const std::string source = "mov r0, 0\nmov r1, 0\n" +
+            xor64_slab_loads(commands, tile_address, mbar_address, "addi r0, r0, 8\n");
         nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
         machine.run(200000);
         return machine.trace().summary();
@@ -565,62 +728,48 @@ void test_xor64_byte_primitive_matches_fp16_formula() {
 }
 
 void test_tma_fp32_xor64_validation() {
-    const auto accepted = [](uint8_t element_bytes, uint8_t swizzle,
-                             std::array<uint32_t, 3> box, nanosm::TmaDirection direction) {
+    const auto rejection = [](uint8_t element_bytes, uint8_t swizzle, std::array<uint32_t, 2> box) {
         nanosm::TmaDescriptor descriptor;
         descriptor.rank = 2;
-        descriptor.direction = direction;
         descriptor.element_bytes = element_bytes;
         descriptor.swizzle = swizzle;
-        descriptor.dimensions = {128, 128, 1};
-        descriptor.strides = {128, 0};
+        descriptor.dimensions = {128, 128};
+        descriptor.row_stride = 128;
         descriptor.box = box;
-        descriptor.shmem_base = 1024;
-        descriptor.completion_mbar = 128;
-        try {
-            (void)nanosm::encode_tma_descriptor(descriptor);
-            return std::string();
-        } catch (const nanosm::SimError& error) {
-            return std::string(error.what());
-        }
+        return encode_error(descriptor);
     };
-    const auto load = nanosm::TmaDirection::load;
-    const auto store = nanosm::TmaDirection::store;
     // fp32: four elements per 16-byte row; K extent a multiple of 4, up to 64.
-    for (auto direction : {load, store}) {
-        require(accepted(4, 1, {64, 64, 1}, direction).empty(),
-            "fp32 xor64_a 64x64 tile was rejected");
-        require(accepted(4, 2, {64, 64, 1}, direction).empty(),
-            "fp32 xor64_b 64x64 tile was rejected");
-        require(accepted(4, 1, {4, 64, 1}, direction).empty() &&
-                accepted(4, 1, {12, 64, 1}, direction).empty(),
-            "fp32 xor64 single/odd object counts were rejected");
+    require(rejection(4, 1, {64, 64}).empty(), "fp32 xor64_a 64x64 tile was rejected");
+    require(rejection(4, 2, {64, 64}).empty(), "fp32 xor64_b 64x64 tile was rejected");
+    require(rejection(4, 1, {4, 64}).empty() && rejection(4, 1, {12, 64}).empty(),
+        "fp32 xor64 single/odd slice counts were rejected");
+    require(rejection(4, 1, {64, 32}).empty() && rejection(4, 2, {32, 8}).empty(),
+        "fp32 xor64 objects of other row counts were rejected");
+    for (std::array<uint32_t, 2> box : {std::array<uint32_t, 2>{6, 64},
+                                        std::array<uint32_t, 2>{2, 64},
+                                        std::array<uint32_t, 2>{68, 64}}) {
+        require(rejection(4, 1, box).find("K extent") != std::string::npos,
+            "fp32 xor64 accepted a K extent that is not whole slices");
     }
-    for (std::array<uint32_t, 3> box : {std::array<uint32_t, 3>{6, 64, 1},
-                                        std::array<uint32_t, 3>{2, 64, 1},
-                                        std::array<uint32_t, 3>{68, 64, 1},
-                                        std::array<uint32_t, 3>{64, 32, 1}}) {
-        require(accepted(4, 1, box, store).find("geometry") != std::string::npos,
-            "fp32 xor64 accepted a K extent that is not whole objects");
-    }
-    require(accepted(4, 2, {64, 6, 1}, load).find("geometry") != std::string::npos,
-        "fp32 xor64_b accepted a K extent that is not whole objects");
-    require(!accepted(8, 1, {64, 64, 1}, store).empty(), "8-byte xor64 elements were accepted");
-    require(accepted(1, 1, {64, 64, 1}, store).find("requires rank 2") != std::string::npos,
+    require(rejection(4, 1, {64, 48}).find("outer extent") != std::string::npos,
+        "fp32 xor64 accepted 48 rows");
+    require(rejection(4, 2, {64, 6}).find("K extent") != std::string::npos,
+        "fp32 xor64_b accepted a K extent that is not whole slices");
+    require(!rejection(8, 1, {64, 64}).empty(), "8-byte xor64 elements were accepted");
+    require(rejection(1, 1, {64, 64}).find("requires rank 2") != std::string::npos,
         "1-byte xor64 elements were accepted");
-    // fp16 keeps its eight-element rows: 12 is whole fp32 objects, not fp16.
-    for (std::array<uint32_t, 3> box : {std::array<uint32_t, 3>{12, 64, 1},
-                                        std::array<uint32_t, 3>{4, 64, 1},
-                                        std::array<uint32_t, 3>{72, 64, 1},
-                                        std::array<uint32_t, 3>{16, 32, 1}}) {
-        require(accepted(2, 1, box, load).find("geometry") != std::string::npos,
-            "fp16 xor64 wrong geometry was accepted after the fp32 generalization");
+    // fp16 keeps its eight-element rows: 12 is whole fp32 slices, not fp16.
+    for (std::array<uint32_t, 2> box : {std::array<uint32_t, 2>{12, 64},
+                                        std::array<uint32_t, 2>{4, 64},
+                                        std::array<uint32_t, 2>{72, 64}}) {
+        require(rejection(2, 1, box).find("K extent") != std::string::npos,
+            "fp16 xor64 wrong K extent was accepted after the fp32 generalization");
     }
 }
 
-// Independent fp32 xor64_a address: object = col / 4 (four floats per
-// 16-byte row), row = the 16-byte row, word-in-row = (col % 4) XOR bit 2 of
-// the row. Never calls the production primitive.
+// Independent fp32 xor64_a address: slice = col / 4 (four floats per
+// 16-byte row; 1024 bytes for 64 rows), row = the 16-byte row, word-in-row =
+// (col % 4) XOR bit 2 of the row. Never calls the production primitive.
 uint32_t reference_fp32_xor64_a(uint32_t base, uint32_t row, uint32_t col) {
     return base + 1024 * (col / 4) + 16 * row + 4 * ((col % 4) ^ ((row / 4) % 2));
 }
@@ -643,37 +792,27 @@ void test_tma_fp32_xor64_store_and_load() {
             const auto address = reference_fp32_xor64_a(tile_address, row, col);
             require(address % 4 == 0 && address >= tile_address &&
                     address < tile_address + tile_bytes,
-                "fp32 xor64 address left the 16-object span");
+                "fp32 xor64 address left the 16-slice span");
             require(addresses.insert(address).second, "fp32 xor64 map is not bijective");
         }
     }
-    require(addresses.size() == 4096, "fp32 xor64 map did not cover the 16 objects");
+    require(addresses.size() == 4096, "fp32 xor64 map did not cover the 16 slices");
 
-    const auto make_descriptor = [&](nanosm::TmaDirection direction, uint8_t swizzle) {
+    const auto make_descriptor = [&](uint8_t swizzle) {
         nanosm::TmaDescriptor descriptor;
         descriptor.rank = 2;
-        descriptor.direction = direction;
         descriptor.element_bytes = 4;
         descriptor.swizzle = swizzle;
         descriptor.gmem_base = gmem_base;
-        descriptor.dimensions = {64, 64, 1};
-        descriptor.strides = {64, 0};
-        descriptor.box = {64, 64, 1};
-        descriptor.shmem_base = tile_address;
-        descriptor.completion_mbar = mbar_address;
+        descriptor.dimensions = {64, 64};
+        descriptor.row_stride = 64;
+        descriptor.box = {64, 64};
         return descriptor;
     };
-    const char* program = R"(
-        mov r0, 0
-        mov r1, 0
-        mov r2, 0
-        mov r3, 128
-        tma.async [0], r0
-    wait:
-        mbar.try_wait p0, [r3], 0
-        @!p0 bra.uni wait
-        halt
-    )";
+    const auto program = [&](const std::string& opcode) {
+        return "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) +
+            "\nmov r3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+    };
     const nanosm::MbarState mbar{false, true, 1, 0, tile_bytes};
 
     // STORE: shmem tile authored at the independent address -> row-major gmem.
@@ -689,9 +828,9 @@ void test_tma_fp32_xor64_store_and_load() {
                         ? reference_fp32_xor64_a(tile_address, row, col)
                         : tile_address + 4 * (64 * row + col),
                     nanosm::float_bits(fp32_tile_value(row, col)));
-        write_tma_descriptor(shmem, 0, make_descriptor(nanosm::TmaDirection::store, swizzle));
+        write_tma_descriptor(shmem, 0, make_descriptor(swizzle));
         write_u64(shmem, mbar_address, nanosm::encode_mbar_state(mbar));
-        nanosm::Machine machine(canonical_profile(), compile(program), std::move(launch));
+        nanosm::Machine machine(canonical_profile(), compile(program("tma.store")), std::move(launch));
         machine.run(200000);
         for (uint32_t row = 0; row < 64; ++row) {
             for (uint32_t col = 0; col < 64; ++col) {
@@ -710,9 +849,9 @@ void test_tma_fp32_xor64_store_and_load() {
         return machine.trace().summary();
     };
     const auto swizzled_store = run_store(1);
-    // A 32-byte sector is eight consecutive fp32 of one row: four in object
+    // A 32-byte sector is eight consecutive fp32 of one row: four in slice
     // col/4 and four in the next. Both halves sit in the same row of their
-    // objects, so on the same four banks (1024 B = 256 words = 0 mod 16) at
+    // slices, so on the same four banks (1024 B = 256 words = 0 mod 16) at
     // different words: two port-A rounds per sector. Linear placement of the
     // same sector is eight adjacent words: one round.
     require(swizzled_store.tma_command_completions == 1 &&
@@ -735,9 +874,9 @@ void test_tma_fp32_xor64_store_and_load() {
         for (uint32_t col = 0; col < 64; ++col)
             write_u32(gmem, static_cast<uint32_t>(gmem_base) + 4 * (64 * row + col),
                 nanosm::float_bits(fp32_tile_value(row, col)));
-    write_tma_descriptor(shmem, 0, make_descriptor(nanosm::TmaDirection::load, 1));
+    write_tma_descriptor(shmem, 0, make_descriptor(1));
     write_u64(shmem, mbar_address, nanosm::encode_mbar_state(mbar));
-    nanosm::Machine machine(canonical_profile(), compile(program), std::move(launch));
+    nanosm::Machine machine(canonical_profile(), compile(program("tma.load")), std::move(launch));
     machine.run(200000);
     for (uint32_t row = 0; row < 64; ++row) {
         for (uint32_t col = 0; col < 64; ++col) {
@@ -764,10 +903,8 @@ void test_tma_rank1_load_and_oob_zero_fill() {
 
     nanosm::TmaDescriptor descriptor;
     descriptor.gmem_base = 0;
-    descriptor.dimensions = {4, 1, 1};
-    descriptor.box = {8, 1, 1};
-    descriptor.shmem_base = tile_address;
-    descriptor.completion_mbar = mbar_address;
+    descriptor.dimensions = {4, 1};
+    descriptor.box = {8, 1};
     write_tma_descriptor(shmem, descriptor_address, descriptor);
     nanosm::MbarState mbar;
     mbar.valid = true;
@@ -778,9 +915,9 @@ void test_tma_rank1_load_and_oob_zero_fill() {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         mov r0, -4
         mov r1, 0
-        mov r2, 0
+        mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
         mov r3, 128
-        tma.async [0], r0
+        tma.load [0], r0, r2
     wait:
         mbar.try_wait p0, [r3], 0
         @!p0 bra.uni wait
@@ -817,12 +954,9 @@ void test_tma_store_preserves_other_sector_bytes() {
     for (uint32_t i = 0; i < 4; ++i) write_u32(shmem, tile_address + i * 4, 0x200u + i);
 
     nanosm::TmaDescriptor descriptor;
-    descriptor.direction = nanosm::TmaDirection::store;
     descriptor.gmem_base = 12;
-    descriptor.dimensions = {4, 1, 1};
-    descriptor.box = {4, 1, 1};
-    descriptor.shmem_base = tile_address;
-    descriptor.completion_mbar = mbar_address;
+    descriptor.dimensions = {4, 1};
+    descriptor.box = {4, 1};
     write_tma_descriptor(shmem, descriptor_address, descriptor);
     nanosm::MbarState mbar;
     mbar.valid = true;
@@ -833,9 +967,9 @@ void test_tma_store_preserves_other_sector_bytes() {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         mov r0, 0
         mov r1, 0
-        mov r2, 0
+        mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
         mov r3, 128
-        tma.async [64], r0
+        tma.store [64], r0, r2
     wait:
         mbar.try_wait p0, [r3], 0
         @!p0 bra.uni wait
@@ -858,48 +992,58 @@ void test_tma_store_preserves_other_sector_bytes() {
         "tma store logical/useful/physical byte accounting is wrong");
 }
 
-void test_tma_rank3_strides() {
+// Rank 2 with a row stride and an origin, and a third dimension walked in
+// software (this was the rank-3 strides test; a z coordinate no longer fits
+// the instruction's registers). A 3 x 4 x 2 fp32 tensor with row stride 5
+// and plane stride 30 = 6 rows is viewed as rank 2 (3 x 10, row stride 5):
+// plane z is rows 6z .. 6z + 3. A loop issues one 2 x 2 box per plane at
+// (1, 1 + 6z), each into its own box 64 bytes on (the address operand's
+// shared field + 1), both completing into one mbar.
+void test_tma_rank2_strides_planes_in_software() {
     constexpr uint32_t descriptor_address = 0;
     constexpr uint32_t mbar_address = 128;
     constexpr uint32_t tile_address = 256;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + 16);
+    auto& shmem = image_bytes(launch.shmem_image, tile_address + 128);
     auto& gmem = image_bytes(launch.gmem_image, 64 * 4);
     for (uint32_t i = 0; i < 64; ++i) write_u32(gmem, i * 4, 1000 + i);
 
     nanosm::TmaDescriptor descriptor;
-    descriptor.rank = 3;
-    descriptor.dimensions = {3, 4, 2};
-    descriptor.strides = {5, 30};
-    descriptor.box = {2, 2, 1};
-    descriptor.shmem_base = tile_address;
-    descriptor.completion_mbar = mbar_address;
+    descriptor.rank = 2;
+    descriptor.dimensions = {3, 10};
+    descriptor.row_stride = 5;
+    descriptor.box = {2, 2};
     write_tma_descriptor(shmem, descriptor_address, descriptor);
-    nanosm::MbarState mbar;
-    mbar.valid = true;
-    mbar.expected = 1;
-    mbar.tx_bytes = 16;
-    write_u64(shmem, mbar_address, nanosm::encode_mbar_state(mbar));
+    write_tx_mbar(shmem, mbar_address, 32);
 
     nanosm::Machine machine(canonical_profile(), compile(R"(
         mov r0, 1
         mov r1, 1
-        mov r2, 1
+        mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
         mov r3, 128
-        tma.async [0], r0
+        mov r4, 0
+    plane:
+        tma.load [0], r0, r2
+        addi r1, r1, 6
+        addi r2, r2, 65536
+        addi r4, r4, 1
+        setp.lt p0, r4, 2
+        @p0 bra.uni plane
     wait:
         mbar.try_wait p0, [r3], 0
         @!p0 bra.uni wait
         halt
     )"), std::move(launch));
     machine.run();
-    const std::array<uint32_t, 4> expected{1036, 1037, 1041, 1042};
-    for (uint32_t i = 0; i < expected.size(); ++i) {
-        require(
-            machine.read_shmem_u32(tile_address + i * 4) == expected[i],
-            "tma rank-3 stride mapping is wrong");
+    const std::array<std::array<uint32_t, 4>, 2> expected{{{1006, 1007, 1011, 1012}, {1036, 1037, 1041, 1042}}};
+    for (uint32_t plane = 0; plane < 2; ++plane) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            require(machine.read_shmem_u32(tile_address + 64 * plane + i * 4) == expected[plane][i],
+                "tma rank-2 stride / origin mapping is wrong in plane " + std::to_string(plane));
+        }
     }
+    require(machine.trace().summary().tma_command_completions == 2, "one command per plane did not complete");
 }
 
 void test_profile_stamp_rejects_mismatch() {
@@ -969,6 +1113,16 @@ TEST(Tma, tma_descriptor_encoding) {
     test_tma_descriptor_encoding();
 }
 
+// tma address operand: packing, reach, range checks
+TEST(Tma, tma_address_operand) {
+    test_tma_address_operand();
+}
+
+// tma direction is the opcode; one descriptor serves both
+TEST(Tma, tma_direction_is_the_opcode) {
+    test_tma_direction_is_the_opcode();
+}
+
 // tma xor64 transpose load/store
 TEST(Tma, tma_xor64_transpose_load_store) {
     test_tma_xor64_transpose_load_store();
@@ -977,6 +1131,11 @@ TEST(Tma, tma_xor64_transpose_load_store) {
 // tma xor64 feeds MMA
 TEST(TmaSlow, tma_xor64_feeds_mma_orientations) {
     test_tma_xor64_feeds_mma_orientations();
+}
+
+// tma xor64 census: every outer extent and K extent vs the MMA's addressing
+TEST(TmaSlow, tma_xor64_census_against_mma) {
+    test_tma_xor64_census_against_mma();
 }
 
 // tma wide xor64 validation
@@ -1019,9 +1178,9 @@ TEST(Tma, tma_store_preserves_other_sector_bytes) {
     test_tma_store_preserves_other_sector_bytes();
 }
 
-// tma rank-3 strides
-TEST(Tma, tma_rank3_strides) {
-    test_tma_rank3_strides();
+// tma rank-2 strides, planes walked in software (was rank-3 strides)
+TEST(Tma, tma_rank2_strides_planes_in_software) {
+    test_tma_rank2_strides_planes_in_software();
 }
 
 // profile stamp

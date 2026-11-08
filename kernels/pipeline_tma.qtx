@@ -1,6 +1,7 @@
 ; Double-buffered vector add with a TMA producer and a SIMT consumer.
-; Four launch-authored descriptors cover A/B x stage 0/1. The x coordinate
-; advances by one 16-element tile; no swizzle and no transpose are involved.
+; Two launch-authored descriptors (A, B); each stage's destination and
+; full barrier are the tma.load address operand (src/tma.hpp). The x
+; coordinate advances by one 16-element tile; no swizzle, no transpose.
 
 .equ C,      8192
 .equ SA0,    0
@@ -11,10 +12,8 @@
 .equ FULL1,  1032
 .equ EMPTY0, 1040
 .equ EMPTY1, 1048
-.equ ADESC0, 1152
-.equ BDESC0, 1216
-.equ ADESC1, 1280
-.equ BDESC1, 1344
+.equ ADESC,  1152
+.equ BDESC,  1216
 
         sread r0, WARP_ID
         setp.eq p0, r0, 0
@@ -69,15 +68,31 @@ PRODUCER:
         mov   r19, 0
         mov   r20, 0
         mov   r21, 0
-        mov   r22, 0
+; Address operands (src/tma.hpp): the stage / 64 in bits 31:16 (the shli by
+; 10 of its 64-byte-aligned address), the full barrier / 8 in bits 15:0; in RF
+; bank 1 (register mod 3 == 1) beside the coordinates r20 / r21 (banks 2 / 0).
+        shri  r5, r14, 3
+        shri  r6, r15, 3
+        mov   r4, SA0
+        mov   r7, SB0
+        mov   r10, SA1
+        mov   r13, SB1
+        shli  r4, r4, 10
+        shli  r7, r7, 10
+        shli  r10, r10, 10
+        shli  r13, r13, 10
+        or    r4, r4, r5
+        or    r7, r7, r5
+        or    r10, r10, r6
+        or    r13, r13, r6
 
         mbar.arrive.expect_tx [r14], 128
-        tma.async [ADESC0], r20
-        tma.async [BDESC0], r20
+        tma.load [ADESC], r20, r4
+        tma.load [BDESC], r20, r7
         addi  r20, r20, 16
         mbar.arrive.expect_tx [r15], 128
-        tma.async [ADESC1], r20
-        tma.async [BDESC1], r20
+        tma.load [ADESC], r20, r10
+        tma.load [BDESC], r20, r13
         addi  r20, r20, 16
 
         mov   r3, 6
@@ -87,8 +102,8 @@ PE0:    mbar.try_wait p3, [r16], r18
 @!p3    bra.uni PE0
         xori  r18, r18, 1
         mbar.arrive.expect_tx [r14], 128
-        tma.async [ADESC0], r20
-        tma.async [BDESC0], r20
+        tma.load [ADESC], r20, r4
+        tma.load [BDESC], r20, r7
         addi  r20, r20, 16
         addi  r3, r3, -1
         setp.le p1, r3, 0
@@ -97,8 +112,8 @@ PE1:    mbar.try_wait p3, [r17], r19
 @!p3    bra.uni PE1
         xori  r19, r19, 1
         mbar.arrive.expect_tx [r15], 128
-        tma.async [ADESC1], r20
-        tma.async [BDESC1], r20
+        tma.load [ADESC], r20, r10
+        tma.load [BDESC], r20, r13
         addi  r20, r20, 16
         addi  r3, r3, -1
         bra.uni PLOOP

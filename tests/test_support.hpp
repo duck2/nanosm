@@ -80,6 +80,20 @@ inline void write_tma_descriptor(
     std::memcpy(image.data() + address, bytes.data(), bytes.size());
 }
 
+// The tma.load / tma.store address operand (src/tma.hpp) of a box at shmem
+// `shared` completing into the mbar at `mbar`, as assembly that puts it in
+// register `reg`: one mov when it fits the immediate (a box below 2 KiB),
+// else mov / shli / ori.
+inline std::string tma_operand_asm(uint32_t reg, uint32_t shared, uint32_t mbar) {
+    const auto packed = nanosm::pack_tma_addresses(shared, mbar);
+    const auto r = "r" + std::to_string(reg);
+    if (packed <= static_cast<uint32_t>(nanosm::encoding::immediate_max)) {
+        return "mov " + r + ", " + std::to_string(packed) + "\n";
+    }
+    return "mov " + r + ", " + std::to_string(shared / nanosm::tma_shared_unit_bytes) + "\nshli " + r + ", " + r +
+        ", 16\nori " + r + ", " + r + ", " + std::to_string(mbar / nanosm::tma_mbar_unit_bytes) + "\n";
+}
+
 inline std::vector<uint8_t>& image_bytes(
     std::vector<nanosm::ImageSegment>& image, std::size_t size) {
     image.push_back({0, std::vector<uint8_t>(size, 0)});
@@ -185,14 +199,15 @@ inline std::string booking_stream(uint32_t bank, uint32_t count) {
     return text;
 }
 
+// A rank-1 fp32 descriptor of `elements` at gmem_base, and the mbar its
+// command completes into, expecting those bytes. The box's shared address and
+// the mbar are the instruction's operand (tma_operand_asm).
 inline void write_rank1_load(std::vector<uint8_t>& shmem, uint32_t descriptor_address, uint64_t gmem_base,
-                      uint32_t elements, uint32_t tile, uint32_t mbar_address) {
+                      uint32_t elements, uint32_t mbar_address) {
     nanosm::TmaDescriptor descriptor;
     descriptor.gmem_base = gmem_base;
-    descriptor.dimensions = {elements, 1, 1};
-    descriptor.box = {elements, 1, 1};
-    descriptor.shmem_base = tile;
-    descriptor.completion_mbar = mbar_address;
+    descriptor.dimensions = {elements, 1};
+    descriptor.box = {elements, 1};
     write_tma_descriptor(shmem, descriptor_address, descriptor);
     nanosm::MbarState mbar;
     mbar.valid = true;
@@ -212,15 +227,13 @@ inline void write_rank1_load(std::vector<uint8_t>& shmem, uint32_t descriptor_ad
 
 using nanosm::LsuEdge;
 
-inline void write_rank1_tma(std::vector<uint8_t>& shmem, uint32_t descriptor_address, bool store,
-                     uint64_t gmem_base, uint32_t elements, uint32_t tile, uint32_t mbar_address) {
+// The same for either direction (the direction is the instruction's).
+inline void write_rank1_tma(std::vector<uint8_t>& shmem, uint32_t descriptor_address,
+                     uint64_t gmem_base, uint32_t elements, uint32_t mbar_address) {
     nanosm::TmaDescriptor descriptor;
-    descriptor.direction = store ? nanosm::TmaDirection::store : nanosm::TmaDirection::load;
     descriptor.gmem_base = gmem_base;
-    descriptor.dimensions = {elements, 1, 1};
-    descriptor.box = {elements, 1, 1};
-    descriptor.shmem_base = tile;
-    descriptor.completion_mbar = mbar_address;
+    descriptor.dimensions = {elements, 1};
+    descriptor.box = {elements, 1};
     write_tma_descriptor(shmem, descriptor_address, descriptor);
     nanosm::MbarState mbar;
     mbar.valid = true;
@@ -336,14 +349,12 @@ inline void require_mentions(
     }
 }
 
-// Rank-1 linear fp32 TMA of `bytes` between shmem `shmem_base` and gmem 0.
-inline nanosm::TmaDescriptor linear_tma(bool store, uint32_t shmem_base, uint32_t bytes, uint32_t mbar) {
+// Rank-1 linear fp32 TMA of `bytes` at gmem 0 (the shmem side, the mbar and
+// the direction are the instruction's).
+inline nanosm::TmaDescriptor linear_tma(uint32_t bytes) {
     nanosm::TmaDescriptor descriptor;
-    descriptor.direction = store ? nanosm::TmaDirection::store : nanosm::TmaDirection::load;
-    descriptor.dimensions = {bytes / 4, 1, 1};
-    descriptor.box = {bytes / 4, 1, 1};
-    descriptor.shmem_base = shmem_base;
-    descriptor.completion_mbar = mbar;
+    descriptor.dimensions = {bytes / 4, 1};
+    descriptor.box = {bytes / 4, 1};
     return descriptor;
 }
 
@@ -610,13 +621,19 @@ inline std::string describe(const std::vector<I3Rmw>& rmws) {
     return text;
 }
 
-// A rank-1 TMA descriptor at 5120 moving `bytes` between shmem `shmem_base`
-// and gmem 0, completing into the mbar at 4104 (which expects those bytes).
-inline std::function<void(std::vector<uint8_t>&)> i4_tma(bool store, uint32_t shmem_base, uint32_t bytes) {
+// A rank-1 TMA descriptor at 5120 of `bytes` at gmem 0, and the mbar at 4104
+// expecting those bytes. The kernel's tma.load / tma.store names the shmem
+// side and that mbar in its address operand (i4_tma_operand).
+inline std::function<void(std::vector<uint8_t>&)> i4_tma(uint32_t bytes) {
     return [=](std::vector<uint8_t>& shmem) {
-        write_tma_descriptor(shmem, 5120, linear_tma(store, shmem_base, bytes, 4104));
+        write_tma_descriptor(shmem, 5120, linear_tma(bytes));
         write_tx_mbar(shmem, 4104, bytes);
     };
+}
+
+// The address operand of an i4_tma command whose box is at shmem `shared`.
+inline uint32_t i4_tma_operand(uint32_t shared) {
+    return nanosm::pack_tma_addresses(shared, 4104);
 }
 
 // The machine's PANIC text (a clean run is a test failure).

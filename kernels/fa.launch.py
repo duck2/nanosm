@@ -25,11 +25,10 @@ from nanosm import Launch
 ROOT = Path(__file__).resolve().parents[1]
 Q_GLOBAL, K_GLOBAL, V_GLOBAL, O_GLOBAL = 0, 8192, 24576, 65536
 Q_SHARED, K_SHARED, V_SHARED, P_SHARED = 0, 8192, 16384, 40960
-K_SHARED1, V_SHARED1 = 24576, 32768
 SCORE_DONE, OUTPUT_DONE, WORK_DONE, INPUT_DONE = 49160, 49168, 49176, 49184
 OSTAGE_DONE, OSTORE_DONE = 49192, 49200
 CONSTANTS, QDESC, KDESC, VDESC, STATS = 49216, 49664, 49728, 49792, 50176
-KDESC1, VDESC1, ODESC = 49856, 49920, 49984
+ODESC = 49984
 # O staging reuses the Q + K stage-0 region: 16 fp32 xor64_a objects, 16 KiB.
 O_SHARED, O_STAGE_BYTES = 0, 16384
 ROWS, KEYS, WIDTH, BLOCK = 64, 128, 64, 64
@@ -74,25 +73,24 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
         launch.shmem.mbar(address, expected=count)
     # Stage-granular boxes (roofline E2): one command per operand stage reads
     # each source row's full 128 bytes — full sectors at the NATURAL layout.
-    for desc, gbase, dims, shape, sbase, layout, transpose in [
-        (QDESC, Q_GLOBAL, (WIDTH, ROWS), (WIDTH, ROWS), Q_SHARED, "xor64_a", False),
-        (KDESC, K_GLOBAL, (WIDTH, KEYS), (BLOCK, WIDTH), K_SHARED, "xor64_b", True),
-        (VDESC, V_GLOBAL, (WIDTH, KEYS), (WIDTH, BLOCK), V_SHARED, "xor64_b", False),
-        (KDESC1, K_GLOBAL, (WIDTH, KEYS), (BLOCK, WIDTH), K_SHARED1, "xor64_b", True),
-        (VDESC1, V_GLOBAL, (WIDTH, KEYS), (WIDTH, BLOCK), V_SHARED1, "xor64_b", False),
+    # One descriptor per tensor; each command's destination and completion
+    # barrier are its address operand (built in the kernel), so K and V serve
+    # both stage sets.
+    for desc, gbase, dims, shape, layout, transpose in [
+        (QDESC, Q_GLOBAL, (WIDTH, ROWS), (WIDTH, ROWS), "xor64_a", False),
+        (KDESC, K_GLOBAL, (WIDTH, KEYS), (BLOCK, WIDTH), "xor64_b", True),
+        (VDESC, V_GLOBAL, (WIDTH, KEYS), (WIDTH, BLOCK), "xor64_b", False),
     ]:
         launch.shmem.tma_desc(
-            desc, direction="load", gmem_base=gbase,
+            desc, gmem_base=gbase,
             dimensions=dims, strides=(WIDTH,), box=shape,
-            shmem_base=sbase, completion_mbar=INPUT_DONE,
             element_bytes=2, swizzle=layout, transpose=transpose,
         )
     # One store of the whole FP32 tile: the same xor64 byte permutation with
-    # four floats per 16-byte row, sixteen consecutive 1024-byte objects.
+    # four floats per 16-byte row, sixteen consecutive 1024-byte slices.
     launch.shmem.tma_desc(
-        ODESC, direction="store", gmem_base=O_GLOBAL,
+        ODESC, gmem_base=O_GLOBAL,
         dimensions=(WIDTH, ROWS), strides=(WIDTH,), box=(WIDTH, ROWS),
-        shmem_base=O_SHARED, completion_mbar=OSTORE_DONE,
         element_bytes=4, swizzle="xor64_a",
     )
     return launch

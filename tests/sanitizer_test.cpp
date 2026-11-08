@@ -18,16 +18,16 @@ void test_sanitizer_sts_into_tma_store_source() {
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         image_bytes(launch.gmem_image, 2048);
         for (uint32_t i = 0; i < 256; ++i) write_u32(shmem, 4 * i, 3 * i + 1);
-        write_tma_descriptor(shmem, 4096, linear_tma(true, 0, 1024, 4160));
+        write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
         return launch;
     };
     const std::string prologue = R"(
         mov r0, 0
         mov r1, 0
-        mov r2, 0
+    )" + tma_operand_asm(2, 0, 4160) + R"(
         mov r4, 4160
-        tma.async [4096], r0
+        tma.store [4096], r0, r2
     )";
     const std::string stage = R"(
         sread r20, LANE_ID
@@ -105,18 +105,18 @@ void test_sanitizer_lds_from_tma_load_destination() {
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         for (uint32_t i = 0; i < 256; ++i) write_u32(gmem, 4 * i, 5 * i + 2);
-        write_tma_descriptor(shmem, 4096, linear_tma(false, 0, 1024, 4160));
+        write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
         return launch;
     };
     const std::string prologue = R"(
         mov r0, 0
         mov r1, 0
-        mov r2, 0
+    )" + tma_operand_asm(2, 0, 4160) + R"(
         mov r4, 4160
         sread r20, LANE_ID
         shli r20, r20, 2
-        tma.async [4096], r0
+        tma.load [4096], r0, r2
     )";
     const auto message = run_expecting_panic(profile, compile(prologue + R"(
         lds r21, [r20]
@@ -146,15 +146,15 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         image_bytes(launch.gmem_image, 1024);
-        write_tma_descriptor(shmem, 4096, linear_tma(false, 0, 1024, 4160));
+        write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
         write_count_mbar(shmem, 512, 2);
         const auto message = run_expecting_panic(profile, compile(R"(
             mov r0, 0
             mov r1, 0
-            mov r2, 0
+        )" + tma_operand_asm(2, 0, 4160) + R"(
             mov r4, 512
-            tma.async [4096], r0
+            tma.load [4096], r0, r2
             mbar.arrive [r4]
             halt
         )"), std::move(launch), "mbar.arrive inside a TMA load destination");
@@ -169,7 +169,7 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         image_bytes(launch.gmem_image, 1024);
-        write_tma_descriptor(shmem, 4096, linear_tma(false, 2048, 1024, 512));
+        write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 512, 1024);
         const auto message = run_expecting_panic(profile, compile(R"(
             .acc C, 0, 64, 64
@@ -177,10 +177,10 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
             mov r1, 1024
             mov r8, 0
             mov r9, 0
-            mov r10, 0
+        )" + tma_operand_asm(10, 2048, 512) + R"(
             mma.async.init.m64n64k8 C, [r0], [r1]
             mma.async.m64n64k8 C, [r0], [r1]
-            tma.async [4096], r8
+            tma.load [4096], r8, r10
             halt
         )"), std::move(launch), "engine complete_tx into an MMA operand stage");
         require_mentions(message, {"engine complete_tx writes mbar bytes [512, 520)",
@@ -191,14 +191,14 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
 
 void test_sanitizer_tma_and_mma_accept_conflicts() {
     const auto& profile = canonical_profile();
-    const auto launch_with = [](bool second_store) {
+    // One descriptor (1 KiB at gmem 0) serves every command below: each one's
+    // direction, shmem side and completion mbar are the instruction's.
+    const auto launch_with_descriptor = [] {
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 8192);
         image_bytes(launch.gmem_image, 1024);
-        write_tma_descriptor(shmem, 4096, linear_tma(false, 0, 1024, 4160));
-        write_tma_descriptor(shmem, 4224, linear_tma(second_store, 1024, 1024, 4168));
-        write_tma_descriptor(shmem, 4288, linear_tma(true, 0, 1024, 4168));
+        write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
         write_tx_mbar(shmem, 4168, 1024);
         return launch;
@@ -210,14 +210,14 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r1, 1024
         mov r8, 0
         mov r9, 0
-        mov r10, 0
+    )" + tma_operand_asm(10, 0, 4160) + R"(
         mma.async.init.m64n64k8 C, [r0], [r1]
-        tma.async [4096], r8
+        tma.load [4096], r8, r10
         halt
-    )"), launch_with(false), "TMA load over an active MMA operand");
+    )"), launch_with_descriptor(), "TMA load over an active MMA operand");
     require_mentions(message, {"shmem race: tma load #0 destination bytes [0, 1024)",
         "owned by mma.async #1 [fetching]", "A operand [0, 1024)",
-        "wait the operand-consumed depbar sb", "inst='tma.async"}, "TMA load vs MMA");
+        "wait the operand-consumed depbar sb", "inst='tma.load [4096], r8, r10"}, "TMA load vs MMA");
     // MMA accepted over a pending TMA load destination (the other direction).
     message = run_expecting_panic(profile, compile(R"(
         .acc C, 0, 64, 64
@@ -225,22 +225,22 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r1, 1024
         mov r8, 0
         mov r9, 0
-        mov r10, 0
-        tma.async [4224], r8
+    )" + tma_operand_asm(10, 1024, 4168) + R"(
+        tma.load [4096], r8, r10
         mma.async.init.m64n64k8 C, [r0], [r1]
         halt
-    )"), launch_with(false), "MMA over a pending TMA load destination");
+    )"), launch_with_descriptor(), "MMA over a pending TMA load destination");
     require_mentions(message, {"shmem race: mma.async #1 B operand bytes [1024, 2048)",
         "owned by tma load #0", "wait the TMA completion mbar [4168]"}, "MMA vs TMA load");
     // TMA store accepted whose source a pending TMA load still writes.
     message = run_expecting_panic(profile, compile(R"(
         mov r8, 0
         mov r9, 0
-        mov r10, 0
-        tma.async [4096], r8
-        tma.async [4288], r8
+    )" + tma_operand_asm(10, 0, 4160) + tma_operand_asm(13, 0, 4168) + R"(
+        tma.load [4096], r8, r10
+        tma.store [4096], r8, r13
         halt
-    )"), launch_with(false), "TMA store of a pending TMA load destination");
+    )"), launch_with_descriptor(), "TMA store of a pending TMA load destination");
     require_mentions(message, {"shmem race: tma store #1 source bytes [0, 1024)",
         "owned by tma load #0", "wait the TMA completion mbar [4160]"}, "TMA store vs TMA load");
     // Two readers never conflict: a TMA store of an MMA operand stage is legal.
@@ -251,14 +251,14 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         mov r4, 4168
         mov r8, 0
         mov r9, 0
-        mov r10, 0
+    )" + tma_operand_asm(10, 1024, 4168) + R"(
         mma.async.init.m64n64k8 C, [r0], [r1]
-        tma.async [4224], r8
+        tma.store [4096], r8, r10
     wait:
         mbar.try_wait p0, [r4], 0
         @!p0 bra.uni wait
         halt
-    )"), launch_with(true));
+    )"), launch_with_descriptor());
     readers.run(20000);
 }
 
@@ -353,27 +353,26 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         auto& shmem = image_bytes(launch.shmem_image, 8192 + 24);
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         for (uint32_t i = 0; i < 512; ++i) write_u16(gmem, 2 * i, 0x3c00);
-        for (uint32_t stage = 0; stage < 4; ++stage) {
-            nanosm::TmaDescriptor descriptor;
-            descriptor.element_bytes = 2;
-            descriptor.dimensions = {512, 1, 1};
-            descriptor.box = {512, 1, 1};
-            descriptor.shmem_base = 1024 * stage;
-            descriptor.completion_mbar = stage < 2 ? 8192 : 8200;
-            write_tma_descriptor(shmem, 4096 + 64 * stage, descriptor);
-        }
+        // One descriptor (512 fp16 at gmem 0); each stage's command names its
+        // destination and stage mbar in its address operand.
+        nanosm::TmaDescriptor descriptor;
+        descriptor.element_bytes = 2;
+        descriptor.dimensions = {512, 1};
+        descriptor.box = {512, 1};
+        write_tma_descriptor(shmem, 4096, descriptor);
         for (uint32_t mbar : {8192u, 8200u, 8208u}) write_count_mbar(shmem, mbar, 1);
         nanosm::Machine machine(profile, compile(R"(
             .acc C, 0, 64, 64
             mov r8, 0
             mov r9, 0
-            mov r10, 0
+        )" + tma_operand_asm(10, 0, 8192) + tma_operand_asm(13, 1024, 8192) +
+            tma_operand_asm(25, 2048, 8200) + tma_operand_asm(28, 3072, 8200) + R"(
             mov r2, 8192
             mov r3, 8200
             mov r4, 8208
             mbar.arrive.expect_tx [r2], 2048
-            tma.async [4096], r8
-            tma.async [4160], r8
+            tma.load [4096], r8, r10
+            tma.load [4096], r8, r13
         L0:
             mbar.try_wait p1, [r2], 0
             @!p1 bra.uni L0
@@ -381,8 +380,8 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             mov r1, 1024
             mma.async.init.m64n64k8 C, [r0], [r1]
             mbar.arrive.expect_tx [r3], 2048
-            tma.async [4224], r8
-            tma.async [4288], r8
+            tma.load [4096], r8, r25
+            tma.load [4096], r8, r28
         L1:
             mbar.try_wait p1, [r3], 0
             @!p1 bra.uni L1
@@ -390,8 +389,8 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             mov r1, 3072
             mma.async.m64n64k8 C, [r0], [r1]
             mbar.arrive.expect_tx [r2], 2048
-            tma.async [4096], r8
-            tma.async [4160], r8
+            tma.load [4096], r8, r10
+            tma.load [4096], r8, r13
         L2:
             mbar.try_wait p1, [r2], 1
             @!p1 bra.uni L2

@@ -98,7 +98,7 @@ bool is_mbar_rmw(Opcode opcode) {
 }
 
 bool is_tma(Opcode opcode) {
-    return opcode == Opcode::tma_async;
+    return is_tma_opcode(opcode);
 }
 
 bool is_sfu(Opcode opcode) {
@@ -302,7 +302,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     if (config_.tma_queue_commands == 0) {
         for (const auto word : kernel_.words) {
             if (is_tma(decode(word).opcode)) {
-                throw SimError("tma.async is unsupported by this device profile");
+                throw SimError("tma.load / tma.store are unsupported by this device profile");
             }
         }
     }
@@ -2341,8 +2341,8 @@ namespace {
 // 16 bytes and depends on the row (m or n) only, so a 32-row A object is the
 // top half of a 64-row one for k = 8. A shape with k > 8 stacks its 8-deep K
 // blocks as whole objects of (rows x 16 B), the compact object of its shape
-// (1024 B for 64 rows, the TMA's spacing). The dense diagnostic layout is
-// row-major in the command's shape.
+// (1024 B for 64 rows; a TMA box of that many rows has the same spacing). The
+// dense diagnostic layout is row-major in the command's shape.
 constexpr uint32_t xor64_row_elements = 8;
 
 uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t m, uint32_t k) {
@@ -2373,6 +2373,11 @@ uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
 }
 
 } // namespace
+
+uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, bool a_operand,
+    uint32_t outer, uint32_t k) {
+    return a_operand ? mma_a_address(config, shape, base, outer, k) : mma_b_address(config, shape, base, k, outer);
+}
 
 // The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
 // (c)): free if it runs no transfer. The MMA never matters here -- it has
@@ -2776,7 +2781,7 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
             }
             MbarRmwRequest event;
             event.operation = MbarRmwOperation::complete_tx;
-            event.byte_address = command.descriptor.completion_mbar;
+            event.byte_address = command.mbar_address;
             event.value = static_cast<uint32_t>(command.logical_bytes);
             event.tma_command = command.id; // (S) the sanitizer's accept-time phase peek
             want.present_event = std::move(event);
@@ -2859,7 +2864,7 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(
     plan.command_after = start;
     auto& command = plan.command_after;
     if (command.walker_done) return plan;
-    const bool load = command.descriptor.direction == TmaDirection::load;
+    const bool load = command.direction == TmaDirection::load;
 
     while (!load && !command.walker_done && !tma_coordinate_in_bounds(command)) {
         (void)tma_advance_coordinate(command);
@@ -3003,7 +3008,7 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
         }
     }
     if (!command.walker_done) return; // credit or channel pressure: retry next cycle
-    const bool load = command.descriptor.direction == TmaDirection::load;
+    const bool load = command.direction == TmaDirection::load;
     if ((load && command.pending_load_writes == 0) || (!load && command.pending_store_captures == 0)) {
         mark_tma_data_complete(command);
     }
@@ -3035,7 +3040,8 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& re
         command.logical_bytes = tma_logical_bytes(command.descriptor);
         validate_tma_runtime_descriptor(command);
         // releases the descriptor read-ownership; verifies the accept-time peek
-        sanitizer_.record_tma_descriptor_read(command.id, command.descriptor);
+        sanitizer_.record_tma_descriptor_read(command.id, command.descriptor, command.shmem_address,
+            command.direction == TmaDirection::load);
         command.state = TmaCommandState::walking;
         return;
     }
@@ -3055,7 +3061,7 @@ void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed)
     auto command_it = tma.commands.find(placed.command);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
     auto& command = command_it->second;
-    if (command.descriptor.direction != TmaDirection::load || command.pending_load_writes == 0) {
+    if (command.direction != TmaDirection::load || command.pending_load_writes == 0) {
         throw SimError("unexpected tma load return");
     }
     for (const auto& fragment : placed.fragments) {
@@ -3076,7 +3082,7 @@ void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
     auto command_it = tma.commands.find(command_id);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
     auto& command = command_it->second;
-    if (command.descriptor.direction != TmaDirection::store || command.pending_store_captures == 0) {
+    if (command.direction != TmaDirection::store || command.pending_store_captures == 0) {
         throw SimError("unexpected tma store capture");
     }
     --command.pending_store_captures;
@@ -3154,14 +3160,12 @@ bool Machine::tma_advance_coordinate(TmaCommand& command) {
     command.x = 0;
     if (++command.y < source_y) return true;
     command.y = 0;
-    if (++command.z < command.descriptor.box[2]) return true;
-    command.z = 0;
     command.walker_done = true;
     return false;
 }
 
 bool Machine::tma_coordinate_in_bounds(const TmaCommand& command) const {
-    const std::array<uint32_t, 3> local{command.x, command.y, command.z};
+    const std::array<uint32_t, 2> local{command.x, command.y};
     for (uint32_t dimension = 0; dimension < command.descriptor.rank; ++dimension) {
         const auto coordinate = static_cast<int64_t>(command.origin[dimension]) + local[dimension];
         if (coordinate < 0 ||
@@ -3177,8 +3181,6 @@ uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
         static_cast<int64_t>(command.origin[0]) + command.x);
     const auto y = static_cast<uint64_t>(
         static_cast<int64_t>(command.origin[1]) + command.y);
-    const auto z = static_cast<uint64_t>(
-        static_cast<int64_t>(command.origin[2]) + command.z);
     uint64_t element = x;
     const auto add_product = [&](uint64_t coordinate, uint64_t stride) {
         if (coordinate != 0 && stride > UINT64_MAX / coordinate) {
@@ -3190,8 +3192,7 @@ uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
         }
         element += term;
     };
-    if (command.descriptor.rank >= 2) add_product(y, command.descriptor.strides[0]);
-    if (command.descriptor.rank >= 3) add_product(z, command.descriptor.strides[1]);
+    if (command.descriptor.rank >= 2) add_product(y, command.descriptor.row_stride);
     if (element > UINT64_MAX / command.descriptor.element_bytes) {
         throw SimError("tma global byte address arithmetic overflow");
     }
@@ -3209,29 +3210,26 @@ uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
 uint32_t Machine::tma_shmem_address(const TmaCommand& command) const {
     const uint32_t u = command.descriptor.transpose ? command.y : command.x;
     const uint32_t v = command.descriptor.transpose ? command.x : command.y;
-    // Stage-granular boxes: with E = 16 / element_bytes elements per 16-byte
-    // row (8 fp16, 4 fp32), logical K selects the 1024-byte object (k / E)
-    // and the byte within the row ((k % E) * element_bytes); the outer
-    // coordinate is the row. For fp16 this is exactly the former k >> 3 /
-    // k & 7 / 2*k map, and a K-extent-8 box keeps the single-object behavior.
+    // xor64 boxes are compact operand objects: with E = 16 / element_bytes
+    // elements per 16-byte row (8 fp16, 4 fp32), logical K selects the K slice
+    // (k / E) and the byte within the row ((k % E) * element_bytes); the outer
+    // coordinate is the row. A slice is one 16-byte row per outer index, so
+    // slices sit 16 x outer apart -- the spacing the MMA reads an operand of
+    // that many rows with (mma_a_address / mma_b_address).
     const uint32_t element_bytes = command.descriptor.element_bytes;
     const uint32_t row_elements = 16u / element_bytes;
-    if (command.descriptor.swizzle == static_cast<uint8_t>(TmaSwizzle::xor64_a)) {
-        return xor64_byte_address(
-            command.descriptor.shmem_base + 1024 * (u / row_elements), v,
-            (u % row_elements) * element_bytes, 0);
-    }
-    if (command.descriptor.swizzle == static_cast<uint8_t>(TmaSwizzle::xor64_b)) {
-        return xor64_byte_address(
-            command.descriptor.shmem_base + 1024 * (v / row_elements), u,
-            (v % row_elements) * element_bytes, 2);
+    if (is_xor64(command.descriptor)) {
+        const uint32_t slice_bytes = 16u * tma_xor64_outer_extent(command.descriptor);
+        const bool a_role = command.descriptor.swizzle == static_cast<uint8_t>(TmaSwizzle::xor64_a);
+        const uint32_t k = a_role ? u : v;
+        const uint32_t outer = a_role ? v : u;
+        return xor64_byte_address(command.shmem_address + slice_bytes * (k / row_elements), outer,
+            (k % row_elements) * element_bytes, a_role ? 0 : 2);
     }
     uint64_t element = u;
     element += static_cast<uint64_t>(v) * command.descriptor.box[0];
-    element += static_cast<uint64_t>(command.z) * command.descriptor.box[0] *
-        command.descriptor.box[1];
     const auto offset = element * command.descriptor.element_bytes;
-    const auto address = static_cast<uint64_t>(command.descriptor.shmem_base) + offset;
+    const auto address = static_cast<uint64_t>(command.shmem_address) + offset;
     if (address > shmem_.size() || command.descriptor.element_bytes > shmem_.size() - address) {
         throw SimError("tma shmem access is outside shmem");
     }
@@ -3243,12 +3241,11 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
         command.logical_bytes > std::numeric_limits<uint32_t>::max()) {
         throw SimError("tma logical byte count is outside the mbar encoding");
     }
-    if (command.descriptor.shmem_base > shmem_.size() ||
-        command.logical_bytes > shmem_.size() - command.descriptor.shmem_base) {
+    // The shared address operand is 64-byte aligned by its packing (64-byte
+    // units, src/tma.hpp); the whole box must lie in shmem.
+    if (command.shmem_address > shmem_.size() ||
+        command.logical_bytes > shmem_.size() - command.shmem_address) {
         throw SimError("tma logical box does not fit in shmem");
-    }
-    if (static_cast<uint64_t>(command.descriptor.completion_mbar) + 8 > shmem_.size()) {
-        throw SimError("tma completion mbar is outside shmem");
     }
     if (command.descriptor.gmem_base > gmem_.size()) {
         throw SimError("tma global base is outside gmem");
@@ -3745,7 +3742,8 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
     case Opcode::ldg_uni:
         dispatch_lsu(op, w);
         break;
-    case Opcode::tma_async:
+    case Opcode::tma_load:
+    case Opcode::tma_store:
         dispatch_tma(op, w);
         break;
     case Opcode::mbar_init_i:
@@ -3949,19 +3947,25 @@ void Machine::dispatch_tma(const DispatchEntry& op, Wires& w) {
         static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_.size()) {
         panic(op, "tma descriptor is not 64-byte aligned and in shmem");
     }
-    if (inst.src0 > 253) panic(op, "tma coordinate register triplet is invalid");
+    if (inst.src0 > 254) panic(op, "tma coordinate register pair is invalid");
     const auto command_id = next_tma_command_id_++;
     TmaCommand command;
     command.id = command_id;
     command.warp = op.warp;
     command.pc = op.pc;
     command.instruction = inst;
+    command.direction = inst.opcode == Opcode::tma_store ? TmaDirection::store : TmaDirection::load;
     command.descriptor_address = static_cast<uint32_t>(inst.imm);
     command.origin = {
         static_cast<int32_t>(uniform_reg(op, inst.src0, "tma x coordinate")),
         static_cast<int32_t>(uniform_reg(op, inst.src0 + 1, "tma y coordinate")),
-        static_cast<int32_t>(uniform_reg(op, inst.src0 + 2, "tma z coordinate")),
     };
+    const auto addresses = unpack_tma_addresses(uniform_reg(op, inst.src1, "tma address operand"));
+    command.shmem_address = addresses.shmem;
+    command.mbar_address = addresses.mbar; // 8-byte aligned by the packing
+    if (static_cast<uint64_t>(command.mbar_address) + 8 > shmem_.size()) {
+        panic(op, "tma completion mbar is outside shmem");
+    }
     // Sanitizer: the descriptor the engine will read -- memory as of this
     // cycle's edge; anything still travelling to it PANICs in
     // record_tma_accept (missing fence.sh / race, rfc12 section 11) -- and the
@@ -3970,7 +3974,8 @@ void Machine::dispatch_tma(const DispatchEntry& op, Wires& w) {
     // mbar). The engine accepts the command now, at its dispatch.
     const auto descriptor_bytes = tma_descriptor_at_accept(command.descriptor_address, w);
     sanitizer_.record_tma_accept(site(op), command_id, command.descriptor_address, descriptor_bytes,
-        pending_tma_completion_mbar(descriptor_bytes, w));
+        command.direction == TmaDirection::load, command.shmem_address, command.mbar_address,
+        pending_tma_completion_mbar(command.mbar_address, w));
     trace_->tma_command_begin(cycle_, command_id, op.warp, static_cast<uint32_t>(inst.imm),
         w.tma_next.commands.size() + 1);
     w.dispatch.tma = std::move(command);
@@ -5076,11 +5081,8 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::mbar_arrive_expect_tx_r:
     case Opcode::mbar_test_wait_r:
     case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
-    case Opcode::tma_async: return {
-        inst.src0,
-        static_cast<uint8_t>(inst.src0 + 1),
-        static_cast<uint8_t>(inst.src0 + 2),
-    };
+    case Opcode::tma_load:
+    case Opcode::tma_store: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::atom_add_uni:
@@ -5415,17 +5417,10 @@ std::array<uint8_t, tma_descriptor_bytes> Machine::tma_descriptor_at_accept(uint
 // writes already granted and still travelling (the write pipelines' earlier
 // stages, oldest first, then this cycle's grants: an RMW's write among them),
 // then the RMW's computed update (its ALU stages and this cycle's update:
-// its write is granted later). None when the peeked descriptor is invalid or
-// its mbar is outside shmem (the engine's own descriptor read panics then).
+// its write is granted later). None when the mbar is outside shmem (the
+// dispatch has panicked then).
 // Sanitizer-only: the hardware reads no mbar at TMA start.
-std::optional<uint64_t> Machine::pending_tma_completion_mbar(
-    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, const Wires& w) const {
-    uint32_t mbar = 0;
-    try {
-        mbar = decode_tma_descriptor(descriptor_bytes.data(), descriptor_bytes.size()).completion_mbar;
-    } catch (const SimError&) {
-        return std::nullopt;
-    }
+std::optional<uint64_t> Machine::pending_tma_completion_mbar(uint32_t mbar, const Wires& w) const {
     if (mbar % 8 != 0 || static_cast<uint64_t>(mbar) + 8 > shmem_.size()) return std::nullopt;
     auto bytes = shmem_after_edge(mbar, 8, w);
     const auto overlay_beat = [&](const std::optional<WriteBeat>& beat) {

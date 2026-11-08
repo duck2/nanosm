@@ -79,7 +79,12 @@ enum class Opcode : uint8_t {
     atom_and_uni = 0x3a,
     atom_xor_uni = 0x3b,
     atom_exch_uni = 0x3c,
-    tma_async = 0x40,
+    // tma.load / tma.store [DESC], rXY, rADDR (src/tma.hpp): the direction is
+    // the opcode; rXY / rXY+1 are the box origin's x / y; rADDR packs the
+    // completion mbar (bits 15:0, 8-byte units) and the shared address (bits
+    // 31:16, 64-byte units).
+    tma_load = 0x40,
+    tma_store = 0x41,
     acc_ld = 0x50,
     acc_ld_v8 = 0x51,
     acc_st = 0x52,
@@ -159,8 +164,9 @@ namespace encoding {
 // Branch immediates are signed byte displacements relative to the following PC.
 // mbar addresses are held in a register; mbar immediates and register operands
 // have distinct opcodes, as do setp immediates and register operands.
-// tma.async uses src0 as a three-register coordinate-group base and its
-// immediate as a static 64-byte-aligned shmem descriptor address.
+// tma payload: coordinates[8] (x; y is the next register), address[8] (the
+// mbar / 8 | shared address / 64 << 16, src/tma.hpp), simm[22] (the static
+// 64-byte-aligned shmem descriptor address).
 // stall is 5 bits so a slow FPGA-priced SFU (20+ cycles) can still be a stall count.
 inline constexpr unsigned opcode_shift = 56;
 inline constexpr unsigned predicate_shift = 52;
@@ -205,6 +211,10 @@ struct MmaShape {
 // mma_block_shapes shapes.
 inline constexpr uint8_t mma_block_first = 0x70;
 inline constexpr uint32_t mma_block_shapes = 8;
+
+inline bool is_tma_opcode(Opcode opcode) {
+    return opcode == Opcode::tma_load || opcode == Opcode::tma_store;
+}
 
 inline bool is_mma_async(Opcode opcode) {
     const auto value = static_cast<uint8_t>(opcode);

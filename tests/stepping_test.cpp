@@ -467,13 +467,11 @@ void test_mbar_engine_events_visible_next_cycle() {
     write_mbar(shmem, commit_mbar, 1, 0);
     write_mbar(shmem, tx_mbar, 0, 64);
     nanosm::TmaDescriptor descriptor;
-    descriptor.dimensions = {16, 1, 1};
-    descriptor.box = {16, 1, 1};
-    descriptor.shmem_base = 2048;
-    descriptor.completion_mbar = tx_mbar;
+    descriptor.dimensions = {16, 1};
+    descriptor.box = {16, 1};
     write_tma_descriptor(shmem, 6144, descriptor);
     std::string text = ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
-        "mov r8, 0\nmov r9, 0\nmov r10, 0\ntma.async [6144], r8\n";
+        "mov r8, 0\nmov r9, 0\n" + tma_operand_asm(10, 2048, tx_mbar) + "tma.load [6144], r8, r10\n";
     for (uint32_t i = 0; i < 300; ++i) text += "mov r" + std::to_string(12 + i % 8) + ", " + std::to_string(i) + "\n";
     text += "mma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
@@ -696,10 +694,8 @@ void test_driver_shuffle_unit_kernels() {
         write_mbar(shmem, 4096, 1, 0);
         write_mbar(shmem, 4104, 0, 64);
         nanosm::TmaDescriptor descriptor;
-        descriptor.dimensions = {16, 1, 1};
-        descriptor.box = {16, 1, 1};
-        descriptor.shmem_base = 2048;
-        descriptor.completion_mbar = 4104;
+        descriptor.dimensions = {16, 1};
+        descriptor.box = {16, 1};
         write_tma_descriptor(shmem, 6144, descriptor);
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             .acc C, 0, 64, 64
@@ -708,10 +704,10 @@ void test_driver_shuffle_unit_kernels() {
             mov r4, 4096
             mov r8, 0
             mov r9, 0
-            mov r10, 0
+        )" + tma_operand_asm(10, 2048, 4104) + R"(
             mma.async.init.m64n64k8 C, [r0], [r1]
             mma.commit [r4]
-            tma.async [6144], r8
+            tma.load [6144], r8, r10
             mma.async.m64n64k8 C, [r0], [r1]
             halt
         )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -736,7 +732,7 @@ void test_driver_shuffle_unit_kernels() {
         launch.active_warps = 2;
         auto& shmem = image_bytes(launch.shmem_image, 4096);
         fill_pattern(shmem, 1024, 64, 0);
-        write_rank1_tma(shmem, 0, true, 2048, 64, 1024, 128);
+        write_rank1_tma(shmem, 0, 2048, 64, 128);
         image_bytes(launch.gmem_image, 8192);
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             sread r29, WARP_ID
@@ -744,9 +740,9 @@ void test_driver_shuffle_unit_kernels() {
             @p0 bra.uni other
             mov r0, 0
             mov r1, 0
-            mov r2, 0
+            mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
             mov r3, 128
-            tma.async [0], r0
+            tma.store [0], r0, r2
         wait:
             mbar.try_wait p1, [r3], 0
             @!p1 bra.uni wait

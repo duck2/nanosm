@@ -499,8 +499,8 @@ void Sanitizer::check_kernel_end(uint64_t cycle) const {
 
 void Sanitizer::record_tma_accept(
     const IssueSite& site, uint64_t command, uint32_t descriptor_address,
-    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes,
-    std::optional<uint64_t> completion_mbar_word) {
+    const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, bool load,
+    uint32_t shmem_address, uint32_t completion_mbar, std::optional<uint64_t> completion_mbar_word) {
     ShmemOwner descriptor_owner;
     descriptor_owner.kind = ShmemOwnerKind::tma_descriptor;
     descriptor_owner.command = command;
@@ -521,16 +521,15 @@ void Sanitizer::record_tma_accept(
     std::optional<TmaDescriptor> descriptor;
     try {
         descriptor = decode_tma_descriptor(descriptor_bytes.data(), descriptor_bytes.size());
-        (void)tma_shmem_span(*descriptor);
+        (void)tma_shmem_span(*descriptor, shmem_address);
     } catch (const SimError&) {
         descriptor.reset();
     }
 
     std::optional<ShmemOwner> data_owner;
+    descriptor_owner.completion_mbar = completion_mbar;
     if (descriptor.has_value()) {
-        const bool load = descriptor->direction == TmaDirection::load;
-        const auto [begin, end] = tma_shmem_span(*descriptor);
-        descriptor_owner.completion_mbar = descriptor->completion_mbar;
+        const auto [begin, end] = tma_shmem_span(*descriptor, shmem_address);
         const auto label = std::string(load ? "tma load #" : "tma store #") +
             std::to_string(command) + (load ? " destination" : " source");
         // The box against SIMT accesses still travelling to the RAM: a load's
@@ -562,7 +561,8 @@ void Sanitizer::record_tma_accept(
     }
 }
 
-void Sanitizer::record_tma_descriptor_read(uint64_t command, const TmaDescriptor& decoded) {
+void Sanitizer::record_tma_descriptor_read(
+    uint64_t command, const TmaDescriptor& decoded, uint32_t shmem_address, bool load) {
     // Nothing was travelling to the descriptor at accept (else the missing-
     // fence / race check panicked) and it was read-owned since, so the engine
     // must decode exactly what the sanitizer peeked. A mismatch is a
@@ -570,8 +570,7 @@ void Sanitizer::record_tma_descriptor_read(uint64_t command, const TmaDescriptor
     std::erase_if(shmem_owners_, [&](const ShmemOwner& owner) {
         return owner.kind == ShmemOwnerKind::tma_descriptor && owner.command == command;
     });
-    const auto [begin, end] = tma_shmem_span(decoded);
-    const bool load = decoded.direction == TmaDirection::load;
+    const auto [begin, end] = tma_shmem_span(decoded, shmem_address);
     const auto owner = std::find_if(shmem_owners_.begin(), shmem_owners_.end(),
         [&](const ShmemOwner& candidate) {
             return candidate.command == command &&

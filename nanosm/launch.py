@@ -62,30 +62,30 @@ class SparseMemory:
         self,
         address: int,
         *,
-        direction: str,
         gmem_base: int,
         dimensions: tuple[int, ...],
         box: tuple[int, ...],
-        shmem_base: int,
-        completion_mbar: int,
         element_bytes: int = 4,
         strides: tuple[int, ...] = (),
         swizzle: int | str = "linear",
         transpose: bool = False,
     ) -> None:
+        """A TMA descriptor: the global tensor and the box (rank 1 or 2).
+
+        The direction is the instruction's (tma.load / tma.store), and the shared
+        address and completion mbar are its address operand, which the kernel
+        builds (src/tma.hpp): mbar / 8 in bits 15:0, shared / 64 in bits 31:16.
+        """
         rank = len(dimensions)
-        if rank not in (1, 2, 3) or len(box) != rank or len(strides) != rank - 1:
-            raise ValueError("tma dimensions/box must have rank 1..3 and rank-1 strides")
-        direction_code = {"load": 0, "store": 1}.get(direction)
-        if direction_code is None:
-            raise ValueError("tma direction must be 'load' or 'store'")
-        dimensions3 = tuple(dimensions) + (1,) * (3 - rank)
-        box3 = tuple(box) + (1,) * (3 - rank)
-        strides2 = tuple(strides) + (0,) * (2 - len(strides))
+        if rank not in (1, 2) or len(box) != rank or len(strides) != rank - 1:
+            raise ValueError("tma dimensions/box must have rank 1 or 2 and rank-1 strides")
+        dimensions2 = tuple(dimensions) + (1,) * (2 - rank)
+        box2 = tuple(box) + (1,) * (2 - rank)
+        row_stride = strides[0] if strides else 0
         for name, values in {
-            "dimensions": dimensions3,
-            "box": box3,
-            "strides": strides2,
+            "dimensions": dimensions2,
+            "box": box2,
+            "strides": (row_stride,),
         }.items():
             if any(value < 0 or value > 0xFFFFFFFF for value in values):
                 raise ValueError(f"tma {name} contains a value outside uint32_t")
@@ -99,8 +99,6 @@ class SparseMemory:
             ("gmem_base", gmem_base, 0xFFFFFFFFFFFFFFFF),
             ("element_bytes", element_bytes, 0xFFFFFFFF),
             ("swizzle", swizzle_code, 0xFFFFFFFF),
-            ("shmem_base", shmem_base, 0xFFFFFFFF),
-            ("completion_mbar", completion_mbar, 0xFFFFFFFF),
         ]:
             if not isinstance(value, int) or value < 0 or value > maximum:
                 raise ValueError(f"tma {name} is outside the C ABI range")
@@ -112,16 +110,13 @@ class SparseMemory:
             address,
             encode_tma_descriptor(
                 rank,
-                direction_code,
                 int(transpose),
                 gmem_base,
-                dimensions3,
-                strides2,
-                box3,
+                dimensions2,
+                row_stride,
+                box2,
                 element_bytes,
                 swizzle_code,
-                shmem_base,
-                completion_mbar,
             ),
         )
 

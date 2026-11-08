@@ -562,15 +562,18 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 inst.opcode = Opcode::mbar_try_wait_i;
                 inst.imm = parse_value(args[2], constants, line_number);
             }
-        } else if (op == "tma.async") {
-            expect_count(args, 2, line_number);
-            inst.opcode = Opcode::tma_async;
+        } else if (op == "tma.load" || op == "tma.store") {
+            // tma.load / tma.store [DESC], rXY, rADDR: x in rXY, y in rXY + 1,
+            // rADDR = completion mbar / 8 | shared address / 64 << 16 (src/tma.hpp).
+            expect_count(args, 3, line_number);
+            inst.opcode = op == "tma.load" ? Opcode::tma_load : Opcode::tma_store;
             inst.imm = parse_static_address(args[0], constants, line_number);
             inst.src0 = parse_reg(args[1], line_number);
-            if (inst.src0 > 253) {
+            inst.src1 = parse_reg(args[2], line_number);
+            if (inst.src0 > 254) {
                 throw SimError(
                     "line " + std::to_string(line_number) +
-                    ": tma coordinate group must leave room for three registers");
+                    ": tma coordinate pair must leave room for two registers");
             }
         } else if (op == "acc.ld" || op == "acc.ld.v8") {
             expect_count(args, 3, line_number);
@@ -703,9 +706,9 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::mbar_arrive_expect_tx_r:
     case Opcode::mbar_test_wait_r:
     case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
-    case Opcode::tma_async:
-        return {inst.src0, static_cast<uint8_t>(inst.src0 + 1),
-            static_cast<uint8_t>(inst.src0 + 2)};
+    case Opcode::tma_load:
+    case Opcode::tma_store:
+        return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::atom_add_uni:
@@ -965,10 +968,10 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 "line " + std::to_string(inst.line) +
                 ": mbar.try_wait is unsupported by this device profile");
         }
-        if (inst.opcode == Opcode::tma_async && profile.tma_queue_commands == 0) {
+        if (is_tma_opcode(inst.opcode) && profile.tma_queue_commands == 0) {
             throw SimError(
                 "line " + std::to_string(inst.line) +
-                ": tma.async is unsupported by this device profile");
+                ": tma.load / tma.store are unsupported by this device profile");
         }
         if ((is_mma_async(inst.opcode) || inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
             throw SimError("line " + std::to_string(inst.line) + ": MMA is unsupported by this device profile");
@@ -1218,11 +1221,11 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                 "line " + std::to_string(inst.line) +
                 ": mbar.try_wait is unsupported by this device profile");
         }
-        if (inst.opcode == Opcode::tma_async) {
+        if (is_tma_opcode(inst.opcode)) {
             if (profile.tma_queue_commands == 0) {
                 throw SimError(
                     "line " + std::to_string(inst.line) +
-                    ": tma.async is unsupported by this device profile");
+                    ": tma.load / tma.store are unsupported by this device profile");
             }
             if (inst.imm < 0 || inst.imm % 64 != 0 ||
                 static_cast<uint64_t>(inst.imm) + 64 > profile.shmem_bytes) {
@@ -1230,10 +1233,10 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                     "line " + std::to_string(inst.line) +
                     ": tma descriptor address must be 64-byte aligned and in shmem");
             }
-            if (inst.src0 > 253) {
+            if (inst.src0 > 254) {
                 throw SimError(
                     "line " + std::to_string(inst.line) +
-                    ": tma coordinate group exceeds the register file");
+                    ": tma coordinate pair exceeds the register file");
             }
         }
         if (inst.opcode == Opcode::mbar_init_i && (inst.imm <= 0 || inst.imm > 0x7fff)) {

@@ -56,22 +56,16 @@ lib.nanosm_mbar_encode.argtypes = [
 ]
 lib.nanosm_mbar_encode.restype = ctypes.c_int32
 lib.nanosm_tma_descriptor_encode.argtypes = [
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
+    ctypes.c_uint32,  # rank
+    ctypes.c_uint32,  # transpose
+    ctypes.c_uint64,  # gmem_base
+    ctypes.c_uint32,  # dim_x
+    ctypes.c_uint32,  # dim_y
+    ctypes.c_uint32,  # row_stride
+    ctypes.c_uint32,  # box_x
+    ctypes.c_uint32,  # box_y
+    ctypes.c_uint32,  # element_bytes
+    ctypes.c_uint32,  # swizzle
     ctypes.POINTER(ctypes.c_uint8),
     ctypes.c_uint64,
 ]
@@ -143,31 +137,25 @@ def encode_mbar(phase: int, expected: int, remaining: int, tx_bytes: int) -> int
 
 def encode_tma_descriptor(
     rank: int,
-    direction: int,
     transpose: int,
     gmem_base: int,
-    dimensions: tuple[int, int, int],
-    strides: tuple[int, int],
-    box: tuple[int, int, int],
+    dimensions: tuple[int, int],
+    row_stride: int,
+    box: tuple[int, int],
     element_bytes: int,
     swizzle: int,
-    shmem_base: int,
-    completion_mbar: int,
 ) -> bytes:
     output = (ctypes.c_uint8 * 64)()
     _check(
         lib.nanosm_tma_descriptor_encode(
             rank,
-            direction,
             transpose,
             gmem_base,
             *dimensions,
-            *strides,
+            row_stride,
             *box,
             element_bytes,
             swizzle,
-            shmem_base,
-            completion_mbar,
             output,
             len(output),
         )

@@ -143,6 +143,13 @@ struct RoundRobinGrant {
 };
 RoundRobinGrant round_robin_grant(const std::vector<uint8_t>& ready, uint32_t cursor, uint32_t ports);
 
+// The shmem byte address the MMA reads operand element (outer, k) of a
+// command of `shape` from, its operand starting at `base` (outer: m for A, n
+// for B): the operand fetch's own addressing (src/sim.cpp mma_a_address /
+// mma_b_address), named here so tests can hold a TMA box against it.
+uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, bool a_operand,
+    uint32_t outer, uint32_t k);
+
 class Machine {
 public:
     Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace_options = {});
@@ -845,15 +852,20 @@ private:
         uint32_t warp = 0;
         uint32_t pc = 0;
         Instruction instruction;
+        // The instruction's operands: the opcode's direction, the descriptor
+        // (an immediate), the origin (x, y) and the address register's shared
+        // address and completion mbar (src/tma.hpp TmaAddresses).
+        TmaDirection direction = TmaDirection::load;
         uint32_t descriptor_address = 0;
-        std::array<int32_t, 3> origin{};
+        std::array<int32_t, 2> origin{};
+        uint32_t shmem_address = 0;
+        uint32_t mbar_address = 0;
         TmaCommandState state = TmaCommandState::descriptor;
         TmaDescriptor descriptor;
         uint64_t logical_bytes = 0;
         uint64_t useful_bytes = 0;
         uint32_t x = 0;
         uint32_t y = 0;
-        uint32_t z = 0;
         uint32_t pending_load_writes = 0;
         uint32_t pending_store_captures = 0;
         bool walker_done = false;
@@ -1736,8 +1748,7 @@ private:
     [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
     [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> tma_descriptor_at_accept(
         uint32_t address, const Wires& w) const;
-    [[nodiscard]] std::optional<uint64_t> pending_tma_completion_mbar(
-        const std::array<uint8_t, tma_descriptor_bytes>& descriptor_bytes, const Wires& w) const;
+    [[nodiscard]] std::optional<uint64_t> pending_tma_completion_mbar(uint32_t mbar, const Wires& w) const;
 
     // The RF write calendar. Issue books its fixed write (at issue +
     // issue_to_port), a future cycle; the async writers take the current

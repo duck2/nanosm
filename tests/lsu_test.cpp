@@ -538,16 +538,16 @@ void test_lsu_tma_and_vector_streams_interleave() {
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, 4096);
-    write_rank1_load(shmem, 0, 0, 128, 1024, 128);
+    write_rank1_load(shmem, 0, 0, 128, 128);
     auto& gmem = image_bytes(launch.gmem_image, 1024);
     fill_pattern(gmem, 0, 256, 0);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         mov r0, 0
         mov r1, 0
-        mov r2, 0
+        mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
         mov r3, 128
         mov r30, 512
-        tma.async [0], r0
+        tma.load [0], r0, r2
         ldg.v8 r8, [r30]
     wait:
         mbar.try_wait p1, [r3], 0
@@ -645,9 +645,12 @@ void test_lsu_profile_and_encoding() {
     require(nanosm::decode(nanosm::encode(decoded)).opcode == nanosm::Opcode::ldg_uni, "ldg.uni encoding round trip");
 }
 
-std::string tma_and_wait(uint32_t descriptor_address, uint32_t mbar_address) {
-    return "mov r0, 0\nmov r1, 0\nmov r2, 0\nmov r3, " + std::to_string(mbar_address) +
-        "\ntma.async [" + std::to_string(descriptor_address) + "], r0\n"
+// One TMA command at the origin (its box at shmem `shared`, completing into
+// the mbar at `mbar_address`), then a wait for that mbar.
+std::string tma_and_wait(bool store, uint32_t descriptor_address, uint32_t shared, uint32_t mbar_address) {
+    return "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(shared, mbar_address)) +
+        "\nmov r3, " + std::to_string(mbar_address) + "\n" + (store ? "tma.store [" : "tma.load [") +
+        std::to_string(descriptor_address) + "], r0, r2\n"
         "wait:\nmbar.try_wait p1, [r3], 0\n@!p1 bra.uni wait\nhalt\n";
 }
 
@@ -785,10 +788,10 @@ void test_lsu_edge_widths() {
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 4096);
-        write_rank1_tma(shmem, 0, store, 0, 512, 1024, 128);
+        write_rank1_tma(shmem, 0, 0, 512, 128);
         auto& gmem = image_bytes(launch.gmem_image, 4096);
         if (store) fill_pattern(shmem, 1024, 512, 0); else fill_pattern(gmem, 0, 512, 0);
-        nanosm::Machine machine(config, compile(tma_and_wait(0, 128), config), std::move(launch));
+        nanosm::Machine machine(config, compile(tma_and_wait(store, 0, 1024, 128), config), std::move(launch));
         machine.enable_edge_probe();
         machine.run();
         for (uint32_t i = 0; i < 512; ++i)
@@ -815,9 +818,9 @@ void test_tma_store_egress_is_pluck_bound() {
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 16384 + 256);
         fill_pattern(shmem, 0, 4096, 0);
-        write_rank1_tma(shmem, 16384, true, 0, 4096, 0, 16384 + 128);
+        write_rank1_tma(shmem, 16384, 0, 4096, 16384 + 128);
         image_bytes(launch.gmem_image, 16384);
-        nanosm::Machine machine(config, compile(tma_and_wait(16384, 16384 + 128), config), std::move(launch));
+        nanosm::Machine machine(config, compile(tma_and_wait(true, 16384, 0, 16384 + 128), config), std::move(launch));
         machine.run();
         for (uint32_t i = 0; i < 4096; ++i)
             require(machine.read_gmem_u32(4 * i) == pattern_word(i), "16 KiB TMA store data mismatch");
@@ -873,7 +876,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
         launch.active_warps = 1;
         auto& gmem = image_bytes(launch.gmem_image, 8192);
         fill_pattern(gmem, 0, 2048, 0);
-        if (tma) write_rank1_tma(image_bytes(launch.shmem_image, 2048), 0, false, 0, 8, 1024, 128);
+        if (tma) write_rank1_tma(image_bytes(launch.shmem_image, 2048), 0, 0, 8, 128);
         auto machine = std::make_unique<nanosm::Machine>(config, compile(text, config), std::move(launch));
         machine->enable_edge_probe();
         machine->run();
@@ -913,7 +916,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
         }
     }
     { // TMA load, one sector: bus -> ingress FIFO -> TMA sector register -> shmem
-        const auto machine = run(tma_and_wait(0, 128), true, 1);
+        const auto machine = run(tma_and_wait(false, 0, 1024, 128), true, 1);
         uint64_t last = 0;
         for (const auto& beat : of(*machine, LsuEdge::bus_read_beat)) {
             for (const auto& event : of(*machine, LsuEdge::tma_reg_write)) {
@@ -1073,10 +1076,10 @@ void test_lsu_one_write_contract() {
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 2048);
-        write_rank1_tma(shmem, 0, true, 1024, 128, 1024, 128);
+        write_rank1_tma(shmem, 0, 1024, 128, 128);
         fill_pattern(shmem, 1024, 128, 0);
         image_bytes(launch.gmem_image, 2048);
-        nanosm::Machine machine(config, compile(tma_and_wait(0, 128)), std::move(launch));
+        nanosm::Machine machine(config, compile(tma_and_wait(true, 0, 1024, 128)), std::move(launch));
         machine.enable_edge_probe();
         std::multiset<uint64_t> releases;
         uint32_t credits = 0;

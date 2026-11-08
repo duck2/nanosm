@@ -161,16 +161,29 @@ controller is a finite FIFO with fixed latency and one fixed-width bus behind a 
 in the profile's `lsu` section. This is the replaceable timing policy in front of the eventual
 bank/row scheduler, not a fixed-latency whole-load shortcut.
 
-The first TMA slice implements rank-1/2/3 load and store through that same controller and through
-contended shmem port A. `tma.async [descriptor], rcoord` captures three signed coordinates and
-continues; its 64-byte live descriptor is fetched from shmem later. Completion subtracts the full
-logical box debt from the descriptor's mbar only after load writes commit or store source bytes are
-captured. The v0 engine accepts element sizes 1, 2 and 4, dense shmem tiles, and zero-fills/drops
-out-of-bounds elements. Swizzle and transpose are deliberately rejected in this slice.
+**The TMA interface below is provisional and will change.** It is a stepping stone toward operands
+supplied from a uniform register file (trash/rfc16.md); do not treat its instruction form, operand
+packing, rank limit or descriptor fields as settled design.
 
-`kernels/pipeline_tma.launch.py` authors four descriptors with `launch.shmem.tma_desc`, runs the
-double-buffered A/B pipeline, validates output, and with `--trace PATH` writes a Perfetto trace
-(no launch writes a trace unless asked, so overlapping runs never share an output file).
+The TMA moves rank-1 and rank-2 boxes through that same controller and through contended shmem
+port A, split the way NVIDIA splits it: a 64-byte descriptor in shmem describes the global tensor
+(base, dimensions, row stride) and the box (extents, element size, layout role -- linear, xor64 A or
+xor64 B -- and transpose), and the instruction says what to do with it.
+`tma.load [descriptor], rXY, rADDR` and `tma.store [descriptor], rXY, rADDR` take the box origin's
+signed x / y in rXY and rXY + 1 and an address operand in rADDR: the completion mbar's address / 8
+in bits 15:0 and the box's shared address / 64 in bits 31:16 (`src/tma.hpp`), so one descriptor
+serves both directions and every stage of a tensor. The three registers fill the one RF read round
+(one per bank). The command continues at once; its descriptor is fetched from shmem later.
+Completion subtracts the full logical box debt from the instruction's mbar only after load writes
+commit or store source bytes are captured. Element sizes are 1, 2 and 4; out-of-bounds elements
+are zero-filled (load) or dropped (store). An xor64 box is a compact MMA operand object: its K
+slices are 16 bytes x its outer extent apart (rows for A, n for B; a power of two 4 .. 128), the
+same spacing the MMA reads an operand of that shape with.
+
+`kernels/pipeline_tma.launch.py` authors one descriptor per tensor with `launch.shmem.tma_desc`
+(the kernel builds each stage's address operand), runs the double-buffered A/B pipeline, validates
+output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
+overlapping runs never share an output file).
 The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared
 bus ownership, and logical/useful/physical byte totals.
 

@@ -1636,7 +1636,9 @@ void test_i6b1_back_to_back_same_bank_reads() {
 // the word -- in both builds, naming the instruction and the registers.
 // Every operand form: the two- and three-source arithmetic, setp, sts's
 // base and value, stg, an atomic, the mbar register forms, mma.async's two
-// addresses, and (with two banks) tma.async's coordinate group r0..r2. The
+// addresses, and tma.load / tma.store's three registers (x, y = x + 1 and the
+// address operand: canonical, the address register in x's or y's bank; with
+// two banks, x and an address register two above it). The
 // kernel-load case carries words a looser profile (more read ports)
 // assembled, restamped for the profile under test.
 void test_i6b1_same_bank_sources_are_malformed() {
@@ -1671,7 +1673,9 @@ void test_i6b1_same_bank_sources_are_malformed() {
         {"mbar.test_wait p0, [r3], r6", "r3 and r6", &canonical},
         {"mbar.try_wait p0, [r3], r6", "r3 and r6", &canonical},
         {"mma.async.m64n64k8 C, [r3], [r6]", "r3 and r6", &canonical},
-        {"tma.async [1024], r0", "r0 and r2", &two_banks},
+        {"tma.load [1024], r0, r3", "r0 and r3", &canonical},
+        {"tma.store [1024], r0, r4", "r1 and r4", &canonical},
+        {"tma.load [1024], r0, r2", "r0 and r2", &two_banks},
     };
     const auto mentions = [](const std::string& message, const std::string& where, const Case& c) {
         return message.rfind(where, 0) == 0 && message.find(": malformed instruction '") != std::string::npos &&
