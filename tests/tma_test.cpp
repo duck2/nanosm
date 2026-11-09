@@ -147,8 +147,8 @@ void test_tma_address_operand() {
         write_tma_descriptor(shmem, 0, linear_tma(bytes));
         if (mbar + 8 <= shmem.size()) write_tx_mbar(shmem, mbar, bytes);
         return std::make_unique<nanosm::Machine>(canonical_profile(),
-            compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, shared, mbar) + "mov r3, " + std::to_string(mbar) +
-                "\ntma.load [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n"),
+            compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, shared, mbar) + "umov ur3, " + std::to_string(mbar) +
+                "\ntma.load [0], r0, r2\nwait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n"),
             std::move(launch));
     };
     // The last box and the last mbar of shmem are in range.
@@ -187,15 +187,15 @@ void test_tma_direction_is_the_opcode() {
     write_tx_mbar(shmem, 136, 64);
     nanosm::Machine machine(profile, compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, 1024, 128) +
         tma_operand_asm(5, 2048, 136) + R"(
-        mov r3, 128
-        mov r4, 136
+        umov ur3, 128
+        umov ur4, 136
         tma.load [0], r0, r2
     loaded:
-        mbar.try_wait p0, [r3], 0
+        mbar.try_wait p0, [ur3], 0
         @!p0 bra.uni loaded
         tma.store [0], r0, r5
     stored:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni stored
         halt
     )"), std::move(launch));
@@ -226,7 +226,7 @@ void test_tma_xor64_transpose_load_store() {
     constexpr uint32_t stride = 83;
     const auto program = [&](const std::string& opcode) {
         return "mov r0, 3\nmov r1, 2\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) +
-            "\nmov r3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+            "\numov ur3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
     };
     for (uint8_t layout : {uint8_t{1}, uint8_t{2}}) {
         const uint32_t box_x = layout == 1 ? 8 : 64;
@@ -369,39 +369,39 @@ void test_tma_xor64_feeds_mma_orientations() {
             mov r0, 8
             tma.load [0], r0, r14
 )" + chunk1_b + R"(
-            mov r4, 512
+            umov ur4, 512
         wait0:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait0
-            mov r4, 520
+            umov ur4, 520
         wait1:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait1
-            mov r4, 528
+            umov ur4, 528
         wait2:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait2
-            mov r4, 536
+            umov ur4, 536
         wait3:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait3
-            mov r10, 1024
-            mov r11, 2048
-            mma.async.init.m64n64k8 C, [r10], [r11]
-            mov r10, 3072
-            mov r11, 4096
-            mma.async.m64n64k8 C, [r10], [r11]
-            mov r4, 544
-            mma.commit [r4]
+            umov ur10, 1024
+            umov ur11, 2048
+            mma.async.init.m64n64k8 C, [ur10], [ur11]
+            umov ur10, 3072
+            umov ur11, 4096
+            mma.async.m64n64k8 C, [ur10], [ur11]
+            umov ur4, 544
+            mma.commit [ur4]
         wait_commit:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait_commit
-            mov r8, 0
-            mov r9, 0
-            acc.ld.v8 r20, C, r8
-            mov r12, 48
-            mov r13, 56
-            acc.ld.v8 r28, C, r12
+            umov ur8, 0
+            umov ur9, 0
+            acc.ld.v8 r20, C, ur8
+            umov ur12, 48
+            umov ur13, 56
+            acc.ld.v8 r28, C, ur12
             halt
         )");
         nanosm::Machine machine(canonical_profile(), kernel, std::move(launch), {.timeline = true});
@@ -451,10 +451,10 @@ void test_tma_xor64_census_against_mma() {
     constexpr uint8_t poison = 0xa5;
     const auto tag = [](uint32_t outer, uint32_t k) { return static_cast<uint16_t>(0x8000u | outer << 6 | k); };
     const auto kernel = compile("mov r0, 0\nmov r1, 0\n" + tma_operand_asm(2, base, mbar_address) + R"(
-        mov r3, 64
+        umov ur3, 64
         tma.load [0], r0, r2
     wait:
-        mbar.try_wait p0, [r3], 0
+        mbar.try_wait p0, [ur3], 0
         @!p0 bra.uni wait
         halt
     )");
@@ -589,15 +589,15 @@ uint32_t reference_wide_xor64(uint32_t base, uint8_t layout, uint32_t u, uint32_
 
 // `commands` loads of a K / commands slab each, one descriptor, their
 // address operands built in turn in r2: command i's box starts at
-// tile + 1024 x (its K / 8) x i.
+// tile + 1024 x (its K / 8) x i. The wait's mbar address is in ur3.
 std::string xor64_slab_loads(uint32_t commands, uint32_t tile, uint32_t mbar, const std::string& step) {
     const uint32_t k_extent = 64 / commands;
-    std::string source = "mov r3, " + std::to_string(mbar) + "\n";
+    std::string source = "umov ur3, " + std::to_string(mbar) + "\n";
     for (uint32_t i = 0; i < commands; ++i) {
         if (i != 0) source += step;
         source += tma_operand_asm(2, tile + 1024 * (k_extent / 8) * i, mbar) + "tma.load [0], r0, r2\n";
     }
-    return source + "wait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+    return source + "wait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
 }
 
 void test_tma_wide_xor64_matches_narrow() {
@@ -811,7 +811,7 @@ void test_tma_fp32_xor64_store_and_load() {
     };
     const auto program = [&](const std::string& opcode) {
         return "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) +
-            "\nmov r3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [r3], 0\n@!p0 bra.uni wait\nhalt\n";
+            "\numov ur3, 128\n" + opcode + " [0], r0, r2\nwait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
     };
     const nanosm::MbarState mbar{false, true, 1, 0, tile_bytes};
 
@@ -916,10 +916,10 @@ void test_tma_rank1_load_and_oob_zero_fill() {
         mov r0, -4
         mov r1, 0
         mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
-        mov r3, 128
+        umov ur3, 128
         tma.load [0], r0, r2
     wait:
-        mbar.try_wait p0, [r3], 0
+        mbar.try_wait p0, [ur3], 0
         @!p0 bra.uni wait
         halt
     )"), std::move(launch));
@@ -968,10 +968,10 @@ void test_tma_store_preserves_other_sector_bytes() {
         mov r0, 0
         mov r1, 0
         mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
-        mov r3, 128
+        umov ur3, 128
         tma.store [64], r0, r2
     wait:
-        mbar.try_wait p0, [r3], 0
+        mbar.try_wait p0, [ur3], 0
         @!p0 bra.uni wait
         halt
     )"), std::move(launch));
@@ -1021,7 +1021,7 @@ void test_tma_rank2_strides_planes_in_software() {
         mov r0, 1
         mov r1, 1
         mov r2, )" + std::to_string(nanosm::pack_tma_addresses(tile_address, mbar_address)) + R"(
-        mov r3, 128
+        umov ur3, 128
         mov r4, 0
     plane:
         tma.load [0], r0, r2
@@ -1031,7 +1031,7 @@ void test_tma_rank2_strides_planes_in_software() {
         setp.lt p0, r4, 2
         @p0 bra.uni plane
     wait:
-        mbar.try_wait p0, [r3], 0
+        mbar.try_wait p0, [ur3], 0
         @!p0 bra.uni wait
         halt
     )"), std::move(launch));
@@ -1091,8 +1091,8 @@ void test_dram_uses_its_own_clock() {
     // ldg.uni: one declared sector request, two 16-byte beats. (This test
     // used a 16-lane scalar ldg when the coalescer made that two sectors.)
     nanosm::Machine machine(config, compile(R"(
-        mov r0, 0
-        ldg.uni r1, [r0]
+        umov ur0, 0
+        ldg.uni r1, [ur0]
         halt
     )", config), std::move(launch), {.timeline = true, .debug = true});
     machine.run();

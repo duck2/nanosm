@@ -177,7 +177,8 @@ void test_uniform_role_dispatch() {
     nanosm::Launch launch;
     launch.active_warps = 2;
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r0, ur0
         setp.eq p0, r0, 0
         @p0 bra.uni warp_zero
         mov r1, 11
@@ -247,11 +248,11 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
     launch.active_warps = 1;
     image_bytes(launch.shmem_image, 128);
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 64
-        mbar.init [r0], 1
-        mbar.arrive.expect_tx [r0], 8
+        umov ur0, 64
+        mbar.init [ur0], 1
+        mbar.arrive.expect_tx [ur0], 8
     wait:
-        mbar.try_wait p0, [r0], 0
+        mbar.try_wait p0, [ur0], 0
         @!p0 bra.uni wait
         mov r1, 9
         halt
@@ -295,8 +296,8 @@ void test_mbar_test_wait_broadcasts_predicate() {
     initial.remaining = 1;
     write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 64
-        mbar.test_wait p0, [r0], 0
+        umov ur0, 64
+        mbar.test_wait p0, [ur0], 0
         @p0 bra.uni complete
         mov r1, 1
         halt
@@ -321,9 +322,9 @@ void test_mbar_try_wait_immediate_success() {
     initial.remaining = 1;
     write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 64
-        mov r2, 0
-        mbar.try_wait p0, [r0], r2
+        umov ur0, 64
+        umov ur2, 0
+        mbar.try_wait p0, [ur0], ur2
         @p0 bra.uni complete
         mov r1, 1
         halt
@@ -351,8 +352,8 @@ void test_mbar_try_wait_times_out_false() {
     initial.remaining = 1;
     write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(profile, compile(R"(
-        mov r0, 64
-        mbar.try_wait p0, [r0], 0
+        umov ur0, 64
+        mbar.try_wait p0, [ur0], 0
         @p0 bra.uni unexpected
         mov r1, 7
         halt
@@ -387,8 +388,8 @@ void test_mbar_phase_flip_wins_on_try_wait_deadline() {
     initial.tx_bytes = 8;
     write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(profile, compile(R"(
-        mov r0, 64
-        mbar.try_wait p0, [r0], 0
+        umov ur0, 64
+        mbar.try_wait p0, [ur0], 0
         @p0 bra.uni complete
         mov r1, 1
         halt
@@ -419,8 +420,8 @@ void test_mbar_try_wait_slots_limit_parked_warps() {
     initial.remaining = 1;
     write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(profile, compile(R"(
-        mov r0, 64
-        mbar.try_wait p0, [r0], 0
+        umov ur0, 64
+        mbar.try_wait p0, [ur0], 0
         halt
     )", profile), std::move(launch));
     machine.run();
@@ -436,7 +437,7 @@ void test_mbar_try_wait_slots_limit_parked_warps() {
 void test_staged_pipeline_kernel() {
     // The everything-so-far kernel: warp 0 stages gmem tiles into double-buffered shmem
     // through the RF, warp 1 consumes and stores back; full/empty barrier pairs, try_wait
-    // retry loops with xori parity toggling, counted loops, role dispatch.
+    // retry loops with uxori parity toggling, counted loops, role dispatch.
     constexpr uint32_t tiles = 8;
     constexpr uint32_t elements = tiles * 16; // one lane-width tile per pass
     nanosm::Launch launch;
@@ -510,7 +511,7 @@ void test_profile_can_disable_mbar_try_wait() {
     profile.mbar_try_wait_timeout_cycles = 0;
     nanosm::validate_device_profile(profile);
     try {
-        nanosm::compile_qtx("mov r0, 64\nmbar.try_wait p0, [r0], 0\nhalt", profile);
+        nanosm::compile_qtx("umov ur0, 64\nmbar.try_wait p0, [ur0], 0\nhalt", profile);
         throw std::runtime_error("qtxc accepted try_wait with no wait slots");
     } catch (const nanosm::SimError& error) {
         require(
@@ -540,12 +541,13 @@ void test_warp_handoff_through_mbar() {
     initial.remaining = 1;
     write_u64(shmem, 256, nanosm::encode_mbar_state(initial));
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r0, ur0
         setp.eq p0, r0, 0
         @p0 bra.uni producer
-        mov r1, 256
+        umov ur1, 256
     consume_wait:
-        mbar.try_wait p1, [r1], 0
+        mbar.try_wait p1, [ur1], 0
         @!p1 bra.uni consume_wait
         sread r2, LANE_ID
         shli r2, r2, 2
@@ -559,8 +561,8 @@ void test_warp_handoff_through_mbar() {
         sread r4, LANE_ID
         addi r4, r4, 7
         sts [r2], r4
-        mov r1, 256
-        mbar.arrive [r1]
+        umov ur1, 256
+        mbar.arrive [ur1]
         halt
     )"), std::move(launch));
     machine.run();
@@ -582,35 +584,15 @@ void test_warp_handoff_through_mbar() {
         "warp attribution does not sum to total with a sleeping warp");
 }
 
-void test_mbar_requires_uniform_address() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 128);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        sread r0, LANE_ID
-        shli r0, r0, 3
-        mbar.init [r0], 1
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("nonuniform mbar address was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("mbar address is not warp-uniform") != std::string::npos,
-            "nonuniform mbar address produced the wrong PANIC");
-    }
-}
-
 void test_mbar_arrival_underflow_panics() {
     nanosm::Launch launch;
     launch.active_warps = 1;
     image_bytes(launch.shmem_image, 128);
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 64
-        mbar.init [r0], 1
-        mbar.arrive.expect_tx [r0], 8
-        mbar.arrive [r0]
+        umov ur0, 64
+        mbar.init [ur0], 1
+        mbar.arrive.expect_tx [ur0], 8
+        mbar.arrive [ur0]
         halt
     )"), std::move(launch));
     try {
@@ -755,12 +737,6 @@ TEST(Basics, launch_image_rejects_bad_segment_hex) {
 // mbar warp handoff
 TEST(Basics, warp_handoff_through_mbar) {
     test_warp_handoff_through_mbar();
-}
-
-// mbar uniform address
-TEST(Basics, mbar_requires_uniform_address) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_mbar_requires_uniform_address();
 }
 
 // mbar arrival underflow

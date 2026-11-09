@@ -80,6 +80,38 @@
 //
 // qtxc models none of this (issuing later is always safe); only the
 // predicate's sample point enters its distances (issue_to_predicate_sample).
+//
+// The uniform register file (trash/rfc16.md; trash/urf-slice-2026-11-08.md):
+// per warp urf.registers 32-bit registers, TWO read ports and ONE write port,
+// the same edge convention as the RF with its own depths Lu
+// (urf.read_latency_cycles) and Wu (urf.write_depth_cycles):
+//   - Reads: an instruction's uniform registers (at most two, so the two
+//     ports always suffice) are sampled in its one read round, at the issue
+//     register's cycle c0 + 1, beside its vector registers; their values are
+//     at the URF output Lu later (no later than the vector operands: Lu <=
+//     Lr, validated).
+//   - Writes: the only writers are uniform arithmetic (the SM's one uniform
+//     ALU, Eu = urf.alu_latency_cycles) and r2ur (lane 0 of a vector
+//     register). Each presents its result at the URF write port at the SAME
+//     fixed L = urf.issue_to_port_cycles after its issue -- the shorter path
+//     padded to the longer:
+//         uniform ALU  accept c0, sample c0 + 1, operands c0 + 1 + Lu, result c0 + 1 + Lu + Eu
+//         r2ur         accept c0, RF sample c0 + 1, lane 0 at c0 + 1 + Lr
+//     so L >= 1 + max(Lu + Eu, Lr). At most one instruction is accepted per
+//     cycle, so two writes never present in one cycle: one write port, no
+//     write calendar, no arbitration. A write presented at W is at the RAM
+//     at W + Wu and lands at that edge: a sample at W + Wu still sees the old
+//     value, one from W + Wu + 1 the new one.
+//   - Canonical (Lu 1, Eu 1, Wu 1, Lr 2, L 3): a writer accepted at c0
+//     presents at c3, lands at c4, is visible from c5; a dependent uniform
+//     reader (sampling at its issue + 1) issues from c4, four cycles later.
+//   - Reuse of a uniform register while it is still being read cannot happen
+//     in this slice: every read is at issue + 1, every write lands L + Wu >= 3
+//     cycles after its own issue.
+//   - ur2r rD, urS (a uniform register into every lane of a vector
+//     register) is a fixed-latency VECTOR result: its uniform operand is
+//     sampled at c0 + 1 and it rides the arithmetic pipeline like mov, its
+//     write booked on the RF write calendar at issue_to_port.
 
 namespace nanosm {
 
@@ -167,6 +199,39 @@ inline uint32_t earliest_rf_visible(const DeviceProfile& profile) {
 // WAR are judged on it: a younger write lands at its visibility - 1.
 inline uint32_t issue_to_visible_min(const Instruction& inst, const DeviceProfile& profile) {
     return uses_arithmetic_pipeline(inst) ? issue_to_visible(inst, profile) : earliest_rf_visible(profile);
+}
+
+// The URF's ports (fixed, HUMAN 2026-11-08: two read ports, one write port).
+inline constexpr uint32_t urf_read_ports = 2;
+inline constexpr uint32_t urf_write_ports = 1;
+
+// Accepted issue -> the sample of every uniform register the instruction
+// reads (the same round as its vector registers).
+inline constexpr uint32_t issue_to_urf_sample = issue_register_stages;
+
+// Accepted issue -> its uniform operands at the URF output.
+inline uint32_t issue_to_urf_operands(const DeviceProfile& profile) {
+    return issue_to_urf_sample + profile.urf_read_latency_cycles;
+}
+
+// The longest uniform-register writer's path to the URF write port (the
+// least L the profile may declare): the issue register, then the uniform
+// ALU's URF read and execution or r2ur's vector RF read.
+inline uint32_t urf_longest_writer_path(const DeviceProfile& profile) {
+    return issue_register_stages + std::max(profile.urf_read_latency_cycles + profile.urf_alu_latency_cycles,
+        profile.rf_read_latency_cycles);
+}
+
+// Accepted issue -> a uniform-register writer's presentation at the URF
+// write port (L, the same for every writer).
+inline uint32_t issue_to_urf_port(const DeviceProfile& profile) {
+    return profile.urf_issue_to_port_cycles;
+}
+
+// Accepted issue -> the first cycle a sample sees the written uniform
+// register (canonical 5).
+inline uint32_t issue_to_urf_visible(const DeviceProfile& profile) {
+    return issue_to_urf_port(profile) + profile.urf_write_depth_cycles + 1;
 }
 
 // The registers an instruction reads in its one round, from the source

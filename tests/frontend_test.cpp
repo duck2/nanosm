@@ -133,14 +133,19 @@ void test_i6b2_warps_interleave() {
 // full of their fall-through (prefetch runs through the setp -> bra.uni
 // wait), so what counts is after the redirects: from the first waiter's
 // first request (its branch's resolve + 1) to the first cycle after the
-// last waiter's resolve in which all three are full. In that window every
-// warp asks and each waiter is granted exactly its two packet entries, with
-// the hot warp's turn between: at least 2 x 3 + 1 grants, in rotation.
+// last waiter's resolve in which all three are full. In that window each
+// waiter is granted its two packet entries, with the hot warp's turns
+// between: at least 2 x 3 + 1 grants, in rotation. (Since the warp id is read
+// with usread + ur2r, the redirects fall where the waiters' first movs take
+// issue slots from the hot warp, whose FIFO is then full for a few cycles:
+// the rotation passes over it there, and only there -- a warp is passed over
+// only while its packets and read in flight fill its FIFO.)
 void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
     const auto& profile = canonical_profile();
     const auto depth = profile.core_instruction_buffer_packets;
     auto machine = i6b2_machine(profile, R"(
-        sread r29, WARP_ID
+        usread ur1, WARP_ID
+        ur2r r29, ur1
         setp.ne p0, r29, 0
         bra.uni waiter {pred=p0, stall=0, set=-, wait=-}
     )" + i6b2_independent_movs(30) + R"(
@@ -151,26 +156,32 @@ void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
         halt
     )", 4, true);
     std::map<uint64_t, bool> waiters_full; // per cycle (Q): every waiter's FIFO full
+    std::map<uint64_t, std::array<bool, 4>> room; // per cycle (Q): packets + read in flight below the depth
     while (!machine->done()) {
         waiters_full[machine->cycle()] = machine->instruction_fifo_packets(1) == depth &&
             machine->instruction_fifo_packets(2) == depth && machine->instruction_fifo_packets(3) == depth;
+        for (uint32_t warp = 0; warp < 4; ++warp) {
+            room[machine->cycle()][warp] = machine->instruction_fifo_packets(warp) +
+                    (machine->fetch_in_flight() == std::optional<uint32_t>(warp) ? 1 : 0) < depth;
+        }
         tick_capped(*machine);
     }
     const auto fetches = i6b2_fetches(*machine);
     const auto issues = i6b2_issues(*machine);
-    // The waiters' branches (pc 16), their first stalled mov (pc 34 * 8:
-    // after sread, setp, bra.uni, thirty movs and the halt) and their second.
+    // The waiters' branches (pc 24), their first stalled mov (pc 35 * 8:
+    // after usread, ur2r, setp, bra.uni, thirty movs and the halt) and their
+    // second.
     uint64_t first_branch = std::numeric_limits<uint64_t>::max();
     uint64_t last_branch = 0;
     uint64_t waiter_start = 0;
     uint64_t waiter_resume = std::numeric_limits<uint64_t>::max();
     for (const auto& [cycle, warp, pc] : issues) {
-        if (warp != 0 && pc == 16) {
+        if (warp != 0 && pc == 24) {
             first_branch = std::min(first_branch, cycle);
             last_branch = std::max(last_branch, cycle);
         }
-        if (warp == 3 && pc == 34 * 8) waiter_start = cycle;
-        if (warp != 0 && pc == 35 * 8) waiter_resume = std::min(waiter_resume, cycle);
+        if (warp == 3 && pc == 35 * 8) waiter_start = cycle;
+        if (warp != 0 && pc == 36 * 8) waiter_resume = std::min(waiter_resume, cycle);
     }
     require(waiter_start != 0 && waiter_resume != std::numeric_limits<uint64_t>::max(), "the waiters did not run");
     std::optional<uint64_t> full;
@@ -178,14 +189,19 @@ void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
         if (!full.has_value() && all && cycle > last_branch + nanosm::issue_to_branch_resolve) full = cycle;
     }
     require(full.has_value(), "the waiters' FIFOs never filled after their branches");
-    // While all four ask, the grants rotate w0, w1, w2, w3.
-    std::vector<uint32_t> rotation;
+    // While the warps ask, the grants rotate w0, w1, w2, w3, passing over
+    // only a warp with no room.
+    std::vector<std::pair<uint64_t, uint32_t>> rotation; // (cycle, warp)
     for (const auto& [cycle, warp, pc] : fetches) {
-        if (cycle > first_branch + nanosm::issue_to_branch_resolve && cycle < *full) rotation.push_back(warp);
+        if (cycle > first_branch + nanosm::issue_to_branch_resolve && cycle < *full) rotation.emplace_back(cycle, warp);
     }
     require(rotation.size() >= 2 * 3 + 1, "the window where all four warps ask is too short to show the rotation");
     for (std::size_t i = 1; i < rotation.size(); ++i) {
-        require(rotation[i] == (rotation[i - 1] + 1) % 4, "fetch did not rotate over the warps with room");
+        const auto [cycle, warp] = rotation[i];
+        for (auto passed = (rotation[i - 1].second + 1) % 4; passed != warp; passed = (passed + 1) % 4) {
+            require(!room.at(cycle)[passed], "fetch did not rotate over the warps with room: warp " +
+                std::to_string(passed) + " was passed over at c" + std::to_string(cycle) + issue_log(*machine));
+        }
     }
     // From then until the waiters ask again (their stall ends), every fetch
     // is the hot warp's, and it issues every cycle from full + 1.
@@ -399,7 +415,7 @@ void test_i6b2_prefetch_through_waits() {
         // + 1 + Wd (its RF write lands); the waiting mov sees the counter at 0
         // the cycle after.
         auto machine = i6b2_machine(profile, R"(
-            lds.uni r20, [r21] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r20, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
             mov r1, 1 {pred=PT, stall=0, set=-, wait=sb0}
         )" + i6b2_independent_movs(3) + "halt\n");
         const auto release = nanosm::fetch_to_issue + nanosm::issue_to_dispatch(profile) + 1 +
@@ -412,8 +428,8 @@ void test_i6b2_prefetch_through_waits() {
         auto one = profile;
         one.shmem_load_slots = 1;
         auto machine = i6b2_machine(one, R"(
-            lds.uni r20, [r21] {pred=PT, stall=0, set=sb0, wait=-}
-            lds.uni r22, [r21 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+            lds.uni r20, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r22, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
         )" + i6b2_independent_movs(3) + "halt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n");
         const auto release = nanosm::fetch_to_issue + 1 + 1 + i1_lds_shift(one);
         check(*machine, 8, release, "refused head");

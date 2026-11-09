@@ -77,6 +77,20 @@ one bank (register mod `rf.banks`) than `rf.read_ports_per_bank` allows -- at th
 two distinct sources in one bank -- is malformed: qtxc, qtxas and kernel load reject it with the
 registers named.
 
+Each warp also has a uniform register file (the profile's `urf` section; trash/rfc16.md and
+trash/urf-slice-2026-11-08.md): sixteen 32-bit registers `ur0`..`ur15`, two read ports, one write
+port. Only uniform arithmetic (`umov`, `uadd`, `uaddi`, `usub`, `ushl`/`ushr`/`ushli`/`ushri`,
+`uand`/`uor`/`uxor` and their immediates, `usread urD, WARP_ID | N_WARPS`) and `r2ur urD, rS` (lane 0
+of a vector register) write it, each presenting its result at the URF write port the same fixed
+`urf.issue_to_port_cycles` after issue, so one issue per cycle is one URF write per cycle: no
+calendar. `ur2r rD, urS` copies a uniform register into every lane of a vector register. An
+instruction reads its uniform registers (at most two) in its one read round; they are not vector
+registers and do not count toward the bank rule. The uniform consumers take them as operands:
+`lds.uni`/`ldg.uni` bases, `atom.*.uni` address and operand, `acc.ld`/`acc.st` coordinates (row in
+`urC`, column in `urC + 1`), mbar addresses and values, MMA operand addresses and `mma.commit`'s mbar.
+`bra.uni`'s predicate, the TMA operands and the `ldg.v8`/`stg.v8` base still come from lane 0 of a
+vector register. `sread` reads only the per-lane `LANE_ID` / `THREAD_ID`.
+
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
 `setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands, and `@p0 bra.uni label`. A
 `bra.uni` predicate must agree across every lane in its warp or the simulator PANICs. General

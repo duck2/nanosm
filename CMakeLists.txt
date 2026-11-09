@@ -128,6 +128,7 @@ set(NANOSM_TEST_SOURCES
     tests/shmem_test.cpp
     tests/rmw_test.cpp
     tests/frontend_test.cpp
+    tests/urf_test.cpp
 )
 
 function(add_nanosm_tests NAME LIBRARY)

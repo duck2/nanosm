@@ -108,6 +108,18 @@ public:
     // reader may still own the register.
     void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width, uint64_t earliest_visible) const;
 
+    // ---- uniform-register hazards (src/rf.hpp) ----
+    // A uniform register's READY cycle is its latest write's visibility (every
+    // writer is fixed-latency: issue + L + Wu + 1). RAW: each uniform source,
+    // sampled at sample_cycle, must be visible by then. WAW: the younger write
+    // (visible from visible_cycle) must land after the older one. No WAR: a
+    // uniform register is read at issue + 1, written L + Wu after its writer's
+    // issue. Values from uniform registers are uniform by construction: no
+    // lane check applies to them.
+    void record_uniform_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle);
+    void check_uniform_raw(const IssueSite& site, const std::vector<uint8_t>& sources, uint64_t sample_cycle) const;
+    void check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t visible_cycle) const;
+
     // ---- admission reads no operand (rfc10 section 1) ----
     // Every issue attempt opens with record_issue_attempt; record_issue_accepted
     // marks the moment admission has decided. A capture in an attempt not
@@ -121,15 +133,17 @@ public:
     void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;
 
     // ---- declared uniformity (rfc09 pin 3) ----
-    // A declared-uniform operand (lds.uni / ldg.uni / ldg.v8 / stg.v8 bases,
-    // engine and mbar operands, accumulator coordinates, the bra.uni
-    // predicate) must hold one value in every lane. Hardware reads lane 0
-    // only; anything else is UB, diagnosed here. lane_values: the operand, by lane.
+    // A declared-uniform operand still taken from a vector register (the
+    // ldg.v8 / stg.v8 bases, the TMA operands, the bra.uni predicate; every
+    // other uniform operand is a uniform register since the URF slice) must
+    // hold one value in every lane. Hardware reads lane 0 only; anything else
+    // is UB, diagnosed here. lane_values: the operand, by lane.
     void check_warp_uniform(
         const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const;
     // A uniform operation -- every instruction with a declared-uniform
-    // operand (the list above; the machine calls this from uniform_reg) and
-    // bra.uni -- under a partial or empty active mask. Hardware reads lane 0
+    // operand (the list above and every uniform-register operand of a ".uni"
+    // consumer; the machine calls this from uniform_reg and uniform_operand)
+    // and bra.uni -- under a partial or empty active mask. Hardware reads lane 0
     // whatever the mask, so this is UB, diagnosed here (HUMAN 2026-10-12,
     // backlog D12 / D12.1, rfc13 section 2); what the machine does then is
     // no contract.
@@ -316,6 +330,7 @@ private:
         std::vector<uint64_t> read_until;    // WAR: last scheduled sample, exclusive end
         std::vector<uint32_t> async_readers; // WAR: acc.st / stg.v8 sources not yet read
         std::array<uint64_t, 7> predicate_ready_cycle{};
+        std::vector<uint64_t> uniform_ready_cycle; // uniform RAW/WAW: the latest write's visibility
     };
 
     struct OrderedRequest {
@@ -427,6 +442,9 @@ public:
     NANOSM_SANITIZER_NOOP(check_pred_raw)
     NANOSM_SANITIZER_NOOP(check_rf_raw)
     NANOSM_SANITIZER_NOOP(check_rf_waw_war)
+    NANOSM_SANITIZER_NOOP(record_uniform_ready)
+    NANOSM_SANITIZER_NOOP(check_uniform_raw)
+    NANOSM_SANITIZER_NOOP(check_uniform_waw)
     NANOSM_SANITIZER_NOOP(record_issue_attempt)
     NANOSM_SANITIZER_NOOP(record_issue_accepted)
     NANOSM_SANITIZER_NOOP(check_issue_capture)

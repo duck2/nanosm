@@ -157,7 +157,8 @@ void test_assembly_contract_drain_denied() {
     fill_pattern(gmem, 0, 1024, 0);
     // r8 and warp 1's stream (r2, r5, ...) share RF bank 2.
     std::string text = R"(
-        sread r29, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r29, ur0
         setp.ne p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
@@ -241,7 +242,8 @@ void test_assembly_contract_wide_pluck() {
     launch.active_warps = 2;
     fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
     std::string text = R"(
-        sread r29, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r29, ur0
         setp.ne p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
@@ -470,10 +472,10 @@ void test_mbar_engine_events_visible_next_cycle() {
     descriptor.dimensions = {16, 1};
     descriptor.box = {16, 1};
     write_tma_descriptor(shmem, 6144, descriptor);
-    std::string text = ".acc C, 0, 64, 64\nmov r0, 0\nmov r1, 1024\nmov r4, 4096\n"
+    std::string text = ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\numov ur4, 4096\n"
         "mov r8, 0\nmov r9, 0\n" + tma_operand_asm(10, 2048, tx_mbar) + "tma.load [6144], r8, r10\n";
     for (uint32_t i = 0; i < 300; ++i) text += "mov r" + std::to_string(12 + i % 8) + ", " + std::to_string(i) + "\n";
-    text += "mma.async.init.m64n64k8 C, [r0], [r1]\nmma.commit [r4]\nhalt\n";
+    text += "mma.async.init.m64n64k8 C, [ur0], [ur1]\nmma.commit [ur4]\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
     std::optional<uint64_t> tma_presented;
     std::optional<uint64_t> mma_presented;
@@ -506,17 +508,18 @@ void test_mbar_engine_events_visible_next_cycle() {
 // sample D after that grant, its word Lb later, the gather register one cycle
 // later (the RF write decision's grant), the write lands Wd after it: its
 // depbar completion is presented then. `pad` independent movs put the ldg
-// there. (The mov issues at fetch_to_issue, its word fetched at c0; the
-// three-word FIFO then supplies one instruction per cycle.)
+// there. (The umov issues at fetch_to_issue, its word fetched at c0; the
+// three-word FIFO then supplies one instruction per cycle.) The lds.uni's
+// base is the umov's uniform register; the ldg's vector base r0 is never
+// written (0).
 void test_simultaneous_depbar_completion_and_admission() {
     const auto& profile = canonical_profile();
-    const uint64_t lds_issue = nanosm::fetch_to_issue +
-        nanosm::issue_to_visible(nanosm::decode(compile("mov r0, 0\nhalt").words[0]), profile) -
-        nanosm::issue_register_stages; // mov r0 at c2, the lds that reads it at its distance
+    const uint64_t lds_issue = nanosm::fetch_to_issue + nanosm::issue_to_urf_visible(profile) -
+        nanosm::issue_register_stages; // umov ur0 at c2, the lds.uni that reads it at the uniform distance
     const auto completion_cycle = lds_issue + nanosm::issue_to_dispatch(profile) + 1 + profile.shmem_port_a_depth +
         profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles;
     const auto pad = completion_cycle - lds_issue - 1;
-    std::string body = "mov r0, 0\nlds.uni r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}\n";
+    std::string body = "umov ur0, 0\nlds.uni r1, [ur0] {pred=PT, stall=0, set=sb0, wait=-}\n";
     for (uint64_t i = 0; i < pad; ++i) body += "mov r5, 7\n";
     body += "ldg r3, [r0] {pred=PT, stall=0, set=sb0, wait=-}\nhalt {pred=PT, stall=0, set=-, wait=sb0}\n";
     nanosm::Launch launch;
@@ -558,11 +561,11 @@ void test_simultaneous_full_queue_pop_and_push() {
     image_bytes(launch.shmem_image, 4096);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         .acc C, 0, 64, 64
-        mov r0, 0
-        mov r1, 1024
-        mma.async.init.m64n64k8 C, [r0], [r1]
-        mma.async.m64n64k8 C, [r0], [r1]
-        mma.async.m64n64k8 C, [r0], [r1]
+        umov ur0, 0
+        umov ur1, 1024
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.async.m64n64k8 C, [ur0], [ur1]
+        mma.async.m64n64k8 C, [ur0], [ur1]
         halt
     )"), std::move(launch), {.timeline = true});
     std::map<uint64_t, std::size_t> depth_after;
@@ -613,7 +616,8 @@ void test_simultaneous_ingress_push_and_pop() {
     auto& gmem = image_bytes(launch.gmem_image, 4096);
     fill_pattern(gmem, 0, 1024, 0);
     std::string text = R"(
-        sread r29, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r29, ur0
         setp.ne p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
@@ -678,7 +682,7 @@ void test_driver_shuffle_unit_kernels() {
         nanosm::Launch launch;
         launch.active_warps = 2;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-        std::string text = "sread r29, WARP_ID\nsetp.ne p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
+        std::string text = "usread ur0, WARP_ID\nur2r r29, ur0\nsetp.ne p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
             "mov r28, 2048\nldg.v8 r0, [r30]\nldg.v8 r8, [r31]\nldg r16, [r28]\nstg.v8 [r28], r0\nhalt\nother:\n";
         text += booking_stream(0, 150);
         text += "halt\n";
@@ -699,16 +703,16 @@ void test_driver_shuffle_unit_kernels() {
         write_tma_descriptor(shmem, 6144, descriptor);
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             .acc C, 0, 64, 64
-            mov r0, 0
-            mov r1, 1024
-            mov r4, 4096
+            umov ur0, 0
+            umov ur1, 1024
+            umov ur4, 4096
             mov r8, 0
             mov r9, 0
         )" + tma_operand_asm(10, 2048, 4104) + R"(
-            mma.async.init.m64n64k8 C, [r0], [r1]
-            mma.commit [r4]
+            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.commit [ur4]
             tma.load [6144], r8, r10
-            mma.async.m64n64k8 C, [r0], [r1]
+            mma.async.m64n64k8 C, [ur0], [ur1]
             halt
         )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
     };
@@ -718,11 +722,11 @@ void test_driver_shuffle_unit_kernels() {
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             .acc C, 0, 64, 64
             sread r0, THREAD_ID
-            sread r8, WARP_ID
-            shli r8, r8, 4
-            mov r9, 0
-            acc.st.v8 C, r8, r0
-            acc.ld.v8 r16, C, r8
+            usread ur8, WARP_ID
+            ushli ur8, ur8, 4
+            umov ur9, 0
+            acc.st.v8 C, ur8, r0
+            acc.ld.v8 r16, C, ur8
             fadd r24, r16, r17
             halt
         )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -735,16 +739,17 @@ void test_driver_shuffle_unit_kernels() {
         write_rank1_tma(shmem, 0, 2048, 64, 128);
         image_bytes(launch.gmem_image, 8192);
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
-            sread r29, WARP_ID
+            usread ur0, WARP_ID
+            ur2r r29, ur0
             setp.ne p0, r29, 0
             @p0 bra.uni other
             mov r0, 0
             mov r1, 0
             mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
-            mov r3, 128
+            umov ur3, 128
             tma.store [0], r0, r2
         wait:
-            mbar.try_wait p1, [r3], 0
+            mbar.try_wait p1, [ur3], 0
             @!p1 bra.uni wait
             halt
         other:

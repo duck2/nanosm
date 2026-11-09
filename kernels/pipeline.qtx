@@ -2,10 +2,12 @@
 ; Warp 0 stages gmem tiles into double-buffered shmem through the RF (the deliberate
 ; no-cp.async path); warp 1 consumes, adds, and stores to gmem. Exercises everything
 ; built so far: role dispatch, counted loops, ldg/sts/lds/fadd/stg, full/empty mbar
-; pairs, try_wait retry loops with xori parity toggling, and depbar scheduling.
+; pairs, try_wait retry loops with uxori parity toggling, and depbar scheduling.
 ;
 ; 8 tiles x 16 f32 (one lane-width each) per array. C[i] = A[i] + B[i]. Barriers are launch-image objects
 ; (expected=1); stages start free, so the producer peels the first two fills.
+; The barrier addresses and their parities are uniform registers (ur1..ur6);
+; the per-lane addresses and the loop counters stay vector (setp is vector).
 
 .equ A,      0
 .equ B,      4096
@@ -19,7 +21,8 @@
 .equ EMPTY0, 1040
 .equ EMPTY1, 1048
 
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r  r0, ur0
         setp.eq p0, r0, 0
 @p0     bra.uni PRODUCER
 
@@ -31,31 +34,31 @@
         addi  r12, r0, SA1
         addi  r13, r0, SB1
         addi  r1, r0, C
-        mov   r14, FULL0
-        mov   r15, FULL1
-        mov   r16, EMPTY0
-        mov   r17, EMPTY1
-        mov   r18, 0            ; FULL0 parity
-        mov   r19, 0            ; FULL1 parity
+        umov  ur1, FULL0
+        umov  ur2, FULL1
+        umov  ur3, EMPTY0
+        umov  ur4, EMPTY1
+        umov  ur5, 0            ; FULL0 parity
+        umov  ur6, 0            ; FULL1 parity
         mov   r3, 4             ; outer iterations, two tiles each
 CLOOP:  setp.le p1, r3, 0
 @p1     bra.uni CDONE
-CF0:    mbar.try_wait p3, [r14], r18
+CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
-        xori  r18, r18, 1
+        uxori ur5, ur5, 1
         lds   r8, [r10]
         lds   r9, [r11]
         fadd  r8, r8, r9
-        mbar.arrive [r16]       ; stage 0 values live in RF; hand the buffer back
+        mbar.arrive [ur3]       ; stage 0 values live in RF; hand the buffer back
         stg   [r1], r8
         addi  r1, r1, 64
-CF1:    mbar.try_wait p3, [r15], r19
+CF1:    mbar.try_wait p3, [ur2], ur6
 @!p3    bra.uni CF1
-        xori  r19, r19, 1
+        uxori ur6, ur6, 1
         lds   r8, [r12]
         lds   r9, [r13]
         fadd  r8, r8, r9
-        mbar.arrive [r17]
+        mbar.arrive [ur4]
         stg   [r1], r8
         addi  r1, r1, 64
         addi  r3, r3, -1
@@ -72,51 +75,51 @@ PRODUCER:
         addi  r11, r0, SB0
         addi  r12, r0, SA1
         addi  r13, r0, SB1
-        mov   r14, FULL0
-        mov   r15, FULL1
-        mov   r16, EMPTY0
-        mov   r17, EMPTY1
-        mov   r18, 0            ; EMPTY0 parity
-        mov   r19, 0            ; EMPTY1 parity
+        umov  ur1, FULL0
+        umov  ur2, FULL1
+        umov  ur3, EMPTY0
+        umov  ur4, EMPTY1
+        umov  ur5, 0            ; EMPTY0 parity
+        umov  ur6, 0            ; EMPTY1 parity
         ; cold start is peeled: both stages begin free, no empty wait
         ldg   r8, [r1]
         ldg   r9, [r2]
         sts   [r10], r8
         sts   [r11], r9
-        mbar.arrive [r14]       ; sts -> arrive order is free: both serialize through port A
+        mbar.arrive [ur1]       ; sts -> arrive order is free: both serialize through port A
         addi  r1, r1, 64
         addi  r2, r2, 64
         ldg   r8, [r1]
         ldg   r9, [r2]
         sts   [r12], r8
         sts   [r13], r9
-        mbar.arrive [r15]
+        mbar.arrive [ur2]
         addi  r1, r1, 64
         addi  r2, r2, 64
         mov   r3, 6             ; tiles left after the peel
 PLOOP:  setp.le p1, r3, 0
 @p1     bra.uni PDONE
-PE0:    mbar.try_wait p3, [r16], r18
+PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
-        xori  r18, r18, 1
+        uxori ur5, ur5, 1
         ldg   r8, [r1]
         ldg   r9, [r2]
         sts   [r10], r8
         sts   [r11], r9
-        mbar.arrive [r14]
+        mbar.arrive [ur1]
         addi  r1, r1, 64
         addi  r2, r2, 64
         addi  r3, r3, -1
         setp.le p1, r3, 0
 @p1     bra.uni PDONE
-PE1:    mbar.try_wait p3, [r17], r19
+PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1
-        xori  r19, r19, 1
+        uxori ur6, ur6, 1
         ldg   r8, [r1]
         ldg   r9, [r2]
         sts   [r12], r8
         sts   [r13], r9
-        mbar.arrive [r15]
+        mbar.arrive [ur2]
         addi  r1, r1, 64
         addi  r2, r2, 64
         addi  r3, r3, -1

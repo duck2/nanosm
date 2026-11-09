@@ -149,6 +149,21 @@ void TraceRecorder::rf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_
     });
 }
 
+void TraceRecorder::urf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t value) {
+    ++summary_.urf_writes;
+    add({
+        TraceEventKind::instant,
+        TraceCategory::instruction,
+        "UR write",
+        "ur" + std::to_string(reg) + " = " + std::to_string(value),
+        warp_track_base + warp,
+        cycle,
+        0,
+        static_cast<int64_t>(value),
+        reg,
+    });
+}
+
 void TraceRecorder::rf_read(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank) {
     if (!options_.debug) return;
     add({
@@ -562,6 +577,7 @@ std::string TraceRecorder::summary_text() const {
         << " async_waits=" << summary_.rf_async_waits
         << " simt_inhibited=" << summary_.rf_simt_inhibited
         << " simt_read_inhibited=" << summary_.rf_simt_read_inhibited << '\n';
+    out << "urf: writes=" << summary_.urf_writes << '\n';
     out << "mbar: rmw=" << summary_.mbar_rmw_requests
         << " phase_changes=" << summary_.mbar_phase_changes
         << " probes=" << summary_.mbar_initial_probes

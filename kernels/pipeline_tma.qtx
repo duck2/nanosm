@@ -2,6 +2,8 @@
 ; Two launch-authored descriptors (A, B); each stage's destination and
 ; full barrier are the tma.load address operand (src/tma.hpp). The x
 ; coordinate advances by one 16-element tile; no swizzle, no transpose.
+; The barrier addresses and parities are uniform registers (ur1..ur6); the
+; TMA operands (coordinates, address operands) stay vector registers.
 
 .equ C,      8192
 .equ SA0,    0
@@ -15,7 +17,8 @@
 .equ ADESC,  1152
 .equ BDESC,  1216
 
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r  r0, ur0
         setp.eq p0, r0, 0
 @p0     bra.uni PRODUCER
 
@@ -27,31 +30,31 @@
         addi  r12, r0, SA1
         addi  r13, r0, SB1
         addi  r1, r0, C
-        mov   r14, FULL0
-        mov   r15, FULL1
-        mov   r16, EMPTY0
-        mov   r17, EMPTY1
-        mov   r18, 0
-        mov   r19, 0
+        umov  ur1, FULL0
+        umov  ur2, FULL1
+        umov  ur3, EMPTY0
+        umov  ur4, EMPTY1
+        umov  ur5, 0
+        umov  ur6, 0
         mov   r3, 4
 CLOOP:  setp.le p1, r3, 0
 @p1     bra.uni CDONE
-CF0:    mbar.try_wait p3, [r14], r18
+CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
-        xori  r18, r18, 1
+        uxori ur5, ur5, 1
         lds   r8, [r10]
         lds   r9, [r11]
         fadd  r8, r8, r9
-        mbar.arrive [r16]
+        mbar.arrive [ur3]
         stg   [r1], r8
         addi  r1, r1, 64
-CF1:    mbar.try_wait p3, [r15], r19
+CF1:    mbar.try_wait p3, [ur2], ur6
 @!p3    bra.uni CF1
-        xori  r19, r19, 1
+        uxori ur6, ur6, 1
         lds   r8, [r12]
         lds   r9, [r13]
         fadd  r8, r8, r9
-        mbar.arrive [r17]
+        mbar.arrive [ur4]
         stg   [r1], r8
         addi  r1, r1, 64
         addi  r3, r3, -1
@@ -60,23 +63,25 @@ CDONE:  halt
 
 ; ---- producer: warp 0 ----
 PRODUCER:
-        mov   r14, FULL0
-        mov   r15, FULL1
-        mov   r16, EMPTY0
-        mov   r17, EMPTY1
-        mov   r18, 0
-        mov   r19, 0
-        mov   r20, 0
-        mov   r21, 0
+        umov  ur1, FULL0
+        umov  ur2, FULL1
+        umov  ur3, EMPTY0
+        umov  ur4, EMPTY1
+        umov  ur5, 0
+        umov  ur6, 0
+        mov   r14, 0
+        mov   r15, 0
 ; Address operands (src/tma.hpp): the stage / 64 in bits 31:16 (the shli by
 ; 10 of its 64-byte-aligned address), the full barrier / 8 in bits 15:0; in RF
-; bank 1 (register mod 3 == 1) beside the coordinates r20 / r21 (banks 2 / 0).
-        shri  r5, r14, 3
-        shri  r6, r15, 3
+; bank 1 (register mod 3 == 1) beside the coordinates r14 / r15 (banks 2 / 0).
+        mov   r5, FULL0
+        mov   r6, FULL1
         mov   r4, SA0
         mov   r7, SB0
         mov   r10, SA1
         mov   r13, SB1
+        shri  r5, r5, 3
+        shri  r6, r6, 3
         shli  r4, r4, 10
         shli  r7, r7, 10
         shli  r10, r10, 10
@@ -86,35 +91,35 @@ PRODUCER:
         or    r10, r10, r6
         or    r13, r13, r6
 
-        mbar.arrive.expect_tx [r14], 128
-        tma.load [ADESC], r20, r4
-        tma.load [BDESC], r20, r7
-        addi  r20, r20, 16
-        mbar.arrive.expect_tx [r15], 128
-        tma.load [ADESC], r20, r10
-        tma.load [BDESC], r20, r13
-        addi  r20, r20, 16
+        mbar.arrive.expect_tx [ur1], 128
+        tma.load [ADESC], r14, r4
+        tma.load [BDESC], r14, r7
+        addi  r14, r14, 16
+        mbar.arrive.expect_tx [ur2], 128
+        tma.load [ADESC], r14, r10
+        tma.load [BDESC], r14, r13
+        addi  r14, r14, 16
 
         mov   r3, 6
 PLOOP:  setp.le p1, r3, 0
 @p1     bra.uni PDONE
-PE0:    mbar.try_wait p3, [r16], r18
+PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
-        xori  r18, r18, 1
-        mbar.arrive.expect_tx [r14], 128
-        tma.load [ADESC], r20, r4
-        tma.load [BDESC], r20, r7
-        addi  r20, r20, 16
+        uxori ur5, ur5, 1
+        mbar.arrive.expect_tx [ur1], 128
+        tma.load [ADESC], r14, r4
+        tma.load [BDESC], r14, r7
+        addi  r14, r14, 16
         addi  r3, r3, -1
         setp.le p1, r3, 0
 @p1     bra.uni PDONE
-PE1:    mbar.try_wait p3, [r17], r19
+PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1
-        xori  r19, r19, 1
-        mbar.arrive.expect_tx [r15], 128
-        tma.load [ADESC], r20, r10
-        tma.load [BDESC], r20, r13
-        addi  r20, r20, 16
+        uxori ur6, ur6, 1
+        mbar.arrive.expect_tx [ur2], 128
+        tma.load [ADESC], r14, r10
+        tma.load [BDESC], r14, r13
+        addi  r14, r14, 16
         addi  r3, r3, -1
         bra.uni PLOOP
 PDONE:  halt

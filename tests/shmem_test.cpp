@@ -7,13 +7,21 @@ namespace {
 
 using namespace nanosm_test;
 
+// Issue to dependent issue behind a uniform-register writer (umov, usread,
+// u* arithmetic, r2ur): visible issue_to_urf_visible after the writer's
+// issue, sampled issue_to_urf_sample after the reader's (src/rf.hpp; 4 at
+// canonical, where alu_distance is 6).
+uint64_t uniform_distance(const nanosm::DeviceProfile& profile) {
+    return nanosm::issue_to_urf_visible(profile) - nanosm::issue_to_urf_sample;
+}
+
 // ---------------------------------------------------------------------------
 // B3 (rfc09 pin 3): uniformity is declared, never detected.
 // - lds / sts: rounds = the most lanes on any one bank, bank = (address / 4)
 //   % 16. Two lanes on one word are two lanes on one bank. Each bank serves
 //   its lanes in ascending lane order, one per round.
-// - lds.uni: one access at lane 0's address, the word fanned out to every
-//   lane, one RF write. A nonuniform address is UB: a sanitizer PANIC.
+// - lds.uni: one access at the address in a uniform register (uniform by
+//   construction), the word fanned out to every lane, one RF write.
 // trash/b3-uniformity-2026-10-08.md.
 // ---------------------------------------------------------------------------
 
@@ -79,14 +87,17 @@ std::vector<RegisterWrite> watch_register(nanosm::Machine& machine, uint32_t reg
 
 // lds.uni: one port-A round, every lane gets the word, one full-width RF
 // write at issue + 2 (the round, then the write port). The plain lds of the
-// same word takes sixteen rounds: still one RF write, at issue + 17.
+// same word takes sixteen rounds: still one RF write, at issue + 17. The
+// lds.uni base is the uniform register ur0, the lds base the vector r0.
 void test_b3_lds_uni_one_round_one_write() {
     for (const std::string operation : {"lds.uni", "lds"}) {
-        const uint32_t rounds = operation == "lds.uni" ? 1 : 16;
+        const bool uniform = operation == "lds.uni";
+        const uint32_t rounds = uniform ? 1 : 16;
+        const std::string base = uniform ? "ur0" : "r0";
         // r1 differs in every lane before the load, so one write of the load
         // changes all sixteen lanes in one cycle.
-        auto machine = b3_machine(
-            "sread r1, LANE_ID\nmov r0, 60\n" + operation + " r1, [r0 + 16]\nhalt\n", b3_launch());
+        auto machine = b3_machine("sread r1, LANE_ID\n" + std::string(uniform ? "umov" : "mov") + " " + base +
+            ", 60\n" + operation + " r1, [" + base + " + 16]\nhalt\n", b3_launch());
         const auto writes = watch_register(*machine, 1);
         require(writes.size() == 2, operation + ": r1 was not written exactly twice (sread, load)");
         const auto& load = writes[1];
@@ -199,24 +210,33 @@ void test_b3_sts_bank_serves_lanes_in_order() {
 }
 
 // lds.uni composes with the RF read round, WAR, WAW and depbars exactly as
-// a one-round lds does: the same compiled controls, the same issue timeline.
-// The plain lds reads word 16 + l in lane l (one lane per bank); lds.uni
-// reads word 16 in every lane.
+// a one-round lds does: from the load on, the same compiled controls and the
+// same issue timeline. The plain lds reads word 16 + l in lane l (one lane
+// per bank) through the vector base r0; lds.uni reads word 16 in every lane
+// through the uniform base ur0, computed by uniform arithmetic. The address
+// sources differ in timing (a uniform write -> read is 4 cycles at
+// canonical, a vector one 6), so the controls before the load and the
+// absolute cycles are not compared: the timeline is relative to the load's
+// issue.
 void test_b3_lds_uni_composes_like_lds() {
-    const auto program = [](const std::string& address_source, const std::string& load) {
-        return address_source + "\nshli r0, r0, 2\n" + load + " r1, [r0 + 64]\n" +
-            "mov r0, 7\n"        // WAR on the load's address register
+    const auto program = [](bool uniform) {
+        const std::string base = uniform ? "ur0" : "r0";
+        return std::string(uniform ? "umov ur0, 0\nushli " : "sread r0, LANE_ID\nshli ") + base + ", " + base +
+            ", 2\n" + (uniform ? "lds.uni" : "lds") + " r1, [" + base + " + 64]\n" + (uniform ? "umov " : "mov ") +
+            base + ", 7\n"       // WAR on the load's address register
             "fadd r2, r1, r1\n"  // RAW through the load's depbar
             "mov r1, 3\n"        // WAW on the load's destination
             "halt\n";
     };
-    const auto plain = program("sread r0, LANE_ID", "lds");
-    const auto uniform = program("mov r0, 0", "lds.uni");
-    const auto timeline = [](const nanosm::Machine& machine) {
-        std::vector<std::pair<uint64_t, uint64_t>> issues; // cycle, pc
+    const auto plain = program(false);
+    const auto uniform = program(true);
+    constexpr uint32_t load_pc = 2 * 8;
+    const auto timeline = [&](const nanosm::Machine& machine) {
+        std::vector<std::pair<uint64_t, uint64_t>> issues; // cycle after the load's issue, pc
+        const auto load = issued_at(machine, load_pc).at(0);
         for (const auto& event : machine.trace().events()) {
-            if (is_issue_event(event)) {
-                issues.emplace_back(event.start_cycle, event.id);
+            if (is_issue_event(event) && event.id >= load_pc) {
+                issues.emplace_back(event.start_cycle - load, event.id);
             }
         }
         return issues;
@@ -229,7 +249,8 @@ void test_b3_lds_uni_composes_like_lds() {
         const auto& profile = canonical_profile();
         const auto plain_asm = nanosm::compile_qtx(plain, profile);
         const auto uniform_asm = nanosm::compile_qtx(uniform, profile);
-        for (std::size_t i = 0; i < plain_asm.instructions.size(); ++i) {
+        require(plain_asm.instructions.size() == uniform_asm.instructions.size(), what + ": instruction counts differ");
+        for (std::size_t i = load_pc / 8; i < plain_asm.instructions.size(); ++i) {
             const auto& a = plain_asm.instructions[i].control;
             const auto& b = uniform_asm.instructions[i].control;
             require(a.stall == b.stall && a.set_depbar == b.set_depbar && a.wait_mask == b.wait_mask,
@@ -239,32 +260,17 @@ void test_b3_lds_uni_composes_like_lds() {
         auto uniform_run = b3_machine(uniform, b3_launch(), profile);
         plain_run->run();
         uniform_run->run();
-        require(timeline(*plain_run) == timeline(*uniform_run), what + ": issue timelines differ");
-        require(plain_run->cycle() == uniform_run->cycle(), what + ": run lengths differ");
+        require(timeline(*plain_run) == timeline(*uniform_run), what + ": issue timelines from the load on differ");
+        require(plain_run->cycle() - issued_at(*plain_run, load_pc).at(0) ==
+                uniform_run->cycle() - issued_at(*uniform_run, load_pc).at(0),
+            what + ": run lengths after the load differ");
+        require(uniform_run->read_ureg(0, 0) == 7, what + ": lds.uni WAR order");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(plain_run->read_reg(0, lane, 2) == twice(b3_word(64 + 4 * lane)), what + ": lds value");
             require(uniform_run->read_reg(0, lane, 2) == twice(b3_word(64)), what + ": lds.uni value");
-            require(uniform_run->read_reg(0, lane, 0) == 7 && uniform_run->read_reg(0, lane, 1) == 3,
-                what + ": lds.uni WAR/WAW order");
+            require(uniform_run->read_reg(0, lane, 1) == 3, what + ": lds.uni WAW order");
         }
     }
-}
-
-// Sanitizer ON only (tagged): compiled out, hardware reads lane 0's address
-// and the program runs.
-void test_b3_lds_uni_nonuniform_panics() {
-    // Lane 15's base is 128, the others 64: both aligned and in bounds, so
-    // only the uniformity rule can fire (the ldg.uni contract test's setup).
-    auto machine = b3_machine(R"(
-        sread r1, LANE_ID
-        addi r1, r1, 1
-        shri r1, r1, 4
-        shli r1, r1, 6
-        addi r0, r1, 64
-        lds.uni r8, [r0]
-        halt
-    )", b3_launch());
-    expect_sim_panic(*machine, "lds.uni base address is not warp-uniform", "non-uniform lds.uni base");
 }
 
 // Alignment and bounds: the machine's own panics, as for lds, in both builds.
@@ -273,11 +279,11 @@ void test_b3_lds_uni_alignment_and_bounds() {
         auto machine = b3_machine(program, b3_launch());
         expect_sim_panic(*machine, needle, what);
     };
-    expect("mov r0, 6\nlds.uni r1, [r0]\nhalt\n", "unaligned 32-bit shmem access", "2-byte aligned lds.uni");
-    expect("mov r0, 65532\nlds.uni r1, [r0 + 4]\nhalt\n", "shmem access out of bounds", "lds.uni past shmem");
-    expect("mov r0, 0\nlds.uni r1, [r0 - 4]\nhalt\n", "shmem address arithmetic overflow",
+    expect("umov ur0, 6\nlds.uni r1, [ur0]\nhalt\n", "unaligned 32-bit shmem access", "2-byte aligned lds.uni");
+    expect("umov ur0, 65532\nlds.uni r1, [ur0 + 4]\nhalt\n", "shmem access out of bounds", "lds.uni past shmem");
+    expect("umov ur0, 0\nlds.uni r1, [ur0 - 4]\nhalt\n", "shmem address arithmetic overflow",
         "negative lds.uni address");
-    auto last_word = b3_machine("mov r0, 65532\nlds.uni r1, [r0]\nhalt\n", b3_launch());
+    auto last_word = b3_machine("umov ur0, 65532\nlds.uni r1, [ur0]\nhalt\n", b3_launch());
     last_word->run();
     require(last_word->read_reg(0, 9, 1) == 0, "lds.uni of the last shmem word");
 }
@@ -285,7 +291,11 @@ void test_b3_lds_uni_alignment_and_bounds() {
 // ---------------------------------------------------------------------------
 // I1: declared-uniform operands are a sanitizer rule (rfc09 pin 3). Hardware
 // reads lane 0's value; with the sanitizer, a value that differs across lanes
-// PANICs with the operand's name, as before. One test for both builds.
+// PANICs with the operand's name, as before. One test for both builds. Since
+// the uniform register file only the operands still taken from a vector
+// register are lane 0's: the ldg.v8 / stg.v8 bases and the bra.uni predicate
+// (the lds.uni / ldg.uni bases and the mbar addresses are uniform registers,
+// uniform by construction, so their cases are gone).
 // ---------------------------------------------------------------------------
 
 nanosm::Launch uniformity_launch() {
@@ -331,16 +341,6 @@ void test_uniformity_uses_lane_zero() {
                 require(machine.read_gmem_u32(64) == 0 && machine.read_gmem_u32(60) == pattern_word(15),
                     "stg.v8 did not store at lane 0's block");
             }},
-        {"ldg.uni base", one_lane_differs + "ldg.uni r8, [r0]\nhalt\n", "ldg.uni base address is not warp-uniform",
-            [&](const nanosm::Machine& machine) { all_lanes(machine, 8, pattern_word(16), "ldg.uni"); }},
-        {"lds.uni base", one_lane_differs + "lds.uni r8, [r0]\nhalt\n", "lds.uni base address is not warp-uniform",
-            [&](const nanosm::Machine& machine) { all_lanes(machine, 8, 0x5000 + 64, "lds.uni"); }},
-        {"mbar address", "sread r0, LANE_ID\nshli r0, r0, 3\nmbar.init [r0], 1\nhalt\n",
-            "mbar address is not warp-uniform",
-            [](const nanosm::Machine& machine) {
-                const auto state = machine.read_mbar_state(0);
-                require(state.valid && state.expected == 1, "mbar.init did not use lane 0's address");
-            }},
         {"bra.uni predicate",
             "sread r0, LANE_ID\nsetp.lt p0, r0, 8\n@p0 bra.uni taken\nmov r5, 1\nhalt\ntaken:\nmov r5, 2\nhalt\n",
             "bra.uni predicate is not warp-uniform",
@@ -357,28 +357,29 @@ void test_uniformity_uses_lane_zero() {
     }
 }
 
-// qtxc and qtxas: opcode 0x26, the RRI payload, a depbar like every memory op.
+// qtxc and qtxas: opcode 0x26, the RRI payload (src0: the base's uniform
+// register number), a depbar like every memory op.
 void test_b3_lds_uni_encoding() {
     const auto& profile = canonical_profile();
-    const auto kernel = compile("mov r3, 0\nlds.uni r5, [r3 + 8]\nhalt\n");
+    const auto kernel = compile("umov ur3, 0\nlds.uni r5, [ur3 + 8]\nhalt\n");
     const auto decoded = nanosm::decode(kernel.words[1]);
     require(static_cast<unsigned>(decoded.opcode) == 0x26 && decoded.dst == 5 && decoded.src0 == 3 &&
             decoded.imm == 8 && decoded.control.set_depbar < 6,
         "lds.uni did not survive qtxc + qtxas");
-    require(nanosm::format_instruction(decoded, false) == "lds.uni r5, [r3 + 8]", "lds.uni formatting");
+    require(nanosm::format_instruction(decoded, false) == "lds.uni r5, [ur3 + 8]", "lds.uni formatting");
     auto negative = decoded;
     negative.imm = -2048;
     require(nanosm::decode(nanosm::encode(negative)).imm == -2048, "lds.uni negative immediate");
     const auto header = ".profile " + profile.name + ", 0x" +
         nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + "\n";
     (void)nanosm::assemble_asm(header + R"(
-        mov r0, 0 {pred=PT, stall=1, set=-, wait=-}
-        lds.uni r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}
+        umov ur0, 0 {pred=PT, stall=1, set=-, wait=-}
+        lds.uni r1, [ur0] {pred=PT, stall=0, set=sb0, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )", profile);
     try {
         (void)nanosm::assemble_asm(header + R"(
-            lds.uni r1, [r0] {pred=PT, stall=0, set=-, wait=-}
+            lds.uni r1, [ur0] {pred=PT, stall=0, set=-, wait=-}
             halt {pred=PT, stall=0, set=-, wait=-}
         )", profile);
         throw std::runtime_error("qtxas accepted lds.uni without a depbar");
@@ -394,11 +395,13 @@ void test_b3_lds_uni_encoding() {
 // RMW starts the next cycle (the store started last, so the alternation bit
 // gives the RMW the next start) and waits for its read until the cycle after
 // the store's last round, starting nothing new on A-read meanwhile
-// (select_a_read step 2). Warp 0 runs `body` after the dispatch (p6, r20,
-// r21, r29 are the dispatch's and warp 1's).
+// (select_a_read step 2). Warp 0 runs `body` after the dispatch (p6, ur15,
+// r20, r21, r29 are the dispatch's and warp 1's: usread reads the warp id,
+// ur2r copies it to r29 for the setp).
 std::string i3_with_blocker(const std::string& body) {
     return R"(
-        sread r29, WARP_ID
+        usread ur15, WARP_ID
+        ur2r r29, ur15
         setp.ne p6, r29, 0
         bra.uni i3_blocker {pred=p6, stall=0, set=-, wait=-}
     )" + body + R"(
@@ -460,6 +463,9 @@ uint64_t i3_hold_a_read(nanosm::Machine& machine) {
 // until its grant, issues there and reaches A-read t + 1 later (a same-warp
 // read can no longer be granted the cycle after the store). The WAW's second
 // sts likewise follows the first's last round t + 1 later.
+// URF: P's base is the uniform ur1 (never written: 0), and the dispatch in
+// i3_with_blocker is one instruction longer (usread + ur2r), so every pc is
+// one instruction later; the cycles above are relative to issues and grants.
 void test_i2_same_warp_order_with_reordered_reads() {
     const auto& profile = canonical_profile();
     require(i2_return(profile) == 4 && profile.shmem_load_slots == 2, "the timeline is derived for D = Lb = 2");
@@ -468,7 +474,7 @@ void test_i2_same_warp_order_with_reordered_reads() {
     auto machine = i2_machine(profile, i3_with_blocker(R"(
         sread r0, LANE_ID
         shli r0, r0, 2
-        lds.uni r3, [r1 + 256] {pred=PT, stall=0, set=sb4, wait=-}
+        lds.uni r3, [ur1 + 256] {pred=PT, stall=0, set=sb4, wait=-}
         lds r7, [r0 + 128] {pred=PT, stall=0, set=sb0, wait=sb4}
         lds r10, [r0 + 192] {pred=PT, stall=0, set=sb1, wait=-}
         mov r5, 0x5150
@@ -481,7 +487,7 @@ void test_i2_same_warp_order_with_reordered_reads() {
     const uint64_t r = blocker + 16;            // the RMW's read: the cycle after the blocker's last round
     const uint64_t w = r + i2_return(profile) + c; // its write
     const auto reads = i2_grants(*machine, "A-read");
-    constexpr uint32_t p_pc = 5 * 8, blocker_pc = 15 * 8, r5_pc = 8 * 8;
+    constexpr uint32_t p_pc = 6 * 8, blocker_pc = 16 * 8, r5_pc = 9 * 8;
     const auto p = issued_at(*machine, p_pc).at(0);
     require(issued_at(*machine, blocker_pc) == std::vector<uint64_t>{blocker - t - 1} &&
             reads == std::vector<I2Grant>{{p + t + 1, "A-read", "simt", 0}, {r, "A-read", "rmw", 0},
@@ -490,7 +496,7 @@ void test_i2_same_warp_order_with_reordered_reads() {
             describe(i2_grants(*machine)) + " | issues" + issue_log(*machine) + " | ordered" +
             describe(refusals(*machine, 0, "ordered behind own access")) + " slots" +
             describe(refusals(*machine, 0, "load slots full")));
-    constexpr uint32_t old_pc = 6 * 8, young_pc = 7 * 8, war_pc = 9 * 8;
+    constexpr uint32_t old_pc = 7 * 8, young_pc = 8 * 8, war_pc = 10 * 8;
     const auto old_issue = p + i1_lds_shift(profile) + 2 + profile.rf_write_depth_cycles + 1; // P visible: sb4 clear
     require(issued_at(*machine, old_pc) == std::vector<uint64_t>{old_issue} &&
             issued_at(*machine, young_pc) == std::vector<uint64_t>{old_issue + 1},
@@ -614,9 +620,9 @@ void test_i2_divergence() {
         }
     }
 #if NANOSM_SANITIZER
-    for (const std::string uniform :
-             {"lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [r2]", "mbar.test_wait p0, [r2], 0"}) {
-        auto machine = i2_machine(profile, "mov r2, 4096\n" + uniform + "\nhalt\n");
+    for (const std::string uniform : {"lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [ur2]",
+             "mbar.test_wait p0, [ur2], 0"}) {
+        auto machine = i2_machine(profile, "umov ur2, 4096\n" + uniform + "\nhalt\n");
         machine->test_set_active_mask(0, 0xfffe);
         try {
             machine->run();
@@ -638,7 +644,8 @@ void test_i2_divergence() {
 // issue_to_dispatch + 1 after that.
 void test_i2_store_slots_one_and_two() {
     const std::string program = R"(
-        sread r29, WARP_ID
+        usread ur15, WARP_ID
+        ur2r r29, ur15
         sread r0, LANE_ID
         andi r1, r0, 7
         shri r2, r0, 3
@@ -728,19 +735,20 @@ void test_i2_store_slot_reuse_and_done() {
 // I6b-2: the two warps issue their bra.uni one cycle apart; the reader's lds
 // follows its not-taken branch by branch_not_taken_interval, the writer's sts
 // its mov at the branch target by alu_distance, and the target the taken
-// branch by branch_taken_interval (src/rf.hpp) plus one cycle of fetch
-// contention (two-word packets): the reader's lds is the second half of its
-// packet, so issuing it pops the packet and the reader asks for a fetch in
-// the same cycle the writer first asks for its target's packet; the
-// round-robin cursor, last moved past the writer by the writer's own
-// previous fetch, serves the reader first. So the sts issues
-// 1 + (taken + 1) - not taken + alu_distance after the lds (10 at
-// canonical), each is granted t + 1 after its issue, and the two
-// sixteen-cycle windows share 16 minus that many cycles -- in every one of
-// which both services grant.
+// branch by branch_taken_interval (src/rf.hpp). (Before the URF the lds was
+// the second half of its two-word packet: issuing it popped the packet and
+// the reader's fetch contended with the writer's target fetch, one cycle
+// more.) URF: the dispatch is usread + ur2r, one instruction more, so the lds
+// is now the first half of its packet, with the halt: the reader asks for no
+// fetch and the writer's target is fetched uncontended. So the sts issues
+// 1 + taken - not taken + alu_distance after the lds (9 at canonical, was
+// 10), each is granted t + 1 after its issue, and the two sixteen-cycle
+// windows share 16 minus that many cycles -- in every one of which both
+// services grant.
 void test_i2_a_read_and_a_write_same_cycle() {
     auto machine = i2_machine(canonical_profile(), R"(
-        sread r29, WARP_ID
+        usread ur15, WARP_ID
+        ur2r r29, ur15
         sread r0, LANE_ID
         shli r0, r0, 6
         setp.ne p0, r29, 0
@@ -757,10 +765,10 @@ void test_i2_a_read_and_a_write_same_cycle() {
     for (const auto& grant : i2_grants(*machine, "A-read")) read_cycles.insert(grant.cycle);
     uint32_t together = 0;
     for (const auto& grant : i2_grants(*machine, "A-write")) together += read_cycles.contains(grant.cycle) ? 1 : 0;
-    const auto apart = 1 + (nanosm::branch_taken_interval + 1) - nanosm::branch_not_taken_interval +
+    const auto apart = 1 + nanosm::branch_taken_interval - nanosm::branch_not_taken_interval +
         alu_distance(canonical_profile());
-    require(issued_at(*machine, 8 * 8).at(0) == issued_at(*machine, 5 * 8).at(0) + apart,
-        "the sts did not issue 1 + (taken + 1) - not taken + alu_distance after the lds:" + issue_log(*machine));
+    require(issued_at(*machine, 9 * 8).at(0) == issued_at(*machine, 6 * 8).at(0) + apart,
+        "the sts did not issue 1 + taken - not taken + alu_distance after the lds:" + issue_log(*machine));
     require(read_cycles.size() == 16 && together == 16 - apart,
         "A-read and A-write were not granted in the same cycles (" + std::to_string(together) + ")");
     for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -790,6 +798,12 @@ void test_i2_a_read_and_a_write_same_cycle() {
 // serves warp 0 first, warp 1's target issues a cycle later and its
 // blocking store starts at b = c36. The primed stall is therefore 17 (was
 // 15): the tma.load issues at c33 and is ready at c37 = b + 1.
+// URF: the dispatch (usread + ur2r) is one instruction longer and four
+// cycles later, and the first priming lds.uni is now the first half of its
+// packet, so that fetch contention is gone: warp 1's blocking store starts
+// at b = c38 in both runs. The stalls are unchanged: the tma.load issues at
+// c36 (plain; ready at c40 = b + 2) or c37 (primed; ready at c41 = b + 3),
+// inside the hold that starts at b + 1.
 void test_i2_round_robin_tma_reads_and_loads() {
     const auto& profile = canonical_profile();
     require(i2_return(profile) == 4, "the timeline is derived for D = Lb = 2");
@@ -804,8 +818,8 @@ void test_i2_round_robin_tma_reads_and_loads() {
         write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(mbar));
         write_rank1_load(shmem, 5120, 0, 16, 4104);
         fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
-        const std::string priming = primed ? "lds.uni r5, [r1 + 8] {pred=PT, stall=0, set=sb3, wait=-}\n"
-                                             "lds.uni r6, [r1 + 12] {pred=PT, stall=0, set=sb4, wait=-}\n"
+        const std::string priming = primed ? "lds.uni r5, [ur1 + 8] {pred=PT, stall=0, set=sb3, wait=-}\n"
+                                             "lds.uni r6, [ur1 + 12] {pred=PT, stall=0, set=sb4, wait=-}\n"
                                            : "";
         const std::string stall = primed ? "17" : "18";
         // The stalling mov also sets the TMA's address operand (box at 1024,
@@ -814,8 +828,8 @@ void test_i2_round_robin_tma_reads_and_loads() {
             "mov r10, " + std::to_string(nanosm::pack_tma_addresses(1024, 4104)) + " {pred=PT, stall=" + stall +
             ", set=-, wait=-}\n" + R"(
             tma.load [5120], r8, r10
-            lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}
-            lds.uni r4, [r1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+            lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
+            lds.uni r4, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )")), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
         const auto blocker = i3_hold_a_read(machine);
@@ -823,7 +837,7 @@ void test_i2_round_robin_tma_reads_and_loads() {
         const uint64_t r = blocker + 16; // the RMW's read
         // warp 0's tma.load and two lds.uni (the last three before halt)
         // became ready (dispatch + 1) while A-read was held
-        const uint32_t tma_pc = (primed ? 6 : 4) * 8;
+        const uint32_t tma_pc = (primed ? 7 : 5) * 8;
         const auto ready = [&](uint32_t pc) { return issued_at(machine, pc).front() + nanosm::issue_to_dispatch(profile) + 1; };
         for (const uint32_t pc : {tma_pc, tma_pc + 8, tma_pc + 16}) {
             require(issued_at(machine, pc).size() == 1 && ready(pc) < r && ready(pc) > blocker,
@@ -862,29 +876,30 @@ void test_i2_tma_placement_on_port_b() {
     fill_pattern(image_bytes(launch.gmem_image, 1024), 0, 256, 0);
     std::string program = R"(
         .acc C, 0, 64, 64
-        sread r29, WARP_ID
+        usread ur15, WARP_ID
+        ur2r r29, ur15
         setp.ne p0, r29, 0
         @p0 bra.uni hammer
-        mov r0, 0
-        mov r1, 1024
-        mov r4, 4096
-        mbar.init [r4], 1
-        mma.async.init.m64n64k8 C, [r0], [r1]
-        mma.commit [r4]
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur4, 4096
+        mbar.init [ur4], 1
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.commit [ur4]
         mov r8, 0
         mov r9, 0
     )" + tma_operand_asm(10, 2048, 4104) + R"(
-        mov r11, 4104
+        umov ur11, 4104
         tma.load [5120], r8, r10
     tma_wait:
-        mbar.try_wait p1, [r11], 0
+        mbar.try_wait p1, [ur11], 0
         @!p1 bra.uni tma_wait
     mma_wait:
-        mbar.try_wait p2, [r4], 0
+        mbar.try_wait p2, [ur4], 0
         @!p2 bra.uni mma_wait
-        mov r12, 0
-        mov r13, 0
-        acc.ld r16, C, r12
+        umov ur12, 0
+        umov ur13, 0
+        acc.ld r16, C, ur12
         halt
     hammer:
         sread r20, LANE_ID
@@ -1023,7 +1038,7 @@ void test_i2_profile_fields() {
             "a shmem field was omitted from the fingerprint");
     }
     const auto result_cycle = [](const nanosm::DeviceProfile& profile) {
-        auto machine = i2_machine(profile, "lds.uni r3, [r1] {pred=PT, stall=0, set=sb0, wait=-}\n"
+        auto machine = i2_machine(profile, "lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}\n"
                                            "halt {pred=PT, stall=0, set=-, wait=sb0}\n");
         const auto written = i1_run(*machine, {3});
         return written.at(3).front();
@@ -1068,14 +1083,18 @@ void test_i2_profile_fields() {
 // a store round has not reached the RAM by that cycle (every old-word
 // outcome and the tie are among those); the other pads run and read only
 // new words. The sweep must have both outcomes.
+// URF: the role dispatch is usread + ur2r, four cycles longer than the old
+// sread, so warp 0's sts reaches its slot four cycles later (c31); Lb is 28
+// (was 24) so the pause still ends after that, at w = 32.
 void test_i2_read_first_across_services() {
     auto profile = canonical_profile();
-    profile.shmem_read_latency_cycles = 24;
+    profile.shmem_read_latency_cycles = 28;
     const uint64_t w = profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + profile.shmem_rmw_compute_cycles;
     std::set<std::string> sides;
     for (uint32_t stall = 0; stall <= 31; ++stall) {
         auto machine = i2_machine(profile, R"(
-            sread r29, WARP_ID
+            usread ur15, WARP_ID
+            ur2r r29, ur15
             sread r0, LANE_ID
             shli r0, r0, 2
             setp.ne p6, r29, 0
@@ -1127,14 +1146,14 @@ void test_i2_read_first_across_services() {
         // I7: the commit mbar is in the image (an mbar.init would be an RMW
         // behind the host's, ordering the sts after its long write).
         qtx << ".acc C, 0, 32, 64\n"
-            << "mov r0, 0\nmov r1, 1024\nmov r4, 896\n"
+            << "umov ur0, 0\numov ur1, 1024\numov ur4, 896\n"
             << "sread r20, LANE_ID\nshli r20, r20, 2\n"
             << "mov r21, 16384\nshli r22, r21, 16\nor r21, r21, r22\n" // two fp16 2.0 halves
             << "sts [r20], r21\n";
         for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
-        qtx << "mma.async.init.m32n64k8 C, [r0], [r1]\nmma.commit [r4]\n"
-            << "wait:\nmbar.try_wait p0, [r4], 0\n@!p0 bra.uni wait\n"
-            << "mov r8, 0\nmov r9, 0\nacc.ld r10, C, r8\nhalt\n";
+        qtx << "mma.async.init.m32n64k8 C, [ur0], [ur1]\nmma.commit [ur4]\n"
+            << "wait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\n"
+            << "umov ur8, 0\numov ur9, 0\nacc.ld r10, C, ur8\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 2048);
@@ -1232,7 +1251,7 @@ void test_i2_read_first_across_services() {
 // write reaches the RAM -- the phase flips at that clock edge -- D cycles
 // after that. The engine is busy (its trace slice) D + Lb + C + 1 cycles.
 // (Before I6a the arrive issued at c1 and was read at c2; now it waits for
-// the mov's r4 -- src/rf.hpp -- and for its dispatch.)
+// the umov's ur4 -- src/rf.hpp -- and for its dispatch.)
 void test_i21_rmw_compute_stage() {
     i21_check_optional_field("shmem", "rmw_compute_cycles", 2, &nanosm::DeviceProfile::shmem_rmw_compute_cycles);
     for (const uint32_t c : {1u, 2u, 3u}) {
@@ -1241,8 +1260,8 @@ void test_i21_rmw_compute_stage() {
         const uint64_t d = profile.shmem_port_a_depth;
         const uint64_t lb = profile.shmem_read_latency_cycles;
         auto machine = i21_machine(profile, R"(
-            mov r4, 4160
-            mbar.arrive [r4]
+            umov ur4, 4160
+            mbar.arrive [ur4]
             halt
         )", {{4160, i21_mbar(1, 1)}});
         std::optional<uint64_t> flipped; // the cycle whose clock edge landed the new phase
@@ -1285,22 +1304,23 @@ void test_i21_rmw_compute_stage() {
 // engine's class rule -- the class that did not start last; at the first
 // tie, SIMT -- starts the arrive. Same cycles as in I2.1.
 // I6a: the same scenario, moved: the commit issues at m (it needs the
-// first mov's r4: alu_distance), reaches the MMA queue at its dispatch
+// first umov's ur4: uniform_distance), reaches the MMA queue at its dispatch
 // m + issue_to_dispatch and presents at P = m + issue_to_dispatch + 1. The
 // arrive issues at m + 1 and reaches the SIMT RMW register at its own
 // dispatch, P: the cycle the commit is presented, as before. Both are held
-// at P + 1 and the arrive is served first. (I6b-2: the first mov issues at
-// fetch_to_issue, so m is that + alu_distance.)
+// at P + 1 and the arrive is served first. (I6b-2: the first umov issues at
+// fetch_to_issue, so m is that + uniform_distance; before the URF the
+// addresses were vector movs and m was that + alu_distance.)
 void test_i21_simt_rmw_admission_registered_state() {
     const auto& profile = canonical_profile();
     auto machine = i21_machine(profile, R"(
-        mov r4, 4160
-        mov r5, 4168
-        mma.commit [r4]
-        mbar.arrive [r5]
+        umov ur4, 4160
+        umov ur5, 4168
+        mma.commit [ur4]
+        mbar.arrive [ur5]
         halt
     )", {{4160, i21_mbar(1, 1)}, {4168, i21_mbar(2, 2)}});
-    const auto m = nanosm::fetch_to_issue + alu_distance(profile);
+    const auto m = nanosm::fetch_to_issue + uniform_distance(profile);
     const auto p = m + nanosm::issue_to_dispatch(profile) + 1;
     i2_run_until(*machine, p + 1);
     require(machine->mma_mbar_event_held(), "the commit was not presented at P (held from P + 1)");
@@ -1344,11 +1364,11 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
         auto machine = i21_machine(profile, R"(
             sread r0, LANE_ID
             shli r0, r0, 6
-            mov r4, 4160
+            umov ur4, 4160
             mov r5, 0x5a
             sts [r0 + 8], r5 {pred=PT, stall=0, set=sb0, wait=-}
             lds r6, [r0 + 8] {pred=PT, stall=0, set=sb1, wait=-}
-            mbar.arrive [r4]
+            mbar.arrive [ur4]
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )", {{4160, i21_mbar(2, 2)}});
         machine->run();
@@ -1366,7 +1386,7 @@ void test_i21_simt_rmw_behind_own_lds_and_sts() {
             return true;
         };
         const auto t = nanosm::issue_to_dispatch(profile);
-        const auto s = nanosm::fetch_to_issue + 2 + 2 * alu_distance(profile); // sread, shli; mov r4, mov r5; the sts
+        const auto s = nanosm::fetch_to_issue + 2 + 2 * alu_distance(profile); // sread, shli; umov ur4, mov r5; the sts
         const auto issues = " | issues" + issue_log(*machine);
         require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s}, what + "the sts did not issue at s:" + issues);
         require(consecutive(store_rounds, s + t + 1) && consecutive(load_rounds, s + 2 * t + 17),
@@ -1411,10 +1431,10 @@ void test_i21_probe_behind_own_sts() {
             xori r2, r1, 15
             shli r2, r2, 6
             mov r6, )" + std::to_string(new_low) + R"(
-            mov r4, 6144
+            umov ur4, 6144
             mov r9, 0
             sts [r2 + 6144], r6 {pred=PT, stall=0, set=sb0, wait=-}
-            mbar.test_wait p0, [r4], 0
+            mbar.test_wait p0, [ur4], 0
             bra.uni done {pred=!p0, stall=0, set=-, wait=-}
             mov r9, 1
         done: halt {pred=PT, stall=0, set=-, wait=sb0}
@@ -1461,18 +1481,19 @@ void test_i21_stale_probe_after_wake() {
     const uint64_t t = nanosm::issue_to_dispatch(profile);
     const auto program = [](uint32_t warp1_stall) {
         return R"(
-            sread r29, WARP_ID
+            usread ur15, WARP_ID
+            ur2r r29, ur15
             setp.ne p1, r29, 0
             bra.uni w1 {pred=p1, stall=0, set=-, wait=-}
-            mov r4, 4096
+            umov ur4, 4096
             mov r9, 0
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             bra.uni w0done {pred=!p0, stall=0, set=-, wait=-}
             mov r9, 1
         w0done: halt
-        w1: mov r5, 4176
+        w1: umov ur5, 4176
             mov r10, 0 {pred=PT, stall=)" + std::to_string(warp1_stall) + R"(, set=-, wait=-}
-            mbar.try_wait p2, [r5], 0
+            mbar.try_wait p2, [ur5], 0
             bra.uni w1done {pred=!p2, stall=0, set=-, wait=-}
             mov r10, 1
         w1done: halt
@@ -1480,8 +1501,8 @@ void test_i21_stale_probe_after_wake() {
     };
     const std::vector<std::pair<uint32_t, nanosm::MbarState>> mbars{
         {i2_event_mbar, i21_mbar(1, 0, 64)}, {4176, i21_mbar(1, 1)}};
-    constexpr uint32_t warp0_try_wait = 5 * 8;
-    constexpr uint32_t warp1_try_wait = 11 * 8;
+    constexpr uint32_t warp0_try_wait = 6 * 8;
+    constexpr uint32_t warp1_try_wait = 12 * 8;
     // When warp 0's try_wait issues (independent of the host's event).
     const auto try_wait_issue = [&](uint32_t warps, uint32_t warp1_stall) {
         auto dry = i21_machine(profile, program(warp1_stall), mbars, warps);
@@ -1701,10 +1722,10 @@ void test_i21_acc_ld_read_ownership() {
         std::string body = R"(
             .acc C, 0, 64, 64
             sread r0, LANE_ID
-            mov r8, 0
-            mov r9, 0
-            mov r1, 0
-            mov r2, 1024
+            umov ur8, 0
+            umov ur9, 0
+            umov ur1, 0
+            umov ur2, 1024
         )";
         body += "mov r23, 77\n"; // nonzero: the acc.ld's write of the old (zero) tmem value shows
         for (uint32_t i = 0; i < 6; ++i) body += "setp.eq p" + std::to_string(5 + i % 2) + ", r0, 0\n";
@@ -1716,7 +1737,7 @@ void test_i21_acc_ld_read_ownership() {
             setp.eq p5, r0, 0
             setp.eq p6, r0, 0
             setp.eq p5, r0, 0
-            acc.ld.v8 r16, C, r8 {pred=PT, stall=0, set=sb0, wait=-}
+            acc.ld.v8 r16, C, ur8 {pred=PT, stall=0, set=sb0, wait=-}
         )";
         // One filler per cycle: they rotate over six predicates (I6a: a setp
         // waits until the previous write of its predicate is in the file,
@@ -1724,7 +1745,7 @@ void test_i21_acc_ld_read_ownership() {
         // would issue in pairs five cycles apart).
         for (uint32_t i = 0; i < gap; ++i) body += "setp.eq p" + std::to_string(1 + i % 6) + ", r0, 0\n";
         body += R"(
-            mma.async.init.m64n64k8 C, [r1], [r2] {pred=PT, stall=0, set=sb1, wait=-}
+            mma.async.init.m64n64k8 C, [ur1], [ur2] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )";
         return body;
@@ -1959,19 +1980,19 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
             mov r8, 0
             mov r9, 0
             mov r10, )" + std::to_string(i4_tma_operand(0)) + R"(
-            mov r12, 4104
+            umov ur12, 4104
             sread r0, LANE_ID
             shli r0, r0, 2
             mov r5, 0x777
             sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
             fence.sh
             tma.store [5120], r8, r10
-        wait: mbar.try_wait p0, [r12], 0
+        wait: mbar.try_wait p0, [ur12], 0
             bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )", i4_tma(1024));
         engine->run(); // the sanitizer build: no missing-fence PANIC
-        const uint64_t ge = first + 4 + 2 * distance + 1 + t + 1; // four movs, then as in `one`
+        const uint64_t ge = first + 4 + 2 * distance + 1 + t + 1; // three movs and a umov, then as in `one`
         require(i2_grants(*engine, "A-write").front().cycle == ge && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{ge + d} &&
                 issued_at(*engine, 9 * 8) == std::vector<uint64_t>{ge + 1 + d},
             what + "the TMA store did not follow the fence at the sts's grant + D + 1:" + describe(i2_grants(*engine)) +
@@ -1998,18 +2019,19 @@ void test_i4_missing_fence_panics() {
     const auto program = [](const std::string& before, bool fenced, const std::string& command) {
         return before + (fenced ? "fence.sh\n" : "") + command + R"(
         wait:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait
             halt
         )";
     };
-    // r10: the TMA's address operand (its box at `shared`, completing into 4104).
+    // r10: the TMA's address operand (its box at `shared`, completing into
+    // 4104); ur4: that mbar, for the wait.
     const auto prologue = [](uint32_t shared) {
         return R"(
         mov r8, 0
         mov r9, 0
         mov r10, )" + std::to_string(i4_tma_operand(shared)) + R"(
-        mov r4, 4104
+        umov ur4, 4104
         sread r20, LANE_ID
         shli r20, r20, 2
     )";
@@ -2056,9 +2078,9 @@ void test_i4_missing_fence_panics() {
         write_count_mbar(shmem, 896, 1);
         return std::make_unique<nanosm::Machine>(dense, compile(std::string(R"(
             .acc C, 0, 32, 64
-            mov r0, 0
-            mov r1, 1024
-            mov r4, 896
+            umov ur0, 0
+            umov ur1, 1024
+            umov ur4, 896
             sread r20, LANE_ID
             shli r20, r20, 2
             mov r21, 16384
@@ -2066,20 +2088,20 @@ void test_i4_missing_fence_panics() {
             or r21, r21, r22
             sts [r20], r21
         )") + (fence ? "fence.sh\n" : "") + R"(
-            mma.async.init.m32n64k8 C, [r0], [r1]
-            mma.commit [r4]
+            mma.async.init.m32n64k8 C, [ur0], [ur1]
+            mma.commit [ur4]
         wait:
-            mbar.try_wait p0, [r4], 0
+            mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait
-            mov r8, 0
-            mov r9, 0
-            acc.ld r10, C, r8
+            umov ur8, 0
+            umov ur9, 0
+            acc.ld r10, C, ur8
             halt
         )", dense), std::move(launch));
     };
     message = i4_panic(*mma_machine(false), "sts -> mma.async");
     require_mentions(message, {"reason=missing fence.sh: mma.async #1 A operand bytes [0, 64) overlap this warp's earlier "
-        "sts [r20], r21", "inst='mma.async.init.m32n64k8 ACC0, [r0], [r1]"}, "sts -> mma.async");
+        "sts [r20], r21", "inst='mma.async.init.m32n64k8 ACC0, [ur0], [ur1]"}, "sts -> mma.async");
     auto mma = mma_machine(true);
     mma->run(10000);
     require(nanosm::bits_float(mma->read_reg(0, 0, 10)) == 16.0f, "the fenced MMA did not read the stored 2.0 halves");
@@ -2120,15 +2142,16 @@ void test_i4_cross_warp_race() {
     // TMA's address operand, and the timeline depends only on the bank.)
     const auto two_warps = [](const std::string& access, const std::string& command) {
         return R"(
-            sread r29, WARP_ID
+            usread ur15, WARP_ID
+            ur2r r29, ur15
             setp.ne p6, r29, 0
             bra.uni other {pred=p6, stall=0, set=-, wait=-}
             mov r8, 0
             mov r9, 0
             mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"( {pred=PT, stall=20, set=-, wait=-}
             )" + command + R"( [5120], r8, r10
-            mov r4, 4104
-        wait: mbar.try_wait p0, [r4], 0
+            umov ur4, 4104
+        wait: mbar.try_wait p0, [ur4], 0
             bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
             halt
         other: sread r20, LANE_ID
@@ -2163,26 +2186,27 @@ void test_i4_cross_warp_race() {
     under_way(*machine, message, "A-read");
 
     auto handoff = i4_machine(profile, R"(
-            sread r29, WARP_ID
+            usread ur15, WARP_ID
+            ur2r r29, ur15
             setp.ne p6, r29, 0
             bra.uni producer {pred=p6, stall=0, set=-, wait=-}
             mov r8, 0
             mov r9, 0
             mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"(
-            mov r4, 4104
-            mov r5, 4112
-        ready: mbar.try_wait p0, [r5], 0
+            umov ur4, 4104
+            umov ur5, 4112
+        ready: mbar.try_wait p0, [ur5], 0
             bra.uni ready {pred=!p0, stall=0, set=-, wait=-}
             tma.store [5120], r8, r10
-        stored: mbar.try_wait p0, [r4], 0
+        stored: mbar.try_wait p0, [ur4], 0
             bra.uni stored {pred=!p0, stall=0, set=-, wait=-}
             halt
         producer: sread r20, LANE_ID
             shli r20, r20, 6
             mov r21, 0x66
-            mov r5, 4112
+            umov ur5, 4112
             sts [r20 + 1024], r21 {pred=PT, stall=0, set=sb0, wait=-}
-            mbar.arrive [r5]
+            mbar.arrive [ur5]
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )", [](std::vector<uint8_t>& shmem) {
             i4_tma(1024)(shmem);
@@ -2209,20 +2233,20 @@ void test_i4_read_read_overlap_is_clean() {
     write_count_mbar(shmem, 896, 1);
     nanosm::Machine mma(dense, compile(R"(
         .acc C, 0, 32, 64
-        mov r0, 0
-        mov r1, 1024
-        mov r4, 896
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur4, 896
         sread r20, LANE_ID
         shli r20, r20, 2
         lds r21, [r20]
-        mma.async.init.m32n64k8 C, [r0], [r1]
-        mma.commit [r4]
+        mma.async.init.m32n64k8 C, [ur0], [ur1]
+        mma.commit [ur4]
     wait:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
-        mov r8, 0
-        mov r9, 0
-        acc.ld r10, C, r8
+        umov ur8, 0
+        umov ur9, 0
+        acc.ld r10, C, ur8
         halt
     )", dense), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
     mma.run(10000);
@@ -2238,12 +2262,12 @@ void test_i4_read_read_overlap_is_clean() {
         mov r8, 0
         mov r9, 0
         mov r10, )" + std::to_string(i4_tma_operand(0)) + R"(
-        mov r4, 4104
+        umov ur4, 4104
         sread r20, LANE_ID
         shli r20, r20, 2
         lds r21, [r20] {pred=PT, stall=0, set=sb0, wait=-}
         tma.store [5120], r8, r10
-    wait: mbar.try_wait p0, [r4], 0
+    wait: mbar.try_wait p0, [ur4], 0
         bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )", i4_tma(1024));
@@ -2270,18 +2294,20 @@ void test_i4_read_read_overlap_is_clean() {
 // live-waiter PANICs are gone (backlog D12 / D12.1): C10 is the only check.
 void test_i4_live_mbar_opacity() {
     const auto& profile = canonical_profile();
+    // The mbar's address is ur4; ur2r copies it into r4 for the lanes' addresses.
     const std::string lanes = R"(
         sread r20, LANE_ID
         shli r20, r20, 2
+        ur2r r4, ur4
         add r20, r20, r4
         mov r21, 9
     )";
-    auto message = i4_panic(*i4_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\n" + lanes + "sts [r20], r21\nhalt\n",
+    auto message = i4_panic(*i4_machine(profile, "umov ur4, 4160\nmbar.init [ur4], 1\n" + lanes + "sts [r20], r21\nhalt\n",
         {}, 1, false), "sts onto a live mbar");
     require_mentions(message, {"reason=live mbar opacity: sts writes bytes [4160, 4168) of the live mbar [4160, 4168) "
         "(mbar.init by warp 0 pc 8 at cycle ", "until kernel end only mbar operations may touch it",
         "inst='sts [r20], r21"}, "sts onto a live mbar");
-    auto repurpose = i4_machine(profile, "mov r4, 4160\n" + lanes + "sts [r20], r21\nmbar.init [r4], 1\nhalt\n", {}, 1, false);
+    auto repurpose = i4_machine(profile, "umov ur4, 4160\n" + lanes + "sts [r20], r21\nmbar.init [ur4], 1\nhalt\n", {}, 1, false);
     repurpose->run();
     const auto state = repurpose->read_mbar_state(4160);
     require(state.valid && state.expected == 1 && repurpose->read_shmem_u32(4168) == 9,
@@ -2291,14 +2317,14 @@ void test_i4_live_mbar_opacity() {
         mov r8, 0
         mov r9, 0
         mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"(
-        mov r4, 4104
-        mov r5, 1032
-        mbar.init [r5], 1
+        umov ur4, 4104
+        umov ur5, 1032
+        mbar.init [ur5], 1
     )";
     const std::string load = R"(
         tma.load [5120], r8, r10
     wait:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
         halt
     )";
@@ -2309,12 +2335,12 @@ void test_i4_live_mbar_opacity() {
     message = i4_panic(*i4_machine(profile, placement + load, i4_tma(64), 1, false),
         "TMA load over an mbar.init in flight");
     require_mentions(message, {"reason=missing fence.sh: tma load #0 destination bytes [1032, 1040) overlap this warp's "
-        "earlier mbar.init [r5], 1 (pc 40"}, "TMA load over an mbar.init in flight");
+        "earlier mbar.init [ur5], 1 (pc 40"}, "TMA load over an mbar.init in flight");
 
-    message = i4_panic(*i4_machine(profile, "mov r4, 4160\nmbar.init [r4], 1\nmbar.init [r4], 2\nhalt\n", {}, 1, false),
+    message = i4_panic(*i4_machine(profile, "umov ur4, 4160\nmbar.init [ur4], 1\nmbar.init [ur4], 2\nhalt\n", {}, 1, false),
         "mbar.init over a live mbar");
     require_mentions(message, {"reason=mbar.init over the live mbar [4160, 4168) (mbar.init by warp 0 pc 8 at cycle ",
-        "(v0 has no mbar.inval: an mbar is initialized once per kernel)", "inst='mbar.init [r4], 2"},
+        "(v0 has no mbar.inval: an mbar is initialized once per kernel)", "inst='mbar.init [ur4], 2"},
         "mbar.init over a live mbar");
 }
 
@@ -2343,12 +2369,6 @@ TEST(Shmem, b3_sts_bank_serves_lanes_in_order) {
 // B3: lds.uni composes like lds
 TEST(Shmem, b3_lds_uni_composes_like_lds) {
     test_b3_lds_uni_composes_like_lds();
-}
-
-// B3: lds.uni nonuniform PANIC
-TEST(Shmem, b3_lds_uni_nonuniform_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_b3_lds_uni_nonuniform_panics();
 }
 
 // B3: lds.uni alignment and bounds

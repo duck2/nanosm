@@ -1,5 +1,6 @@
 #include "profile.hpp"
 #include "hash.hpp"
+#include "rf.hpp"
 #include "mma_numeric.hpp"
 
 #include <nlohmann/json.hpp>
@@ -37,6 +38,13 @@ json profile_json(const DeviceProfile& p) {
             {"write_ports_per_bank", p.rf_write_ports_per_bank},
             {"read_latency_cycles", p.rf_read_latency_cycles},
             {"write_depth_cycles", p.rf_write_depth_cycles},
+        }},
+        {"urf", {
+            {"registers", p.urf_registers},
+            {"read_latency_cycles", p.urf_read_latency_cycles},
+            {"write_depth_cycles", p.urf_write_depth_cycles},
+            {"alu_latency_cycles", p.urf_alu_latency_cycles},
+            {"issue_to_port_cycles", p.urf_issue_to_port_cycles},
         }},
         {"shmem", {
             {"bytes", p.shmem_bytes},
@@ -133,6 +141,37 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.rf_read_latency_cycles + longest_execution + p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
         throw ProfileError("device profile: the longest fixed-latency dependency (RF depths and execution) "
             "must fit the five-bit stall field");
+    }
+    // The uniform register file (src/rf.hpp). Its depths are nonzero register
+    // stages; a uniform operand must reach its unit no later than the vector
+    // operands read in the same round (dispatch is issue + 1 + Lr); every
+    // writer presents at issue + L, so L covers the longest writer (r2ur
+    // through the vector RF, or the uniform ALU through the URF) and a
+    // dependent uniform reader, d = L + Wu cycles later, fits the stall field.
+    if (p.urf_registers == 0 || p.urf_registers > 64) {
+        throw ProfileError("device profile: urf registers must be in 1..64");
+    }
+    if (p.urf_read_latency_cycles == 0 || p.urf_read_latency_cycles > 8 ||
+        p.urf_write_depth_cycles == 0 || p.urf_write_depth_cycles > 8 ||
+        p.urf_alu_latency_cycles == 0 || p.urf_alu_latency_cycles > 8) {
+        throw ProfileError("device profile: urf read_latency_cycles, write_depth_cycles and alu_latency_cycles "
+            "must be in 1..8 register stages");
+    }
+    if (p.urf_read_latency_cycles > p.rf_read_latency_cycles) {
+        throw ProfileError("device profile: urf read_latency_cycles (" + std::to_string(p.urf_read_latency_cycles) +
+            ") may not exceed rf read_latency_cycles (" + std::to_string(p.rf_read_latency_cycles) +
+            "): an instruction's uniform operands must reach its unit with its vector operands");
+    }
+    const uint32_t longest_writer = urf_longest_writer_path(p);
+    if (p.urf_issue_to_port_cycles < longest_writer) {
+        throw ProfileError("device profile: urf issue_to_port_cycles (" + std::to_string(p.urf_issue_to_port_cycles) +
+            ") must cover the longest uniform-register writer, " + std::to_string(longest_writer) +
+            " (the issue register + the larger of urf read_latency_cycles + alu_latency_cycles and rf "
+            "read_latency_cycles)");
+    }
+    if (p.urf_issue_to_port_cycles + p.urf_write_depth_cycles > encoding::stall_mask) {
+        throw ProfileError("device profile: a dependent uniform-register read (urf issue_to_port_cycles + "
+            "write_depth_cycles) must fit the five-bit stall field");
     }
     if (p.core_warps == 0 || p.core_warps > 64) {
         throw ProfileError("device profile: core warps must be in 1..64");
@@ -338,6 +377,25 @@ DeviceProfile parse_device_profile(std::string_view source) {
     };
     optional_rf("read_latency_cycles", p.rf_read_latency_cycles);
     optional_rf("write_depth_cycles", p.rf_write_depth_cycles);
+    // The uniform register file: an optional section, each field optional
+    // (absent: the canonical values); present: an integer in [low, high].
+    if (document.contains("urf")) {
+        const auto& urf = document.at("urf");
+        const auto optional_urf = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
+            if (!urf.contains(name)) return;
+            const auto& value = urf.at(name);
+            if (!value.is_number_unsigned() || value < low || value > high) {
+                throw ProfileError(std::string("device profile: urf ") + name + " must be an integer in " +
+                    std::to_string(low) + ".." + std::to_string(high));
+            }
+            out = value.get<uint32_t>();
+        };
+        optional_urf("registers", 1, 64, p.urf_registers);
+        optional_urf("read_latency_cycles", 1, 8, p.urf_read_latency_cycles);
+        optional_urf("write_depth_cycles", 1, 8, p.urf_write_depth_cycles);
+        optional_urf("alu_latency_cycles", 1, 8, p.urf_alu_latency_cycles);
+        optional_urf("issue_to_port_cycles", 1, 30, p.urf_issue_to_port_cycles);
+    }
     const auto& shmem = document.at("shmem");
     p.shmem_bytes = field<uint32_t>(shmem, "bytes");
     p.shmem_banks = field<uint32_t>(shmem, "banks");

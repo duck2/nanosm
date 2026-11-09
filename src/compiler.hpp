@@ -54,6 +54,12 @@ void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
 // accumulator has that shape's rows and columns (qtxc and the assembler
 // apply the same rule per source line).
 void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: every uniform register an instruction names (src/isa.hpp
+// uniform_sources -- a coordinate pair's second register included -- and
+// uniform_destination) is below the profile's urf.registers, else a SimError
+// naming the pc and the instruction (qtxc and the assembler refuse it per
+// source line).
+void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile);
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);

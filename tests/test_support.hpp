@@ -257,7 +257,7 @@ inline nanosm::DeviceProfile fast_bus_profile(uint32_t pluck) {
 // "RF read" samples and "RF write" port presentations).
 inline bool is_issue_event(const nanosm::TimelineEvent& event) {
     return event.category == nanosm::TraceCategory::instruction && event.name != "RF read" &&
-        event.name != "RF write";
+        event.name != "RF write" && event.name != "UR write";
 }
 
 inline std::vector<uint64_t> issued_at(const nanosm::Machine& machine, uint32_t pc) {

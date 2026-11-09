@@ -63,6 +63,7 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         warp.ready_cycle.resize(kernel.register_count, 0);
         warp.read_until.resize(kernel.register_count, 0);
         warp.async_readers.resize(kernel.register_count, 0);
+        warp.uniform_ready_cycle.resize(config.urf_registers, 0);
     }
 }
 
@@ -160,6 +161,28 @@ void Sanitizer::check_rf_waw_war(
             throw_issue_panic(site, "RF WAW hazard: missing stall or depbar wait for r" + std::to_string(reg));
         if (warp.read_until[reg] > earliest_visible || warp.async_readers[reg] != 0)
             throw_issue_panic(site, "RF WAR hazard: pending reader of r" + std::to_string(reg));
+    }
+}
+
+void Sanitizer::record_uniform_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle) {
+    warps_.at(warp).uniform_ready_cycle.at(reg) = visible_cycle;
+}
+
+void Sanitizer::check_uniform_raw(
+    const IssueSite& site, const std::vector<uint8_t>& sources, uint64_t sample_cycle) const {
+    const auto& warp = warps_.at(site.warp);
+    for (const auto reg : sources) {
+        if (warp.uniform_ready_cycle.at(reg) > sample_cycle) {
+            throw_issue_panic(site, "URF RAW hazard: missing stall for ur" + std::to_string(reg));
+        }
+    }
+}
+
+// The younger write lands at visible_cycle - 1, the older at its ready
+// cycle - 1: the younger must be later.
+void Sanitizer::check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t visible_cycle) const {
+    if (warps_.at(site.warp).uniform_ready_cycle.at(dst) >= visible_cycle) {
+        throw_issue_panic(site, "URF WAW hazard: missing stall for ur" + std::to_string(dst));
     }
 }
 

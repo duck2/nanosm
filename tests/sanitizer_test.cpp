@@ -26,7 +26,7 @@ void test_sanitizer_sts_into_tma_store_source() {
         mov r0, 0
         mov r1, 0
     )" + tma_operand_asm(2, 0, 4160) + R"(
-        mov r4, 4160
+        umov ur4, 4160
         tma.store [4096], r0, r2
     )";
     const std::string stage = R"(
@@ -45,7 +45,7 @@ void test_sanitizer_sts_into_tma_store_source() {
     // Control: waiting the store's completion mbar orders the overwrite.
     nanosm::Machine machine(profile, compile(prologue + R"(
     wait:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
     )" + stage), launch_with_store());
     machine.run(20000);
@@ -67,14 +67,14 @@ void test_sanitizer_sts_into_mma_operand_stage() {
         write_count_mbar(shmem, 8192, 1);
         const auto kernel = compile(std::string(R"(
             .acc C, 0, 64, 64
-            mov r0, 0
-            mov r1, 1024
-            mov r2, 2048
-            mov r3, 3072
-            mov r4, 8192
-            mma.async.init.m64n64k8 C, [r0], [r1]
-            mma.commit [r4]
-            mma.async.m64n64k8 C, [r2], [r3]
+            umov ur0, 0
+            umov ur1, 1024
+            umov ur2, 2048
+            umov ur3, 3072
+            umov ur4, 8192
+            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.commit [ur4]
+            mma.async.m64n64k8 C, [ur2], [ur3]
             sread r20, LANE_ID
             shli r20, r20, 2
             addi r20, r20, )") + (queued ? "2048" : "0") + R"(
@@ -113,7 +113,7 @@ void test_sanitizer_lds_from_tma_load_destination() {
         mov r0, 0
         mov r1, 0
     )" + tma_operand_asm(2, 0, 4160) + R"(
-        mov r4, 4160
+        umov ur4, 4160
         sread r20, LANE_ID
         shli r20, r20, 2
         tma.load [4096], r0, r2
@@ -128,7 +128,7 @@ void test_sanitizer_lds_from_tma_load_destination() {
 
     nanosm::Machine machine(profile, compile(prologue + R"(
     wait:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
         lds r21, [r20]
         halt
@@ -153,9 +153,9 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
             mov r0, 0
             mov r1, 0
         )" + tma_operand_asm(2, 0, 4160) + R"(
-            mov r4, 512
+            umov ur4, 512
             tma.load [4096], r0, r2
-            mbar.arrive [r4]
+            mbar.arrive [ur4]
             halt
         )"), std::move(launch), "mbar.arrive inside a TMA load destination");
         require_mentions(message, {"shmem race: mbar.arrive writes mbar bytes [512, 520)",
@@ -173,13 +173,13 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         write_tx_mbar(shmem, 512, 1024);
         const auto message = run_expecting_panic(profile, compile(R"(
             .acc C, 0, 64, 64
-            mov r0, 0
-            mov r1, 1024
+            umov ur0, 0
+            umov ur1, 1024
             mov r8, 0
             mov r9, 0
         )" + tma_operand_asm(10, 2048, 512) + R"(
-            mma.async.init.m64n64k8 C, [r0], [r1]
-            mma.async.m64n64k8 C, [r0], [r1]
+            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.async.m64n64k8 C, [ur0], [ur1]
             tma.load [4096], r8, r10
             halt
         )"), std::move(launch), "engine complete_tx into an MMA operand stage");
@@ -206,12 +206,12 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
     // TMA load accepted over a stage an active MMA reads.
     auto message = run_expecting_panic(profile, compile(R"(
         .acc C, 0, 64, 64
-        mov r0, 0
-        mov r1, 1024
+        umov ur0, 0
+        umov ur1, 1024
         mov r8, 0
         mov r9, 0
     )" + tma_operand_asm(10, 0, 4160) + R"(
-        mma.async.init.m64n64k8 C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
         tma.load [4096], r8, r10
         halt
     )"), launch_with_descriptor(), "TMA load over an active MMA operand");
@@ -221,13 +221,13 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
     // MMA accepted over a pending TMA load destination (the other direction).
     message = run_expecting_panic(profile, compile(R"(
         .acc C, 0, 64, 64
-        mov r0, 0
-        mov r1, 1024
+        umov ur0, 0
+        umov ur1, 1024
         mov r8, 0
         mov r9, 0
     )" + tma_operand_asm(10, 1024, 4168) + R"(
         tma.load [4096], r8, r10
-        mma.async.init.m64n64k8 C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
         halt
     )"), launch_with_descriptor(), "MMA over a pending TMA load destination");
     require_mentions(message, {"shmem race: mma.async #1 B operand bytes [1024, 2048)",
@@ -246,16 +246,16 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
     // Two readers never conflict: a TMA store of an MMA operand stage is legal.
     nanosm::Machine readers(profile, compile(R"(
         .acc C, 0, 64, 64
-        mov r0, 0
-        mov r1, 1024
-        mov r4, 4168
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur4, 4168
         mov r8, 0
         mov r9, 0
     )" + tma_operand_asm(10, 1024, 4168) + R"(
-        mma.async.init.m64n64k8 C, [r0], [r1]
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
         tma.store [4096], r8, r10
     wait:
-        mbar.try_wait p0, [r4], 0
+        mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
         halt
     )"), launch_with_descriptor());
@@ -271,18 +271,18 @@ void test_sanitizer_tmem_ownership_both_directions() {
     };
     const std::string header = R"(
         .acc C, 0, 64, 64
-        mov r0, 0
-        mov r1, 1024
-        mov r8, 0
-        mov r9, 0
-        mov r10, 16
-        mov r11, 0
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur8, 0
+        umov ur9, 0
+        umov ur10, 16
+        umov ur11, 0
     )";
     // C4, new direction: an MMA accepted while an acc.st on its accumulator
     // is still writing tmem.
     auto message = run_expecting_panic(profile, compile(header + R"(
-        acc.st.v8 C, r8, r16
-        mma.async.init.m64n64k8 C, [r0], [r1]
+        acc.st.v8 C, ur8, r16
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.st");
     require_mentions(message, {"tmem race: mma.async #1 on 'C'",
@@ -292,16 +292,16 @@ void test_sanitizer_tmem_ownership_both_directions() {
     // read-ownership ends at the final tmem read (I8: the last beat's tmem
     // sample), not the final RF write.
     message = run_expecting_panic(profile, compile(header + R"(
-        acc.ld.v8 r24, C, r8
-        mma.async.init.m64n64k8 C, [r0], [r1]
+        acc.ld.v8 r24, C, ur8
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.ld");
     require_mentions(message, {"tmem race: mma.async #1 on 'C'", "acc.ld #0",
         "read-owner of 'C' rows [0, 16) cols [0, 8) until its final tmem read"}, "MMA vs acc.ld");
     // Existing direction, same text plus the owner.
     message = run_expecting_panic(profile, compile(header + R"(
-        mma.async.init.m64n64k8 C, [r0], [r1]
-        acc.ld.v8 r24, C, r8
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        acc.ld.v8 r24, C, ur8
         halt
     )"), one_warp(), "acc.ld over accepted MMA work");
     require_mentions(message, {"accumulator transfer races accepted MMA work on 'C' owned by "
@@ -313,21 +313,21 @@ void test_sanitizer_tmem_ownership_both_directions() {
     // without that wait shows the sanitizer's diagnosis.
     const std::string hand_header = R"(
         .acc C, 0, 64, 64
-        mov r8, 0
-        mov r9, 0
-        mov r10, 16
-        mov r11, 0
+        umov ur8, 0
+        umov ur9, 0
+        umov ur10, 16
+        umov ur11, 0
     )";
     message = run_expecting_panic(profile, hand_assemble(i1_asm(profile, hand_header + R"(
-        acc.st.v8 C, r8, r16 {pred=PT, stall=0, set=sb0, wait=-}
-        acc.ld.v8 r24, C, r8 {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 C, ur8, r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp(), "acc.ld over an in-flight acc.st");
     require_mentions(message, {"tmem race: acc.ld reads 'C' rows [0, 16) cols [0, 8)",
         "overlapping acc.st #0", "wait that transfer's depbar sb"}, "acc.ld vs acc.st");
     message = run_expecting_panic(profile, hand_assemble(i1_asm(profile, hand_header + R"(
-        acc.ld.v8 r24, C, r8 {pred=PT, stall=0, set=sb1, wait=-}
-        acc.st.v8 C, r8, r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 C, ur8, r16 {pred=PT, stall=0, set=sb0, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp(), "acc.st over an in-flight acc.ld");
     require_mentions(message, {"tmem race: acc.st writes 'C' rows [0, 16) cols [0, 8)",
@@ -335,8 +335,8 @@ void test_sanitizer_tmem_ownership_both_directions() {
     // Disjoint rows: concurrent, legal, and exact.
     nanosm::Machine disjoint(profile, hand_assemble(i1_asm(profile, hand_header + R"(
         mov r16, 41
-        acc.st.v8 C, r10, r16 {pred=PT, stall=0, set=sb0, wait=-}
-        acc.ld.v8 r24, C, r8 {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 C, ur10, r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp());
     disjoint.run(2000);
@@ -367,43 +367,43 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             mov r9, 0
         )" + tma_operand_asm(10, 0, 8192) + tma_operand_asm(13, 1024, 8192) +
             tma_operand_asm(25, 2048, 8200) + tma_operand_asm(28, 3072, 8200) + R"(
-            mov r2, 8192
-            mov r3, 8200
-            mov r4, 8208
-            mbar.arrive.expect_tx [r2], 2048
+            umov ur2, 8192
+            umov ur3, 8200
+            umov ur4, 8208
+            mbar.arrive.expect_tx [ur2], 2048
             tma.load [4096], r8, r10
             tma.load [4096], r8, r13
         L0:
-            mbar.try_wait p1, [r2], 0
+            mbar.try_wait p1, [ur2], 0
             @!p1 bra.uni L0
-            mov r0, 0
-            mov r1, 1024
-            mma.async.init.m64n64k8 C, [r0], [r1]
-            mbar.arrive.expect_tx [r3], 2048
+            umov ur0, 0
+            umov ur1, 1024
+            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mbar.arrive.expect_tx [ur3], 2048
             tma.load [4096], r8, r25
             tma.load [4096], r8, r28
         L1:
-            mbar.try_wait p1, [r3], 0
+            mbar.try_wait p1, [ur3], 0
             @!p1 bra.uni L1
-            mov r0, 2048
-            mov r1, 3072
-            mma.async.m64n64k8 C, [r0], [r1]
-            mbar.arrive.expect_tx [r2], 2048
+            umov ur0, 2048
+            umov ur1, 3072
+            mma.async.m64n64k8 C, [ur0], [ur1]
+            mbar.arrive.expect_tx [ur2], 2048
             tma.load [4096], r8, r10
             tma.load [4096], r8, r13
         L2:
-            mbar.try_wait p1, [r2], 1
+            mbar.try_wait p1, [ur2], 1
             @!p1 bra.uni L2
-            mov r0, 0
-            mov r1, 1024
-            mma.async.m64n64k8 C, [r0], [r1]
-            mma.commit [r4]
+            umov ur0, 0
+            umov ur1, 1024
+            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.commit [ur4]
         L3:
-            mbar.try_wait p1, [r4], 0
+            mbar.try_wait p1, [ur4], 0
             @!p1 bra.uni L3
-            mov r12, 0
-            mov r13, 0
-            acc.ld.v8 r16, C, r12
+            umov ur12, 0
+            umov ur13, 0
+            acc.ld.v8 r16, C, ur12
             halt
         )"), std::move(launch), {.timeline = true});
         machine.run(50000);
@@ -437,9 +437,10 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         write_count_mbar(shmem, 8200, 1);
         nanosm::Machine machine(profile, compile(R"(
             .acc C, 0, 64, 64
-            mov r10, 8192
-            mov r11, 8200
-            sread r0, WARP_ID
+            umov ur10, 8192
+            umov ur11, 8200
+            usread ur0, WARP_ID
+            ur2r r0, ur0
             setp.eq p0, r0, 0
             @p0 bra.uni ISSUER
             sread r20, LANE_ID
@@ -454,9 +455,9 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             addi r25, r25, 64
             setp.lt p1, r25, 1024
             @p1 bra.uni FILL1
-            mbar.arrive [r10]
+            mbar.arrive [ur10]
         DONE0:
-            mbar.try_wait p1, [r11], 0
+            mbar.try_wait p1, [ur11], 0
             @!p1 bra.uni DONE0
             mov r21, 16384
             shli r22, r21, 16
@@ -468,30 +469,30 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             addi r25, r25, 64
             setp.lt p1, r25, 1024
             @p1 bra.uni FILL2
-            mbar.arrive [r10]
+            mbar.arrive [ur10]
             halt
         ISSUER:
-            mov r0, 0
-            mov r1, 1024
+            umov ur0, 0
+            umov ur1, 1024
         READY0:
-            mbar.try_wait p1, [r10], 0
+            mbar.try_wait p1, [ur10], 0
             @!p1 bra.uni READY0
-            mma.async.init.m64n64k8 C, [r0], [r1]
-            mma.commit [r11]
+            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.commit [ur11]
         WAIT0:
-            mbar.try_wait p1, [r11], 0
+            mbar.try_wait p1, [ur11], 0
             @!p1 bra.uni WAIT0
         READY1:
-            mbar.try_wait p1, [r10], 1
+            mbar.try_wait p1, [ur10], 1
             @!p1 bra.uni READY1
-            mma.async.m64n64k8 C, [r0], [r1]
-            mma.commit [r11]
+            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.commit [ur11]
         WAIT1:
-            mbar.try_wait p1, [r11], 1
+            mbar.try_wait p1, [ur11], 1
             @!p1 bra.uni WAIT1
-            mov r12, 0
-            mov r13, 0
-            acc.ld.v8 r16, C, r12
+            umov ur12, 0
+            umov ur13, 0
+            acc.ld.v8 r16, C, ur12
             halt
         )"), std::move(launch));
         machine.run(50000);

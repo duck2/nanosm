@@ -4,12 +4,16 @@
 ; See fa.launch.py for descriptors, constants, independent reference and census.
 ;
 ; Worker registers:
-; r1 row, r2 staged-output barrier, r3 stats pointer, r4/r5 P addresses,
-; r6 block/parity, r8 constants, r9 log2(e)/8, r10 running max, r11 denominator,
-; r12 new max, r13 alpha/inverse, r14 block sum, r15 scratch, r16..23 eight-column
-; chunk, r24..29 reduction/coefficient/packing scratch, r30/r31 O staging
-; addresses (even/odd columns), r32/r33 TMEM row/column, r34 score-ready,
-; r35 workers-done, r37 PV-done (OUTPUT_DONE, the PV commit barrier).
+; r1 row, r2 column loop counter (the loop's setp), r3 stats pointer, r4/r5
+; P addresses, r6 block (the loop's setp), r7 P base, r9 log2(e)/8, r10
+; running max, r11 denominator, r12 new max, r13 alpha/inverse, r14 block
+; sum, r15 scratch, r16..23 eight-column chunk, r24..29
+; reduction/coefficient/packing scratch, r30/r31 O staging addresses
+; (even/odd columns).
+; Worker uniform registers: ur0/ur1 TMEM row/column (the acc coordinate
+; pair), ur2 constants, ur3 score-ready, ur4 workers-done, ur5 PV-done
+; (OUTPUT_DONE, the PV commit barrier), ur6 block parity, ur7 staged-output
+; barrier.
 
 .acc S, 0, 64, 64
 .acc O, 4096, 64, 64
@@ -43,44 +47,47 @@
 .equ ODESC,      49984
 .equ STATS,      50176
 
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r  r0, ur0
         setp.eq p0, r0, 0
 @p0     bra.uni ISSUER
 
 ; ---- row workers ----
-        sread r32, WARP_ID
-        addi  r32, r32, -1
-        shli  r32, r32, 4
+        uaddi ur0, ur0, -1
+        ushli ur0, ur0, 4          ; TMEM row base: 16 * (warp - 1)
         sread r0, LANE_ID
-        add   r1, r0, r32
+        ur2r  r1, ur0
+        add   r1, r0, r1           ; row
         shli  r3, r1, 2
         addi  r3, r3, STATS
-        mov   r8, CONSTANTS
-        lds.uni r9, [r8]
-        lds.uni r10, [r8+4]        ; -infinity
+        umov  ur2, CONSTANTS
+        lds.uni r9, [ur2]
+        lds.uni r10, [ur2+4]       ; -infinity
         mov   r11, 0              ; denominator = 0.0
         mov   r6, 0
-        mov   r34, SCORE_DONE
-        mov   r35, WORK_DONE
-        mov   r37, OUTPUT_DONE
+        umov  ur6, 0
+        umov  ur3, SCORE_DONE
+        umov  ur4, WORK_DONE
+        umov  ur5, OUTPUT_DONE
 ; P pair-zero base for this row, computed in-kernel: PBUF + 16*row + 4*((row>>2)&1).
-        shli  r36, r1, 4
+        shli  r7, r1, 4
         shri  r26, r1, 2
         andi  r26, r26, 1
         shli  r26, r26, 2
-        add   r36, r36, r26
-        addi  r36, r36, PBUF
+        add   r7, r7, r26
+        addi  r7, r7, PBUF
 
 WORK_BLOCK:
 S_READY:
-        mbar.try_wait p1, [r34], r6
+        mbar.try_wait p1, [ur3], ur6
 @!p1    bra.uni S_READY
 
 ; Pass 1: row max. Keep only eight scores resident, not a whole row.
-        lds.uni r12, [r8+4]
-        mov   r33, 0
+        lds.uni r12, [ur2+4]
+        umov  ur1, 0
+        mov   r2, 0
 ROW_MAX:
-        acc.ld.v8 r16, S, r32
+        acc.ld.v8 r16, S, ur0
         fmax  r24, r16, r17
         fmax  r25, r18, r19
         fmax  r26, r20, r21
@@ -89,8 +96,9 @@ ROW_MAX:
         fmax  r29, r26, r27
         fmax  r28, r28, r29
         fmax  r12, r12, r28
-        addi  r33, r33, 8
-        setp.lt p2, r33, 64
+        uaddi ur1, ur1, 8
+        addi  r2, r2, 8
+        setp.lt p2, r2, 64
 @p2     bra.uni ROW_MAX
 
 ; Positive scale lets max commute with score scaling. Maxima use base-2 units.
@@ -101,12 +109,13 @@ ROW_MAX:
         ex2   r13, r13             ; alpha = 2^(old_max - new_max)
         addi  r10, r12, 0
         mov   r14, 0
-        mov   r33, 0
-        addi  r4, r36, 0           ; pair-zero address for this row, chunk zero
+        umov  ur1, 0
+        mov   r2, 0
+        addi  r4, r7, 0           ; pair-zero address for this row, chunk zero
 
 ; Pass 2: exp(score - max), FP32 row sum, packed-half P in MMA's A layout.
 MAKE_P:
-        acc.ld.v8 r16, S, r32
+        acc.ld.v8 r16, S, ur0
         addi  r24, r9, 0
         addi  r25, r9, 0
         fmul  r16, r16, r24
@@ -155,8 +164,9 @@ MAKE_P:
         cvt.pack.f16x2 r27, r22, r23
         sts   [r5], r27
         addi  r4, r4, 1024
-        addi  r33, r33, 8
-        setp.lt p2, r33, 64
+        uaddi ur1, ur1, 8
+        addi  r2, r2, 8
+        setp.lt p2, r2, 64
 @p2     bra.uni MAKE_P
 
         fmul  r11, r11, r13
@@ -170,11 +180,12 @@ MAKE_P:
 @p2     bra.uni P_READY           ; first PV uses init; never read uninitialized O
 
 ; Correct the old FP32 numerator BEFORE accumulating this block's PV.
-        mov   r33, 0
+        umov  ur1, 0
+        mov   r2, 0
         addi  r24, r13, 0
         addi  r25, r13, 0
 CORRECT_O:
-        acc.ld.v8 r16, O, r32
+        acc.ld.v8 r16, O, ur0
         fmul  r16, r16, r24
         fmul  r17, r17, r24
         fmul  r18, r18, r25
@@ -183,17 +194,19 @@ CORRECT_O:
         fmul  r21, r21, r25
         fmul  r22, r22, r24
         fmul  r23, r23, r24
-        acc.st.v8 O, r32, r16
-        addi  r33, r33, 8
-        setp.lt p2, r33, 64
+        acc.st.v8 O, ur0, r16
+        uaddi ur1, ur1, 8
+        addi  r2, r2, 8
+        setp.lt p2, r2, 64
 @p2     bra.uni CORRECT_O
 
 P_READY:
-        mbar.arrive [r35]         ; qtxc waits for this warp's sts + acc.st depbar
+        mbar.arrive [ur4]         ; qtxc waits for this warp's sts + acc.st depbar
 PV_READY:
-        mbar.try_wait p1, [r37], r6
+        mbar.try_wait p1, [ur5], ur6
 @!p1    bra.uni PV_READY
         addi  r6, r6, 1
+        uaddi ur6, ur6, 1
         setp.lt p2, r6, 2
 @p2     bra.uni WORK_BLOCK
 
@@ -209,7 +222,8 @@ PV_READY:
         rcp   r13, r11
         addi  r24, r13, 0
         addi  r25, r13, 0
-        mov   r33, 0
+        umov  ur1, 0
+        mov   r2, 0
         shli  r30, r1, 4
         shri  r26, r1, 2
         andi  r26, r26, 1
@@ -217,9 +231,9 @@ PV_READY:
         add   r30, r30, r26
         addi  r30, r30, OSTAGE    ; even-column base for chunk 0
         xori  r31, r30, 4         ; odd-column base for chunk 0
-        mov   r2, OSTAGE_DONE
+        umov  ur7, OSTAGE_DONE
 NORMALIZE:
-        acc.ld.v8 r16, O, r32
+        acc.ld.v8 r16, O, ur0
         fmul  r16, r16, r24
         fmul  r17, r17, r24
         fmul  r26, r18, r25
@@ -238,39 +252,45 @@ NORMALIZE:
         sts   [r31+1032], r23     ; col c+7
         addi  r30, r30, 2048
         addi  r31, r31, 2048
-        addi  r33, r33, 8
-        setp.lt p2, r33, 64
+        uaddi ur1, ur1, 8
+        addi  r2, r2, 8
+        setp.lt p2, r2, 64
 @p2     bra.uni NORMALIZE
 
-        mbar.arrive [r2]          ; qtxc waits for this warp's sts depbar
+        mbar.arrive [ur7]         ; qtxc waits for this warp's sts depbar
         halt
 
 ; ---- issuer: two unrolled blocks; block 1's inputs prefetch under block 0 ----
 ISSUER:
+; Issuer uniform registers: ur0 / ur1 the MMA A / B addresses, ur2
+; INPUT_DONE, ur3 SCORE_DONE, ur4 WORK_DONE, ur5 OUTPUT_DONE, ur6 OSTAGE_DONE,
+; ur7 OSTORE_DONE. The TMA operands stay vector registers (in this slice TMA
+; still reads lane 0 of vector registers).
 ; TMA address operands (src/tma.hpp), one per command: the destination / 64
 ; in bits 31:16 (the shli by 10 of its 64-byte-aligned address) and the
 ; completion mbar / 8 in bits 15:0; in RF bank 1 (register mod 3 == 1) beside
 ; the coordinates r8 / r9. The barrier and coordinate movs fill the operand
 ; build's dependency gaps; stage set 1's operands and the output store's are
 ; built while the prologue lands.
-        mov   r2, INPUT_DONE
+        umov  ur2, INPUT_DONE
+        mov   r24, INPUT_DONE
         mov   r10, QBUF
         mov   r13, KBUF0
         mov   r16, VBUF0
-        mov   r3, SCORE_DONE
-        mov   r4, WORK_DONE
-        shri  r24, r2, 3
+        umov  ur3, SCORE_DONE
+        umov  ur4, WORK_DONE
+        shri  r24, r24, 3
         shli  r10, r10, 10
         shli  r13, r13, 10
         shli  r16, r16, 10
-        mov   r5, OUTPUT_DONE
+        umov  ur5, OUTPUT_DONE
         mov   r8, 0
         mov   r9, 0
         or    r10, r10, r24
         or    r13, r13, r24
         or    r16, r16, r24
 ; Prologue: Q and block 0's K/V land together — one barrier round trip.
-        mbar.arrive.expect_tx [r2], 24576
+        mbar.arrive.expect_tx [ur2], 24576
         tma.load [QDESC], r8, r10
         tma.load [KDESC], r8, r13
         tma.load [VDESC], r8, r16
@@ -286,138 +306,138 @@ ISSUER:
         or    r22, r22, r24
         or    r25, r25, r26
 IN0:
-        mbar.try_wait p1, [r2], 0
+        mbar.try_wait p1, [ur2], 0
 @!p1    bra.uni IN0
 ; Prefetch block 1 into stage set 1: port A fills while MMA reads set 0.
         mov   r9, 64
-        mbar.arrive.expect_tx [r2], 16384
+        mbar.arrive.expect_tx [ur2], 16384
         tma.load [KDESC], r8, r19
         tma.load [VDESC], r8, r22
         mov   r9, 0
 
-        mov   r0, QBUF
-        mov   r1, KBUF0
-        mma.async.init.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        mma.commit [r3]
+        umov  ur0, QBUF
+        umov  ur1, KBUF0
+        mma.async.init.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        mma.commit [ur3]
 W0:
-        mbar.try_wait p1, [r4], 0
+        mbar.try_wait p1, [ur4], 0
 @!p1    bra.uni W0
 
-        mov   r0, PBUF
-        mov   r1, VBUF0
-        mma.async.init.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        mma.commit [r5]
+        umov  ur0, PBUF
+        umov  ur1, VBUF0
+        mma.async.init.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        mma.commit [ur5]
 ; Block 1: data long since prefetched; QK(1) queues behind PV(0)'s commit
 ; fence and the engine flows through with no issuer round trip.
 IN1:
-        mbar.try_wait p1, [r2], 1
+        mbar.try_wait p1, [ur2], 1
 @!p1    bra.uni IN1
-        mov   r0, QBUF
-        mov   r1, KBUF1
-        mma.async.init.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 S, [r0], [r1]
-        mma.commit [r3]
+        umov  ur0, QBUF
+        umov  ur1, KBUF1
+        mma.async.init.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 S, [ur0], [ur1]
+        mma.commit [ur3]
 W1:
-        mbar.try_wait p1, [r4], 1
+        mbar.try_wait p1, [ur4], 1
 @!p1    bra.uni W1
-        mov   r0, PBUF
-        mov   r1, VBUF1
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        addi r0, r0, 1024
-        addi r1, r1, 1024
-        mma.async.m64n64k8 O, [r0], [r1]
-        mma.commit [r5]
+        umov  ur0, PBUF
+        umov  ur1, VBUF1
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        uaddi ur0, ur0, 1024
+        uaddi ur1, ur1, 1024
+        mma.async.m64n64k8 O, [ur0], [ur1]
+        mma.commit [ur5]
 ; Epilogue: the four workers stage normalized O (16 KiB) into OSTAGE; one TMA
 ; store writes it to gmem. The store's mbar certifies that the shmem source
 ; was consumed; the kernel-end drain retires the gmem writes.
-        mov   r6, OSTAGE_DONE
+        umov  ur6, OSTAGE_DONE
 STAGED:
-        mbar.try_wait p1, [r6], 0
+        mbar.try_wait p1, [ur6], 0
 @!p1    bra.uni STAGED
-        mov   r7, OSTORE_DONE
-        mbar.arrive.expect_tx [r7], 16384
+        umov  ur7, OSTORE_DONE
+        mbar.arrive.expect_tx [ur7], 16384
         tma.store [ODESC], r8, r25
 STORED:
-        mbar.try_wait p1, [r7], 0
+        mbar.try_wait p1, [ur7], 0
 @!p1    bra.uni STORED
         halt

@@ -12,6 +12,10 @@ std::string reg(uint8_t value) {
     return "r" + std::to_string(value);
 }
 
+std::string ureg(uint8_t value) {
+    return "ur" + std::to_string(value);
+}
+
 std::string special_name(int32_t value) {
     switch (static_cast<SpecialReg>(value)) {
     case SpecialReg::lane_id: return "LANE_ID";
@@ -22,12 +26,16 @@ std::string special_name(int32_t value) {
     return "SPECIAL(" + std::to_string(value) + ")";
 }
 
-std::string address(uint8_t base, int32_t offset) {
+std::string address(const std::string& base, int32_t offset) {
     if (offset == 0) {
-        return "[" + reg(base) + "]";
+        return "[" + base + "]";
     }
-    return "[" + reg(base) + (offset > 0 ? " + " : " - ") +
+    return "[" + base + (offset > 0 ? " + " : " - ") +
         std::to_string(offset > 0 ? offset : -offset) + "]";
+}
+
+std::string address(uint8_t base, int32_t offset) {
+    return address(reg(base), offset);
 }
 
 } // namespace
@@ -175,6 +183,38 @@ uint64_t encode(const Instruction& inst) {
         break;
     case Opcode::bra:
     case Opcode::bra_uni:
+        word |= immediate;
+        break;
+    case Opcode::umov:
+    case Opcode::r2ur:
+    case Opcode::ur2r:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        break;
+    case Opcode::umovi:
+    case Opcode::usread:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= immediate;
+        break;
+    case Opcode::uadd:
+    case Opcode::usub:
+    case Opcode::ushl:
+    case Opcode::ushr:
+    case Opcode::uand:
+    case Opcode::uor:
+    case Opcode::uxor:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        break;
+    case Opcode::uaddi:
+    case Opcode::ushli:
+    case Opcode::ushri:
+    case Opcode::uandi:
+    case Opcode::uori:
+    case Opcode::uxori:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
         break;
     case Opcode::fence_sh:
@@ -332,11 +372,90 @@ Instruction decode(uint64_t word) {
     case Opcode::bra_uni:
         inst.imm = static_cast<int32_t>(immediate);
         break;
+    case Opcode::umov:
+    case Opcode::r2ur:
+    case Opcode::ur2r:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        break;
+    case Opcode::umovi:
+    case Opcode::usread:
+        inst.dst = reg0;
+        inst.imm = static_cast<int32_t>(immediate);
+        break;
+    case Opcode::uadd:
+    case Opcode::usub:
+    case Opcode::ushl:
+    case Opcode::ushr:
+    case Opcode::uand:
+    case Opcode::uor:
+    case Opcode::uxor:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.src1 = reg2;
+        break;
+    case Opcode::uaddi:
+    case Opcode::ushli:
+    case Opcode::ushri:
+    case Opcode::uandi:
+    case Opcode::uori:
+    case Opcode::uxori:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.imm = static_cast<int32_t>(immediate);
+        break;
     case Opcode::fence_sh:
     case Opcode::halt:
         break;
     }
     return inst;
+}
+
+std::vector<uint8_t> uniform_sources(const Instruction& inst) {
+    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
+    switch (inst.opcode) {
+    case Opcode::umov:
+    case Opcode::uaddi:
+    case Opcode::ushli:
+    case Opcode::ushri:
+    case Opcode::uandi:
+    case Opcode::uori:
+    case Opcode::uxori:
+    case Opcode::ur2r:
+    case Opcode::lds_uni:
+    case Opcode::ldg_uni:
+    case Opcode::mbar_init_i:
+    case Opcode::mbar_arrive:
+    case Opcode::mbar_arrive_expect_tx_i:
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_try_wait_i:
+    case Opcode::mma_commit: return {inst.src0};
+    case Opcode::uadd:
+    case Opcode::usub:
+    case Opcode::ushl:
+    case Opcode::ushr:
+    case Opcode::uand:
+    case Opcode::uor:
+    case Opcode::uxor:
+    case Opcode::atom_add_uni:
+    case Opcode::atom_and_uni:
+    case Opcode::atom_xor_uni:
+    case Opcode::atom_exch_uni:
+    case Opcode::mbar_init_r:
+    case Opcode::mbar_arrive_expect_tx_r:
+    case Opcode::mbar_test_wait_r:
+    case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8: return {inst.src1, static_cast<uint8_t>(inst.src1 + 1)};
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
+    default: return {};
+    }
+}
+
+std::optional<uint8_t> uniform_destination(const Instruction& inst) {
+    if (writes_uniform_register(inst.opcode)) return inst.dst;
+    return std::nullopt;
 }
 
 std::string mma_shape_name(const MmaShape& shape) {
@@ -439,6 +558,24 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::atom_exch_uni: return "atom.exch.uni";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
+    case Opcode::umov:
+    case Opcode::umovi: return "umov";
+    case Opcode::uadd: return "uadd";
+    case Opcode::uaddi: return "uaddi";
+    case Opcode::usub: return "usub";
+    case Opcode::ushl: return "ushl";
+    case Opcode::ushr: return "ushr";
+    case Opcode::ushli: return "ushli";
+    case Opcode::ushri: return "ushri";
+    case Opcode::uand: return "uand";
+    case Opcode::uor: return "uor";
+    case Opcode::uxor: return "uxor";
+    case Opcode::uandi: return "uandi";
+    case Opcode::uori: return "uori";
+    case Opcode::uxori: return "uxori";
+    case Opcode::usread: return "usread";
+    case Opcode::r2ur: return "r2ur";
+    case Opcode::ur2r: return "ur2r";
     case Opcode::halt: return "halt";
     }
     std::ostringstream out;
@@ -477,8 +614,8 @@ std::string format_instruction(
     std::ostringstream out;
     out << opcode_name(inst.opcode, mma_shapes);
     if (is_mma_async(inst.opcode)) {
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
-            << "], [" << reg(inst.src1) << ']';
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
+            << "], [" << ureg(inst.src1) << ']';
         if (include_control) out << ' ' << format_control(inst.control);
         return out.str();
     }
@@ -529,29 +666,29 @@ std::string format_instruction(
             << ", " << inst.imm;
         break;
     case Opcode::mbar_init_i:
-        out << " [" << reg(inst.src0) << "], " << inst.imm;
+        out << " [" << ureg(inst.src0) << "], " << inst.imm;
         break;
     case Opcode::mbar_init_r:
-        out << " [" << reg(inst.src0) << "], " << reg(inst.src1);
+        out << " [" << ureg(inst.src0) << "], " << ureg(inst.src1);
         break;
     case Opcode::mbar_arrive:
-        out << " [" << reg(inst.src0) << ']';
+        out << " [" << ureg(inst.src0) << ']';
         break;
     case Opcode::mbar_arrive_expect_tx_i:
-        out << " [" << reg(inst.src0) << "], " << inst.imm;
+        out << " [" << ureg(inst.src0) << "], " << inst.imm;
         break;
     case Opcode::mbar_arrive_expect_tx_r:
-        out << " [" << reg(inst.src0) << "], " << reg(inst.src1);
+        out << " [" << ureg(inst.src0) << "], " << ureg(inst.src1);
         break;
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_try_wait_i:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
+        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
             << "], " << inst.imm;
         break;
     case Opcode::mbar_test_wait_r:
     case Opcode::mbar_try_wait_r:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << reg(inst.src0)
-            << "], " << reg(inst.src1);
+        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
+            << "], " << ureg(inst.src1);
         break;
     case Opcode::tma_load:
     case Opcode::tma_store:
@@ -560,15 +697,45 @@ std::string format_instruction(
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
         out << ' ' << reg(inst.dst) << ", ACC" << static_cast<unsigned>(inst.src0)
-            << ", " << reg(inst.src1);
+            << ", " << ureg(inst.src1);
         break;
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0)
             << ", " << reg(inst.src1);
         break;
     case Opcode::mma_commit:
-        out << " [" << reg(inst.src0) << ']';
+        out << " [" << ureg(inst.src0) << ']';
+        break;
+    case Opcode::umov:
+    case Opcode::r2ur:
+        out << ' ' << ureg(inst.dst) << ", " << (inst.opcode == Opcode::umov ? ureg(inst.src0) : reg(inst.src0));
+        break;
+    case Opcode::ur2r:
+        out << ' ' << reg(inst.dst) << ", " << ureg(inst.src0);
+        break;
+    case Opcode::umovi:
+        out << ' ' << ureg(inst.dst) << ", " << inst.imm;
+        break;
+    case Opcode::usread:
+        out << ' ' << ureg(inst.dst) << ", " << special_name(inst.imm);
+        break;
+    case Opcode::uadd:
+    case Opcode::usub:
+    case Opcode::ushl:
+    case Opcode::ushr:
+    case Opcode::uand:
+    case Opcode::uor:
+    case Opcode::uxor:
+        out << ' ' << ureg(inst.dst) << ", " << ureg(inst.src0) << ", " << ureg(inst.src1);
+        break;
+    case Opcode::uaddi:
+    case Opcode::ushli:
+    case Opcode::ushri:
+    case Opcode::uandi:
+    case Opcode::uori:
+    case Opcode::uxori:
+        out << ' ' << ureg(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
         break;
     case Opcode::addi:
     case Opcode::shli:
@@ -581,9 +748,11 @@ std::string format_instruction(
     case Opcode::lds:
     case Opcode::ldg:
     case Opcode::ldg_v8:
+        out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm);
+        break;
     case Opcode::ldg_uni:
     case Opcode::lds_uni:
-        out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm);
+        out << ' ' << reg(inst.dst) << ", " << address(ureg(inst.src0), inst.imm);
         break;
     case Opcode::sts:
     case Opcode::stg:
@@ -594,7 +763,7 @@ std::string format_instruction(
     case Opcode::atom_and_uni:
     case Opcode::atom_xor_uni:
     case Opcode::atom_exch_uni:
-        out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm) << ", " << reg(inst.src1);
+        out << ' ' << reg(inst.dst) << ", " << address(ureg(inst.src0), inst.imm) << ", " << ureg(inst.src1);
         break;
     case Opcode::bra:
     case Opcode::bra_uni:
@@ -627,6 +796,9 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::shli:
     case Opcode::shri:
     case Opcode::xori:
+    // ur2r: its uniform operand, sampled with the round at issue + 1, rides
+    // the vector arithmetic pipeline to the RF write port like mov.
+    case Opcode::ur2r:
         return timing.alu;
     case Opcode::fadd:
     // The new float ops ride the FPU pipeline: fsub is fadd with a negation,
@@ -686,6 +858,26 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::atom_xor_uni:
     case Opcode::atom_exch_uni:
     case Opcode::halt:
+        return 0;
+    // The uniform register writers are not vector arithmetic: they present at
+    // the URF write port urf.issue_to_port_cycles after issue (src/rf.hpp).
+    case Opcode::umov:
+    case Opcode::umovi:
+    case Opcode::uadd:
+    case Opcode::uaddi:
+    case Opcode::usub:
+    case Opcode::ushl:
+    case Opcode::ushr:
+    case Opcode::ushli:
+    case Opcode::ushri:
+    case Opcode::uand:
+    case Opcode::uor:
+    case Opcode::uxor:
+    case Opcode::uandi:
+    case Opcode::uori:
+    case Opcode::uxori:
+    case Opcode::usread:
+    case Opcode::r2ur:
         return 0;
     }
     throw SimError("latency requested for unknown opcode");

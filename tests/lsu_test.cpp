@@ -192,7 +192,8 @@ void test_lsu_rf_writes_are_full_width_beats() {
     auto& image = image_bytes(launch.gmem_image, 1024);
     fill_pattern(image, 0, 256, 0);
     nanosm::Machine machine(config, compile(R"(
-        sread r0, WARP_ID
+        usread ur0, WARP_ID
+        ur2r r0, ur0
         shli r0, r0, 9
         ldg.v8 r8, [r0]
         halt
@@ -244,15 +245,16 @@ void test_lsu_contract_panics() {
         nanosm::Machine machine(config, compile(text, config), std::move(launch));
         expect_sim_panic(machine, needle, what);
     };
-    // (The non-uniform bases moved to "uniformity: hardware uses lane 0":
-    // since I1 they are sanitizer panics, and this test runs in both builds.)
+    // (The non-uniform ldg.v8 / stg.v8 bases moved to "uniformity: hardware
+    // uses lane 0": since I1 they are sanitizer panics, and this test runs in
+    // both builds. ldg.uni's base is a uniform register.)
     run("mov r0, 32\nldg.v8 r8, [r0]\nhalt\n", 4096,
         "ldg.v8 address 32 is not 64-byte aligned", "rA = 32 mod 64 ldg.v8");
     run("mov r0, 64\nstg.v8 [r0 + 32], r8\nhalt\n", 4096,
         "stg.v8 address 96 is not 64-byte aligned", "rA + imm = 32 mod 64 stg.v8");
     run("sread r0, LANE_ID\nshli r0, r0, 2\nldg r1, [r0 + 2]\nhalt\n", 4096,
         "unaligned 32-bit gmem access", "2-byte aligned scalar ldg");
-    run("mov r0, 6\nldg.uni r1, [r0]\nhalt\n", 4096,
+    run("umov ur0, 6\nldg.uni r1, [ur0]\nhalt\n", 4096,
         "unaligned 32-bit gmem access", "2-byte aligned ldg.uni");
     run("mov r0, 576\nldg.v8 r8, [r0]\nhalt\n", 1024, "out of bounds", "out-of-bounds ldg.v8 block");
 }
@@ -372,7 +374,7 @@ void test_lsu_gather_requests() {
         ldg r10, [r12 + 8192]
     )", 16, [](uint32_t lane) { return (8192 + 4 * (lane & 7)) / 4; });
     // The same word for every lane, declared: one request, fanned out.
-    gather("mov r0, 0\nldg.uni r10, [r0 + 8200]\n", 1, [](uint32_t) { return 8200 / 4; });
+    gather("umov ur0, 0\nldg.uni r10, [ur0 + 8200]\n", 1, [](uint32_t) { return 8200 / 4; });
 }
 
 // (d) Scatters: sixteen masked sector writes; byte enables keep every
@@ -427,7 +429,8 @@ void test_lsu_staging_pool_admission() {
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         fill_pattern(gmem, 0, 256, 0);
         nanosm::Machine machine(config, compile(R"(
-            sread r0, WARP_ID
+            usread ur0, WARP_ID
+            ur2r r0, ur0
             shli r0, r0, 9
             ldg.v8 r8, [r0]
             halt
@@ -481,7 +484,8 @@ void test_lsu_backpressure_chain() {
         // (I1: a ready assembly then waits out up to that many old bookings
         // per denial; a mov storm no longer starves it).
         std::string text = R"(
-            sread r29, WARP_ID
+            usread ur0, WARP_ID
+            ur2r r29, ur0
             setp.ne p0, r29, 0
             @p0 bra.uni other
             mov r30, 0
@@ -545,12 +549,12 @@ void test_lsu_tma_and_vector_streams_interleave() {
         mov r0, 0
         mov r1, 0
         mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
-        mov r3, 128
+        umov ur3, 128
         mov r30, 512
         tma.load [0], r0, r2
         ldg.v8 r8, [r30]
     wait:
-        mbar.try_wait p1, [r3], 0
+        mbar.try_wait p1, [ur3], 0
         @!p1 bra.uni wait
         halt
     )"), std::move(launch), {.timeline = true});
@@ -636,22 +640,22 @@ void test_lsu_profile_and_encoding() {
     streams["lsu"]["read_streams"] = 3;
     require(nanosm::parse_device_profile(streams.dump()).lsu_read_streams == 3, "read_streams = 3 rejected");
 
-    const auto kernel = compile("mov r3, 0\nldg.uni r5, [r3 + 8]\nhalt\n");
+    const auto kernel = compile("umov ur3, 0\nldg.uni r5, [ur3 + 8]\nhalt\n");
     const auto decoded = nanosm::decode(kernel.words[1]);
     require(decoded.opcode == nanosm::Opcode::ldg_uni && decoded.dst == 5 && decoded.src0 == 3 &&
             decoded.imm == 8 && decoded.control.set_depbar < 6,
         "ldg.uni did not survive qtxc + qtxas");
-    require(nanosm::format_instruction(decoded, false) == "ldg.uni r5, [r3 + 8]", "ldg.uni formatting changed");
+    require(nanosm::format_instruction(decoded, false) == "ldg.uni r5, [ur3 + 8]", "ldg.uni formatting changed");
     require(nanosm::decode(nanosm::encode(decoded)).opcode == nanosm::Opcode::ldg_uni, "ldg.uni encoding round trip");
 }
 
 // One TMA command at the origin (its box at shmem `shared`, completing into
-// the mbar at `mbar_address`), then a wait for that mbar.
+// the mbar at `mbar_address`), then a wait for that mbar (its address in ur3).
 std::string tma_and_wait(bool store, uint32_t descriptor_address, uint32_t shared, uint32_t mbar_address) {
     return "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(shared, mbar_address)) +
-        "\nmov r3, " + std::to_string(mbar_address) + "\n" + (store ? "tma.store [" : "tma.load [") +
+        "\numov ur3, " + std::to_string(mbar_address) + "\n" + (store ? "tma.store [" : "tma.load [") +
         std::to_string(descriptor_address) + "], r0, r2\n"
-        "wait:\nmbar.try_wait p1, [r3], 0\n@!p1 bra.uni wait\nhalt\n";
+        "wait:\nmbar.try_wait p1, [ur3], 0\n@!p1 bra.uni wait\nhalt\n";
 }
 
 struct EdgeLoad {
@@ -744,7 +748,8 @@ void test_lsu_edge_widths() {
         auto& gmem = image_bytes(launch.gmem_image, 4096);
         fill_pattern(gmem, 0, 256, 0);
         nanosm::Machine machine(config, compile(R"(
-            sread r0, WARP_ID
+            usread ur0, WARP_ID
+            ur2r r0, ur0
             shli r0, r0, 9
             ldg.v8 r8, [r0]
             stg.v8 [r0 + 2048], r8
@@ -933,7 +938,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
             require(machine->read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA timeline data mismatch");
     }
     { // ldg.uni of word 5 (byte 20, in the beat at offset 16)
-        const auto machine = run("mov r0, 0\nldg.uni r1, [r0 + 20]\nhalt\n", false, 2);
+        const auto machine = run("umov ur0, 0\nldg.uni r1, [ur0 + 20]\nhalt\n", false, 2);
         const auto words = of(*machine, LsuEdge::assembly_write);
         const auto writes = of(*machine, LsuEdge::rf_write_beat);
         require(words.size() == 1 && writes.size() == 1, "ldg.uni: one word, one RF beat");

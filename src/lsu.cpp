@@ -504,7 +504,7 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     case Opcode::ldg_uni: {
         command.kind = LsuKind::uniform_load;
         command.reg = inst.dst;
-        const auto address = checked_address(uniform_reg(op, inst.src0, "ldg.uni base address"));
+        const auto address = checked_address(uniform_operand(op, inst.src0));
         if (address % 4 != 0) panic(op, "unaligned 32-bit gmem access");
         if (address > gmem_.size() || gmem_.size() - address < 4) {
             panic(op, "gmem access out of bounds");

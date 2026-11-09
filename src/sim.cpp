@@ -237,6 +237,9 @@ std::optional<uint8_t> depbar_wait(const Instruction& inst, const std::array<uin
 std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePlan& plan, const ResourceView& view) {
     const auto opcode = inst.opcode;
     if (view.read_inhibited) return Refusal::rf_read_inhibited;
+    // A uniform-register writer needs nothing else: its write port is its
+    // own pipeline stage (src/rf.hpp), its reads the issue register's round.
+    if (writes_uniform_register(opcode)) return std::nullopt;
     if (uses_arithmetic_pipeline(inst)) {
         if (is_sfu(opcode) && !view.sfu_free) return Refusal::sfu_busy;
         if (plan.write_reg.has_value() && !view.write_slot_free) return Refusal::rf_write_booked;
@@ -311,6 +314,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     check_rf_read_rounds(kernel_, config_);
     // An mma.async's shape is one the profile lists and its accumulator's.
     check_mma_shapes(kernel_, config_);
+    // Every uniform register named is one the profile's URF has.
+    check_uniform_registers(kernel_, config_);
     if (launch.active_warps == 0) throw SimError("active warp count is zero");
     // The SM's warp slots (core.warps): the scheduler's and the front end's
     // per-warp state exists for that many warps, whatever the RF could hold.
@@ -388,8 +393,10 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             warp.active_mask = full_mask();
             warp.rf.resize(static_cast<std::size_t>(config_.lanes) * kernel_.register_count, 0);
             for (auto& predicate : warp.predicates) predicate.resize(config_.lanes, 0);
+            warp.urf.resize(config_.urf_registers, 0);
             warps_.push_back(std::move(warp));
         }
+        urf_pipe_.poke(UrfWritePipeline(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles));
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
         // from pc 0; a slot not launched stays halted.
         std::vector<WarpFrontEnd> front_end(config_.core_warps);
@@ -434,7 +441,7 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //    select function grants, data flows downstream. No register's next value
 //    is visible here. Same-cycle visibility exists only where a wire carries
 //    it. The declared ones:
-//      (a) None through the RF or the predicate file (slice I6a, src/rf.hpp):
+//      (a) None through the RF, the URF or the predicate file (slice I6a, src/rf.hpp):
 //          a write lands at the clock edge of its RAM cycle, after every
 //          read of that cycle (READ_FIRST); no same-edge forwarding.
 //      (b) None from a completion to issue: a depbar clear, an mbar wait
@@ -503,6 +510,9 @@ void Machine::tick() {
     w.rf_write = decide_rf_writes();
     rf_write_port(w);
     rf_ram_stage(w);
+    // The URF write pipeline's write port and RAM stage, from Q: nothing
+    // contends for them (one writer per stage by construction).
+    urf_ram_stage(w);
 
     // The store path's last stage frees a TMA store register / a store
     // assembly register for a refill this same cycle (d).
@@ -550,8 +560,11 @@ void Machine::tick() {
     // the redirect, the fetch grant -- one calculation per warp.
     step_front_end(w);
 
-    // The RF read stage: the issue register's round samples now.
+    // The RF read stage: the issue register's round samples now (vector and
+    // uniform registers). Then the URF write pipeline's next state: its
+    // sampled write, the uniform ALU and r2ur's results, issue's new write.
     step_rf_reads(w);
+    step_urf(w);
 
     run_drivers(w);
 
@@ -562,6 +575,7 @@ void Machine::tick() {
     }
     for (const auto& [word, value] : w.tmem_writes) tmem_[word] = value;
     land_rf_writes(w);
+    land_urf_write(w);
     ++cycle_;
     // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
     if (done()) sanitizer_.check_kernel_end(cycle_);
@@ -606,7 +620,7 @@ bool Machine::done() const {
         !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
         tma.credits_used == 0 && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
-        dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() &&
+        dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() && drained(urf_pipe_.cur()) &&
         mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
         mma.arriving.empty() &&
         !acc[0].has_value() && !acc[1].has_value();
@@ -671,6 +685,11 @@ uint32_t Machine::read_reg(
         throw SimError("invalid host RF read");
     }
     return rf(warps_[warp], lane, reg);
+}
+
+uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
+    if (warp >= warps_.size() || reg >= config_.urf_registers) throw SimError("invalid host URF read");
+    return warps_[warp].urf[reg];
 }
 
 // ===========================================================================
@@ -3399,12 +3418,11 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
         (inst.opcode == Opcode::stg_v8 && static_cast<unsigned>(inst.src1) + 8 > 256))
         panic(warp, inst, "global vector register encoding wraps");
     if (is_acc_transfer(inst.opcode)) {
-        const bool load = is_acc_load(inst.opcode);
-        const auto coord = load ? inst.src1 : inst.src0;
-        const auto base = load ? inst.dst : inst.src1;
+        // (The coordinates are a uniform register pair: check_issue_hazards
+        // checks both against the URF.)
+        const auto base = is_acc_load(inst.opcode) ? inst.dst : inst.src1;
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
-        if (coord > 254 || static_cast<unsigned>(base) + width > 256)
-            panic(warp, inst, "accumulator register encoding wraps");
+        if (static_cast<unsigned>(base) + width > 256) panic(warp, inst, "accumulator register encoding wraps");
     }
     if (inst.opcode == Opcode::bra &&
         (inst.control.predicate != 7 || inst.control.predicate_invert)) {
@@ -3413,6 +3431,14 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
     if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
         inst.opcode != Opcode::bra_uni) {
         panic(warp, inst, "only bra.uni may be predicated before divergent execution exists");
+    }
+    if (inst.opcode == Opcode::sread && inst.imm != static_cast<int32_t>(SpecialReg::lane_id) &&
+        inst.imm != static_cast<int32_t>(SpecialReg::thread_id)) {
+        panic(warp, inst, "sread reads LANE_ID / THREAD_ID (WARP_ID / N_WARPS are read with usread)");
+    }
+    if (inst.opcode == Opcode::usread && inst.imm != static_cast<int32_t>(SpecialReg::warp_id) &&
+        inst.imm != static_cast<int32_t>(SpecialReg::n_warps)) {
+        panic(warp, inst, "usread reads WARP_ID / N_WARPS (LANE_ID / THREAD_ID are read with sread)");
     }
 }
 
@@ -3427,6 +3453,21 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     const auto destination = destination_register(inst);
     if (destination.has_value() && *destination >= kernel_.register_count) {
         panic(warp, inst, "destination register out of range");
+    }
+    // Uniform registers: in range, then RAW (each source's sample at issue +
+    // 1) and WAW (the write lands L + Wu after issue) against the uniform
+    // horizons, at every attempt.
+    const auto uniform_sources_read = uniform_sources(inst);
+    for (const auto reg : uniform_sources_read) {
+        if (reg >= config_.urf_registers) panic(warp, inst, "uniform source register out of range");
+    }
+    const auto uniform_dst = uniform_destination(inst);
+    if (uniform_dst.has_value() && *uniform_dst >= config_.urf_registers) {
+        panic(warp, inst, "uniform destination register out of range");
+    }
+    sanitizer_.check_uniform_raw(site(warp, inst), uniform_sources_read, cycle_ + issue_to_urf_sample);
+    if (uniform_dst.has_value()) {
+        sanitizer_.check_uniform_waw(site(warp, inst), *uniform_dst, cycle_ + issue_to_urf_visible(config_));
     }
     if (is_setp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) {
         if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
@@ -3450,18 +3491,19 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
 
 // What an accepted instruction books, from metadata and the profile: its one
 // read round (src/rf.hpp; kernel load refused any round that does not fit
-// its banks' read ports) and a fixed result's write. acc.st reads only its
-// coordinates at issue (its data beat by beat) and stg.v8 only its base (its
-// data in the LSU's RF read stage).
+// its banks' read ports), vector and uniform registers, and a fixed result's
+// write. acc.st reads only its uniform coordinates at issue (its data beat by
+// beat) and stg.v8 only its base (its data in the LSU's RF read stage).
 IssuePlan Machine::issue_plan(const Instruction& inst) const {
     IssuePlan plan;
     auto sources = source_registers(inst);
     if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-        sources = {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
+        sources.clear();
     } else if (inst.opcode == Opcode::stg_v8) {
         sources = {inst.src0};
     }
     plan.reads = rf_read_round(sources);
+    plan.uniform_reads = rf_read_round(uniform_sources(inst));
     const auto destination = destination_register(inst);
     if (uses_arithmetic_pipeline(inst) && destination.has_value()) {
         plan.write_reg = destination;
@@ -3565,6 +3607,10 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         accept_arithmetic(warp, inst, plan, w);
         return;
     }
+    if (writes_uniform_register(inst.opcode)) {
+        accept_uniform(warp, inst, plan, w);
+        return;
+    }
     switch (inst.opcode) {
     case Opcode::bra:
     case Opcode::bra_uni:
@@ -3620,7 +3666,35 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     pending.instruction = inst;
     pending.reads = plan.reads;
     pending.operands.resize(plan.reads.size());
+    pending.uniform_reads = plan.uniform_reads;
+    pending.uniform_operands.resize(plan.uniform_reads.size());
     arithmetic_reads_.push_back(std::move(pending));
+    warp.stall_until = cycle_ + inst.control.stall;
+    trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
+}
+
+// Uniform arithmetic and r2ur: the write enters the URF write pipeline's
+// stage 0 (the issue register's cycle, next cycle), where its operands are
+// sampled; it presents at the URF write port at issue + L and is visible from
+// issue + L + Wu + 1 (src/rf.hpp). r2ur's vector source is part of the round:
+// it owns its bank's read port in the issue register's cycle like any read.
+// No write calendar and no structural check: one issue per cycle is one
+// write per pipeline stage. r2ur reads lane 0, so like every lane-0 operation
+// it is UB under a partial or empty active mask (the sanitizer's PANIC,
+// backlog D12.1); uniform arithmetic reads no lanes.
+void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
+    if (inst.opcode == Opcode::r2ur) sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
+    w.issue.rf_read_banks.assign(config_.rf_banks, 0);
+    for (const auto reg : plan.reads) {
+        ++w.issue.rf_read_banks[reg % config_.rf_banks];
+        sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
+    }
+    sanitizer_.record_uniform_ready(warp.id, inst.dst, cycle_ + issue_to_urf_visible(config_));
+    UrfWrite write;
+    write.warp = warp.id;
+    write.pc = head_pc(warp.id);
+    write.instruction = inst;
+    w.issue.urf_write = std::move(write);
     warp.stall_until = cycle_ + inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
@@ -3678,6 +3752,8 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     entry.instruction = inst;
     entry.reads = plan.reads;
     entry.operands.resize(plan.reads.size());
+    entry.uniform_reads = plan.uniform_reads;
+    entry.uniform_operands.resize(plan.uniform_reads.size());
     w.issue.dispatch = std::move(entry);
 }
 
@@ -3785,8 +3861,8 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     // its existence and its accumulator's match were checked at kernel load
     // (check_mma_shapes).
     const auto shape = *mma_shape_of(config_, inst.opcode);
-    const auto a = uniform_reg(op, inst.src0, "MMA A address");
-    const auto b = uniform_reg(op, inst.src1, "MMA B address");
+    const auto a = uniform_operand(op, inst.src0);
+    const auto b = uniform_operand(op, inst.src1);
     // The layout's actual storage, not the element count (a partly filled
     // xor64 K block is still whole 16-byte rows).
     const uint64_t a_bytes = mma_operand_footprint(config_, shape, true);
@@ -3824,8 +3900,8 @@ void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     // before this transfer was accepted by the MMA before this dispatch
     // (dispatch keeps issue order).
     sanitizer_.check_acc_transfer_vs_mma(site(op), acc_id);
-    const auto row = uniform_reg(op, coord, "accumulator row coordinate");
-    const auto col = uniform_reg(op, static_cast<uint8_t>(coord + 1), "accumulator column coordinate");
+    const auto row = uniform_operand(op, coord);
+    const auto col = uniform_operand(op, static_cast<uint8_t>(coord + 1));
     sanitizer_.check_acc_transfer_overlap(site(op), acc_id, load, row, col, width);
     if (static_cast<uint64_t>(row) + config_.lanes > acc.rows ||
         static_cast<uint64_t>(col) + width > acc.cols ||
@@ -3850,10 +3926,9 @@ void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
 // arrives now and the bank rounds come from it (active lanes only). The load
 // takes the load slot admission secured; A-read serves it from the next
 // cycle; its gathered vector waits in the slot for the RF write decision. No
-// RF booking: the depbar completes it. lds.uni ignores the mask (lane 0's
-// address, even if lane 0 is inactive; the mask gates only its RF write's
-// lanes): a partial or empty mask is the sanitizer's PANIC (backlog D12, in
-// uniform_reg).
+// RF booking: the depbar completes it. lds.uni ignores the mask (its base is
+// a uniform register; the mask gates only its RF write's lanes): a partial or
+// empty mask is the sanitizer's PANIC (backlog D12, in uniform_operand).
 void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool uniform = inst.opcode == Opcode::lds_uni;
@@ -3981,9 +4056,9 @@ void Machine::dispatch_tma(const DispatchEntry& op, Wires& w) {
     w.dispatch.tma = std::move(command);
 }
 
-// mbar.init / arrive / arrive.expect_tx: a uniform operation, lane 0's
-// operands whatever the active mask (a partial mask is the sanitizer's
-// PANIC, backlog D12, in uniform_reg).
+// mbar.init / arrive / arrive.expect_tx: a uniform operation, its operands
+// uniform registers whatever the active mask (a partial mask is the
+// sanitizer's PANIC, backlog D12, in uniform_operand).
 void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     MbarRmwRequest request;
@@ -3995,7 +4070,7 @@ void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
         request.operation = MbarRmwOperation::init;
         request.value = inst.opcode == Opcode::mbar_init_i
             ? static_cast<uint32_t>(inst.imm)
-            : uniform_reg(op, inst.src1, "mbar expected count");
+            : uniform_operand(op, inst.src1);
         if (request.value == 0 || request.value > mbar_encoding::max_count) {
             panic(op, "mbar expected count is outside 1..32767");
         }
@@ -4008,7 +4083,7 @@ void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
         }
         request.value = inst.opcode == Opcode::mbar_arrive_expect_tx_i
             ? static_cast<uint32_t>(inst.imm)
-            : uniform_reg(op, inst.src1, "mbar tx byte count");
+            : uniform_operand(op, inst.src1);
     }
     sanitizer_.check_simt_mbar_rmw(site(op), request.byte_address);
     if (request.operation == MbarRmwOperation::init) sanitizer_.record_mbar_init(site(op), request.byte_address);
@@ -4022,13 +4097,13 @@ void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
     w.dispatch.rmw = std::move(request);
 }
 
-// atom.op.uni rD, [rA + imm], rB (trash/rfc13.md). Admission found the warp
+// atom.op.uni rD, [urA + imm], urB (trash/rfc13.md). Admission found the warp
 // with no unserviced read or write and secured a load slot and the SIMT RMW
-// register. Now lane 0's address (4-byte aligned, in bounds: PANIC
-// otherwise) and operand arrive -- whatever the active mask; a partial mask,
-// and an address or operand that differs across lanes, are the sanitizer's
-// PANICs -- the RETURN load slot is installed (rD's lanes, the depbar, the
-// old word), and the atomic enters the SIMT RMW register like an mbar
+// register. Now the address (4-byte aligned, in bounds: PANIC otherwise) and
+// the operand, uniform registers, arrive -- whatever the active mask; a
+// partial mask is the sanitizer's PANIC -- the RETURN load slot is installed
+// (rD's lanes, the depbar, the old word), and the atomic enters the SIMT RMW
+// register like an mbar
 // operation: the RMW engine reads the word, the ALU computes the new one,
 // and its write is granted D + Lb + C after the read. The warp's younger
 // shmem accesses wait for that write grant (warp_unserviced_write); rD waits
@@ -4036,8 +4111,8 @@ void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
 // before the write grant.
 void Machine::dispatch_atomic(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
-    const auto address = shmem_address(op, uniform_reg(op, inst.src0, "atom base address"));
-    const auto operand = uniform_reg(op, inst.src1, "atom operand");
+    const auto address = shmem_address(op, uniform_operand(op, inst.src0));
+    const auto operand = uniform_operand(op, inst.src1);
     const auto slot_index = *free_load_slot(w);
     sanitizer_.check_simt_shmem_access(site(op), std::vector<uint32_t>{address}, false);
     // The shadow of the warp's access: one 4-byte write round, reaching the
@@ -4081,7 +4156,7 @@ void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
         inst.opcode == Opcode::mbar_try_wait_i;
     const auto parity_value = immediate
         ? static_cast<uint32_t>(inst.imm)
-        : uniform_reg(op, inst.src1, "mbar parity");
+        : uniform_operand(op, inst.src1);
     if (parity_value > 1) panic(op, "mbar parity is not 0 or 1");
     MbarReadRequest request;
     request.test = test;
@@ -4150,18 +4225,21 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     };
     switch (inst.opcode) {
     case Opcode::sread:
+        // The per-lane special registers; WARP_ID / N_WARPS are usread's.
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             switch (static_cast<SpecialReg>(inst.imm)) {
             case SpecialReg::lane_id: result[lane] = lane; break;
-            case SpecialReg::warp_id: result[lane] = warp.id; break;
             case SpecialReg::thread_id: result[lane] = warp.id * config_.lanes + lane; break;
-            case SpecialReg::n_warps: result[lane] = static_cast<uint32_t>(warps_.size()); break;
-            default: fail("invalid special register");
+            default: fail("invalid special register for sread (WARP_ID / N_WARPS are read with usread)");
             }
         }
         break;
     case Opcode::mov:
         std::fill(result.begin(), result.end(), static_cast<uint32_t>(inst.imm));
+        break;
+    case Opcode::ur2r:
+        // The uniform operand latched at the sample, into every lane.
+        std::fill(result.begin(), result.end(), pending.uniform_operands.at(0));
         break;
     case Opcode::add:
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
@@ -4315,17 +4393,29 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
 // dispatch entry's samples are latched into the entry (the RF output
 // pipeline carries them to its dispatch). Each bank's samples -- the round's
 // and the async readers' (decide_rf_reads) -- never exceed its read ports,
-// and the round's are exactly the issue register's bank use.
+// and the round's are exactly the issue register's bank use. The round's
+// uniform registers are sampled from the URF now too (READ_FIRST: a write
+// landing at this cycle's edge is not seen); one instruction's round reads
+// at most two, the URF's read ports. The URF write pipeline's stage-0 write
+// samples here as well (its operands latch in step_urf).
 void Machine::step_rf_reads(Wires& w) {
     std::vector<uint32_t> simt_reads(config_.rf_banks, 0);
+    uint32_t uniform_reads = 0;
     const auto sample = [&](uint32_t warp, uint8_t reg) {
         ++simt_reads[reg % config_.rf_banks];
         trace_->rf_read(cycle_, warp, reg, reg % config_.rf_banks);
         return lane_values(warps_[warp], reg);
     };
+    const auto sample_uniform = [&](uint32_t warp, const std::vector<uint8_t>& regs) {
+        uniform_reads += static_cast<uint32_t>(regs.size());
+        std::vector<uint32_t> values;
+        for (const auto reg : regs) values.push_back(warps_[warp].urf.at(reg));
+        return values;
+    };
     for (auto it = arithmetic_reads_.begin(); it != arithmetic_reads_.end();) {
         if (it->issue_cycle + issue_to_sample == cycle_) {
             for (std::size_t i = 0; i < it->reads.size(); ++i) it->operands[i] = sample(it->warp, it->reads[i]);
+            it->uniform_operands = sample_uniform(it->warp, it->uniform_reads);
         }
         if (it->issue_cycle + issue_to_operands(config_) == cycle_) {
             execute_arithmetic(*it, w);
@@ -4337,10 +4427,29 @@ void Machine::step_rf_reads(Wires& w) {
     const auto& pipe = dispatch_pipe_.cur();
     for (std::size_t index = 0; index < pipe.size(); ++index) {
         const auto& op = pipe[index];
-        if (op.issue_cycle + issue_to_sample != cycle_ || op.reads.empty()) continue;
+        if (op.issue_cycle + issue_to_sample != cycle_ || (op.reads.empty() && op.uniform_reads.empty())) continue;
         auto operands = op.operands;
         for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
-        w.dispatch_samples.emplace_back(index, std::move(operands));
+        w.dispatch_samples.push_back({index, std::move(operands), sample_uniform(op.warp, op.uniform_reads)});
+    }
+    // The URF write pipeline's stage 0: uniform arithmetic samples its
+    // uniform sources (in operand order; a register named twice is one read),
+    // r2ur its vector source (lane 0 is what it keeps).
+    if (const auto& write = urf_pipe_.cur().front(); write.has_value()) {
+        const auto& inst = write->instruction;
+        if (inst.opcode == Opcode::r2ur) {
+            w.urf_sample = std::vector<uint32_t>{sample(write->warp, inst.src0).at(0)};
+        } else {
+            const auto sources = uniform_sources(inst);
+            uniform_reads += static_cast<uint32_t>(rf_read_round(sources).size());
+            std::vector<uint32_t> values;
+            for (const auto reg : sources) values.push_back(warps_[write->warp].urf.at(reg));
+            w.urf_sample = std::move(values);
+        }
+    }
+    if (uniform_reads > urf_read_ports) {
+        throw SimError("internal: the URF sampled " + std::to_string(uniform_reads) + " uniform registers at cycle " +
+            std::to_string(cycle_) + " (it has " + std::to_string(urf_read_ports) + " read ports)");
     }
     const auto& owned = issue_read_banks_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
@@ -4359,6 +4468,99 @@ void Machine::step_rf_reads(Wires& w) {
 }
 
 // ===========================================================================
+// The URF write pipeline (src/rf.hpp, UrfWrite in src/sim.hpp)
+// ===========================================================================
+
+// From Q: the write in stage L - 1 is presented at the URF write port now
+// (the trace's "UR write"); the one in the last stage is at the RAM now and
+// lands at this cycle's clock edge, after every read of the cycle
+// (land_urf_write). Each stage holds at most one write, so the one write
+// port is never contended.
+void Machine::urf_ram_stage(Wires& w) {
+    const auto& pipe = urf_pipe_.cur();
+    if (const auto& presented = pipe.at(config_.urf_issue_to_port_cycles - 1); presented.has_value()) {
+        if (!presented->value.has_value()) {
+            throw SimError("internal: a uniform write reached the URF write port without its value");
+        }
+        trace_->urf_write(cycle_, presented->warp, presented->instruction.dst, *presented->value);
+    }
+    if (pipe.back().has_value()) w.urf_landing = pipe.back();
+}
+
+// The pipeline's next state: every write moves one stage on. The one leaving
+// stage 0 latches the operands it sampled now (step_rf_reads). A uniform-
+// arithmetic write whose operands are at the URF output now (stage Lu)
+// executes on the uniform ALU, and its result rides the remaining stages as
+// the write's value (the ALU's Eu stages and the padding to L). r2ur's lane 0
+// is at the RF output at stage Lr, which may be the write port's own stage
+// (canonical: Lr 2 = L - 1, the RF output wired to the URF write port); the
+// RF's read stages carry it until then, so the write carries it as its value
+// from the sample on. Issue's accepted writer enters stage 0; the write in
+// the last stage leaves (it lands now).
+void Machine::step_urf(Wires& w) {
+    const auto& pipe = urf_pipe_.cur();
+    UrfWritePipeline next(pipe.size());
+    for (std::size_t stage = 0; stage + 1 < pipe.size(); ++stage) {
+        if (!pipe[stage].has_value()) continue;
+        auto write = *pipe[stage];
+        if (stage == 0) write.operands = w.urf_sample.value();
+        if (write.instruction.opcode == Opcode::r2ur) {
+            if (stage == 0) write.value = write.operands.at(0);
+        } else if (stage == config_.urf_read_latency_cycles) {
+            write.value = execute_uniform(write);
+        }
+        next[stage + 1] = std::move(write);
+    }
+    next.front() = w.issue.urf_write;
+    w.urf_pipe_next = std::move(next);
+}
+
+// The uniform ALU: one 32-bit result from the write's latched operands (its
+// uniform sources in operand order) and its immediate. Register shifts use
+// the low 5 bits, as the vector ALU's.
+uint32_t Machine::execute_uniform(const UrfWrite& write) const {
+    const auto& inst = write.instruction;
+    const auto fail = [&](const std::string& reason) {
+        throw_issue_panic(IssueSite{cycle_, write.warp, write.pc, inst, &config_.mma_shapes}, reason);
+    };
+    const auto a = [&] { return write.operands.at(0); };
+    const auto b = [&] { return write.operands.at(1); };
+    const auto imm = static_cast<uint32_t>(inst.imm);
+    switch (inst.opcode) {
+    case Opcode::umov: return a();
+    case Opcode::umovi: return imm;
+    case Opcode::uadd: return a() + b();
+    case Opcode::uaddi: return a() + imm;
+    case Opcode::usub: return a() - b();
+    case Opcode::ushl: return a() << (b() & 31);
+    case Opcode::ushr: return a() >> (b() & 31);
+    case Opcode::ushli:
+    case Opcode::ushri:
+        if (inst.imm < 0 || inst.imm > 31) fail("shift outside 0..31");
+        return inst.opcode == Opcode::ushli ? a() << inst.imm : a() >> inst.imm;
+    case Opcode::uand: return a() & b();
+    case Opcode::uor: return a() | b();
+    case Opcode::uxor: return a() ^ b();
+    case Opcode::uandi: return a() & imm;
+    case Opcode::uori: return a() | imm;
+    case Opcode::uxori: return a() ^ imm;
+    case Opcode::usread:
+        if (inst.imm == static_cast<int32_t>(SpecialReg::warp_id)) return write.warp;
+        if (inst.imm == static_cast<int32_t>(SpecialReg::n_warps)) return static_cast<uint32_t>(warps_.size());
+        fail("invalid special register for usread");
+        break;
+    default: break;
+    }
+    throw_issue_panic(IssueSite{cycle_, write.warp, write.pc, inst, &config_.mma_shapes}, "not uniform arithmetic");
+}
+
+// The clock edge's URF write (after registers_.commit()).
+void Machine::land_urf_write(const Wires& w) {
+    if (!w.urf_landing.has_value()) return;
+    warps_.at(w.urf_landing->warp).urf.at(w.urf_landing->instruction.dst) = w.urf_landing->value.value();
+}
+
+// ===========================================================================
 // Register drivers. Each computes its register's next value from Q and the
 // wires, and writes it once (or not at all: hold). They read no other
 // register's D and no state another driver writes, so they run in any order;
@@ -4371,7 +4573,7 @@ void Machine::step_rf_reads(Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 35> canonical = {
+    static constexpr std::array<Driver, 36> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -4407,6 +4609,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_issue_read_banks,
         &Machine::drive_dispatch_pipe,
         &Machine::drive_lsu_read_pipe,
+        &Machine::drive_urf_pipe,
     };
     auto order = canonical;
     if (shuffle_.has_value()) std::shuffle(order.begin(), order.end(), *shuffle_);
@@ -4997,10 +5200,22 @@ void Machine::drive_writebacks(const Wires& w) {
 void Machine::drive_dispatch_pipe(const Wires& w) {
     if (!w.dispatched && w.dispatch_samples.empty() && !w.issue.dispatch.has_value()) return;
     auto next = dispatch_pipe_.cur();
-    for (const auto& [index, operands] : w.dispatch_samples) next.at(index).operands = operands;
+    for (const auto& sample : w.dispatch_samples) {
+        next.at(sample.index).operands = sample.operands;
+        next.at(sample.index).uniform_operands = sample.uniform_operands;
+    }
     if (w.dispatched) next.pop_front();
     if (w.issue.dispatch.has_value()) next.push_back(*w.issue.dispatch);
     dispatch_pipe_.set_next(std::move(next), "drive_dispatch_pipe");
+}
+
+// The URF write pipeline's next state (step_urf); held while it is empty.
+void Machine::drive_urf_pipe(const Wires& w) {
+    const auto busy = [](const UrfWritePipeline& pipe) {
+        return std::any_of(pipe.begin(), pipe.end(), [](const auto& stage) { return stage.has_value(); });
+    };
+    if (!busy(urf_pipe_.cur()) && !busy(w.urf_pipe_next)) return;
+    urf_pipe_.set_next(w.urf_pipe_next, "drive_urf_pipe");
 }
 
 // The LSU's store-data reads in flight: the one at the RF output now leaves
@@ -5033,7 +5248,7 @@ Instruction Machine::head_instruction(const Warp& warp) const {
 }
 
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
-    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
+    if (is_mma_async(inst.opcode)) return {};
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::fadd:
@@ -5060,10 +5275,8 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::andi:
     case Opcode::ori:
     case Opcode::lds:
-    case Opcode::lds_uni:
     case Opcode::ldg:
     case Opcode::ldg_v8:
-    case Opcode::ldg_uni:
     case Opcode::ex2:
     case Opcode::rcp:
     case Opcode::setpi_eq:
@@ -5071,38 +5284,23 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::setpi_lt:
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
-    case Opcode::setpi_ge: return {inst.src0};
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_arrive:
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i: return {inst.src0};
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive_expect_tx_r:
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
+    case Opcode::setpi_ge:
+    case Opcode::r2ur: return {inst.src0};
     case Opcode::tma_load:
     case Opcode::tma_store: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
-    case Opcode::stg:
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni: return {inst.src0, inst.src1};
+    case Opcode::stg: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
         std::vector<uint8_t> result{inst.src0};
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8: return {inst.src1, static_cast<uint8_t>(inst.src1 + 1)};
-    case Opcode::acc_st: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
+    case Opcode::acc_st: return {inst.src1};
     case Opcode::acc_st_v8: {
-        std::vector<uint8_t> result{inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
+        std::vector<uint8_t> result;
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::mma_commit: return {inst.src0};
     default: return {};
     }
 }
@@ -5131,6 +5329,7 @@ std::optional<uint8_t> Machine::destination_register(const Instruction& inst) co
     case Opcode::cvt_pack:
     case Opcode::ex2:
     case Opcode::rcp:
+    case Opcode::ur2r:
     case Opcode::lds:
     case Opcode::lds_uni:
     case Opcode::ldg:
@@ -5180,14 +5379,14 @@ std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predi
     return std::vector<uint32_t>(bits.begin(), bits.end());
 }
 
-// A declared-uniform operand (rfc09 pin 3): hardware reads lane 0, whatever
-// the active mask (even when lane 0 is inactive). Two things are UB and the
-// sanitizer panics on them: a value that differs across lanes (named by the
-// operand: "... is not warp-uniform"), and any uniform operation under a
-// partial or empty mask (backlog D12.1, rfc13 section 2: a program with a
-// partial mask uses the per-lane instruction). Every lane-0-sourced operand
-// is read here, so every uniform operation with a register operand gets the
-// mask check; bra.uni checks it in resolve_branch.
+// A declared-uniform operand still taken from a VECTOR register (rfc09 pin
+// 3) -- since the URF slice only the ldg.v8 / stg.v8 bases and the TMA
+// operands: hardware reads lane 0, whatever the active mask (even when lane 0
+// is inactive). Two things are UB and the sanitizer panics on them: a value
+// that differs across lanes (named by the operand: "... is not
+// warp-uniform"), and any uniform operation under a partial or empty mask
+// (backlog D12.1, rfc13 section 2: a program with a partial mask uses the
+// per-lane instruction). bra.uni checks the mask in resolve_branch.
 uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const {
     sanitizer_.check_uniform_mask(site(op), op.active_mask, full_mask());
     const auto lanes = capture(op, reg);
@@ -5195,8 +5394,21 @@ uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::s
     return lanes[0];
 }
 
+// A uniform-register operand (lds.uni / ldg.uni bases, atom.*.uni address
+// and operand, acc.ld / acc.st coordinates, mbar addresses and values, MMA
+// addresses, mma.commit's mbar), as the round latched it at its sample
+// (step_rf_reads). Uniform by construction: no lane check. The uniform
+// operation's partial-mask rule stays (the sanitizer's PANIC).
+uint32_t Machine::uniform_operand(const DispatchEntry& op, uint8_t ureg) const {
+    sanitizer_.check_uniform_mask(site(op), op.active_mask, full_mask());
+    for (std::size_t i = 0; i < op.uniform_reads.size(); ++i) {
+        if (op.uniform_reads[i] == ureg) return op.uniform_operands[i];
+    }
+    throw SimError("internal: ur" + std::to_string(ureg) + " used at dispatch but not read at issue");
+}
+
 uint32_t Machine::mbar_address_operand(const DispatchEntry& op) const {
-    const auto address = uniform_reg(op, op.instruction.src0, "mbar address");
+    const auto address = uniform_operand(op, op.instruction.src0);
     if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_.size()) {
         panic(op, "mbar address is not 8-byte aligned and in shmem");
     }
@@ -5254,10 +5466,10 @@ std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(const 
     return rounds;
 }
 
-// lds.uni: hardware takes the address from lane 0 alone (as ldg.uni does) and
+// lds.uni: the address comes from a uniform register (as ldg.uni's does) and
 // makes one access; serve_simt_round fans the word out to every lane.
 std::vector<std::vector<Machine::LaneAccess>> Machine::build_uniform_shmem_round(const DispatchEntry& op) const {
-    const auto base = uniform_reg(op, op.instruction.src0, "lds.uni base address");
+    const auto base = uniform_operand(op, op.instruction.src0);
     return {{LaneAccess{.lane = 0, .byte_address = shmem_address(op, base)}}};
 }
 

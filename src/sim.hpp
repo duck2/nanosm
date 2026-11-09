@@ -82,6 +82,7 @@ struct LsuEdgeEvent {
 // What an instruction books if it is accepted, from metadata and the profile.
 struct IssuePlan {
     std::vector<uint8_t> reads;         // its one RF read round: each register sampled at issue + issue_to_sample (src/rf.hpp)
+    std::vector<uint8_t> uniform_reads; // the same round's uniform registers (distinct; at most the URF's two read ports)
     std::optional<uint8_t> write_reg;   // a fixed RF-write booking (arithmetic with an RF destination)
     uint64_t write_cycle = 0;           // the cycle that result enters its bank's write port
 };
@@ -249,6 +250,8 @@ public:
     // Test seam (between ticks): tmem word `word` (word w is in fine bank
     // w % tmem.fine_banks).
     [[nodiscard]] uint32_t tmem_word(uint32_t word) const { return tmem_.at(word); }
+    // Test seam (between ticks): uniform register `reg` of warp `warp`.
+    [[nodiscard]] uint32_t read_ureg(uint32_t warp, uint32_t reg) const;
 
     void tick();
     void run(uint64_t cycle_limit = 100000);
@@ -301,6 +304,10 @@ private:
         std::vector<uint32_t> rf;
         // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
         std::array<std::vector<uint8_t>, 7> predicates;
+        // The warp's uniform registers (urf.registers x 32 bits, LUTRAM),
+        // written only by the URF write pipeline's RAM stage, at the clock
+        // edge (READ_FIRST, src/rf.hpp).
+        std::vector<uint32_t> urf;
     };
 
     // One warp slot's front end (trash/front-end-packets-2026-10-18.md), one
@@ -387,6 +394,8 @@ private:
         Instruction instruction;
         std::vector<uint8_t> reads;                  // the round's registers
         std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
+        std::vector<uint8_t> uniform_reads;          // ur2r: the round's uniform register
+        std::vector<uint32_t> uniform_operands;      // by uniform read, latched at the sample
     };
 
     // A memory / engine / mbar instruction between accepted issue and its
@@ -406,7 +415,39 @@ private:
         Instruction instruction;
         std::vector<uint8_t> reads;                  // the round's registers
         std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
+        std::vector<uint8_t> uniform_reads;          // the round's uniform registers
+        std::vector<uint32_t> uniform_operands;      // by uniform read, latched at the sample
     };
+
+    // One uniform-register write in the URF write pipeline (src/rf.hpp;
+    // trash/urf-slice-2026-11-08.md), from its writer's accepted issue at t
+    // to its landing. The pipeline has L + Wu stages (urf.issue_to_port_cycles
+    // + urf.write_depth_cycles); stage k holds the write in cycle t + 1 + k:
+    //   stage 0          the issue register's cycle: its operands are sampled
+    //                    (uniform sources from the URF; r2ur's vector source
+    //                    from the RF, in the instruction's one read round)
+    //   stage Lu         uniform arithmetic: its operands are at the URF
+    //                    output and the uniform ALU takes them (its Eu
+    //                    stages, then padding to L)
+    //   stage Lr         r2ur: lane 0 is at the RF output (padding to L; at
+    //                    the canonical depths this is the write port's own
+    //                    stage). The RF's read stages hold it until then, so
+    //                    the write carries it from the sample on.
+    //   stage L - 1      presented at the URF write port
+    //   stage L + Wu - 1 at the RAM: it lands at this cycle's edge
+    // One instruction is accepted per cycle, so each stage holds at most one
+    // write and the write port sees at most one per cycle: no calendar.
+    // Widths: valid, warp (4 bits at 16 warps), the ALU's control (opcode,
+    // destination register: 4 bits at 16, a 22-bit immediate), two 32-bit
+    // operand latches, the 32-bit value.
+    struct UrfWrite {
+        uint32_t warp = 0;
+        uint32_t pc = 0;                  // (S) PANIC text: the instruction's own pc
+        Instruction instruction;          // the opcode, its registers and immediate
+        std::vector<uint32_t> operands;   // from the sample: the uniform sources in operand order, or r2ur's lane 0
+        std::optional<uint32_t> value;    // the result, from its execution on
+    };
+    using UrfWritePipeline = std::vector<std::optional<UrfWrite>>;
 
     struct LaneAccess {
         uint32_t lane = 0;
@@ -1371,6 +1412,7 @@ private:
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
+        std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
     };
 
     // Everything a dispatched instruction hands to its unit (the unit takes it now).
@@ -1451,9 +1493,21 @@ private:
         IssueDecision issue;
         // The front ends after this cycle (step_front_end, after issue).
         std::vector<WarpFrontEnd> front_end_next;
-        // The RF read stage: dispatch entries' operands latched now
-        // (index in the pipeline's Q, operands by read).
-        std::vector<std::pair<std::size_t, std::vector<std::vector<uint32_t>>>> dispatch_samples;
+        // The RF read stage: dispatch entries' operands latched now (index
+        // in the pipeline's Q, operands by read, uniform operands by uniform
+        // read).
+        struct DispatchSample {
+            std::size_t index = 0;
+            std::vector<std::vector<uint32_t>> operands;
+            std::vector<uint32_t> uniform_operands;
+        };
+        std::vector<DispatchSample> dispatch_samples;
+        // The URF write pipeline: the write at the RAM now (it lands at this
+        // cycle's edge), the operands its stage-0 write samples now (the read
+        // stage), and the pipeline's next state (step_urf).
+        std::optional<UrfWrite> urf_landing;
+        std::optional<std::vector<uint32_t>> urf_sample;
+        UrfWritePipeline urf_pipe_next;
     };
 
     // =======================================================================
@@ -1555,6 +1609,9 @@ private:
     Reg<std::deque<DispatchEntry>> dispatch_pipe_{registers_, "dispatch pipeline"};
     // The LSU's store-data RF reads travelling to the assembly registers (Lr).
     Reg<std::deque<LsuRfRead>> lsu_read_pipe_{registers_, "LSU store-data read pipeline"};
+    // The URF write pipeline (UrfWrite): L + Wu stages, the uniform ALU's and
+    // r2ur's path from the issue register to the URF RAM.
+    Reg<UrfWritePipeline> urf_pipe_{registers_, "URF write pipeline"};
 
     // ---- Unit-internal state (only its own unit's code touches it) ----
     // Issue: scheduler cursor, SFU occupancy, the arithmetic operand latches.
@@ -1683,6 +1740,9 @@ private:
     IssueAttempt refuse(Refusal refusal);
     void accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     void accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
+    // An accepted uniform-register writer (uniform arithmetic, r2ur): its
+    // write enters the URF write pipeline; r2ur's vector read joins the round.
+    void accept_uniform(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     // An accepted memory / engine / mbar instruction: its metadata work now
     // (depbar, the sanitizer's destination and reader records), its read
     // round's bank use, its entry into the dispatch pipeline.
@@ -1693,6 +1753,12 @@ private:
     void check_issue_latency(const Warp& warp, const Instruction& inst) const;
     // ---- the RF read stage: this cycle's fixed samples ----
     void step_rf_reads(Wires& w);
+    // ---- the URF write pipeline: its write port and RAM stage (from Q),
+    // and its next state after the read stage (the ALU, r2ur, issue's entry) ----
+    void urf_ram_stage(Wires& w);
+    void step_urf(Wires& w);
+    [[nodiscard]] uint32_t execute_uniform(const UrfWrite& write) const;
+    void land_urf_write(const Wires& w);
 
     // ---- register drivers: next state from Q + wires; any order ----
     using Driver = void (Machine::*)(const Wires&);
@@ -1731,6 +1797,7 @@ private:
     void drive_issue_read_banks(const Wires& w);
     void drive_dispatch_pipe(const Wires& w);
     void drive_lsu_read_pipe(const Wires& w);
+    void drive_urf_pipe(const Wires& w);
     void run_drivers(const Wires& w);
 
     // ---- helpers ----
@@ -1849,6 +1916,8 @@ private:
     // the kernel's words (a word fetched there is reported only here).
     [[nodiscard]] Instruction head_instruction(const Warp& warp) const;
     [[nodiscard]] uint32_t head_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
+    // The VECTOR registers an instruction reads and writes (its uniform ones:
+    // uniform_sources / uniform_destination, src/isa.hpp).
     [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
     [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
     void check_register_hazards(const Warp& warp, const Instruction& inst) const;
@@ -1860,6 +1929,9 @@ private:
     [[nodiscard]] std::vector<uint32_t> capture_predicate(const Warp& warp, uint8_t predicate) const;
     // A declared-uniform operand: lane 0's value (the sanitizer checks the rest).
     [[nodiscard]] uint32_t uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const;
+    // A uniform-register operand, as the round latched it at its sample:
+    // uniform by construction (the partial-mask rule still applies).
+    [[nodiscard]] uint32_t uniform_operand(const DispatchEntry& op, uint8_t ureg) const;
     [[nodiscard]] uint32_t mbar_address_operand(const DispatchEntry& op) const;
     [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
     [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);

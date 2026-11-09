@@ -116,6 +116,8 @@ struct TraceSummary {
     uint64_t rf_async_waits = 0;
     uint64_t rf_simt_inhibited = 0;
     uint64_t rf_simt_read_inhibited = 0;
+    // Uniform-register writes presented at the URF write port.
+    uint64_t urf_writes = 0;
     uint64_t mbar_rmw_requests = 0;
     uint64_t mbar_phase_changes = 0;
     // Cycles an engine's held mbar event (TMA complete_tx / MMA commit arrive)
@@ -212,6 +214,10 @@ public:
     // Debug only: a write presented at the RF write port (src/rf.hpp: it is
     // at the RAM Wd cycles later and visible from the cycle after that).
     void rf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank);
+    // A uniform-register write presented at the URF write port (src/rf.hpp:
+    // visible Wu + 1 later): an instant on the warp's track with the register
+    // and its value, in every timeline trace (one per uniform writer).
+    void urf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t value);
     void sfu_accept(uint32_t occupancy_cycles);
     void sfu_unit_stall();
     void scheduler_idle(bool draining);

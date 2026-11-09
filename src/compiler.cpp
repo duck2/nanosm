@@ -73,6 +73,39 @@ uint8_t parse_reg(const std::string& text, uint32_t line) {
     return static_cast<uint8_t>(value);
 }
 
+bool is_uniform_register(const std::string& text) {
+    static const std::regex pattern(R"(^[uU][rR][0-9]+$)");
+    return std::regex_match(text, pattern);
+}
+
+// A uniform register, ur0 .. ur(urf.registers - 1).
+uint8_t parse_ureg(const std::string& text, uint32_t line, const DeviceProfile& profile) {
+    static const std::regex pattern(R"(^[uU][rR]([0-9]+)$)");
+    std::smatch match;
+    if (!std::regex_match(text, match, pattern)) {
+        throw SimError("line " + std::to_string(line) + ": expected uniform register (ur0..ur" +
+            std::to_string(profile.urf_registers - 1) + "), got '" + text + "'");
+    }
+    const auto value = std::stoul(match[1].str());
+    if (value >= profile.urf_registers) {
+        throw SimError("line " + std::to_string(line) + ": uniform register '" + text +
+            "' is outside this profile's " + std::to_string(profile.urf_registers) + " (urf.registers)");
+    }
+    return static_cast<uint8_t>(value);
+}
+
+// A pair of consecutive uniform registers named by its first (acc.ld / acc.st
+// coordinates: row in urC, column in urC + 1).
+uint8_t parse_ureg_pair(const std::string& text, uint32_t line, const DeviceProfile& profile) {
+    const auto first = parse_ureg(text, line, profile);
+    if (static_cast<uint32_t>(first) + 1 >= profile.urf_registers) {
+        throw SimError("line " + std::to_string(line) + ": the coordinate pair " + text + ", ur" +
+            std::to_string(first + 1) + " is outside this profile's " + std::to_string(profile.urf_registers) +
+            " uniform registers");
+    }
+    return first;
+}
+
 std::pair<uint8_t, bool> parse_predicate(const std::string& text, uint32_t line) {
     auto value = text;
     bool invert = false;
@@ -181,12 +214,34 @@ Address parse_address(
     return result;
 }
 
-uint8_t parse_mbar_address(const std::string& text, uint32_t line) {
-    const auto address = parse_address(text, {}, line);
+// [urA] or [urA + / - offset]: a uniform register base.
+Address parse_uniform_address(
+    const std::string& text,
+    const std::unordered_map<std::string, int32_t>& constants,
+    uint32_t line,
+    const DeviceProfile& profile) {
+    static const std::regex pattern(
+        R"(^\[\s*([A-Za-z]+[0-9]+)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
+    std::smatch match;
+    if (!std::regex_match(text, match, pattern)) {
+        throw SimError("line " + std::to_string(line) + ": bad address '" + text + "'");
+    }
+    Address result;
+    result.base = parse_ureg(match[1].str(), line, profile);
+    if (match[3].matched) {
+        result.offset = parse_value(match[3].str(), constants, line);
+        if (match[2].str() == "-") result.offset = -result.offset;
+    }
+    return result;
+}
+
+// An mbar or MMA operand address: [urA], no encoded offset.
+uint8_t parse_mbar_address(const std::string& text, uint32_t line, const DeviceProfile& profile) {
+    const auto address = parse_uniform_address(text, {}, line, profile);
     if (address.offset != 0) {
         throw SimError(
             "line " + std::to_string(line) +
-            ": mbar v0 address must be [register] without an encoded offset");
+            ": mbar v0 address must be [uniform register] without an encoded offset");
     }
     return address.base;
 }
@@ -393,15 +448,79 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
 
         if (op == "sread") {
+            // The per-lane special registers. The warp-uniform ones live on the
+            // uniform side: usread, then ur2r for a vector copy.
             expect_count(args, 2, line_number);
             inst.opcode = Opcode::sread;
             inst.dst = parse_reg(args[0], line_number);
             const auto name = upper(args[1]);
             if (name == "LANE_ID") inst.imm = static_cast<int32_t>(SpecialReg::lane_id);
-            else if (name == "WARP_ID") inst.imm = static_cast<int32_t>(SpecialReg::warp_id);
             else if (name == "THREAD_ID") inst.imm = static_cast<int32_t>(SpecialReg::thread_id);
+            else if (name == "WARP_ID" || name == "N_WARPS") {
+                throw SimError("line " + std::to_string(line_number) + ": " + name +
+                    " is warp-uniform: read it with usread into a uniform register (ur2r for a vector copy)");
+            } else throw SimError("line " + std::to_string(line_number) + ": unknown special register '" + args[1] + "'");
+        } else if (op == "usread") {
+            expect_count(args, 2, line_number);
+            inst.opcode = Opcode::usread;
+            inst.dst = parse_ureg(args[0], line_number, profile);
+            const auto name = upper(args[1]);
+            if (name == "WARP_ID") inst.imm = static_cast<int32_t>(SpecialReg::warp_id);
             else if (name == "N_WARPS") inst.imm = static_cast<int32_t>(SpecialReg::n_warps);
-            else throw SimError("line " + std::to_string(line_number) + ": unknown special register '" + args[1] + "'");
+            else if (name == "LANE_ID" || name == "THREAD_ID") {
+                throw SimError("line " + std::to_string(line_number) + ": " + name +
+                    " differs across lanes: read it with sread into a vector register");
+            } else throw SimError("line " + std::to_string(line_number) + ": unknown special register '" + args[1] + "'");
+        } else if (op == "umov") {
+            expect_count(args, 2, line_number);
+            inst.dst = parse_ureg(args[0], line_number, profile);
+            if (is_uniform_register(args[1])) {
+                inst.opcode = Opcode::umov;
+                inst.src0 = parse_ureg(args[1], line_number, profile);
+            } else if (is_register(args[1])) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": umov takes a uniform register or an immediate (r2ur moves lane 0 of a vector register)");
+            } else {
+                inst.opcode = Opcode::umovi;
+                inst.imm = parse_value(args[1], constants, line_number);
+            }
+        } else if (op == "uadd" || op == "usub" || op == "ushl" || op == "ushr" ||
+                   op == "uand" || op == "uor" || op == "uxor") {
+            expect_count(args, 3, line_number);
+            inst.opcode = op == "uadd" ? Opcode::uadd
+                : op == "usub" ? Opcode::usub
+                : op == "ushl" ? Opcode::ushl
+                : op == "ushr" ? Opcode::ushr
+                : op == "uand" ? Opcode::uand
+                : op == "uor" ? Opcode::uor
+                : Opcode::uxor;
+            inst.dst = parse_ureg(args[0], line_number, profile);
+            inst.src0 = parse_ureg(args[1], line_number, profile);
+            inst.src1 = parse_ureg(args[2], line_number, profile);
+        } else if (op == "uaddi" || op == "ushli" || op == "ushri" || op == "uandi" ||
+                   op == "uori" || op == "uxori") {
+            expect_count(args, 3, line_number);
+            inst.opcode = op == "uaddi" ? Opcode::uaddi
+                : op == "ushli" ? Opcode::ushli
+                : op == "ushri" ? Opcode::ushri
+                : op == "uandi" ? Opcode::uandi
+                : op == "uori" ? Opcode::uori
+                : Opcode::uxori;
+            inst.dst = parse_ureg(args[0], line_number, profile);
+            inst.src0 = parse_ureg(args[1], line_number, profile);
+            inst.imm = parse_value(args[2], constants, line_number);
+        } else if (op == "r2ur") {
+            // Lane 0 of a vector register into a uniform register.
+            expect_count(args, 2, line_number);
+            inst.opcode = Opcode::r2ur;
+            inst.dst = parse_ureg(args[0], line_number, profile);
+            inst.src0 = parse_reg(args[1], line_number);
+        } else if (op == "ur2r") {
+            // A uniform register into every lane of a vector register.
+            expect_count(args, 2, line_number);
+            inst.opcode = Opcode::ur2r;
+            inst.dst = parse_reg(args[0], line_number);
+            inst.src0 = parse_ureg(args[1], line_number, profile);
         } else if (op == "mov") {
             expect_count(args, 2, line_number);
             inst.opcode = Opcode::mov;
@@ -476,7 +595,10 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 : op == "ldg.uni" ? Opcode::ldg_uni
                 : Opcode::ldg_v8;
             inst.dst = parse_reg(args[0], line_number);
-            const auto addr = parse_address(args[1], constants, line_number);
+            // lds.uni / ldg.uni: the base is a uniform register.
+            const bool uniform = op == "lds.uni" || op == "ldg.uni";
+            const auto addr = uniform ? parse_uniform_address(args[1], constants, line_number, profile)
+                                      : parse_address(args[1], constants, line_number);
             inst.src0 = addr.base;
             inst.imm = addr.offset;
             if (op == "ldg.v8" && static_cast<unsigned>(inst.dst) + 8 > 256)
@@ -492,28 +614,29 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
         } else if (op == "atom.add.uni" || op == "atom.and.uni" || op == "atom.xor.uni" || op == "atom.exch.uni") {
             // trash/rfc13.md: uniform shared atomics on signed int32. One word
-            // per warp instruction (lane 0's address and operand); its old
-            // value comes back to every lane's rD (async, through a load slot:
-            // a depbar like lds.uni). The offset is a signed 14-bit field.
+            // per warp instruction (its address and operand are uniform
+            // registers); its old value comes back to every lane's rD (async,
+            // through a load slot: a depbar like lds.uni). The offset is a
+            // signed 14-bit field.
             expect_count(args, 3, line_number);
             inst.opcode = op == "atom.add.uni" ? Opcode::atom_add_uni
                 : op == "atom.and.uni" ? Opcode::atom_and_uni
                 : op == "atom.xor.uni" ? Opcode::atom_xor_uni
                 : Opcode::atom_exch_uni;
             inst.dst = parse_reg(args[0], line_number);
-            const auto addr = parse_address(args[1], constants, line_number);
+            const auto addr = parse_uniform_address(args[1], constants, line_number, profile);
             inst.src0 = addr.base;
             inst.imm = addr.offset;
-            inst.src1 = parse_reg(args[2], line_number);
+            inst.src1 = parse_ureg(args[2], line_number, profile);
             if (inst.imm < encoding::atomic_immediate_min || inst.imm > encoding::atomic_immediate_max) {
                 throw SimError("line " + std::to_string(line_number) + ": atom offset must fit a signed 14-bit immediate");
             }
         } else if (op == "mbar.init") {
             expect_count(args, 2, line_number);
-            inst.src0 = parse_mbar_address(args[0], line_number);
-            if (is_register(args[1])) {
+            inst.src0 = parse_mbar_address(args[0], line_number, profile);
+            if (is_uniform_register(args[1]) || is_register(args[1])) {
                 inst.opcode = Opcode::mbar_init_r;
-                inst.src1 = parse_reg(args[1], line_number);
+                inst.src1 = parse_ureg(args[1], line_number, profile);
             } else {
                 inst.opcode = Opcode::mbar_init_i;
                 inst.imm = parse_value(args[1], constants, line_number);
@@ -521,13 +644,13 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         } else if (op == "mbar.arrive") {
             expect_count(args, 1, line_number);
             inst.opcode = Opcode::mbar_arrive;
-            inst.src0 = parse_mbar_address(args[0], line_number);
+            inst.src0 = parse_mbar_address(args[0], line_number, profile);
         } else if (op == "mbar.arrive.expect_tx") {
             expect_count(args, 2, line_number);
-            inst.src0 = parse_mbar_address(args[0], line_number);
-            if (is_register(args[1])) {
+            inst.src0 = parse_mbar_address(args[0], line_number, profile);
+            if (is_uniform_register(args[1]) || is_register(args[1])) {
                 inst.opcode = Opcode::mbar_arrive_expect_tx_r;
-                inst.src1 = parse_reg(args[1], line_number);
+                inst.src1 = parse_ureg(args[1], line_number, profile);
             } else {
                 inst.opcode = Opcode::mbar_arrive_expect_tx_i;
                 inst.imm = parse_value(args[1], constants, line_number);
@@ -539,10 +662,10 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": mbar.test_wait destination must be p0..p6");
             }
             inst.dst = predicate;
-            inst.src0 = parse_mbar_address(args[1], line_number);
-            if (is_register(args[2])) {
+            inst.src0 = parse_mbar_address(args[1], line_number, profile);
+            if (is_uniform_register(args[2]) || is_register(args[2])) {
                 inst.opcode = Opcode::mbar_test_wait_r;
-                inst.src1 = parse_reg(args[2], line_number);
+                inst.src1 = parse_ureg(args[2], line_number, profile);
             } else {
                 inst.opcode = Opcode::mbar_test_wait_i;
                 inst.imm = parse_value(args[2], constants, line_number);
@@ -554,10 +677,10 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": mbar.try_wait destination must be p0..p6");
             }
             inst.dst = predicate;
-            inst.src0 = parse_mbar_address(args[1], line_number);
-            if (is_register(args[2])) {
+            inst.src0 = parse_mbar_address(args[1], line_number, profile);
+            if (is_uniform_register(args[2]) || is_register(args[2])) {
                 inst.opcode = Opcode::mbar_try_wait_r;
-                inst.src1 = parse_reg(args[2], line_number);
+                inst.src1 = parse_ureg(args[2], line_number, profile);
             } else {
                 inst.opcode = Opcode::mbar_try_wait_i;
                 inst.imm = parse_value(args[2], constants, line_number);
@@ -581,12 +704,14 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             if (acc == accumulator_ids.end()) {
                 throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[1] + "'");
             }
+            // acc.ld rD, ACC, urC: the coordinates are uniform registers (row
+            // in urC, column in urC + 1).
             inst.opcode = op == "acc.ld" ? Opcode::acc_ld : Opcode::acc_ld_v8;
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = acc->second;
-            inst.src1 = parse_reg(args[2], line_number);
+            inst.src1 = parse_ureg_pair(args[2], line_number, profile);
             const auto width = op == "acc.ld.v8" ? 8u : 1u;
-            if (inst.src1 > 254 || static_cast<unsigned>(inst.dst) + width > 256) {
+            if (static_cast<unsigned>(inst.dst) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
         } else if (op == "acc.st" || op == "acc.st.v8") {
@@ -595,12 +720,13 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             if (acc == accumulator_ids.end()) {
                 throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
             }
+            // acc.st ACC, urC, rS: uniform coordinates, vector data.
             inst.opcode = op == "acc.st" ? Opcode::acc_st : Opcode::acc_st_v8;
             inst.dst = acc->second;
-            inst.src0 = parse_reg(args[1], line_number);
+            inst.src0 = parse_ureg_pair(args[1], line_number, profile);
             inst.src1 = parse_reg(args[2], line_number);
             const auto width = op == "acc.st.v8" ? 8u : 1u;
-            if (inst.src0 > 254 || static_cast<unsigned>(inst.src1) + width > 256) {
+            if (static_cast<unsigned>(inst.src1) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
         } else if (const auto mma = mma_async_opcode(op, profile, line_number); mma.has_value()) {
@@ -610,12 +736,12 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
             inst.opcode = *mma;
             inst.dst = acc->second;
-            inst.src0 = parse_mbar_address(args[1], line_number);
-            inst.src1 = parse_mbar_address(args[2], line_number);
+            inst.src0 = parse_mbar_address(args[1], line_number, profile);
+            inst.src1 = parse_mbar_address(args[2], line_number, profile);
         } else if (op == "mma.commit") {
             expect_count(args, 1, line_number);
             inst.opcode = Opcode::mma_commit;
-            inst.src0 = parse_mbar_address(args[0], line_number);
+            inst.src0 = parse_mbar_address(args[0], line_number, profile);
         } else if (op == "bra" || op == "bra.uni") {
             expect_count(args, 1, line_number);
             static const std::regex target_pattern(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
@@ -657,8 +783,11 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     return program;
 }
 
+// The VECTOR registers an instruction reads (its uniform registers:
+// uniform_sources, src/isa.hpp). acc.st and stg.v8 read their data later,
+// beat by beat (issue_sources: only what the issue round reads).
 std::vector<uint8_t> sources(const Instruction& inst) {
-    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
+    if (is_mma_async(inst.opcode)) return {};
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::and_:
@@ -685,10 +814,8 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::andi:
     case Opcode::ori:
     case Opcode::lds:
-    case Opcode::lds_uni:
     case Opcode::ldg:
     case Opcode::ldg_v8:
-    case Opcode::ldg_uni:
     case Opcode::ex2:
     case Opcode::rcp:
     case Opcode::setpi_eq:
@@ -696,39 +823,24 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::setpi_lt:
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
-    case Opcode::setpi_ge: return {inst.src0};
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_arrive:
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i: return {inst.src0};
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive_expect_tx_r:
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
+    case Opcode::setpi_ge:
+    case Opcode::r2ur: return {inst.src0};
     case Opcode::tma_load:
     case Opcode::tma_store:
         return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
-    case Opcode::stg:
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni: return {inst.src0, inst.src1};
+    case Opcode::stg: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
         std::vector<uint8_t> result{inst.src0};
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8: return {inst.src1, static_cast<uint8_t>(inst.src1 + 1)};
-    case Opcode::acc_st: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
+    case Opcode::acc_st: return {inst.src1};
     case Opcode::acc_st_v8: {
-        std::vector<uint8_t> result{inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
+        std::vector<uint8_t> result;
         for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
         return result;
     }
-    case Opcode::mma_commit: return {inst.src0};
     default: return {};
     }
 }
@@ -762,6 +874,7 @@ std::optional<uint8_t> destination(const Instruction& inst) {
     case Opcode::cvt_pack:
     case Opcode::ex2:
     case Opcode::rcp:
+    case Opcode::ur2r:
     case Opcode::lds:
     case Opcode::lds_uni:
     case Opcode::ldg: return inst.dst;
@@ -799,12 +912,11 @@ std::string read_file(const std::string& path) {
     return contents.str();
 }
 
-// The registers an instruction's issue reads (acc.st reads only its
-// coordinates at issue, its data beat by beat; stg.v8 only its base).
+// The vector registers an instruction's issue reads (acc.st reads its data
+// beat by beat and its coordinates from uniform registers: nothing here;
+// stg.v8 only its base).
 std::vector<uint8_t> issue_sources(const Instruction& inst) {
-    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-        return {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
-    }
+    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) return {};
     if (inst.opcode == Opcode::stg_v8) return {inst.src0};
     return sources(inst);
 }
@@ -848,14 +960,19 @@ void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumula
 //   read_until: the exclusive end of the fixed reads' samples;
 //   predicate_ready: the vtime from which a predicate is in the file (a
 //     conditional branch samples it issue_to_predicate_sample after its issue;
-//     a predicate writer may issue from it).
+//     a predicate writer may issue from it);
+//   ureg_visible: the vtime from which a URF sample sees a uniform register
+//     (every uniform-register writer is fixed-latency: issue_to_urf_visible).
 // A consumer is placed so its sample of each source is at or after that
 // source's visibility; a writer so its earliest landing comes after the older
-// write's (WAW) and at or after the older reads' samples (WAR).
+// write's (WAW) and at or after the older reads' samples (WAR). A uniform
+// register needs no WAR rule: it is read at issue + 1 and written L + Wu
+// later than its writer's issue.
 struct FixedTimeline {
     std::array<int64_t, 256> reg_visible{};
     std::array<int64_t, 256> read_until{};
     std::array<int64_t, 7> predicate_ready{};
+    std::array<int64_t, 256> ureg_visible{};
 
     // The earliest vtime `inst` may issue at, given the instructions before it.
     // Every source is sampled (or, read later beat by beat, read-owned) from
@@ -877,6 +994,13 @@ struct FixedTimeline {
             at = std::max(at, predicate_ready[inst.control.predicate] - int64_t{issue_to_predicate_sample});
         }
         if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);
+        for (const auto source : uniform_sources(inst)) {
+            at = std::max(at, ureg_visible[source] - int64_t{issue_to_urf_sample}); // uniform RAW
+        }
+        if (const auto dst = uniform_destination(inst); dst.has_value()) {
+            // Uniform WAW: land after the older write (every writer has the same L).
+            at = std::max(at, ureg_visible[*dst] - int64_t{issue_to_urf_visible(profile)} + 1);
+        }
         return at;
     }
 
@@ -898,6 +1022,9 @@ struct FixedTimeline {
             // and its predicate written, so its one-cycle latency always holds.
             predicate_ready[*dst] = vtime + fixed_latency(inst, profile.timing);
         }
+        if (const auto dst = uniform_destination(inst); dst.has_value()) {
+            ureg_visible[*dst] = vtime + issue_to_urf_visible(profile);
+        }
     }
 
     // The earliest vtime any next instruction may issue at once every fixed
@@ -909,6 +1036,9 @@ struct FixedTimeline {
         for (const auto visible : reg_visible) all_ready = std::max<int64_t>(all_ready, visible - issue_register_stages);
         for (const auto end : read_until) all_ready = std::max(all_ready, end - earliest);
         for (const auto ready : predicate_ready) all_ready = std::max(all_ready, ready);
+        for (const auto visible : ureg_visible) {
+            all_ready = std::max<int64_t>(all_ready, visible - int64_t{issue_to_urf_sample});
+        }
         return all_ready;
     }
 
@@ -916,6 +1046,7 @@ struct FixedTimeline {
         reg_visible.fill(0);
         read_until.fill(0);
         predicate_ready.fill(0);
+        ureg_visible.fill(0);
     }
 };
 
@@ -1387,6 +1518,21 @@ void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
         check_mma_shape(decode(kernel.words[index]), kernel.accumulators, profile,
             "kernel pc " + std::to_string(8 * index));
+    }
+}
+
+void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        const auto inst = decode(kernel.words[index]);
+        auto named = uniform_sources(inst);
+        if (const auto dst = uniform_destination(inst); dst.has_value()) named.push_back(*dst);
+        for (const auto reg : named) {
+            if (reg < profile.urf_registers) continue;
+            throw SimError("kernel pc " + std::to_string(8 * index) + ": '" +
+                format_instruction(inst, false, &profile.mma_shapes) + "' names uniform register ur" +
+                std::to_string(reg) + ", outside this profile's " + std::to_string(profile.urf_registers) +
+                " (urf.registers)");
+        }
     }
 }
 

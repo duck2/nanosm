@@ -3,7 +3,9 @@
 ; Interleaved v8 (rfc09): register r(base+j), lane l <-> word 16*j + l of the
 ; block, so one ldg.v8 is eight full-width RF writes and one stg.v8 eight
 ; full-width RF reads; memory order equals register order, no corner turn.
-; The block base is warp-uniform and 64 B aligned, as v8 requires.
+; The block base is warp-uniform and 64 B aligned, as v8 requires; ldg.v8 /
+; stg.v8 still take it from lane 0 of a vector register, so the warp id goes
+; through the uniform side (usread) and back with ur2r.
 ; Launch: kernels/vadd.launch.py.
 
 .equ A, 0
@@ -12,9 +14,10 @@
 .equ BLOCKS_PER_WARP, 16
 .equ WARP_STRIDE, 2048        ; four warps x 512 B
 
-        sread  r20, WARP_ID
-        shli   r20, r20, 9            ; r20 = 512 * warp
+        usread ur0, WARP_ID
+        ushli  ur0, ur0, 9            ; 512 * warp
         mov    r21, BLOCKS_PER_WARP
+        ur2r   r20, ur0               ; r20 = 512 * warp
 loop:
         ldg.v8 r0, [r20 + A]
         ldg.v8 r8, [r20 + B]

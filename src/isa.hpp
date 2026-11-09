@@ -46,8 +46,8 @@ enum class Opcode : uint8_t {
     // bytes; register rD+j, lane l <-> word 16*j + l.
     ldg_v8 = 0x23,
     stg_v8 = 0x24,
-    ldg_uni = 0x25,  // rA warp-uniform: one sector request, the word fans out to every lane
-    lds_uni = 0x26,  // rA warp-uniform: one shmem bank access, the word fans out to every lane
+    ldg_uni = 0x25,  // base in a uniform register: one sector request, the word fans out to every lane
+    lds_uni = 0x26,  // base in a uniform register: one shmem bank access, the word fans out to every lane
     // No operands (trash/rfc12.md section 10): admitted only once every earlier
     // shmem access of the warp has reached the RAM (stores written, loads
     // sampled), so nothing after it issues before that. Never auto-inserted.
@@ -69,9 +69,9 @@ enum class Opcode : uint8_t {
     mbar_try_wait_i = 0x37,
     mbar_try_wait_r = 0x38,
     // Uniform shared-memory atomics on signed int32 (trash/rfc13.md):
-    // atom.op.uni rD, [rA + imm], rB. ONE 32-bit word per warp instruction:
-    // the address (rA + imm) and the operand (rB) come from lane 0, the update
-    // is applied once, and every active lane's rD receives the word's old
+    // atom.op.uni rD, [urA + imm], urB. ONE 32-bit word per warp instruction:
+    // the address (urA + imm) and the operand (urB) are uniform registers, the
+    // update is applied once, and every active lane's rD receives the word's old
     // value. add wraps (32-bit two's complement); exch writes the operand. An
     // mbar-engine operation: the global store pause covers its one read, the
     // ALU's C stages and its one write (D + Lb + C + 1 cycles canonical: 7).
@@ -92,6 +92,34 @@ enum class Opcode : uint8_t {
     mma_commit = 0x62,
     // 0x70..0x7f: the mma.async block (mma_block_first below). The profile's
     // shape list says what each of these opcodes means.
+
+    // The uniform register file (trash/rfc16.md, trash/urf-slice-2026-11-08.md):
+    // sixteen 32-bit registers per warp, ur0..ur15 (urf.registers). The
+    // uniform arithmetic below runs on the SM's one integer uniform ALU, one
+    // value per warp instruction; register operands are uniform registers.
+    // Shifts by a register use its low 5 bits; immediates are the signed
+    // 22-bit field.
+    umov   = 0x80,   // umov urD, urA
+    umovi  = 0x81,   // umov urD, imm
+    uadd   = 0x82,
+    uaddi  = 0x83,
+    usub   = 0x84,
+    ushl   = 0x85,
+    ushr   = 0x86,   // logical
+    ushli  = 0x87,
+    ushri  = 0x88,   // logical
+    uand   = 0x89,
+    uor    = 0x8a,
+    uxor   = 0x8b,
+    uandi  = 0x8c,
+    uori   = 0x8d,
+    uxori  = 0x8e,
+    usread = 0x8f,   // usread urD, WARP_ID / N_WARPS: a warp-uniform special register
+    // Moves between the files: r2ur urD, rS takes lane 0 of a vector register;
+    // ur2r rD, urS writes a uniform register into every lane of a vector
+    // register (a fixed-latency vector result, like mov).
+    r2ur   = 0x90,
+    ur2r   = 0x91,
     halt  = 0xff,
 };
 
@@ -162,8 +190,11 @@ namespace encoding {
 // the third register takes the immediate's high bits)
 // setp uses dst as p0..p6; immediate and register RHS forms have distinct opcodes.
 // Branch immediates are signed byte displacements relative to the following PC.
-// mbar addresses are held in a register; mbar immediates and register operands
-// have distinct opcodes, as do setp immediates and register operands.
+// mbar addresses are held in a uniform register; mbar immediates and register
+// operands have distinct opcodes, as do setp immediates and register operands.
+// A uniform register (ur0..) sits in the same 8-bit register fields: which
+// field names which file is the opcode's (uniform_sources / uniform_destination;
+// trash/urf-slice-2026-11-08.md lists every operand form).
 // tma payload: coordinates[8] (x; y is the next register), address[8] (the
 // mbar / 8 | shared address / 64 << 16, src/tma.hpp), simm[22] (the static
 // 64-byte-aligned shmem descriptor address).
@@ -245,6 +276,26 @@ inline bool is_atomic(Opcode opcode) {
     return opcode == Opcode::atom_add_uni || opcode == Opcode::atom_and_uni ||
         opcode == Opcode::atom_xor_uni || opcode == Opcode::atom_exch_uni;
 }
+
+// Uniform arithmetic: the uniform ALU's opcodes (umov .. usread).
+inline bool is_uniform_arithmetic(Opcode opcode) {
+    return opcode >= Opcode::umov && opcode <= Opcode::usread;
+}
+
+// The writers of the uniform register file: uniform arithmetic and r2ur, and
+// nothing else (no loads into it). Every one presents its result at the URF
+// write port urf.issue_to_port_cycles after its issue (src/rf.hpp).
+inline bool writes_uniform_register(Opcode opcode) {
+    return is_uniform_arithmetic(opcode) || opcode == Opcode::r2ur;
+}
+
+// The uniform registers an instruction reads, all in its one read round at
+// issue + 1 (src/rf.hpp), in operand order (a register named twice is listed
+// twice; the round reads it once). At most two: the URF has two read ports.
+// acc.ld / acc.st read a coordinate pair (row in urC, column in urC + 1).
+std::vector<uint8_t> uniform_sources(const Instruction& instruction);
+// The uniform register an instruction writes, if any.
+std::optional<uint8_t> uniform_destination(const Instruction& instruction);
 
 uint64_t encode(const Instruction& instruction);
 Instruction decode(uint64_t word);
