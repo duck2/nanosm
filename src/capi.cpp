@@ -146,16 +146,20 @@ int32_t nanosm_mbar_encode(
 }
 
 int32_t nanosm_tma_descriptor_encode(
-    uint32_t rank,
-    uint32_t transpose,
-    uint64_t gmem_base,
-    uint32_t dim_x,
-    uint32_t dim_y,
-    uint32_t row_stride,
-    uint32_t box_x,
-    uint32_t box_y,
+    uint64_t base,
     uint32_t element_bytes,
-    uint32_t swizzle,
+    uint32_t d0,
+    uint32_t d1,
+    uint32_t d2,
+    uint32_t d3,
+    uint32_t s1,
+    uint32_t s2,
+    uint32_t s3,
+    uint32_t tile_length,
+    uint32_t tile_rows,
+    uint32_t row_dimension,
+    uint32_t layout,
+    uint32_t transposed,
     uint8_t* output,
     uint64_t output_size) {
     try {
@@ -163,21 +167,25 @@ int32_t nanosm_tma_descriptor_encode(
         if (output == nullptr || output_size != nanosm::tma_descriptor_bytes) {
             throw nanosm::SimError("tma descriptor output must contain exactly 64 bytes");
         }
-        if (rank > UINT8_MAX) throw nanosm::SimError("tma descriptor rank is out of range");
-        if (transpose > 1) throw nanosm::SimError("tma transpose must be zero or one");
-        if (element_bytes > UINT8_MAX) {
-            throw nanosm::SimError("tma element size is out of range");
+        if (element_bytes > UINT8_MAX) throw nanosm::SimError("tma element size is out of range");
+        if (tile_length > UINT16_MAX || tile_rows > UINT16_MAX) {
+            throw nanosm::SimError("tma tile length and rows must fit 16 bits");
         }
-        if (swizzle > UINT8_MAX) throw nanosm::SimError("tma swizzle is out of range");
+        if (row_dimension > UINT8_MAX) throw nanosm::SimError("tma row dimension must be 1, 2 or 3");
+        if (layout > NANOSM_TMA_LAYOUT_XOR64) {
+            throw nanosm::SimError("tma layout must be 0 (dense) or 1 (xor64)");
+        }
+        if (transposed > 1) throw nanosm::SimError("tma transposed must be zero or one");
         nanosm::TmaDescriptor descriptor;
-        descriptor.rank = static_cast<uint8_t>(rank);
-        descriptor.transpose = transpose != 0;
-        descriptor.gmem_base = gmem_base;
-        descriptor.dimensions = {dim_x, dim_y};
-        descriptor.row_stride = row_stride;
-        descriptor.box = {box_x, box_y};
+        descriptor.base = base;
         descriptor.element_bytes = static_cast<uint8_t>(element_bytes);
-        descriptor.swizzle = static_cast<uint8_t>(swizzle);
+        descriptor.dimensions = {d0, d1, d2, d3};
+        descriptor.strides = {s1, s2, s3};
+        descriptor.tile_length = static_cast<uint16_t>(tile_length);
+        descriptor.tile_rows = static_cast<uint16_t>(tile_rows);
+        descriptor.row_dimension = static_cast<uint8_t>(row_dimension);
+        descriptor.layout = static_cast<nanosm::TileLayout>(layout);
+        descriptor.transposed = transposed != 0;
         const auto bytes = nanosm::encode_tma_descriptor(descriptor);
         std::memcpy(output, bytes.data(), bytes.size());
         return NANOSM_OK;

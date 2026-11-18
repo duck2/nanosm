@@ -1,5 +1,5 @@
-"""Double-buffered vector add with a TMA producer (two launch-authored rank-1
-descriptors) and a SIMT consumer. Checks C = A + B.
+"""Double-buffered vector add with a TMA producer (two launch-authored
+one-dimensional descriptors) and a SIMT consumer. Checks C = A + B.
 
 Run from emu2: python -B -m nanosm kernels/pipeline_tma.launch.py [--trace PATH]
 No trace is written unless --trace names one: a fixed output path would be
@@ -38,14 +38,15 @@ launch.gmem.f32(A, (float(i) for i in range(ELEMENTS)))
 launch.gmem.f32(B, (float(2 * i) for i in range(ELEMENTS)))
 for address in [FULL0, FULL1, EMPTY0, EMPTY1]:
     launch.shmem.mbar(address, expected=1)
-# One descriptor per tensor; the stage's destination and full barrier are
-# the instruction's address operand (built in the kernel).
+# One descriptor per tensor (a dense one-dimensional tile of 16 elements);
+# the stage's buffer and full barrier are the instruction's operands.
 for address, base in [(ADESC, A), (BDESC, B)]:
     launch.shmem.tma_desc(
         address,
-        gmem_base=base,
+        base=base,
         dimensions=(ELEMENTS,),
-        box=(16,),
+        tile=(16,),
+        layout="dense",
     )
 
 with launch.run(trace=args.trace) as result:

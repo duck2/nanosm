@@ -119,6 +119,7 @@ set(NANOSM_TEST_SOURCES
     tests/basics_test.cpp
     tests/lsu_test.cpp
     tests/tma_test.cpp
+    tests/tma_operands_test.cpp
     tests/machine_test.cpp
     tests/rf_test.cpp
     tests/mma_test.cpp

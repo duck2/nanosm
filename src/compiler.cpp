@@ -246,14 +246,45 @@ uint8_t parse_mbar_address(const std::string& text, uint32_t line, const DeviceP
     return address.base;
 }
 
-int32_t parse_static_address(
+// "tma.load.2d" -> (store false, 2 coordinates); nullopt for anything else.
+std::optional<std::pair<bool, uint32_t>> tma_mnemonic(const std::string& op) {
+    static const std::regex pattern(R"(^tma\.(load|store)\.([1-4])d$)");
+    std::smatch match;
+    if (!std::regex_match(op, match, pattern)) return std::nullopt;
+    return std::pair<bool, uint32_t>{match[1].str() == "store", static_cast<uint32_t>(match[2].str()[0] - '0')};
+}
+
+// A tma's buffer or barrier operand: [urA], no offset.
+uint8_t parse_tma_address(const std::string& text, const std::string& what, uint32_t line, const DeviceProfile& profile) {
+    const auto address = parse_uniform_address(text, {}, line, profile);
+    if (address.offset != 0) {
+        throw SimError("line " + std::to_string(line) + ": the tma " + what +
+            " is [uniform register] without an offset");
+    }
+    return address.base;
+}
+
+// A tma's tile operand [DESC, urC]: the descriptor's shared address (a
+// constant, 64-byte aligned, below 1 MiB: the instruction holds it in 64-byte
+// units) and the first coordinate register.
+std::pair<int32_t, uint8_t> parse_tma_tile(
     const std::string& text,
     const std::unordered_map<std::string, int32_t>& constants,
-    uint32_t line) {
-    if (text.size() < 3 || text.front() != '[' || text.back() != ']') {
-        throw SimError("line " + std::to_string(line) + ": bad static address '" + text + "'");
+    uint32_t line,
+    const DeviceProfile& profile) {
+    const auto inner = text.size() >= 2 && text.front() == '[' && text.back() == ']'
+        ? split(text.substr(1, text.size() - 2), ',') : std::vector<std::string>{};
+    if (inner.size() != 2) {
+        throw SimError("line " + std::to_string(line) + ": bad tma tile operand '" + text +
+            "' (expected [DESC, urC])");
     }
-    return parse_value(trim(text.substr(1, text.size() - 2)), constants, line);
+    const auto descriptor = parse_value(inner[0], constants, line);
+    if (descriptor < 0 || descriptor % encoding::tma_descriptor_field_unit != 0 ||
+        static_cast<uint64_t>(descriptor) / encoding::tma_descriptor_field_unit > encoding::tma_descriptor_field_mask) {
+        throw SimError("line " + std::to_string(line) + ": tma descriptor address " + std::to_string(descriptor) +
+            " must be 64-byte aligned and below 1 MiB");
+    }
+    return {descriptor, parse_ureg(inner[1], line, profile)};
 }
 
 bool is_register(const std::string& text) {
@@ -686,17 +717,26 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 inst.imm = parse_value(args[2], constants, line_number);
             }
         } else if (op == "tma.load" || op == "tma.store") {
-            // tma.load / tma.store [DESC], rXY, rADDR: x in rXY, y in rXY + 1,
-            // rADDR = completion mbar / 8 | shared address / 64 << 16 (src/tma.hpp).
+            throw SimError("line " + std::to_string(line_number) + ": " + op +
+                " needs its coordinate count: " + op + ".1d .. " + op + ".4d");
+        } else if (const auto tma = tma_mnemonic(op); tma.has_value()) {
+            // tma.load.Nd [urS], [DESC, urC], [urM] / tma.store.Nd [DESC, urC],
+            // [urS], [urM] (src/tma.hpp): the buffer, the descriptor (a
+            // constant) with the first of N coordinate registers, the barrier.
             expect_count(args, 3, line_number);
-            inst.opcode = op == "tma.load" ? Opcode::tma_load : Opcode::tma_store;
-            inst.imm = parse_static_address(args[0], constants, line_number);
-            inst.src0 = parse_reg(args[1], line_number);
-            inst.src1 = parse_reg(args[2], line_number);
-            if (inst.src0 > 254) {
-                throw SimError(
-                    "line " + std::to_string(line_number) +
-                    ": tma coordinate pair must leave room for two registers");
+            const auto [store, coordinates] = *tma;
+            inst.opcode = tma_opcode(store, coordinates);
+            const auto& tile = store ? args[0] : args[1];
+            const auto& buffer = store ? args[1] : args[0];
+            const auto [descriptor, first] = parse_tma_tile(tile, constants, line_number, profile);
+            inst.imm = descriptor;
+            inst.src1 = first;
+            inst.src0 = parse_tma_address(buffer, "buffer", line_number, profile);
+            inst.src2 = parse_tma_address(args[2], "barrier", line_number, profile);
+            if (static_cast<uint32_t>(first) + coordinates > profile.urf_registers) {
+                throw SimError("line " + std::to_string(line_number) + ": the coordinates ur" +
+                    std::to_string(first) + " .. ur" + std::to_string(first + coordinates - 1) +
+                    " pass this profile's last uniform register, ur" + std::to_string(profile.urf_registers - 1));
             }
         } else if (op == "acc.ld" || op == "acc.ld.v8") {
             expect_count(args, 3, line_number);
@@ -825,9 +865,6 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
     case Opcode::r2ur: return {inst.src0};
-    case Opcode::tma_load:
-    case Opcode::tma_store:
-        return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
     case Opcode::stg: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
@@ -1364,11 +1401,6 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                     "line " + std::to_string(inst.line) +
                     ": tma descriptor address must be 64-byte aligned and in shmem");
             }
-            if (inst.src0 > 254) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": tma coordinate pair exceeds the register file");
-            }
         }
         if (inst.opcode == Opcode::mbar_init_i && (inst.imm <= 0 || inst.imm > 0x7fff)) {
             throw SimError("line " + std::to_string(inst.line) + ": mbar expected count must be 1..32767");
@@ -1524,6 +1556,12 @@ void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
 void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
         const auto inst = decode(kernel.words[index]);
+        if (is_tma_opcode(inst.opcode) &&
+            uint32_t{inst.src1} + tma_coordinate_count(inst.opcode) > profile.urf_registers) {
+            throw SimError("kernel pc " + std::to_string(8 * index) + ": '" + format_instruction(inst, false) +
+                "' names coordinates past this profile's last uniform register, ur" +
+                std::to_string(profile.urf_registers - 1));
+        }
         auto named = uniform_sources(inst);
         if (const auto dst = uniform_destination(inst); dst.has_value()) named.push_back(*dst);
         for (const auto reg : named) {

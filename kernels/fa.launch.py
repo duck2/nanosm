@@ -5,7 +5,7 @@ Optional trace: --case rising --trace trash/fa-tma-out.perfetto.json
 
 Plain row-major FP16 inputs enter through TMA, not prepacked shared memory, and
 the FP32 output leaves through TMA: workers stage normalized O in shmem in the
-fp32 xor64_a layout (over the dead Q/K0 stages) and one TMA store writes it.
+fp32 xor64 layout (over the dead Q/K0 stages) and one TMA store writes it.
 The host supplies only descriptors, synchronization state and constants.
 Workers compute P's and O's swizzled addresses and do all softmax, P
 conversion/stores, O correction, normalization and O staging stores.
@@ -29,7 +29,7 @@ SCORE_DONE, OUTPUT_DONE, WORK_DONE, INPUT_DONE = 49160, 49168, 49176, 49184
 OSTAGE_DONE, OSTORE_DONE = 49192, 49200
 CONSTANTS, QDESC, KDESC, VDESC, STATS = 49216, 49664, 49728, 49792, 50176
 ODESC = 49984
-# O staging reuses the Q + K stage-0 region: 16 fp32 xor64_a objects, 16 KiB.
+# O staging reuses the Q + K stage-0 region: 16 fp32 xor64 slices, 16 KiB.
 O_SHARED, O_STAGE_BYTES = 0, 16384
 ROWS, KEYS, WIDTH, BLOCK = 64, 128, 64, 64
 
@@ -71,27 +71,29 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
     for address, count in [(SCORE_DONE, 1), (OUTPUT_DONE, 1), (WORK_DONE, 4),
                            (INPUT_DONE, 1), (OSTAGE_DONE, 4), (OSTORE_DONE, 1)]:
         launch.shmem.mbar(address, expected=count)
-    # Stage-granular boxes (roofline E2): one command per operand stage reads
-    # each source row's full 128 bytes — full sectors at the NATURAL layout.
-    # One descriptor per tensor; each command's destination and completion
-    # barrier are its address operand (built in the kernel), so K and V serve
-    # both stage sets.
-    for desc, gbase, dims, shape, layout, transpose in [
-        (QDESC, Q_GLOBAL, (WIDTH, ROWS), (WIDTH, ROWS), "xor64_a", False),
-        (KDESC, K_GLOBAL, (WIDTH, KEYS), (BLOCK, WIDTH), "xor64_b", True),
-        (VDESC, V_GLOBAL, (WIDTH, KEYS), (WIDTH, BLOCK), "xor64_b", False),
+    # Stage-granular tiles (roofline E2): one command per operand stage reads
+    # each source row's full 128 bytes -- full sectors at the NATURAL layout.
+    # One descriptor per tensor: a 64 x 64 tile of fp16 rows (64 channels),
+    # cut at the instruction's coordinates (c0 = 0, c1 = the first row), so K
+    # and V serve both stage sets. Every tile is xor64, the profile's
+    # mma.layout, so the tensor core reads them: the tensor core stores both
+    # operands as rows (A: m, B: n) sliced along K. Q's and the K cache's rows
+    # are those rows (K, the channels, runs along them); V's K (the keys) runs
+    # across its rows, so V is transposed.
+    for desc, gbase, rows, transposed in [
+        (QDESC, Q_GLOBAL, ROWS, False),
+        (KDESC, K_GLOBAL, KEYS, False),
+        (VDESC, V_GLOBAL, KEYS, True),
     ]:
         launch.shmem.tma_desc(
-            desc, gmem_base=gbase,
-            dimensions=dims, strides=(WIDTH,), box=shape,
-            element_bytes=2, swizzle=layout, transpose=transpose,
+            desc, base=gbase, dimensions=(WIDTH, rows), tile=(WIDTH, BLOCK),
+            element_bytes=2, layout="xor64", transposed=transposed,
         )
-    # One store of the whole FP32 tile: the same xor64 byte permutation with
-    # four floats per 16-byte row, sixteen consecutive 1024-byte slices.
+    # One store of the whole FP32 tile, xor64 as the workers staged it: four
+    # floats per 16-byte row, sixteen consecutive 1024-byte slices.
     launch.shmem.tma_desc(
-        ODESC, gmem_base=O_GLOBAL,
-        dimensions=(WIDTH, ROWS), strides=(WIDTH,), box=(WIDTH, ROWS),
-        element_bytes=4, swizzle="xor64_a",
+        ODESC, base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, ROWS),
+        element_bytes=4, layout="xor64",
     )
     return launch
 
@@ -246,7 +248,7 @@ def run_case(case: str, trace: Path | None) -> None:
         staged = set()
         for row in range(ROWS):
             for col in range(WIDTH):
-                # Independent fp32 xor64_a address: object col//4, 16-byte row,
+                # Independent fp32 xor64 address: slice col//4, 16-byte row,
                 # word (col % 4) XOR bit 2 of the row.
                 offset = 1024 * (col // 4) + 16 * row + 4 * ((col % 4) ^ ((row // 4) % 2))
                 staged.add(offset)
@@ -256,7 +258,7 @@ def run_case(case: str, trace: Path | None) -> None:
         assert len(staged) == ROWS * WIDTH, "staged O addresses are not a bijection"
         # These are algorithmic counts, not a pinned performance result.
         expected_counters = {
-            # Stage-granular loads plus ONE fp32 xor64_a store of the 16 KiB O
+            # Stage-granular loads plus ONE fp32 xor64 store of the 16 KiB O
             # tile (was 32 per-lane stg.v8 commands): tma commands 5 -> 6 and
             # bytes 40960 -> 57344 (+16384 = O). Port-A data requests: 1280
             # input sectors + 512 output sectors; every one is two bank rounds

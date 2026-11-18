@@ -50,6 +50,11 @@ uint64_t encode(const Instruction& inst) {
         (inst.imm < encoding::atomic_immediate_min || inst.imm > encoding::atomic_immediate_max)) {
         throw SimError("atomic offset does not fit its signed 14-bit immediate: " + format_instruction(inst));
     }
+    if (is_tma_opcode(inst.opcode) &&
+        (inst.imm < 0 || inst.imm % encoding::tma_descriptor_field_unit != 0 ||
+         static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit > encoding::tma_descriptor_field_mask)) {
+        throw SimError("tma descriptor address must be 64-byte aligned and below 1 MiB: " + format_instruction(inst));
+    }
     const auto predicate = static_cast<uint64_t>(
         inst.control.predicate | (inst.control.predicate_invert ? 8 : 0));
     uint64_t word =
@@ -148,11 +153,18 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
         break;
-    case Opcode::tma_load:
-    case Opcode::tma_store:
+    case Opcode::tma_load_1d:
+    case Opcode::tma_load_2d:
+    case Opcode::tma_load_3d:
+    case Opcode::tma_load_4d:
+    case Opcode::tma_store_1d:
+    case Opcode::tma_store_2d:
+    case Opcode::tma_store_3d:
+    case Opcode::tma_store_4d:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
-        word |= immediate;
+        word |= static_cast<uint64_t>(inst.src2) << encoding::reg2_shift;
+        word |= static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit;
         break;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
@@ -332,11 +344,18 @@ Instruction decode(uint64_t word) {
         inst.src0 = reg1;
         inst.src1 = reg2;
         break;
-    case Opcode::tma_load:
-    case Opcode::tma_store:
+    case Opcode::tma_load_1d:
+    case Opcode::tma_load_2d:
+    case Opcode::tma_load_3d:
+    case Opcode::tma_load_4d:
+    case Opcode::tma_store_1d:
+    case Opcode::tma_store_2d:
+    case Opcode::tma_store_3d:
+    case Opcode::tma_store_4d:
         inst.src0 = reg0;
         inst.src1 = reg1;
-        inst.imm = static_cast<int32_t>(immediate);
+        inst.src2 = reg2;
+        inst.imm = static_cast<int32_t>((word & encoding::tma_descriptor_field_mask) * encoding::tma_descriptor_field_unit);
         break;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
@@ -413,6 +432,13 @@ Instruction decode(uint64_t word) {
 
 std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
+    if (is_tma_opcode(inst.opcode)) {
+        std::vector<uint8_t> result{inst.src0, inst.src2};
+        for (uint32_t i = 0; i < tma_coordinate_count(inst.opcode); ++i) {
+            result.push_back(static_cast<uint8_t>(inst.src1 + i));
+        }
+        return result;
+    }
     switch (inst.opcode) {
     case Opcode::umov:
     case Opcode::uaddi:
@@ -536,8 +562,14 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::mbar_test_wait_r: return "mbar.test_wait";
     case Opcode::mbar_try_wait_i:
     case Opcode::mbar_try_wait_r: return "mbar.try_wait";
-    case Opcode::tma_load: return "tma.load";
-    case Opcode::tma_store: return "tma.store";
+    case Opcode::tma_load_1d: return "tma.load.1d";
+    case Opcode::tma_load_2d: return "tma.load.2d";
+    case Opcode::tma_load_3d: return "tma.load.3d";
+    case Opcode::tma_load_4d: return "tma.load.4d";
+    case Opcode::tma_store_1d: return "tma.store.1d";
+    case Opcode::tma_store_2d: return "tma.store.2d";
+    case Opcode::tma_store_3d: return "tma.store.3d";
+    case Opcode::tma_store_4d: return "tma.store.4d";
     case Opcode::acc_ld: return "acc.ld";
     case Opcode::acc_ld_v8: return "acc.ld.v8";
     case Opcode::acc_st: return "acc.st";
@@ -690,9 +722,19 @@ std::string format_instruction(
         out << " p" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
             << "], " << ureg(inst.src1);
         break;
-    case Opcode::tma_load:
-    case Opcode::tma_store:
-        out << " [" << inst.imm << "], " << reg(inst.src0) << ", " << reg(inst.src1);
+    case Opcode::tma_load_1d:
+    case Opcode::tma_load_2d:
+    case Opcode::tma_load_3d:
+    case Opcode::tma_load_4d:
+        out << " [" << ureg(inst.src0) << "], [" << inst.imm << ", " << ureg(inst.src1) << "], ["
+            << ureg(inst.src2) << ']';
+        break;
+    case Opcode::tma_store_1d:
+    case Opcode::tma_store_2d:
+    case Opcode::tma_store_3d:
+    case Opcode::tma_store_4d:
+        out << " [" << inst.imm << ", " << ureg(inst.src1) << "], [" << ureg(inst.src0) << "], ["
+            << ureg(inst.src2) << ']';
         break;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
@@ -845,8 +887,14 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::mbar_arrive_expect_tx_r:
     case Opcode::mbar_try_wait_i:
     case Opcode::mbar_try_wait_r:
-    case Opcode::tma_load:
-    case Opcode::tma_store:
+    case Opcode::tma_load_1d:
+    case Opcode::tma_load_2d:
+    case Opcode::tma_load_3d:
+    case Opcode::tma_load_4d:
+    case Opcode::tma_store_1d:
+    case Opcode::tma_store_2d:
+    case Opcode::tma_store_3d:
+    case Opcode::tma_store_4d:
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
     case Opcode::acc_st:

@@ -545,13 +545,9 @@ void test_lsu_tma_and_vector_streams_interleave() {
     write_rank1_load(shmem, 0, 0, 128, 128);
     auto& gmem = image_bytes(launch.gmem_image, 1024);
     fill_pattern(gmem, 0, 256, 0);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov r0, 0
-        mov r1, 0
-        mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
-        umov ur3, 128
+    nanosm::Machine machine(canonical_profile(), compile(tma_operands_asm(10, 1024, 3, 128, 8) + R"(
         mov r30, 512
-        tma.load [0], r0, r2
+        tma.load.1d [ur10], [0, ur8], [ur3]
         ldg.v8 r8, [r30]
     wait:
         mbar.try_wait p1, [ur3], 0
@@ -649,12 +645,14 @@ void test_lsu_profile_and_encoding() {
     require(nanosm::decode(nanosm::encode(decoded)).opcode == nanosm::Opcode::ldg_uni, "ldg.uni encoding round trip");
 }
 
-// One TMA command at the origin (its box at shmem `shared`, completing into
-// the mbar at `mbar_address`), then a wait for that mbar (its address in ur3).
+// One TMA command at the origin (its tile at shmem `shared` in ur10,
+// completing into the mbar at `mbar_address` in ur3, its coordinate ur8),
+// then a wait for that mbar.
 std::string tma_and_wait(bool store, uint32_t descriptor_address, uint32_t shared, uint32_t mbar_address) {
-    return "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(shared, mbar_address)) +
-        "\numov ur3, " + std::to_string(mbar_address) + "\n" + (store ? "tma.store [" : "tma.load [") +
-        std::to_string(descriptor_address) + "], r0, r2\n"
+    const auto descriptor = std::to_string(descriptor_address);
+    return tma_operands_asm(10, shared, 3, mbar_address, 8) +
+        (store ? "tma.store.1d [" + descriptor + ", ur8], [ur10], [ur3]\n"
+               : "tma.load.1d [ur10], [" + descriptor + ", ur8], [ur3]\n") +
         "wait:\nmbar.try_wait p1, [ur3], 0\n@!p1 bra.uni wait\nhalt\n";
 }
 
@@ -810,8 +808,8 @@ void test_lsu_edge_widths() {
     }
 }
 
-// Codex's B2 probe (chan 2026-10-04, finding 3): a 16 KiB rank-1 linear TMA
-// store, DRAM = core clock, 32 B per tick, latency 0, egress_sectors 2. B2
+// Codex's B2 probe (chan 2026-10-04, finding 3): a 16 KiB one-dimensional
+// plain TMA store, DRAM = core clock, 32 B per tick, latency 0, egress_sectors 2. B2
 // took 520 cycles at pluck 1, 2 and 8 (the store bypassed egress). Now every
 // TMA store sector crosses the shared egress write port, so the run is
 // pluck-bound: 16384 / (4 x pluck) cycles plus a short tail.

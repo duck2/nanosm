@@ -1,6 +1,7 @@
 #pragma once
 
 #include "isa.hpp"
+#include "layout.hpp"
 
 #include <stdint.h>
 #include <stdexcept>
@@ -15,10 +16,6 @@ class ProfileError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
-
-// Fixed for a device, not selected by individual MMA instructions. xor64 is
-// the only supported swizzle; dense is an unswizzled diagnostic baseline.
-enum class MmaLayout { dense, xor64 };
 
 // One profile is consumed by qtxc, qtxas and the simulator. Core quantities are
 // measured in core cycles; controller quantities are measured in DRAM ticks.
@@ -122,9 +119,12 @@ struct DeviceProfile {
     // operands are fetched. Cheaper throughput is declared by smaller core
     // dimensions, not by a stall parameter.
     uint32_t mma_result_latency_cycles = 0;
-    // mma.layout in the profile; shared with TMA through xor64_byte_address.
-    // Plane spacing is derived separately from the operand's row count.
-    MmaLayout mma_layout = MmaLayout::dense;
+    // mma.layout in the profile: the layout the tensor core reads both
+    // operands in (src/layout.hpp), fixed for a device, not selected by
+    // individual MMA instructions. xor64 is the only supported swizzle; dense
+    // is an unswizzled diagnostic baseline. A slice's spacing follows the
+    // operand's row count.
+    TileLayout mma_layout = TileLayout::dense;
     // SFU: one separate unit whose throughput is independent of lane count.
     // It serves sfu_lanes lanes per cycle, so one warp op occupies it for
     // ceil(lanes / sfu_lanes) cycles. timing.sfu is derived from these.

@@ -468,12 +468,9 @@ void test_mbar_engine_events_visible_next_cycle() {
     for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
     write_mbar(shmem, commit_mbar, 1, 0);
     write_mbar(shmem, tx_mbar, 0, 64);
-    nanosm::TmaDescriptor descriptor;
-    descriptor.dimensions = {16, 1};
-    descriptor.box = {16, 1};
-    write_tma_descriptor(shmem, 6144, descriptor);
-    std::string text = ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\numov ur4, 4096\n"
-        "mov r8, 0\nmov r9, 0\n" + tma_operand_asm(10, 2048, tx_mbar) + "tma.load [6144], r8, r10\n";
+    write_tma_descriptor(shmem, 6144, plain_tma_1d(16));
+    std::string text = ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\numov ur4, 4096\n" +
+        tma_operands_asm(10, 2048, 11, tx_mbar, 8) + "tma.load.1d [ur10], [6144, ur8], [ur11]\n";
     for (uint32_t i = 0; i < 300; ++i) text += "mov r" + std::to_string(12 + i % 8) + ", " + std::to_string(i) + "\n";
     text += "mma.async.init.m64n64k8 C, [ur0], [ur1]\nmma.commit [ur4]\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
@@ -697,21 +694,16 @@ void test_driver_shuffle_unit_kernels() {
         for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
         write_mbar(shmem, 4096, 1, 0);
         write_mbar(shmem, 4104, 0, 64);
-        nanosm::TmaDescriptor descriptor;
-        descriptor.dimensions = {16, 1};
-        descriptor.box = {16, 1};
-        write_tma_descriptor(shmem, 6144, descriptor);
+        write_tma_descriptor(shmem, 6144, plain_tma_1d(16));
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             .acc C, 0, 64, 64
             umov ur0, 0
             umov ur1, 1024
             umov ur4, 4096
-            mov r8, 0
-            mov r9, 0
-        )" + tma_operand_asm(10, 2048, 4104) + R"(
+        )" + tma_operands_asm(10, 2048, 11, 4104, 8) + R"(
             mma.async.init.m64n64k8 C, [ur0], [ur1]
             mma.commit [ur4]
-            tma.load [6144], r8, r10
+            tma.load.1d [ur10], [6144, ur8], [ur11]
             mma.async.m64n64k8 C, [ur0], [ur1]
             halt
         )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
@@ -743,11 +735,8 @@ void test_driver_shuffle_unit_kernels() {
             ur2r r29, ur0
             setp.ne p0, r29, 0
             @p0 bra.uni other
-            mov r0, 0
-            mov r1, 0
-            mov r2, )" + std::to_string(nanosm::pack_tma_addresses(1024, 128)) + R"(
-            umov ur3, 128
-            tma.store [0], r0, r2
+        )" + tma_operands_asm(10, 1024, 3, 128, 8) + R"(
+            tma.store.1d [0, ur8], [ur10], [ur3]
         wait:
             mbar.try_wait p1, [ur3], 0
             @!p1 bra.uni wait

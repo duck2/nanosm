@@ -116,8 +116,11 @@ struct TraceSummary {
     uint64_t rf_async_waits = 0;
     uint64_t rf_simt_inhibited = 0;
     uint64_t rf_simt_read_inhibited = 0;
-    // Uniform-register writes presented at the URF write port.
+    // Uniform-register writes presented at the URF write port; warp-cycles a
+    // uniform reader was refused because a tma's later operand rounds held
+    // the URF read ports (src/rf.hpp tma_operand_rounds).
     uint64_t urf_writes = 0;
+    uint64_t urf_read_ports_held = 0;
     uint64_t mbar_rmw_requests = 0;
     uint64_t mbar_phase_changes = 0;
     // Cycles an engine's held mbar event (TMA complete_tx / MMA commit arrive)
@@ -254,6 +257,7 @@ public:
     void rf_async_wait() { ++summary_.rf_async_waits; }
     void rf_simt_inhibited() { ++summary_.rf_simt_inhibited; }
     void rf_simt_read_inhibited() { ++summary_.rf_simt_read_inhibited; }
+    void urf_read_ports_held() { ++summary_.urf_read_ports_held; }
     // One event per LSU command (gmem commands track): admit .. completion,
     // its phases and stall reasons in the detail. No per-word events.
     void lsu_command_begin(uint64_t cycle, uint64_t command, uint32_t warp, std::string name);

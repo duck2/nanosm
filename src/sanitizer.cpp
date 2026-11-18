@@ -206,6 +206,17 @@ void Sanitizer::check_uniform_mask(const IssueSite& site, uint64_t active_mask, 
     }
 }
 
+void Sanitizer::check_tma_operand_alignment(const IssueSite& site, uint32_t buffer, uint32_t barrier) const {
+    if (buffer % tma_buffer_alignment != 0) {
+        throw_issue_panic(site, "tma buffer address " + std::to_string(buffer) +
+            " is not 64-byte aligned (the machine does not wire its low 6 bits)");
+    }
+    if (barrier % tma_barrier_alignment != 0) {
+        throw_issue_panic(site, "tma barrier address " + std::to_string(barrier) +
+            " is not 8-byte aligned (the machine does not wire its low 3 bits)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Same-word stores (backlog D12): which lane's word lands is not part of the
 // contract, so two lanes of one store naming one word is UB, diagnosed here.

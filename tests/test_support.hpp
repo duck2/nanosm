@@ -80,18 +80,28 @@ inline void write_tma_descriptor(
     std::memcpy(image.data() + address, bytes.data(), bytes.size());
 }
 
-// The tma.load / tma.store address operand (src/tma.hpp) of a box at shmem
-// `shared` completing into the mbar at `mbar`, as assembly that puts it in
-// register `reg`: one mov when it fits the immediate (a box below 2 KiB),
-// else mov / shli / ori.
-inline std::string tma_operand_asm(uint32_t reg, uint32_t shared, uint32_t mbar) {
-    const auto packed = nanosm::pack_tma_addresses(shared, mbar);
-    const auto r = "r" + std::to_string(reg);
-    if (packed <= static_cast<uint32_t>(nanosm::encoding::immediate_max)) {
-        return "mov " + r + ", " + std::to_string(packed) + "\n";
+// A one-dimensional fp32 tensor of `elements` at gmem `base`, its tile the
+// whole tensor, dense (src/tma.hpp): the descriptor most tests use.
+inline nanosm::TmaDescriptor plain_tma_1d(uint32_t elements, uint64_t base = 0) {
+    nanosm::TmaDescriptor descriptor;
+    descriptor.base = base;
+    descriptor.dimensions = {elements, 1, 1, 1};
+    descriptor.tile_length = static_cast<uint16_t>(elements);
+    return descriptor;
+}
+
+// A tma's uniform-register operands as assembly: the buffer's shared address
+// into ur`buffer_ur`, the barrier's into ur`barrier_ur`, and the coordinates
+// into ur`coordinate_ur` onwards. umov's signed 22-bit immediate holds any
+// shared address.
+inline std::string tma_operands_asm(uint32_t buffer_ur, uint32_t buffer, uint32_t barrier_ur, uint32_t barrier,
+    uint32_t coordinate_ur, const std::vector<int32_t>& coordinates = {0}) {
+    std::string text = "umov ur" + std::to_string(buffer_ur) + ", " + std::to_string(buffer) + "\n" +
+        "umov ur" + std::to_string(barrier_ur) + ", " + std::to_string(barrier) + "\n";
+    for (std::size_t i = 0; i < coordinates.size(); ++i) {
+        text += "umov ur" + std::to_string(coordinate_ur + i) + ", " + std::to_string(coordinates[i]) + "\n";
     }
-    return "mov " + r + ", " + std::to_string(shared / nanosm::tma_shared_unit_bytes) + "\nshli " + r + ", " + r +
-        ", 16\nori " + r + ", " + r + ", " + std::to_string(mbar / nanosm::tma_mbar_unit_bytes) + "\n";
+    return text;
 }
 
 inline std::vector<uint8_t>& image_bytes(
@@ -199,16 +209,13 @@ inline std::string booking_stream(uint32_t bank, uint32_t count) {
     return text;
 }
 
-// A rank-1 fp32 descriptor of `elements` at gmem_base, and the mbar its
-// command completes into, expecting those bytes. The box's shared address and
-// the mbar are the instruction's operand (tma_operand_asm).
+// A one-dimensional fp32 descriptor of `elements` at gmem_base
+// (plain_tma_1d), and the mbar its command completes into, expecting those
+// bytes. The buffer and the mbar are the instruction's operands
+// (tma_operands_asm).
 inline void write_rank1_load(std::vector<uint8_t>& shmem, uint32_t descriptor_address, uint64_t gmem_base,
                       uint32_t elements, uint32_t mbar_address) {
-    nanosm::TmaDescriptor descriptor;
-    descriptor.gmem_base = gmem_base;
-    descriptor.dimensions = {elements, 1};
-    descriptor.box = {elements, 1};
-    write_tma_descriptor(shmem, descriptor_address, descriptor);
+    write_tma_descriptor(shmem, descriptor_address, plain_tma_1d(elements, gmem_base));
     nanosm::MbarState mbar;
     mbar.valid = true;
     mbar.expected = 1;
@@ -230,11 +237,7 @@ using nanosm::LsuEdge;
 // The same for either direction (the direction is the instruction's).
 inline void write_rank1_tma(std::vector<uint8_t>& shmem, uint32_t descriptor_address,
                      uint64_t gmem_base, uint32_t elements, uint32_t mbar_address) {
-    nanosm::TmaDescriptor descriptor;
-    descriptor.gmem_base = gmem_base;
-    descriptor.dimensions = {elements, 1};
-    descriptor.box = {elements, 1};
-    write_tma_descriptor(shmem, descriptor_address, descriptor);
+    write_tma_descriptor(shmem, descriptor_address, plain_tma_1d(elements, gmem_base));
     nanosm::MbarState mbar;
     mbar.valid = true;
     mbar.expected = 1;
@@ -316,7 +319,7 @@ inline nanosm::DeviceProfile dense_one_bank_profile(uint32_t result_latency) {
     profile.mma_core_m = 4;
     profile.mma_core_n = 4;
     profile.mma_core_k = 4;
-    profile.mma_layout = nanosm::MmaLayout::dense;
+    profile.mma_layout = nanosm::TileLayout::dense;
     profile.mma_result_latency_cycles = result_latency;
     profile.shmem_banks = 1;
     nanosm::validate_device_profile(profile);
@@ -349,13 +352,10 @@ inline void require_mentions(
     }
 }
 
-// Rank-1 linear fp32 TMA of `bytes` at gmem 0 (the shmem side, the mbar and
-// the direction are the instruction's).
+// A one-dimensional dense fp32 TMA of `bytes` at gmem 0 (the buffer, the
+// mbar and the direction are the instruction's).
 inline nanosm::TmaDescriptor linear_tma(uint32_t bytes) {
-    nanosm::TmaDescriptor descriptor;
-    descriptor.dimensions = {bytes / 4, 1};
-    descriptor.box = {bytes / 4, 1};
-    return descriptor;
+    return plain_tma_1d(bytes / 4);
 }
 
 // An mbar already expecting `tx` bytes and no arrivals: one complete_tx flips it.
@@ -621,9 +621,9 @@ inline std::string describe(const std::vector<I3Rmw>& rmws) {
     return text;
 }
 
-// A rank-1 TMA descriptor at 5120 of `bytes` at gmem 0, and the mbar at 4104
-// expecting those bytes. The kernel's tma.load / tma.store names the shmem
-// side and that mbar in its address operand (i4_tma_operand).
+// A one-dimensional TMA descriptor at 5120 of `bytes` at gmem 0, and the mbar
+// at 4104 expecting those bytes. The kernel's tma.load.1d / tma.store.1d
+// names the buffer and that mbar in uniform registers (i4_tma_operands).
 inline std::function<void(std::vector<uint8_t>&)> i4_tma(uint32_t bytes) {
     return [=](std::vector<uint8_t>& shmem) {
         write_tma_descriptor(shmem, 5120, linear_tma(bytes));
@@ -631,9 +631,11 @@ inline std::function<void(std::vector<uint8_t>&)> i4_tma(uint32_t bytes) {
     };
 }
 
-// The address operand of an i4_tma command whose box is at shmem `shared`.
-inline uint32_t i4_tma_operand(uint32_t shared) {
-    return nanosm::pack_tma_addresses(shared, 4104);
+// An i4_tma command's operands, its buffer at shmem `shared`: ur10 the
+// buffer, ur11 the mbar (4104), ur8 the coordinate (0). For
+// "tma.load.1d [ur10], [5120, ur8], [ur11]" (or the tma.store.1d form).
+inline std::string i4_tma_operands(uint32_t shared) {
+    return tma_operands_asm(10, shared, 11, 4104, 8);
 }
 
 // The machine's PANIC text (a clean run is a test failure).

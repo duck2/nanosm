@@ -62,61 +62,61 @@ class SparseMemory:
         self,
         address: int,
         *,
-        gmem_base: int,
+        base: int,
         dimensions: tuple[int, ...],
-        box: tuple[int, ...],
+        tile: tuple[int, ...],
         element_bytes: int = 4,
-        strides: tuple[int, ...] = (),
-        swizzle: int | str = "linear",
-        transpose: bool = False,
+        strides: tuple[int, ...] | None = None,
+        row_dimension: int = 1,
+        layout: str = "dense",
+        transposed: bool = False,
     ) -> None:
-        """A TMA descriptor: the global tensor and the box (rank 1 or 2).
+        """A TMA descriptor (src/tma.hpp): one tensor, its tile size and layout.
 
-        The direction is the instruction's (tma.load / tma.store), and the shared
-        address and completion mbar are its address operand, which the kernel
-        builds (src/tma.hpp): mbar / 8 in bits 15:0, shared / 64 in bits 31:16.
+        dimensions: d0 .. d3 in elements, dimension 0 the contiguous one (one
+        to four values; the missing ones are 1). strides: s1 .. s(n-1) in
+        elements, one index of that dimension to the next (default: dense).
+        tile: (length,) or (length, rows): `rows` runs of `length` elements
+        along dimension 0, the rows stepping along `row_dimension` (1..3).
+        layout: the tile's shared-memory layout (src/layout.hpp), "dense"
+        (row after row) or "xor64" (slices of 16-byte rows), the names of the
+        profile's mma.layout; transposed (xor64 only): the positions along
+        dimension 0 become the stored rows. The direction, buffer, barrier
+        and coordinates are the instruction's (tma.load.Nd / tma.store.Nd).
         """
-        rank = len(dimensions)
-        if rank not in (1, 2) or len(box) != rank or len(strides) != rank - 1:
-            raise ValueError("tma dimensions/box must have rank 1 or 2 and rank-1 strides")
-        dimensions2 = tuple(dimensions) + (1,) * (2 - rank)
-        box2 = tuple(box) + (1,) * (2 - rank)
-        row_stride = strides[0] if strides else 0
-        for name, values in {
-            "dimensions": dimensions2,
-            "box": box2,
-            "strides": (row_stride,),
-        }.items():
-            if any(value < 0 or value > 0xFFFFFFFF for value in values):
-                raise ValueError(f"tma {name} contains a value outside uint32_t")
-        if isinstance(swizzle, str):
-            swizzle_code = {"linear": 0, "xor64_a": 1, "xor64_b": 2}.get(swizzle)
-            if swizzle_code is None:
-                raise ValueError("tma swizzle must be 'linear', 'xor64_a', or 'xor64_b'")
+        if not 1 <= len(dimensions) <= 4:
+            raise ValueError("tma dimensions must have one to four values")
+        dims = tuple(dimensions) + (1,) * (4 - len(dimensions))
+        if strides is None:
+            strides = tuple(dims[0] * (dims[1] if k > 1 else 1) * (dims[2] if k > 2 else 1) for k in (1, 2, 3))
+        elif len(strides) != len(dimensions) - 1:
+            raise ValueError("tma strides must have one value per dimension after the first")
         else:
-            swizzle_code = swizzle
-        for name, value, maximum in [
-            ("gmem_base", gmem_base, 0xFFFFFFFFFFFFFFFF),
-            ("element_bytes", element_bytes, 0xFFFFFFFF),
-            ("swizzle", swizzle_code, 0xFFFFFFFF),
+            strides = tuple(strides) + (1,) * (3 - len(strides))
+        if len(tile) not in (1, 2):
+            raise ValueError("tma tile must be (length,) or (length, rows)")
+        length, rows = (tuple(tile) + (1,))[:2]
+        layout_code = {"dense": 0, "xor64": 1}.get(layout) if isinstance(layout, str) else None
+        if layout_code is None:
+            raise ValueError("tma layout must be 'dense' or 'xor64'")
+        for name, values, maximum in [
+            ("base", (base,), 0xFFFFFFFFFFFFFFFF),
+            ("dimensions", dims, 0xFFFFFFFF),
+            ("strides", strides, 0xFFFFFFFF),
+            ("element_bytes", (element_bytes,), 0xFFFFFFFF),
+            ("tile", (length, rows), 0xFFFFFFFF),
+            ("row_dimension", (row_dimension,), 0xFFFFFFFF),
         ]:
-            if not isinstance(value, int) or value < 0 or value > maximum:
+            if any(not isinstance(value, int) or value < 0 or value > maximum for value in values):
                 raise ValueError(f"tma {name} is outside the C ABI range")
-        if not isinstance(transpose, bool):
-            raise ValueError("tma transpose must be a bool")
+        if not isinstance(transposed, bool):
+            raise ValueError("tma transposed must be a bool")
         if address % 64 != 0:
             raise ValueError("tma descriptor address must be 64-byte aligned")
         self.write(
             address,
             encode_tma_descriptor(
-                rank,
-                int(transpose),
-                gmem_base,
-                dimensions2,
-                row_stride,
-                box2,
-                element_bytes,
-                swizzle_code,
+                base, element_bytes, dims, strides, length, rows, row_dimension, layout_code, int(transposed)
             ),
         )
 

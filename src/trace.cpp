@@ -577,7 +577,7 @@ std::string TraceRecorder::summary_text() const {
         << " async_waits=" << summary_.rf_async_waits
         << " simt_inhibited=" << summary_.rf_simt_inhibited
         << " simt_read_inhibited=" << summary_.rf_simt_read_inhibited << '\n';
-    out << "urf: writes=" << summary_.urf_writes << '\n';
+    out << "urf: writes=" << summary_.urf_writes << " read_ports_held=" << summary_.urf_read_ports_held << '\n';
     out << "mbar: rmw=" << summary_.mbar_rmw_requests
         << " phase_changes=" << summary_.mbar_phase_changes
         << " probes=" << summary_.mbar_initial_probes

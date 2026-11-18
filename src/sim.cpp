@@ -8,6 +8,7 @@
 #include <limits>
 #include <new>
 #include <set>
+#include <tuple>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -237,6 +238,10 @@ std::optional<uint8_t> depbar_wait(const Instruction& inst, const std::array<uin
 std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePlan& plan, const ResourceView& view) {
     const auto opcode = inst.opcode;
     if (view.read_inhibited) return Refusal::rf_read_inhibited;
+    // A tma's later operand rounds own the URF's two read ports (src/rf.hpp
+    // tma_operand_rounds): an instruction whose read round has a uniform
+    // register (a tma included) would sample in one of them.
+    if (view.urf_ports_held && !plan.uniform_reads.empty()) return Refusal::urf_read_ports_held;
     // A uniform-register writer needs nothing else: its write port is its
     // own pipeline stage (src/rf.hpp), its reads the issue register's round.
     if (writes_uniform_register(opcode)) return std::nullopt;
@@ -397,6 +402,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             warps_.push_back(std::move(warp));
         }
         urf_pipe_.poke(UrfWritePipeline(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles));
+        tma_read_pairs_.poke(TmaReadPairs(config_.urf_read_latency_cycles));
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
         // from pc 0; a slot not launched stays halted.
         std::vector<WarpFrontEnd> front_end(config_.core_warps);
@@ -543,8 +549,11 @@ void Machine::tick() {
     step_gmem_controller(w);
     step_tma(w);
 
-    // The dispatch pipeline's end: a memory / engine / mbar instruction
-    // whose operands arrive now goes to its unit.
+    // The TMA operand read's end: a tma's last words at the URF output now
+    // push its command into the TMA queue. Then the dispatch pipeline's end:
+    // a memory / engine / mbar instruction whose operands arrive now goes to
+    // its unit.
+    arrive_tma_operands(w);
     dispatch_issued(w);
     // The async RF readers (acc.st beats, the LSU's store-data read) take the
     // read ports the issue register's instruction leaves free now, from Q,
@@ -619,7 +628,8 @@ bool Machine::done() const {
         read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
         !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
-        tma.credits_used == 0 && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
+        tma.credits_used == 0 && empty(tma_read_rounds_) && drained(tma_read_pairs_.cur()) &&
+        empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
         dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() && drained(urf_pipe_.cur()) &&
         mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
         mma.arriving.empty() &&
@@ -2356,24 +2366,26 @@ void Machine::decide_mbar_timeouts(Wires& w) {
 
 namespace {
 
-// An operand element's byte address. xor64 keeps 8 fp16 of k in each row's
-// 16 bytes and depends on the row (m or n) only, so a 32-row A object is the
-// top half of a 64-row one for k = 8. A shape with k > 8 stacks its 8-deep K
-// blocks as whole objects of (rows x 16 B), the compact object of its shape
-// (1024 B for 64 rows; a TMA box of that many rows has the same spacing). The
-// dense diagnostic layout is row-major in the command's shape.
-constexpr uint32_t xor64_row_elements = 8;
+// An operand element's byte address, in the profile's layout through the
+// layout rule the TMA places tiles with (src/layout.hpp); the same rule for
+// A and B. Under xor64 both operands are stored as rows of k -- A as m rows,
+// B as n rows -- with k sliced, 8 fp16 per 16-byte row: the address depends
+// on the row only within a slice, so a 32-row A object is the top half of a
+// 64-row one for k = 8, and a shape with k > 8 stacks its 8-deep K slices as
+// whole (rows x 16 B) pieces, the compact tile of its shape (1024 B for 64
+// rows; an xor64 TMA tile of that many stored rows has the same spacing). The
+// dense diagnostic layout is row-major in the command's shape: A m rows of k,
+// B k rows of n.
+constexpr uint32_t xor64_row_elements = xor64_row_bytes / 2; // fp16
 
 uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t m, uint32_t k) {
-    if (config.mma_layout == MmaLayout::dense) return base + 2 * (m * shape.k + k);
-    const uint32_t object = base + 16 * shape.m * (k / xor64_row_elements);
-    return xor64_operand_address(object, m, k % xor64_row_elements, 0);
+    if (config.mma_layout == TileLayout::dense) return dense_address(base, m, k, shape.k, 2);
+    return xor64_address(base, shape.m, m, k, 2);
 }
 
 uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t k, uint32_t n) {
-    if (config.mma_layout == MmaLayout::dense) return base + 2 * (k * shape.n + n);
-    const uint32_t object = base + 16 * shape.n * (k / xor64_row_elements);
-    return xor64_operand_address(object, n, k % xor64_row_elements, 2);
+    if (config.mma_layout == TileLayout::dense) return dense_address(base, k, n, shape.n, 2);
+    return xor64_address(base, shape.n, n, k, 2);
 }
 
 // The shared-memory storage an operand of `shape` occupies from its base:
@@ -2382,9 +2394,9 @@ uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t bas
 // still the layout's); the dense layout is exactly rows x k fp16.
 uint64_t mma_operand_footprint(const Config& config, const MmaShape& shape, bool a_operand) {
     const uint64_t rows = a_operand ? shape.m : shape.n;
-    if (config.mma_layout == MmaLayout::dense) return rows * shape.k * 2;
+    if (config.mma_layout == TileLayout::dense) return rows * shape.k * 2;
     const uint64_t k_blocks = (shape.k + xor64_row_elements - 1) / xor64_row_elements;
-    return 16 * rows * k_blocks;
+    return xor64_row_bytes * rows * k_blocks;
 }
 
 uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
@@ -2817,7 +2829,7 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
         request.sector_request = ticket.sector_request;
         request.from_sector_register = ticket.from_sector_register;
         request.fragments = ticket.fragments;
-        request.rounds = tma_port_rounds(request.fragments);
+        request.rounds = tma_port_rounds(request.fragments, ticket.from_sector_register);
         want.placement = std::move(request);
     }
 
@@ -3058,6 +3070,7 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& re
         command.descriptor = decode_tma_descriptor(bytes.data(), bytes.size());
         command.logical_bytes = tma_logical_bytes(command.descriptor);
         validate_tma_runtime_descriptor(command);
+        tma_command_start(command);
         // releases the descriptor read-ownership; verifies the accept-time peek
         sanitizer_.record_tma_descriptor_read(command.id, command.descriptor, command.shmem_address,
             command.direction == TmaDirection::load);
@@ -3127,10 +3140,25 @@ std::optional<uint64_t> Machine::next_data_complete_tma_command(const TmaQueue& 
     return std::nullopt;
 }
 
+// The bank rounds of one TMA shmem transaction: each round, every bank serves
+// one word.
+//
+// A load's placement from the sector register (from_sector_register) has one
+// more rule (HUMAN 2026-11-18): in a round a bank takes its bytes from ONE
+// 4-byte word of the sector register, rotated by one byte amount, and writes
+// them with byte enables. That is all the wiring the path has per bank: a
+// word select, a four-way byte rotate, four byte enables. A shared word whose
+// bytes come from two sector words (a row that starts off a 4-byte boundary)
+// is therefore two partial writes in two rounds; a word that straddles two
+// sectors gets its halves from the two sectors' placements. Crooked data is
+// slower, never refused. Reads (the descriptor, a store's source) and zero
+// fills take whole words and have no such rule.
 std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_rounds(
-    const std::vector<GmemSectorRequest::TmaFragment>& fragments) const {
+    const std::vector<GmemSectorRequest::TmaFragment>& fragments, bool from_sector_register) const {
     using Piece = TmaPortRequest::Piece;
-    std::vector<std::map<uint32_t, std::vector<Piece>>> words(config_.shmem_banks);
+    // Per bank: (shared word, sector word, byte rotation) -> its bytes.
+    using Source = std::tuple<uint32_t, uint64_t, uint8_t>;
+    std::vector<std::map<Source, std::vector<Piece>>> words(config_.shmem_banks);
     std::set<std::pair<uint32_t, uint8_t>> occupied;
     for (uint32_t index = 0; index < fragments.size(); ++index) {
         const auto& fragment = fragments[index];
@@ -3142,14 +3170,21 @@ std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_round
             const uint32_t address = fragment.shmem_address + offset;
             const uint32_t word = address / 4;
             const uint8_t within = static_cast<uint8_t>(address % 4);
-            const uint8_t size = static_cast<uint8_t>(
-                std::min<uint32_t>(fragment.size - offset, 4 - within));
+            uint32_t run = std::min<uint32_t>(fragment.size - offset, 4 - within);
+            Source source{word, 0, 0};
+            if (from_sector_register) {
+                const uint64_t from = fragment.gmem_address + offset;
+                const uint8_t from_within = static_cast<uint8_t>(from % 4);
+                run = std::min<uint32_t>(run, 4 - from_within);
+                source = {word, from / 4, static_cast<uint8_t>((within + 4 - from_within) % 4)};
+            }
+            const uint8_t size = static_cast<uint8_t>(run);
             for (uint8_t byte = 0; byte < size; ++byte) {
                 if (!occupied.emplace(word, uint8_t(within + byte)).second) {
                     throw SimError("overlapping tma fragments target the same shmem byte");
                 }
             }
-            words[word % config_.shmem_banks][word].push_back(Piece{index, offset, size});
+            words[word % config_.shmem_banks][source].push_back(Piece{index, offset, size});
             offset = static_cast<uint8_t>(offset + size);
         }
     }
@@ -3161,8 +3196,8 @@ std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_round
     std::vector<std::vector<Piece>> result(rounds);
     for (const auto& bank : words) {
         std::size_t round = 0;
-        for (const auto& [word, pieces] : bank) {
-            (void)word;
+        for (const auto& [source, pieces] : bank) {
+            (void)source;
             result[round].insert(result[round].end(), pieces.begin(), pieces.end());
             ++round;
         }
@@ -3170,89 +3205,85 @@ std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_round
     return result;
 }
 
+// The walker's next element: along the row (dimension 0), then the next row.
 bool Machine::tma_advance_coordinate(TmaCommand& command) {
-    const uint32_t source_x = command.descriptor.transpose
-        ? command.descriptor.box[1] : command.descriptor.box[0];
-    const uint32_t source_y = command.descriptor.transpose
-        ? command.descriptor.box[0] : command.descriptor.box[1];
-    if (++command.x < source_x) return true;
+    if (++command.x < command.descriptor.tile_length) return true;
     command.x = 0;
-    if (++command.y < source_y) return true;
+    if (++command.y < command.descriptor.tile_rows) return true;
     command.y = 0;
     command.walker_done = true;
     return false;
 }
 
+// The walker's element is inside the tensor in every dimension: dimension 0
+// at c0 + x, the row dimension at its coordinate + y, the other two at their
+// coordinates (fixed_in_bounds, decided once per command).
 bool Machine::tma_coordinate_in_bounds(const TmaCommand& command) const {
-    const std::array<uint32_t, 2> local{command.x, command.y};
-    for (uint32_t dimension = 0; dimension < command.descriptor.rank; ++dimension) {
-        const auto coordinate = static_cast<int64_t>(command.origin[dimension]) + local[dimension];
-        if (coordinate < 0 ||
-            static_cast<uint64_t>(coordinate) >= command.descriptor.dimensions[dimension]) {
-            return false;
-        }
-    }
-    return true;
+    const auto& descriptor = command.descriptor;
+    const auto inside = [&](uint32_t dimension, int64_t coordinate) {
+        return coordinate >= 0 && static_cast<uint64_t>(coordinate) < descriptor.dimensions[dimension];
+    };
+    const auto row = descriptor.row_dimension;
+    return command.fixed_in_bounds && inside(0, int64_t{command.coordinates[0]} + command.x) &&
+        inside(row, int64_t{command.coordinates[row]} + command.y);
 }
 
+// An in-bounds element's global byte address:
+//     base + (c0 + x + (c_row + y) s_row + fixed_offset) x element_bytes
+// (src/tma.hpp; in bounds, every coordinate is at or above zero). Arithmetic
+// that leaves 64 bits is a SimError, not machine behaviour.
 uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
-    const auto x = static_cast<uint64_t>(
-        static_cast<int64_t>(command.origin[0]) + command.x);
-    const auto y = static_cast<uint64_t>(
-        static_cast<int64_t>(command.origin[1]) + command.y);
-    uint64_t element = x;
-    const auto add_product = [&](uint64_t coordinate, uint64_t stride) {
-        if (coordinate != 0 && stride > UINT64_MAX / coordinate) {
-            throw SimError("tma global address arithmetic overflow");
-        }
-        const auto term = coordinate * stride;
-        if (element > UINT64_MAX - term) {
-            throw SimError("tma global address arithmetic overflow");
-        }
-        element += term;
-    };
-    if (command.descriptor.rank >= 2) add_product(y, command.descriptor.row_stride);
-    if (element > UINT64_MAX / command.descriptor.element_bytes) {
-        throw SimError("tma global byte address arithmetic overflow");
-    }
-    const auto byte_offset = element * command.descriptor.element_bytes;
-    if (command.descriptor.gmem_base > UINT64_MAX - byte_offset) {
-        throw SimError("tma global byte address arithmetic overflow");
-    }
-    const auto address = command.descriptor.gmem_base + byte_offset;
-    if (address > gmem_.size() || command.descriptor.element_bytes > gmem_.size() - address) {
+    const auto& descriptor = command.descriptor;
+    const auto row = descriptor.row_dimension;
+    const auto overflow = [] { throw SimError("tma global address arithmetic overflow"); };
+    uint64_t element = static_cast<uint64_t>(int64_t{command.coordinates[0]} + command.x);
+    const auto row_index = static_cast<uint64_t>(int64_t{command.coordinates[row]} + command.y);
+    const auto stride = tma_stride(descriptor, row);
+    if (row_index != 0 && stride > UINT64_MAX / row_index) overflow();
+    if (element > UINT64_MAX - row_index * stride) overflow();
+    element += row_index * stride;
+    if (element > UINT64_MAX - command.fixed_offset) overflow();
+    element += command.fixed_offset;
+    if (element > UINT64_MAX / descriptor.element_bytes) overflow();
+    const auto byte_offset = element * descriptor.element_bytes;
+    if (descriptor.base > UINT64_MAX - byte_offset) overflow();
+    const auto address = descriptor.base + byte_offset;
+    if (address > gmem_.size() || descriptor.element_bytes > gmem_.size() - address) {
         throw SimError("tma global access is outside gmem");
     }
     return address;
 }
 
+// Where the walker's element lands in (load) or comes from (store) shared
+// memory: the buffer plus the tile's offset in its descriptor's layout
+// (src/tma.hpp tma_tile_offset, through src/layout.hpp).
 uint32_t Machine::tma_shmem_address(const TmaCommand& command) const {
-    const uint32_t u = command.descriptor.transpose ? command.y : command.x;
-    const uint32_t v = command.descriptor.transpose ? command.x : command.y;
-    // xor64 boxes are compact operand objects: with E = 16 / element_bytes
-    // elements per 16-byte row (8 fp16, 4 fp32), logical K selects the K slice
-    // (k / E) and the byte within the row ((k % E) * element_bytes); the outer
-    // coordinate is the row. A slice is one 16-byte row per outer index, so
-    // slices sit 16 x outer apart -- the spacing the MMA reads an operand of
-    // that many rows with (mma_a_address / mma_b_address).
-    const uint32_t element_bytes = command.descriptor.element_bytes;
-    const uint32_t row_elements = 16u / element_bytes;
-    if (is_xor64(command.descriptor)) {
-        const uint32_t slice_bytes = 16u * tma_xor64_outer_extent(command.descriptor);
-        const bool a_role = command.descriptor.swizzle == static_cast<uint8_t>(TmaSwizzle::xor64_a);
-        const uint32_t k = a_role ? u : v;
-        const uint32_t outer = a_role ? v : u;
-        return xor64_byte_address(command.shmem_address + slice_bytes * (k / row_elements), outer,
-            (k % row_elements) * element_bytes, a_role ? 0 : 2);
-    }
-    uint64_t element = u;
-    element += static_cast<uint64_t>(v) * command.descriptor.box[0];
-    const auto offset = element * command.descriptor.element_bytes;
-    const auto address = static_cast<uint64_t>(command.shmem_address) + offset;
+    const auto address = uint64_t{command.shmem_address} + tma_tile_offset(command.descriptor, command.x, command.y);
     if (address > shmem_.size() || command.descriptor.element_bytes > shmem_.size() - address) {
         throw SimError("tma shmem access is outside shmem");
     }
     return static_cast<uint32_t>(address);
+}
+
+// Once per command, at the descriptor's decode: the two dimensions the tile
+// does not walk (neither 0 nor the row dimension) -- are their coordinates
+// inside the tensor, and their element offset.
+void Machine::tma_command_start(TmaCommand& command) const {
+    const auto& descriptor = command.descriptor;
+    command.fixed_in_bounds = true;
+    command.fixed_offset = 0;
+    for (uint32_t dimension = 1; dimension < tma_max_coordinates; ++dimension) {
+        if (dimension == descriptor.row_dimension) continue;
+        const int64_t coordinate = command.coordinates[dimension];
+        if (coordinate < 0 || static_cast<uint64_t>(coordinate) >= descriptor.dimensions[dimension]) {
+            command.fixed_in_bounds = false;
+            command.fixed_offset = 0;
+            return;
+        }
+        const auto term = static_cast<uint64_t>(coordinate) * tma_stride(descriptor, dimension);
+        if (command.fixed_offset > UINT64_MAX - term) throw SimError("tma global address arithmetic overflow");
+        command.fixed_offset += term;
+    }
 }
 
 void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
@@ -3260,13 +3291,13 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
         command.logical_bytes > std::numeric_limits<uint32_t>::max()) {
         throw SimError("tma logical byte count is outside the mbar encoding");
     }
-    // The shared address operand is 64-byte aligned by its packing (64-byte
-    // units, src/tma.hpp); the whole box must lie in shmem.
+    // The buffer address is 64-byte aligned (its low bits are not wired,
+    // src/tma.hpp); the whole tile must lie in shmem.
     if (command.shmem_address > shmem_.size() ||
         command.logical_bytes > shmem_.size() - command.shmem_address) {
-        throw SimError("tma logical box does not fit in shmem");
+        throw SimError("tma tile does not fit in shmem");
     }
-    if (command.descriptor.gmem_base > gmem_.size()) {
+    if (command.descriptor.base > gmem_.size()) {
         throw SimError("tma global base is outside gmem");
     }
 }
@@ -3465,7 +3496,16 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     if (uniform_dst.has_value() && *uniform_dst >= config_.urf_registers) {
         panic(warp, inst, "uniform destination register out of range");
     }
-    sanitizer_.check_uniform_raw(site(warp, inst), uniform_sources_read, cycle_ + issue_to_urf_sample);
+    if (is_tma(inst.opcode)) {
+        // A tma's registers are sampled over its rounds (src/rf.hpp): each
+        // must be written by its own round's sample.
+        for (uint32_t round = 0; round < tma_operand_rounds(tma_coordinate_count(inst.opcode)); ++round) {
+            sanitizer_.check_uniform_raw(site(warp, inst), tma_operand_round(inst, round),
+                cycle_ + issue_to_tma_round_sample(round));
+        }
+    } else {
+        sanitizer_.check_uniform_raw(site(warp, inst), uniform_sources_read, cycle_ + issue_to_urf_sample);
+    }
     if (uniform_dst.has_value()) {
         sanitizer_.check_uniform_waw(site(warp, inst), *uniform_dst, cycle_ + issue_to_urf_visible(config_));
     }
@@ -3503,7 +3543,9 @@ IssuePlan Machine::issue_plan(const Instruction& inst) const {
         sources = {inst.src0};
     }
     plan.reads = rf_read_round(sources);
-    plan.uniform_reads = rf_read_round(uniform_sources(inst));
+    // A tma's issue round is its operand read's round 0 (src/rf.hpp); its
+    // later rounds are the TMA operand read's own.
+    plan.uniform_reads = is_tma(inst.opcode) ? tma_operand_round(inst, 0) : rf_read_round(uniform_sources(inst));
     const auto destination = destination_register(inst);
     if (uses_arithmetic_pipeline(inst) && destination.has_value()) {
         plan.write_reg = destination;
@@ -3531,7 +3573,12 @@ ResourceView Machine::resource_view(
         view.write_inhibited = w.rf_write.banks.at(*plan.write_reg % config_.rf_banks).inhibit_simt;
     }
     view.wait_slot_free = free_wait_slot_count(w) > claims.wait_slots;
-    view.tma_queue_room = w.tma_next.commands.size() + claims.tma_commands < config_.tma_queue_commands;
+    // A queue slot is counted as taken from a tma's accept: the queue after
+    // this cycle, the command its operand read pushes now, the commands it
+    // still holds. So the push always fits.
+    view.tma_queue_room = w.tma_next.commands.size() + (w.tma_pushed.has_value() ? 1 : 0) +
+        tma_commands_being_read() < config_.tma_queue_commands;
+    view.urf_ports_held = tma_read_ports_held();
     view.mma_queue_room = w.mma_next.queue.size() + claims.mma_commands < config_.mma_queue_commands;
     if (is_acc_transfer(inst.opcode)) {
         const bool load = is_acc_load(inst.opcode);
@@ -3559,6 +3606,9 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     case Refusal::rf_read_inhibited:
         trace_->rf_simt_read_inhibited();
         return {false, WarpState::structural, "RF read inhibited"};
+    case Refusal::urf_read_ports_held:
+        trace_->urf_read_ports_held();
+        return {false, WarpState::structural, "uniform read ports held"};
     case Refusal::sfu_busy:
         trace_->sfu_unit_stall();
         return {false, WarpState::structural, "SFU unit busy"};
@@ -3622,7 +3672,11 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         w.issue.halt = true;
         break;
     default:
-        accept_for_dispatch(warp, inst, plan, w);
+        if (is_tma(inst.opcode)) {
+            accept_tma(warp, inst, w);
+        } else {
+            accept_for_dispatch(warp, inst, plan, w);
+        }
         break;
     }
     check_issue_latency(warp, inst);
@@ -3757,6 +3811,22 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     w.issue.dispatch = std::move(entry);
 }
 
+// A tma accepted now (trash/rfc17.md section 4): it loads the TMA operand
+// read's round counter, whose round 0 samples urS / urM next cycle (the
+// issue register's), and from now on it counts as a slot of the TMA queue
+// (resource_view). It reads no vector register and sets no depbar. Issue
+// accepted it only with the counter free after this cycle (its last round,
+// if any, is sampled now: tma_read_ports_held).
+void Machine::accept_tma(Warp& warp, const Instruction& inst, Wires& w) {
+    TmaReadRounds rounds;
+    rounds.header.issue_cycle = cycle_;
+    rounds.header.warp = warp.id;
+    rounds.header.pc = head_pc(warp.id);
+    rounds.header.active_mask = warp.active_mask;
+    rounds.header.instruction = inst;
+    w.issue.tma_read = std::move(rounds);
+}
+
 // What the dispatch pipeline's instructions will take when they reach their
 // units: the claims every later admission subtracts from the space it sees.
 Machine::DispatchClaims Machine::dispatch_claims() const {
@@ -3769,7 +3839,6 @@ Machine::DispatchClaims Machine::dispatch_claims() const {
         if (is_mbar_predicate_writer(opcode)) ++claims.probes;
         if (is_mbar_try_wait(opcode)) ++claims.wait_slots;
         if (is_lsu_opcode(opcode)) ++claims.lsu_commands;
-        if (is_tma(opcode)) ++claims.tma_commands;
         if (is_mma_command(opcode)) ++claims.mma_commands;
         if (is_acc_transfer(opcode)) ++claims.acc[is_acc_load(opcode) ? 0 : 1];
     }
@@ -3818,10 +3887,6 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
     case Opcode::ldg_uni:
         dispatch_lsu(op, w);
         break;
-    case Opcode::tma_load:
-    case Opcode::tma_store:
-        dispatch_tma(op, w);
-        break;
     case Opcode::mbar_init_i:
     case Opcode::mbar_init_r:
     case Opcode::mbar_arrive:
@@ -3867,7 +3932,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     // xor64 K block is still whole 16-byte rows).
     const uint64_t a_bytes = mma_operand_footprint(config_, shape, true);
     const uint64_t b_bytes = mma_operand_footprint(config_, shape, false);
-    if ((config_.mma_layout == MmaLayout::xor64 && ((a | b) & 63u) != 0) ||
+    if ((config_.mma_layout == TileLayout::xor64 && ((a | b) & 63u) != 0) ||
         static_cast<uint64_t>(a) + a_bytes > shmem_.size() ||
         static_cast<uint64_t>(b) + b_bytes > shmem_.size())
         panic(op, "MMA operand alignment or footprint is outside shmem");
@@ -4016,44 +4081,104 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     w.dispatch.lsu = std::move(admission);
 }
 
-void Machine::dispatch_tma(const DispatchEntry& op, Wires& w) {
-    const auto& inst = op.instruction;
-    if (inst.imm < 0 || inst.imm % 64 != 0 ||
-        static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_.size()) {
-        panic(op, "tma descriptor is not 64-byte aligned and in shmem");
+// ===========================================================================
+// The TMA operand read's end (TmaReadRounds in src/sim.hpp; the timing is
+// src/rf.hpp tma_operand_rounds). The pair in the URF read stages' last stage
+// is at the URF output now: it goes into the holding register (round 0 starts
+// the command: its instruction's fields, the buffer and the barrier, the
+// coordinates zero until supplied). With the command's last pair the command
+// is pushed into the TMA queue now; the engine sees it from the next cycle.
+// ===========================================================================
+
+void Machine::arrive_tma_operands(Wires& w) {
+    const auto& pairs = tma_read_pairs_.cur();
+    if (pairs.empty() || !pairs.back().has_value()) return;
+    const auto& pair = *pairs.back();
+    auto holding = tma_holding_.cur();
+    if (pair.round == 0) {
+        if (holding.has_value()) {
+            throw SimError("internal: a tma's operands arrived while the holding register held another command");
+        }
+        holding = TmaReadHolding{};
+        holding->header = pair.header.value();
+        holding->buffer = pair.words.at(0);
+        holding->barrier = pair.words.at(1);
+    } else {
+        if (!holding.has_value()) throw SimError("internal: a tma's coordinates arrived without their command");
+        for (std::size_t i = 0; i < pair.words.size(); ++i) {
+            holding->coordinates.at(2 * (pair.round - 1) + i) = static_cast<int32_t>(pair.words[i]);
+        }
     }
-    if (inst.src0 > 254) panic(op, "tma coordinate register pair is invalid");
-    const auto command_id = next_tma_command_id_++;
+    if (pair.last) {
+        w.tma_pushed = tma_command_from(*holding, w);
+        holding.reset();
+    }
+    w.tma_holding_changed = true;
+    w.tma_holding_after = std::move(holding);
+}
+
+// The holding register's command, complete now, as the TMA queue takes it
+// (what dispatch did before rfc17): the machine's panics on its operands, and
+// the sanitizer's checks -- the uniform operation's partial-mask rule, the
+// address operands' low bits, the descriptor's and the tile's footprint.
+Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wires& w) {
+    const auto& header = holding.header;
+    const auto& inst = header.instruction;
+    const IssueSite where{cycle_, header.warp, header.pc, inst, &config_.mma_shapes};
+    if (static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_.size()) {
+        throw_issue_panic(where, "tma descriptor is not in shmem");
+    }
+    sanitizer_.check_uniform_mask(where, header.active_mask, full_mask());
+    sanitizer_.check_tma_operand_alignment(where, holding.buffer, holding.barrier);
     TmaCommand command;
-    command.id = command_id;
-    command.warp = op.warp;
-    command.pc = op.pc;
+    command.id = next_tma_command_id_++;
+    command.warp = header.warp;
+    command.pc = header.pc;
     command.instruction = inst;
-    command.direction = inst.opcode == Opcode::tma_store ? TmaDirection::store : TmaDirection::load;
+    command.direction = is_tma_store(inst.opcode) ? TmaDirection::store : TmaDirection::load;
     command.descriptor_address = static_cast<uint32_t>(inst.imm);
-    command.origin = {
-        static_cast<int32_t>(uniform_reg(op, inst.src0, "tma x coordinate")),
-        static_cast<int32_t>(uniform_reg(op, inst.src0 + 1, "tma y coordinate")),
-    };
-    const auto addresses = unpack_tma_addresses(uniform_reg(op, inst.src1, "tma address operand"));
-    command.shmem_address = addresses.shmem;
-    command.mbar_address = addresses.mbar; // 8-byte aligned by the packing
+    command.coordinates = holding.coordinates;
+    // The two addresses' low bits are not wired (src/tma.hpp).
+    command.shmem_address = holding.buffer & ~(tma_buffer_alignment - 1);
+    command.mbar_address = holding.barrier & ~(tma_barrier_alignment - 1);
     if (static_cast<uint64_t>(command.mbar_address) + 8 > shmem_.size()) {
-        panic(op, "tma completion mbar is outside shmem");
+        throw_issue_panic(where, "tma completion mbar is outside shmem");
     }
     // Sanitizer: the descriptor the engine will read -- memory as of this
     // cycle's edge; anything still travelling to it PANICs in
     // record_tma_accept (missing fence.sh / race, rfc12 section 11) -- and the
     // phase of its completion mbar now, the accept-time peek a TMA's
     // complete_tx is checked against (rfc12 section 8; the hardware reads no
-    // mbar). The engine accepts the command now, at its dispatch.
+    // mbar). The engine accepts the command now, at its push.
     const auto descriptor_bytes = tma_descriptor_at_accept(command.descriptor_address, w);
-    sanitizer_.record_tma_accept(site(op), command_id, command.descriptor_address, descriptor_bytes,
+    sanitizer_.record_tma_accept(where, command.id, command.descriptor_address, descriptor_bytes,
         command.direction == TmaDirection::load, command.shmem_address, command.mbar_address,
         pending_tma_completion_mbar(command.mbar_address, w));
-    trace_->tma_command_begin(cycle_, command_id, op.warp, static_cast<uint32_t>(inst.imm),
+    trace_->tma_command_begin(cycle_, command.id, header.warp, command.descriptor_address,
         w.tma_next.commands.size() + 1);
-    w.dispatch.tma = std::move(command);
+    return command;
+}
+
+// The commands the TMA operand read holds after this cycle, each counted as
+// a slot of the TMA queue since its accept: the one in the round counter, and
+// each whose last pair is still in the URF read stages (the pair in the last
+// stage arrives now: tma_pushed).
+uint32_t Machine::tma_commands_being_read() const {
+    uint32_t commands = tma_read_rounds_.cur().has_value() ? 1 : 0;
+    const auto& pairs = tma_read_pairs_.cur();
+    for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) {
+        if (pairs[stage].has_value() && pairs[stage]->last) ++commands;
+    }
+    return commands;
+}
+
+// The round counter's command has rounds still to start after the one it
+// samples now: an instruction accepted now would sample a uniform register
+// in one of them.
+bool Machine::tma_read_ports_held() const {
+    const auto& rounds = tma_read_rounds_.cur();
+    return rounds.has_value() &&
+        rounds->round + 1 < tma_operand_rounds(tma_coordinate_count(rounds->header.instruction.opcode));
 }
 
 // mbar.init / arrive / arrive.expect_tx: a uniform operation, its operands
@@ -4397,7 +4522,9 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
 // uniform registers are sampled from the URF now too (READ_FIRST: a write
 // landing at this cycle's edge is not seen); one instruction's round reads
 // at most two, the URF's read ports. The URF write pipeline's stage-0 write
-// samples here as well (its operands latch in step_urf).
+// samples here as well (its operands latch in step_urf), and so does the TMA
+// operand read's round (issue refused every other uniform reader that would
+// sample with one of its later rounds).
 void Machine::step_rf_reads(Wires& w) {
     std::vector<uint32_t> simt_reads(config_.rf_banks, 0);
     uint32_t uniform_reads = 0;
@@ -4446,6 +4573,20 @@ void Machine::step_rf_reads(Wires& w) {
             for (const auto reg : sources) values.push_back(warps_[write->warp].urf.at(reg));
             w.urf_sample = std::move(values);
         }
+    }
+    // The TMA operand read's round now (src/rf.hpp tma_operand_round): its
+    // registers by operand position, in the counter's warp. The pair and its
+    // tag enter the URF read stages.
+    if (const auto& rounds = tma_read_rounds_.cur(); rounds.has_value()) {
+        const auto& inst = rounds->header.instruction;
+        const auto registers = tma_operand_round(inst, rounds->round);
+        TmaReadPair pair;
+        pair.round = rounds->round;
+        pair.last = rounds->round + 1 == tma_operand_rounds(tma_coordinate_count(inst.opcode));
+        if (rounds->round == 0) pair.header = rounds->header;
+        for (const auto reg : registers) pair.words.push_back(warps_[rounds->header.warp].urf.at(reg));
+        uniform_reads += static_cast<uint32_t>(registers.size());
+        w.tma_sampled = std::move(pair);
     }
     if (uniform_reads > urf_read_ports) {
         throw SimError("internal: the URF sampled " + std::to_string(uniform_reads) + " uniform registers at cycle " +
@@ -4573,7 +4714,7 @@ void Machine::land_urf_write(const Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 36> canonical = {
+    static constexpr std::array<Driver, 37> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -4597,6 +4738,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_tma_transactions,
         &Machine::drive_tma_sector,
         &Machine::drive_tma_store_registers,
+        &Machine::drive_tma_operand_read,
         &Machine::drive_lsu_commands,
         &Machine::drive_assembly_pool,
         &Machine::drive_ingress,
@@ -4929,8 +5071,37 @@ void Machine::drive_issue_read_banks(const Wires& w) {
 // The TMA command queue: step_tma's result, plus issue's new command.
 void Machine::drive_tma_queue(const Wires& w) {
     auto next = w.tma_next;
-    if (w.dispatch.tma.has_value()) next.commands.emplace(w.dispatch.tma->id, *w.dispatch.tma);
+    if (w.tma_pushed.has_value()) next.commands.emplace(w.tma_pushed->id, *w.tma_pushed);
     tma_.set_next(std::move(next), "drive_tma_queue");
+}
+
+// The TMA operand read's registers: the round counter moves to its next round
+// (it empties after the last) or takes issue's new command; every sampled
+// pair moves one URF read stage on (the one in the last stage arrived now);
+// the holding register takes this cycle's arrival.
+void Machine::drive_tma_operand_read(const Wires& w) {
+    const auto& rounds = tma_read_rounds_.cur();
+    std::optional<TmaReadRounds> next_rounds;
+    if (tma_read_ports_held()) {
+        next_rounds = rounds;
+        ++next_rounds->round;
+    }
+    if (w.issue.tma_read.has_value()) {
+        if (next_rounds.has_value()) throw SimError("internal: a tma was accepted while the operand read had rounds left");
+        next_rounds = w.issue.tma_read;
+    }
+    if (rounds.has_value() || next_rounds.has_value()) {
+        tma_read_rounds_.set_next(std::move(next_rounds), "drive_tma_operand_read: rounds");
+    }
+    const auto& pairs = tma_read_pairs_.cur();
+    const bool in_flight = std::any_of(pairs.begin(), pairs.end(), [](const auto& stage) { return stage.has_value(); });
+    if (in_flight || w.tma_sampled.has_value()) {
+        TmaReadPairs next(pairs.size());
+        next.front() = w.tma_sampled;
+        for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) next[stage + 1] = pairs[stage];
+        tma_read_pairs_.set_next(std::move(next), "drive_tma_operand_read: URF read stages");
+    }
+    if (w.tma_holding_changed) tma_holding_.set_next(w.tma_holding_after, "drive_tma_operand_read: holding");
 }
 
 // The TMA's shmem transactions after this cycle's grants and returns.
@@ -5286,8 +5457,6 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
     case Opcode::r2ur: return {inst.src0};
-    case Opcode::tma_load:
-    case Opcode::tma_store: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1), inst.src1};
     case Opcode::sts:
     case Opcode::stg: return {inst.src0, inst.src1};
     case Opcode::stg_v8: {
@@ -5380,8 +5549,9 @@ std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predi
 }
 
 // A declared-uniform operand still taken from a VECTOR register (rfc09 pin
-// 3) -- since the URF slice only the ldg.v8 / stg.v8 bases and the TMA
-// operands: hardware reads lane 0, whatever the active mask (even when lane 0
+// 3) -- since the URF slice only the ldg.v8 / stg.v8 bases (the TMA's
+// operands are uniform registers since rfc17): hardware reads lane 0,
+// whatever the active mask (even when lane 0
 // is inactive). Two things are UB and the sanitizer panics on them: a value
 // that differs across lanes (named by the operand: "... is not
 // warp-uniform"), and any uniform operation under a partial or empty mask

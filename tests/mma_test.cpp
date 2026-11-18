@@ -256,7 +256,7 @@ void test_mma_fusion_boundaries() {
     // round the first group to FP32 before cancellation in the second group.
     for (const uint32_t core_k : {4u, 8u}) {
         auto profile = canonical_profile();
-        profile.mma_layout = nanosm::MmaLayout::dense;
+        profile.mma_layout = nanosm::TileLayout::dense;
         profile.mma_core_k = core_k;
         const auto scheduled = nanosm::compile_qtx(
             ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\numov ur4, 4096\numov ur8, 0\n"
@@ -283,7 +283,7 @@ void test_mma_fusion_boundaries() {
 void test_autonomous_mma_gemm_and_commit() {
     auto profile = canonical_profile();
     auto dense = profile;
-    dense.mma_layout = nanosm::MmaLayout::dense;
+    dense.mma_layout = nanosm::TileLayout::dense;
     require(nanosm::device_profile_fingerprint(profile) != nanosm::device_profile_fingerprint(dense),
         "MMA operand layout was omitted from the profile fingerprint");
 
@@ -316,8 +316,8 @@ void test_autonomous_mma_gemm_and_commit() {
     auto a_address = [](uint32_t m, uint32_t k) {
         return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
     };
-    auto b_address = [](uint32_t k, uint32_t n) {
-        return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1) ^ 2)) + 2 * (k & 1);
+    auto b_address = [](uint32_t k, uint32_t n) { // B stored as n rows of k: A's rule
+        return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
     };
     for (uint32_t m = 0; m < 64; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, a_address(m, k), 0x3c00); // 1
@@ -530,15 +530,19 @@ void test_mbar_engine_events_alternate_tma_first() {
     require(tx.phase && tx.tx_bytes == 0, "a TMA completion was lost");
 }
 
-// The same-cycle case with a real TMA load. Filler movs before tma.load set
-// its issue delay; the sweep moves its completion across cycle r (the commit's
-// presentation) in two-cycle steps (DRAM clock), and the test finds the delay
-// at which both present in cycle r. Each event is visible to the RMW engine
-// from the next cycle, so at r + 1 they tie: the TMA goes first (the
-// last-served bit starts at MMA) and the commit follows at r + 3, after
-// waiting the two cycles of the TMA's RMW. At every delay the queued
-// mma.async is still accepted at r (the MMA queue never waits on the TMA) and
-// the TMA command ends the cycle after its event is claimed.
+// The same-cycle case with a real TMA load. After the commit, umovs set the
+// tma.load's uniform-register operands (buffer, barrier, coordinate), then
+// filler movs set its issue delay: vector movs read no uniform register, so
+// they issue one per cycle, and once they cover the umov -> tma distance each
+// one moves the tma.load a cycle later. The sweep moves its completion across
+// cycle r (the commit's presentation) in two-cycle steps (DRAM clock), and
+// the test finds the delay at which both present in cycle r. Each event is
+// visible to the RMW engine from the next cycle, so at r + 1 they tie: the
+// TMA goes first (the last-served bit starts at MMA) and the commit follows
+// once the TMA's RMW is done, at r + 1 + rmw_busy_cycles(). At every delay
+// the queued mma.async is still accepted at r (the MMA queue never waits on
+// the TMA; the tma.load's operand reads are long over by then) and the TMA
+// command ends the cycle after its event is claimed.
 // Two-cycle steps reach r only at one phase of r against the DRAM clock, and
 // which phase the kernel lands on follows its issue distances: when the MMA
 // addresses moved to uniform registers (2026-11-08; umov -> mma.async is 4
@@ -565,18 +569,17 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     };
     const auto run = [&](uint32_t lead, std::optional<uint32_t> delay) {
         std::ostringstream qtx;
-        // The TMA's address operand is built after the commit (with the
-        // fillers), so for one lead the commit's cycle r -- and its phase
-        // against the DRAM clock -- is the same in every run.
+        // The TMA's operands (umov into ur10, ur11, ur8) are set after the
+        // commit (with the fillers), so for one lead the commit's cycle r --
+        // and its phase against the DRAM clock -- is the same in every run.
         qtx << ".acc C, 0, 64, 64\n";
         for (uint32_t i = 0; i < lead; ++i) qtx << "mov r11, " << i << '\n';
         qtx << "umov ur0, 0\numov ur1, 1024\numov ur4, 4096\n"
-            << "mov r8, 0\nmov r9, 0\nmov r10, 0\n"
             << "mma.async.init.m64n64k8 C, [ur0], [ur1]\nmma.commit [ur4]\n";
         if (delay.has_value()) {
-            qtx << tma_operand_asm(10, tile, tx_mbar);
+            qtx << tma_operands_asm(10, tile, 11, tx_mbar, 8);
             for (uint32_t i = 0; i < *delay; ++i) qtx << "mov r" << 12 + i % 8 << ", " << i << '\n';
-            qtx << "tma.load [" << descriptor_address << "], r8, r10\n";
+            qtx << "tma.load.1d [ur10], [" << descriptor_address << ", ur8], [ur11]\n";
         }
         qtx << "mma.async.m64n64k8 C, [ur0], [ur1]\nhalt\n";
         nanosm::Launch launch;
@@ -586,10 +589,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
         for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
         write_mbar(shmem, commit_mbar, 1, 0);
         write_mbar(shmem, tx_mbar, 0, 64);
-        nanosm::TmaDescriptor descriptor;
-        descriptor.dimensions = {16, 1};
-        descriptor.box = {16, 1};
-        write_tma_descriptor(shmem, descriptor_address, descriptor);
+        write_tma_descriptor(shmem, descriptor_address, plain_tma_1d(16));
         nanosm::Machine machine(canonical_profile(), compile(qtx.str()), std::move(launch),
             {.timeline = true});
         machine.run(5000);
@@ -659,7 +659,7 @@ void test_mma_dense_profile_recurrence_bubbles() {
     auto too_slow = canonical_profile();
     too_slow.mma_shapes = {{32, 64, 8}};
     too_slow.mma_core_k = 4;
-    too_slow.mma_layout = nanosm::MmaLayout::dense;
+    too_slow.mma_layout = nanosm::TileLayout::dense;
     too_slow.mma_result_latency_cycles = 1000;
     try {
         nanosm::validate_device_profile(too_slow);
@@ -670,11 +670,11 @@ void test_mma_dense_profile_recurrence_bubbles() {
     }
     auto profile = canonical_profile();
     profile.mma_shapes = {{32, 64, 8}};
-    profile.mma_layout = nanosm::MmaLayout::dense;
+    profile.mma_layout = nanosm::TileLayout::dense;
     profile.mma_result_latency_cycles = 4000;
     nanosm::validate_device_profile(profile);
     auto unsupported = profile;
-    unsupported.mma_layout = nanosm::MmaLayout::xor64;
+    unsupported.mma_layout = nanosm::TileLayout::xor64;
     unsupported.mma_core_n = 2; // xor64 keeps a 4x4 block's rows apart: a 4x4x4 or 4x4x8 core only
     try {
         nanosm::validate_device_profile(unsupported);
@@ -834,7 +834,7 @@ void test_mma_varying_round_service() {
     // fetch must occupy the port for exactly its own rounds: the span of all
     // input steps equals the sum of served rounds plus counted stalls.
     auto profile = canonical_profile();
-    profile.mma_layout = nanosm::MmaLayout::dense;
+    profile.mma_layout = nanosm::TileLayout::dense;
     nanosm::validate_device_profile(profile);
     const auto kernel = compile(R"(
         .acc C, 0, 64, 64
@@ -887,13 +887,13 @@ void test_mma_varying_round_service() {
 
 // Canonical xor64 operand addresses, restated independently of the
 // production helper: A element (m, k) and B element (k, n) of 64x64x8 tiles
-// at 0 and 1024.
+// at 0 and 1024 (one rule: B is stored as n rows of k, as A is m rows of k).
 uint32_t i7_a_address(uint32_t m, uint32_t k) {
     return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
 }
 
 uint32_t i7_b_address(uint32_t k, uint32_t n) {
-    return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1) ^ 2)) + 2 * (k & 1);
+    return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
 }
 
 // One 64x64x8 tile pair (A = a_k on every row, B = b_k on every column) and
@@ -1032,7 +1032,7 @@ uint32_t i9_a_address(uint32_t base, uint32_t m, uint32_t k) {
 }
 
 uint32_t i9_b_address(uint32_t base, uint32_t k, uint32_t n) {
-    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1) ^ 2)) + 2 * (k & 1);
+    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
 }
 
 uint32_t i9_tmem_word(uint32_t base, uint32_t cols, uint32_t row, uint32_t col) {
@@ -1222,7 +1222,7 @@ void test_i9_profile_shapes_and_refusals() {
             nanosm::device_profile_fingerprint(restricted) != nanosm::device_profile_fingerprint(profile),
         "the shape list is not parsed or not fingerprinted");
     auto odd_core = profile;
-    odd_core.mma_layout = nanosm::MmaLayout::dense;
+    odd_core.mma_layout = nanosm::TileLayout::dense;
     odd_core.mma_core_m = 3; // 32 and 64 rows are not whole 3-row blocks
     try {
         nanosm::validate_device_profile(odd_core);

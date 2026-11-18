@@ -89,7 +89,9 @@
 //     ports always suffice) are sampled in its one read round, at the issue
 //     register's cycle c0 + 1, beside its vector registers; their values are
 //     at the URF output Lu later (no later than the vector operands: Lu <=
-//     Lr, validated).
+//     Lr, validated). The one exception is a tma (trash/rfc17.md section 4):
+//     it reads N + 2 registers over R rounds, two per round (below), and
+//     holds the two ports for its later rounds.
 //   - Writes: the only writers are uniform arithmetic (the SM's one uniform
 //     ALU, Eu = urf.alu_latency_cycles) and r2ur (lane 0 of a vector
 //     register). Each presents its result at the URF write port at the SAME
@@ -105,9 +107,13 @@
 //   - Canonical (Lu 1, Eu 1, Wu 1, Lr 2, L 3): a writer accepted at c0
 //     presents at c3, lands at c4, is visible from c5; a dependent uniform
 //     reader (sampling at its issue + 1) issues from c4, four cycles later.
-//   - Reuse of a uniform register while it is still being read cannot happen
-//     in this slice: every read is at issue + 1, every write lands L + Wu >= 3
-//     cycles after its own issue.
+//   - Reuse of a uniform register while it is still being read cannot
+//     happen: every read is at issue + 1 except a tma's later rounds, the
+//     last at issue + R <= issue + 3; a write issued after the tma (at issue
+//     + 1 at the earliest) lands at issue + 1 + L + Wu >= issue + 5 (L >= 3,
+//     Wu >= 1, validated), after the tma's last read. So a tma followed at
+//     once by a rewrite of its operand registers is correct (no rule for
+//     software).
 //   - ur2r rD, urS (a uniform register into every lane of a vector
 //     register) is a fixed-latency VECTOR result: its uniform operand is
 //     sampled at c0 + 1 and it rides the arithmetic pipeline like mov, its
@@ -232,6 +238,53 @@ inline uint32_t issue_to_urf_port(const DeviceProfile& profile) {
 // register (canonical 5).
 inline uint32_t issue_to_urf_visible(const DeviceProfile& profile) {
     return issue_to_urf_port(profile) + profile.urf_write_depth_cycles + 1;
+}
+
+// The tma's operand read (trash/rfc17.md section 4). The URF's two read
+// ports serve the whole SM. A tma.Nd reads N + 2 registers by operand
+// position (a register named twice is read twice), two per round: round 0
+// samples urS and urM at the issue register's cycle like any read, then one
+// round per cycle samples the coordinates in pairs. R = 1 + ceil(N / 2): two
+// rounds for N = 1, 2 and three for N = 3, 4. tma.load.4d accepted at T
+// (canonical depths, Lu 1):
+//     T      accepted; one slot of the TMA queue is counted as taken
+//     T+1    round 0 samples urS, urM
+//     T+2    round 1 samples c0, c1    urS, urM arrive in the holding register
+//     T+3    round 2 samples c2, c3    c0, c1 arrive
+//     T+4                              c2, c3 arrive; the command is pushed into the queue
+//     T+5    the engine may start on it (its descriptor read)
+// While the command still has rounds to start (T+1 .. T+R-1) issue refuses
+// every instruction that reads a uniform register: its sample, a cycle after
+// its issue, would meet a later round. Uniform writers that read nothing and
+// vector-only instructions are never refused. So commands are accepted at
+// most every R cycles. qtxc does not model the rounds: it keeps every operand
+// register's writer the usual uniform distance from the tma (all N + 2
+// visible by its first read).
+inline constexpr uint32_t tma_operand_rounds(uint32_t coordinates) {
+    return 1 + (coordinates + 1) / 2;
+}
+
+// The registers round `round` of a tma samples, in operand order.
+inline std::vector<uint8_t> tma_operand_round(const Instruction& inst, uint32_t round) {
+    if (round == 0) return {inst.src0, inst.src2};
+    std::vector<uint8_t> registers;
+    const uint32_t coordinates = tma_coordinate_count(inst.opcode);
+    for (uint32_t i = 2 * (round - 1); i < std::min(coordinates, 2 * round); ++i) {
+        registers.push_back(static_cast<uint8_t>(inst.src1 + i));
+    }
+    return registers;
+}
+
+// Accepted issue -> the sample of round `round` of a tma.
+inline constexpr uint32_t issue_to_tma_round_sample(uint32_t round) {
+    return issue_to_urf_sample + round;
+}
+
+// Accepted issue -> the cycle a tma's last words reach the holding register
+// and the command is pushed into the TMA queue (the engine sees it from the
+// next cycle): canonical T + 3 for N = 1, 2 and T + 4 for N = 3, 4.
+inline uint32_t issue_to_tma_command(uint32_t coordinates, const DeviceProfile& profile) {
+    return issue_to_tma_round_sample(tma_operand_rounds(coordinates) - 1) + profile.urf_read_latency_cycles;
 }
 
 // The registers an instruction reads in its one round, from the source

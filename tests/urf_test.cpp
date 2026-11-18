@@ -362,7 +362,7 @@ void test_trace_shows_writes() {
         std::move(launch), {.timeline = true});
     machine.run(20000);
     require(machine.trace().summary().urf_writes == 2, "urf write count");
-    require(machine.trace().summary_text().find("urf: writes=2\n") != std::string::npos, "summary urf line");
+    require(machine.trace().summary_text().find("urf: writes=2 read_ports_held=0\n") != std::string::npos, "summary urf line");
     const auto json = machine.trace().perfetto_json();
     require(json.find("UR write") != std::string::npos && json.find("ur2 = 42") != std::string::npos,
         "Perfetto trace lacks the UR write instants");

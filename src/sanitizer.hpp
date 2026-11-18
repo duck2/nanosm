@@ -111,11 +111,13 @@ public:
     // ---- uniform-register hazards (src/rf.hpp) ----
     // A uniform register's READY cycle is its latest write's visibility (every
     // writer is fixed-latency: issue + L + Wu + 1). RAW: each uniform source,
-    // sampled at sample_cycle, must be visible by then. WAW: the younger write
-    // (visible from visible_cycle) must land after the older one. No WAR: a
-    // uniform register is read at issue + 1, written L + Wu after its writer's
-    // issue. Values from uniform registers are uniform by construction: no
-    // lane check applies to them.
+    // sampled at sample_cycle, must be visible by then (a tma's registers:
+    // each at its own round's sample, src/rf.hpp tma_operand_round). WAW: the
+    // younger write (visible from visible_cycle) must land after the older
+    // one. No WAR: a uniform register is read at issue + 1 (a tma's last round
+    // at issue + 3 at most), written L + Wu >= 4 after its writer's issue.
+    // Values from uniform registers are uniform by construction: no lane
+    // check applies to them.
     void record_uniform_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle);
     void check_uniform_raw(const IssueSite& site, const std::vector<uint8_t>& sources, uint64_t sample_cycle) const;
     void check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t visible_cycle) const;
@@ -134,8 +136,8 @@ public:
 
     // ---- declared uniformity (rfc09 pin 3) ----
     // A declared-uniform operand still taken from a vector register (the
-    // ldg.v8 / stg.v8 bases, the TMA operands, the bra.uni predicate; every
-    // other uniform operand is a uniform register since the URF slice) must
+    // ldg.v8 / stg.v8 bases, the bra.uni predicate; every other uniform
+    // operand is a uniform register since the URF slice and rfc17) must
     // hold one value in every lane. Hardware reads lane 0 only; anything else
     // is UB, diagnosed here. lane_values: the operand, by lane.
     void check_warp_uniform(
@@ -148,6 +150,10 @@ public:
     // backlog D12 / D12.1, rfc13 section 2); what the machine does then is
     // no contract.
     void check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const;
+    // A tma's buffer address must be 64-byte aligned and its barrier address
+    // 8-byte aligned (src/tma.hpp). The machine does not wire the low bits
+    // (it ignores them); a program that sets them is wrong, diagnosed here.
+    void check_tma_operand_alignment(const IssueSite& site, uint32_t buffer, uint32_t barrier) const;
 
     // ---- same-word stores (HUMAN 2026-10-12, backlog D12) ----
     // Two active lanes of one sts / stg naming one 4-byte word: UB, as on
@@ -213,8 +219,8 @@ public:
     // the box (a load's destination is written, a store's source read).
     // descriptor_bytes: what the engine's later A-read will see -- memory as
     // of this cycle's clock edge (anything still in flight PANICked above).
-    // load / shmem_address / completion_mbar: the instruction's direction and
-    // its address operand (tma.load / tma.store). completion_mbar_word: that
+    // load / shmem_address / completion_mbar: the instruction's direction, its
+    // buffer and its barrier (low bits dropped). completion_mbar_word: that
     // mbar as it stands at accept (none: outside shmem). Its phase is
     // recorded for the command's complete_tx (rfc12 section 8: the hardware
     // reads no mbar at TMA start; this peek is sanitizer-only metadata).
@@ -450,6 +456,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_issue_capture)
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_uniform_mask)
+    NANOSM_SANITIZER_NOOP(check_tma_operand_alignment)
     NANOSM_SANITIZER_NOOP(check_store_word_collision)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)

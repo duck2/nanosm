@@ -804,6 +804,15 @@ void test_i2_a_read_and_a_write_same_cycle() {
 // at b = c38 in both runs. The stalls are unchanged: the tma.load issues at
 // c36 (plain; ready at c40 = b + 2) or c37 (primed; ready at c41 = b + 3),
 // inside the hold that starts at b + 1.
+// Uniform-register tma: three umovs (buffer, mbar, coordinate) replace the
+// one mov, the last one stalling. Plain, they issue at c18..c20 (the mov was
+// at c18); primed, at c20, c22, c23 (warp 1's first instruction after its
+// branch takes c21; the mov was at c20). So the stalls are 16 / 14 (were
+// 18 / 17) and the tma.load still issues at c36 / c37; its command reaches
+// the TMA at issue + 3, the old dispatch, so it is ready at b + 2 / b + 3 as
+// before. The lds.uni after it reads a uniform register, so issue refuses it
+// in the cycle after the tma (the coordinate round holds the URF read ports):
+// both lds.uni issue a cycle later, still ready inside the hold.
 void test_i2_round_robin_tma_reads_and_loads() {
     const auto& profile = canonical_profile();
     require(i2_return(profile) == 4, "the timeline is derived for D = Lb = 2");
@@ -821,13 +830,12 @@ void test_i2_round_robin_tma_reads_and_loads() {
         const std::string priming = primed ? "lds.uni r5, [ur1 + 8] {pred=PT, stall=0, set=sb3, wait=-}\n"
                                              "lds.uni r6, [ur1 + 12] {pred=PT, stall=0, set=sb4, wait=-}\n"
                                            : "";
-        const std::string stall = primed ? "17" : "18";
-        // The stalling mov also sets the TMA's address operand (box at 1024,
-        // completing into 4104).
+        const std::string stall = primed ? "14" : "16";
+        // The TMA's operands (buffer at 1024 in ur10, completing into 4104 in
+        // ur11, coordinate 0 in ur8); the last umov stalls.
         nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, i3_with_blocker(priming +
-            "mov r10, " + std::to_string(nanosm::pack_tma_addresses(1024, 4104)) + " {pred=PT, stall=" + stall +
-            ", set=-, wait=-}\n" + R"(
-            tma.load [5120], r8, r10
+            "umov ur10, 1024\numov ur11, 4104\numov ur8, 0 {pred=PT, stall=" + stall + ", set=-, wait=-}\n" + R"(
+            tma.load.1d [ur10], [5120, ur8], [ur11]
             lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
             lds.uni r4, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
@@ -836,9 +844,13 @@ void test_i2_round_robin_tma_reads_and_loads() {
         machine.run();
         const uint64_t r = blocker + 16; // the RMW's read
         // warp 0's tma.load and two lds.uni (the last three before halt)
-        // became ready (dispatch + 1) while A-read was held
-        const uint32_t tma_pc = (primed ? 7 : 5) * 8;
-        const auto ready = [&](uint32_t pc) { return issued_at(machine, pc).front() + nanosm::issue_to_dispatch(profile) + 1; };
+        // became ready (the tma's command in the TMA queue, an lds.uni's
+        // dispatch, + 1) while A-read was held
+        const uint32_t tma_pc = (primed ? 9 : 7) * 8;
+        const auto ready = [&](uint32_t pc) {
+            const auto reach = pc == tma_pc ? nanosm::issue_to_tma_command(1, profile) : nanosm::issue_to_dispatch(profile);
+            return issued_at(machine, pc).front() + reach + 1;
+        };
         for (const uint32_t pc : {tma_pc, tma_pc + 8, tma_pc + 16}) {
             require(issued_at(machine, pc).size() == 1 && ready(pc) < r && ready(pc) > blocker,
                 "a request did not become ready inside the hold (blocker c" + std::to_string(blocker) + "):" +
@@ -886,11 +898,8 @@ void test_i2_tma_placement_on_port_b() {
         mbar.init [ur4], 1
         mma.async.init.m64n64k8 C, [ur0], [ur1]
         mma.commit [ur4]
-        mov r8, 0
-        mov r9, 0
-    )" + tma_operand_asm(10, 2048, 4104) + R"(
-        umov ur11, 4104
-        tma.load [5120], r8, r10
+    )" + tma_operands_asm(10, 2048, 11, 4104, 8) + R"(
+        tma.load.1d [ur10], [5120, ur8], [ur11]
     tma_wait:
         mbar.try_wait p1, [ur11], 0
         @!p1 bra.uni tma_wait
@@ -1620,7 +1629,7 @@ void test_i21_rmw_read_behind_a_read_transaction() {
 }
 
 // TMA store sector registers (tma.store_sector_registers, canonical 1).
-// A rank-1 linear TMA store of `sectors` 32 B sectors (one A-read round
+// A one-dimensional plain TMA store of `sectors` 32 B sectors (one A-read round
 // each) under a fast bus: the cycles its source rounds' words returned
 // (edge probe tma_store_round), in order, and the run's length. The warp
 // halts instead of polling the mbar: a try_wait probe would share A-read's
@@ -1633,8 +1642,8 @@ std::pair<std::vector<uint64_t>, uint64_t> i21_tma_store_returns(const nanosm::D
     fill_pattern(shmem, 0, bytes / 4, 0);
     write_rank1_tma(shmem, bytes, 0, bytes / 4, bytes + 128);
     image_bytes(launch.gmem_image, bytes);
-    const auto program = "mov r0, 0\nmov r1, 0\nmov r2, " + std::to_string(nanosm::pack_tma_addresses(0, bytes + 128)) +
-        "\ntma.store [" + std::to_string(bytes) + "], r0, r2\nhalt\n";
+    const auto program = tma_operands_asm(0, 0, 1, bytes + 128, 2) +
+        "tma.store.1d [" + std::to_string(bytes) + ", ur2], [ur0], [ur1]\nhalt\n";
     nanosm::Machine machine(config, compile(program, config), std::move(launch));
     machine.enable_edge_probe();
     machine.run(200000);
@@ -1868,10 +1877,10 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
     }
     // No auto-insertion: an sts the TMA then stores, with no fence written, gets none.
     const auto unfenced = nanosm::compile_qtx(
-        "mov r8, 0\nmov r9, 0\nmov r10, 0\nsts [r8], r8\ntma.store [5120], r8, r10\nhalt\n", profile);
+        "mov r8, 0\n" + i4_tma_operands(0) + "sts [r8], r8\ntma.store.1d [5120, ur8], [ur10], [ur11]\nhalt\n", profile);
     require(std::none_of(unfenced.instructions.begin(), unfenced.instructions.end(),
                 [](const auto& inst) { return inst.opcode == nanosm::Opcode::fence_sh; }) &&
-            unfenced.instructions.size() == 6,
+            unfenced.instructions.size() == 7,
         "qtxc inserted a fence.sh");
 }
 
@@ -1973,26 +1982,23 @@ void test_i4_fence_waits_until_own_accesses_reach_ram() {
         require(written.at(6).size() == 1 && written.at(6).front() > gl + d && load->read_reg(0, 5, 6) == 0x100 + 64 + 5,
             what + "lds: the fence waited for the RF write, or the lds read the wrong word");
 
-        // The TMA's coordinates and mbar are written first (I6a): their fixed
+        // The TMA's operand registers are written first (I6a): their fixed
         // distances are long met when the TMA follows the fence, so qtxc's
         // static schedule puts no stall between them.
-        auto engine = i4_machine(profile, R"(
-            mov r8, 0
-            mov r9, 0
-            mov r10, )" + std::to_string(i4_tma_operand(0)) + R"(
+        auto engine = i4_machine(profile, i4_tma_operands(0) + R"(
             umov ur12, 4104
             sread r0, LANE_ID
             shli r0, r0, 2
             mov r5, 0x777
             sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
             fence.sh
-            tma.store [5120], r8, r10
+            tma.store.1d [5120, ur8], [ur10], [ur11]
         wait: mbar.try_wait p0, [ur12], 0
             bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )", i4_tma(1024));
         engine->run(); // the sanitizer build: no missing-fence PANIC
-        const uint64_t ge = first + 4 + 2 * distance + 1 + t + 1; // three movs and a umov, then as in `one`
+        const uint64_t ge = first + 4 + 2 * distance + 1 + t + 1; // four umovs, then as in `one`
         require(i2_grants(*engine, "A-write").front().cycle == ge && issued_at(*engine, 8 * 8) == std::vector<uint64_t>{ge + d} &&
                 issued_at(*engine, 9 * 8) == std::vector<uint64_t>{ge + 1 + d},
             what + "the TMA store did not follow the fence at the sts's grant + D + 1:" + describe(i2_grants(*engine)) +
@@ -2024,27 +2030,26 @@ void test_i4_missing_fence_panics() {
             halt
         )";
     };
-    // r10: the TMA's address operand (its box at `shared`, completing into
-    // 4104); ur4: that mbar, for the wait.
+    // ur10, ur11, ur8: the TMA's operands (its buffer at `shared`, completing
+    // into 4104, coordinate 0); ur4: that mbar, for the wait.
     const auto prologue = [](uint32_t shared) {
-        return R"(
-        mov r8, 0
-        mov r9, 0
-        mov r10, )" + std::to_string(i4_tma_operand(shared)) + R"(
+        return i4_tma_operands(shared) + R"(
         umov ur4, 4104
         sread r20, LANE_ID
         shli r20, r20, 2
     )";
     };
+    const std::string tma_store = "tma.store.1d [5120, ur8], [ur10], [ur11]\n";
+    const std::string tma_load = "tma.load.1d [ur10], [5120, ur8], [ur11]\n";
 
     // sts -> TMA store source.
     const auto store_source = prologue(0) + "mov r21, 7\nsts [r20], r21\n";
-    auto message = i4_panic(*i4_machine(profile, program(store_source, false, "tma.store [5120], r8, r10\n"),
+    auto message = i4_panic(*i4_machine(profile, program(store_source, false, tma_store),
         i4_tma(1024), 1, false), "sts -> TMA store source");
     require_mentions(message, {"reason=missing fence.sh: tma store #0 source bytes [0, 64) overlap this warp's earlier "
         "sts [r20], r21 (pc 56, issued cycle", "whose write has not reached the RAM; issue fence.sh between them",
-        "inst='tma.store [5120], r8, r10"}, "sts -> TMA store source");
-    auto fenced = i4_machine(profile, program(store_source, true, "tma.store [5120], r8, r10\n"), i4_tma(1024), 1, false);
+        "inst='tma.store.1d [5120, ur8], [ur10], [ur11]"}, "sts -> TMA store source");
+    auto fenced = i4_machine(profile, program(store_source, true, tma_store), i4_tma(1024), 1, false);
     fenced->run();
     for (uint32_t i = 0; i < 256; ++i) {
         require(fenced->read_gmem_u32(4 * i) == (i < 16 ? 7u : 0x100 + i), "fenced TMA store word " + std::to_string(i));
@@ -2057,11 +2062,11 @@ void test_i4_missing_fence_panics() {
         write_tx_mbar(shmem, 4104, 64);
     };
     const auto copy = prologue(1024) + "lds r21, [r20 + 6144]\nsts [r20 + 5120], r21\n";
-    message = i4_panic(*i4_machine(profile, program(copy, false, "tma.load [5120], r8, r10\n"), descriptor_copy, 1, false),
+    message = i4_panic(*i4_machine(profile, program(copy, false, tma_load), descriptor_copy, 1, false),
         "sts -> TMA descriptor");
     require_mentions(message, {"reason=missing fence.sh: tma #0 descriptor bytes [5120, 5184) overlap this warp's earlier "
         "sts [r20 + 5120], r21", "whose write has not reached the RAM"}, "sts -> TMA descriptor");
-    fenced = i4_machine(profile, program(copy, true, "tma.load [5120], r8, r10\n"), descriptor_copy, 1, false);
+    fenced = i4_machine(profile, program(copy, true, tma_load), descriptor_copy, 1, false);
     fenced->run();
     for (uint32_t i = 0; i < 16; ++i) {
         require(fenced->read_shmem_u32(1024 + 4 * i) == 5 * i + 2, "the TMA with the copied descriptor, word " + std::to_string(i));
@@ -2108,12 +2113,12 @@ void test_i4_missing_fence_panics() {
 
     // lds -> TMA load over the words it reads.
     const auto read_then_load = prologue(0) + "lds r21, [r20]\n";
-    message = i4_panic(*i4_machine(profile, program(read_then_load, false, "tma.load [5120], r8, r10\n"),
+    message = i4_panic(*i4_machine(profile, program(read_then_load, false, tma_load),
         i4_tma(1024), 1, false), "lds -> TMA load");
     require_mentions(message, {"reason=missing fence.sh: tma load #0 destination bytes [0, 64) overlap this warp's earlier "
         "lds r21, [r20] (pc 48, issued cycle", "whose read has not sampled the RAM; issue fence.sh between them"},
         "lds -> TMA load");
-    fenced = i4_machine(profile, program(read_then_load, true, "tma.load [5120], r8, r10\n"), i4_tma(1024), 1, false);
+    fenced = i4_machine(profile, program(read_then_load, true, tma_load), i4_tma(1024), 1, false);
     fenced->run();
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(fenced->read_reg(0, lane, 21) == 0x100 + lane, "the fenced lds did not read the old word");
@@ -2134,22 +2139,24 @@ void test_i4_missing_fence_panics() {
 // I6a: the TMA is accepted at its dispatch and warp 1's access reaches its
 // slot at its own; the stall (was 8) is re-chosen so the TMA's accept falls
 // inside warp 1's rounds (before, warp 1's sts was dispatched into the TMA's
-// bytes and PANICked from warp 1's side).
+// bytes and PANICked from warp 1's side). Uniform-register tma: its three
+// operand umovs take the slots of the three movs, and its command enters the
+// TMA queue (the accept) at issue + 3, the old dispatch: the same timeline.
 void test_i4_cross_warp_race() {
     const auto& profile = canonical_profile();
-    // The words are 1024 + 64 * lane (bank 0); the TMA's box is [1024, 2048).
-    // (They were 6144 +: a box there no longer fits the one mov that sets the
-    // TMA's address operand, and the timeline depends only on the bank.)
+    // The words are 1024 + 64 * lane (bank 0); the TMA's buffer is [1024,
+    // 2048). (They were 6144 + once; the timeline depends only on the bank.)
+    // The last of the TMA's operand umovs stalls.
     const auto two_warps = [](const std::string& access, const std::string& command) {
         return R"(
             usread ur15, WARP_ID
             ur2r r29, ur15
             setp.ne p6, r29, 0
             bra.uni other {pred=p6, stall=0, set=-, wait=-}
-            mov r8, 0
-            mov r9, 0
-            mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"( {pred=PT, stall=20, set=-, wait=-}
-            )" + command + R"( [5120], r8, r10
+            umov ur10, 1024
+            umov ur11, 4104
+            umov ur8, 0 {pred=PT, stall=20, set=-, wait=-}
+            )" + command + R"(
             umov ur4, 4104
         wait: mbar.try_wait p0, [ur4], 0
             bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
@@ -2171,14 +2178,14 @@ void test_i4_cross_warp_race() {
                 describe(rounds));
     };
     auto machine = i4_machine(profile, two_warps("sts [r20 + 1024], r21 {pred=PT, stall=0, set=sb0, wait=-}",
-        "tma.store"), i4_tma(1024), 2);
+        "tma.store.1d [5120, ur8], [ur10], [ur11]"), i4_tma(1024), 2);
     auto message = i4_panic(*machine, "warp 1 sts vs warp 0 TMA store");
     require_mentions(message, {"warp=0", "reason=shmem race: tma store #0 source bytes [",
         "overlap warp 1's sts [r20 + 1024], r21 (pc", "whose write has not reached the RAM; order them with an mbar"},
         "cross-warp sts vs TMA store");
     under_way(*machine, message, "A-write");
     machine = i4_machine(profile, two_warps("lds r22, [r20 + 1024] {pred=PT, stall=0, set=sb0, wait=-}",
-        "tma.load"), i4_tma(1024), 2);
+        "tma.load.1d [ur10], [5120, ur8], [ur11]"), i4_tma(1024), 2);
     message = i4_panic(*machine, "warp 1 lds vs warp 0 TMA load");
     require_mentions(message, {"warp=0", "reason=shmem race: tma load #0 destination bytes [",
         "overlap warp 1's lds r22, [r20 + 1024] (pc", "whose read has not sampled the RAM; order them with an mbar"},
@@ -2190,14 +2197,12 @@ void test_i4_cross_warp_race() {
             ur2r r29, ur15
             setp.ne p6, r29, 0
             bra.uni producer {pred=p6, stall=0, set=-, wait=-}
-            mov r8, 0
-            mov r9, 0
-            mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"(
+        )" + i4_tma_operands(1024) + R"(
             umov ur4, 4104
             umov ur5, 4112
         ready: mbar.try_wait p0, [ur5], 0
             bra.uni ready {pred=!p0, stall=0, set=-, wait=-}
-            tma.store [5120], r8, r10
+            tma.store.1d [5120, ur8], [ur10], [ur11]
         stored: mbar.try_wait p0, [ur4], 0
             bra.uni stored {pred=!p0, stall=0, set=-, wait=-}
             halt
@@ -2258,15 +2263,12 @@ void test_i4_read_read_overlap_is_clean() {
         "lds + MMA read/read results");
 
     const auto& profile = canonical_profile();
-    auto store = i4_machine(profile, R"(
-        mov r8, 0
-        mov r9, 0
-        mov r10, )" + std::to_string(i4_tma_operand(0)) + R"(
+    auto store = i4_machine(profile, i4_tma_operands(0) + R"(
         umov ur4, 4104
         sread r20, LANE_ID
         shli r20, r20, 2
         lds r21, [r20] {pred=PT, stall=0, set=sb0, wait=-}
-        tma.store [5120], r8, r10
+        tma.store.1d [5120, ur8], [ur10], [ur11]
     wait: mbar.try_wait p0, [ur4], 0
         bra.uni wait {pred=!p0, stall=0, set=-, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0}
@@ -2313,16 +2315,13 @@ void test_i4_live_mbar_opacity() {
     require(state.valid && state.expected == 1 && repurpose->read_shmem_u32(4168) == 9,
         "an sts before the mbar.init was refused, or the init did not land after it");
 
-    const std::string placement = R"(
-        mov r8, 0
-        mov r9, 0
-        mov r10, )" + std::to_string(i4_tma_operand(1024)) + R"(
+    const std::string placement = i4_tma_operands(1024) + R"(
         umov ur4, 4104
         umov ur5, 1032
         mbar.init [ur5], 1
     )";
     const std::string load = R"(
-        tma.load [5120], r8, r10
+        tma.load.1d [ur10], [5120, ur8], [ur11]
     wait:
         mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait

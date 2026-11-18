@@ -88,8 +88,9 @@ instruction reads its uniform registers (at most two) in its one read round; the
 registers and do not count toward the bank rule. The uniform consumers take them as operands:
 `lds.uni`/`ldg.uni` bases, `atom.*.uni` address and operand, `acc.ld`/`acc.st` coordinates (row in
 `urC`, column in `urC + 1`), mbar addresses and values, MMA operand addresses and `mma.commit`'s mbar.
-`bra.uni`'s predicate, the TMA operands and the `ldg.v8`/`stg.v8` base still come from lane 0 of a
-vector register. `sread` reads only the per-lane `LANE_ID` / `THREAD_ID`.
+The TMA's operands are uniform registers too (below). `bra.uni`'s predicate and the
+`ldg.v8`/`stg.v8` base still come from lane 0 of a vector register. `sread` reads only the
+per-lane `LANE_ID` / `THREAD_ID`.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
 `setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands, and `@p0 bra.uni label`. A
@@ -144,12 +145,15 @@ the two halves of one 64-row tile can feed two m32 commands. A shape whose k is 
 (k = 4 on a 4x4x4 core) leaves its last K block partly empty: legal, but the profile prints a
 warning when it loads, and the operand's footprint still counts the whole block.
 
-`mma.layout` selects a fixed device layout and is included in the profile fingerprint.
-The only supported swizzle is `"xor64"`; `"dense"` is the unswizzled diagnostic baseline.
-MMA and TMA use the same XOR address primitive, with A/B roles choosing its phase.
-The swizzle does not fix the operand's row count or the spacing between K blocks.
-Future swizzles belong here as profile choices for different physical core/bank
-arrangements, with matching TMA placement and SIMT address generation. This does
+`mma.layout` selects the fixed layout the tensor core reads both operands in and is included in the
+profile fingerprint. The only supported swizzle is `"xor64"`; `"dense"` is the unswizzled diagnostic
+baseline. A layout's address rule lives in one place, `src/layout.hpp`, used by the tensor core and
+the TMA alike. `xor64` stores a tile as slices of 16-byte rows: the position along a row is cut into
+16-byte pieces, piece s of every row forming slice s, and word w of row r sits at w XOR bit 2 of r --
+one rule for every tile. The tensor core stores A as m rows and B as n rows, K sliced; `dense` is
+A's m rows of k and B's k rows of n, row after row. The swizzle does not fix the operand's row count
+or the spacing between K blocks. Future swizzles belong here as profile choices for different
+physical core/bank arrangements, with matching TMA placement and SIMT address generation. This does
 not imply hardware that switches between swizzles per instruction.
 
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
@@ -175,28 +179,43 @@ controller is a finite FIFO with fixed latency and one fixed-width bus behind a 
 in the profile's `lsu` section. This is the replaceable timing policy in front of the eventual
 bank/row scheduler, not a fixed-latency whole-load shortcut.
 
-**The TMA interface below is provisional and will change.** It is a stepping stone toward operands
-supplied from a uniform register file (trash/rfc16.md); do not treat its instruction form, operand
-packing, rank limit or descriptor fields as settled design.
+**The TMA interface below is provisional and will change.** It is a first iteration of
+trash/rfc17.md, to be looked at through kernels; do not treat its instruction form, operand read
+or descriptor fields as settled design.
 
-The TMA moves rank-1 and rank-2 boxes through that same controller and through contended shmem
-port A, split the way NVIDIA splits it: a 64-byte descriptor in shmem describes the global tensor
-(base, dimensions, row stride) and the box (extents, element size, layout role -- linear, xor64 A or
-xor64 B -- and transpose), and the instruction says what to do with it.
-`tma.load [descriptor], rXY, rADDR` and `tma.store [descriptor], rXY, rADDR` take the box origin's
-signed x / y in rXY and rXY + 1 and an address operand in rADDR: the completion mbar's address / 8
-in bits 15:0 and the box's shared address / 64 in bits 31:16 (`src/tma.hpp`), so one descriptor
-serves both directions and every stage of a tensor. The three registers fill the one RF read round
-(one per bank). The command continues at once; its descriptor is fetched from shmem later.
-Completion subtracts the full logical box debt from the instruction's mbar only after load writes
-commit or store source bytes are captured. Element sizes are 1, 2 and 4; out-of-bounds elements
-are zero-filled (load) or dropped (store). An xor64 box is a compact MMA operand object: its K
-slices are 16 bytes x its outer extent apart (rows for A, n for B; a power of two 4 .. 128), the
-same spacing the MMA reads an operand of that shape with.
+The TMA moves tiles through that same controller and through contended shmem port A. A 64-byte
+descriptor in shmem describes one tensor and its tile: the global base, the element size (1, 2 or
+4 bytes; 8 and 16 are reserved), four dimensions d0..d3 (an unused one is 1) with strides s1..s3 in
+elements (dimension 0 is the contiguous one), and the tile -- `rows` runs of `length` elements
+along dimension 0, the rows stepping along a named row dimension (1..3) -- with its shared-memory
+layout: `dense` (row after row) or `xor64` (the rules above), and for xor64 whether it is
+transposed (not transposed: the tile's rows are the stored rows and dimension 0 is sliced;
+transposed: dimension 0's positions are the stored rows and the tile's row index is sliced). The
+descriptor says nothing about who reads the tile: a kernel that feeds the tensor core chooses the
+profile's `mma.layout`, any other kernel whatever layout suits it (`src/tma.hpp` has the byte
+layout). The instruction says which tile, where it lands and who to tell:
+`tma.load.Nd [urS], [DESC, urC], [urM]` and `tma.store.Nd [DESC, urC], [urS], [urM]`, N = 1..4:
+the buffer's shared address in urS (64-byte aligned), the tile's signed coordinates c0..c(N-1) in
+urC.. (the rest are zero), the completion barrier in urM (8-byte aligned; the low bits of both
+addresses are not wired, and the sanitizer PANICs if they are set), the descriptor's address a
+constant. So one descriptor serves both directions, every stage buffer and every tile of a tensor;
+the other two coordinates choose which batch / head the tile is cut from. Element (x, y) comes from
+base + (c0 + x + c1 s1 + c2 s2 + c3 s3 + y s_row) x element bytes; an element outside the tensor in
+any dimension is zero-filled (load) or skipped (store). The URF's two read ports serve the whole SM,
+so a tma reads its N + 2 registers two per round: urS and urM in its issue's read, then the
+coordinates, one round per cycle (two rounds for N = 1, 2, three for N = 3, 4); while rounds remain,
+issue refuses every instruction that reads a uniform register. The command reaches the TMA queue
+when its last words arrive (canonically three cycles after issue for N <= 2, four for N > 2) and its
+descriptor is fetched from shmem after that. Completion subtracts the tile's byte count from the
+barrier after load writes commit or store source bytes are captured. An xor64 tile is compact: its
+slices are 16 bytes x its stored-row count apart (a power of two 4 .. 128), the same spacing the
+tensor core reads an xor64 operand of that many rows with; the sliced extent is a multiple of one
+16-byte row's elements, at most 64, and elements are 2 or 4 bytes.
 
 `kernels/pipeline_tma.launch.py` authors one descriptor per tensor with `launch.shmem.tma_desc`
-(the kernel builds each stage's address operand), runs the double-buffered A/B pipeline, validates
-output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
+(its keywords: `base`, `dimensions`, `strides`, `tile=(length, rows)`, `element_bytes`,
+`row_dimension`, `layout="dense" | "xor64"`, `transposed`), runs the double-buffered A/B
+pipeline, validates output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
 overlapping runs never share an output file).
 The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared
 bus ownership, and logical/useful/physical byte totals.

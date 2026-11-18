@@ -1,9 +1,8 @@
 ; Double-buffered vector add with a TMA producer and a SIMT consumer.
-; Two launch-authored descriptors (A, B); each stage's destination and
-; full barrier are the tma.load address operand (src/tma.hpp). The x
-; coordinate advances by one 16-element tile; no swizzle, no transpose.
-; The barrier addresses and parities are uniform registers (ur1..ur6); the
-; TMA operands (coordinates, address operands) stay vector registers.
+; Two launch-authored descriptors (A, B: dense one-dimensional tensors, a
+; 16-element tile); each stage's buffer and full barrier are tma.load.1d
+; operands (src/tma.hpp). The coordinate advances by one tile. Barriers,
+; parities, buffers and the coordinate are uniform registers (ur1..ur11).
 
 .equ C,      8192
 .equ SA0,    0
@@ -69,36 +68,23 @@ PRODUCER:
         umov  ur4, EMPTY1
         umov  ur5, 0
         umov  ur6, 0
-        mov   r14, 0
-        mov   r15, 0
-; Address operands (src/tma.hpp): the stage / 64 in bits 31:16 (the shli by
-; 10 of its 64-byte-aligned address), the full barrier / 8 in bits 15:0; in RF
-; bank 1 (register mod 3 == 1) beside the coordinates r14 / r15 (banks 2 / 0).
-        mov   r5, FULL0
-        mov   r6, FULL1
-        mov   r4, SA0
-        mov   r7, SB0
-        mov   r10, SA1
-        mov   r13, SB1
-        shri  r5, r5, 3
-        shri  r6, r6, 3
-        shli  r4, r4, 10
-        shli  r7, r7, 10
-        shli  r10, r10, 10
-        shli  r13, r13, 10
-        or    r4, r4, r5
-        or    r7, r7, r5
-        or    r10, r10, r6
-        or    r13, r13, r6
+; The stage buffers (ur7..ur10) and the tile's coordinate (ur11, c0 in
+; elements) are uniform registers beside the barriers; the coordinate moves
+; on by one 16-element tile after each stage's pair of loads.
+        umov  ur7, SA0
+        umov  ur8, SB0
+        umov  ur9, SA1
+        umov  ur10, SB1
+        umov  ur11, 0
 
         mbar.arrive.expect_tx [ur1], 128
-        tma.load [ADESC], r14, r4
-        tma.load [BDESC], r14, r7
-        addi  r14, r14, 16
+        tma.load.1d [ur7], [ADESC, ur11], [ur1]
+        tma.load.1d [ur8], [BDESC, ur11], [ur1]
+        uaddi ur11, ur11, 16
         mbar.arrive.expect_tx [ur2], 128
-        tma.load [ADESC], r14, r10
-        tma.load [BDESC], r14, r13
-        addi  r14, r14, 16
+        tma.load.1d [ur9], [ADESC, ur11], [ur2]
+        tma.load.1d [ur10], [BDESC, ur11], [ur2]
+        uaddi ur11, ur11, 16
 
         mov   r3, 6
 PLOOP:  setp.le p1, r3, 0
@@ -107,9 +93,9 @@ PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
         uxori ur5, ur5, 1
         mbar.arrive.expect_tx [ur1], 128
-        tma.load [ADESC], r14, r4
-        tma.load [BDESC], r14, r7
-        addi  r14, r14, 16
+        tma.load.1d [ur7], [ADESC, ur11], [ur1]
+        tma.load.1d [ur8], [BDESC, ur11], [ur1]
+        uaddi ur11, ur11, 16
         addi  r3, r3, -1
         setp.le p1, r3, 0
 @p1     bra.uni PDONE
@@ -117,9 +103,9 @@ PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1
         uxori ur6, ur6, 1
         mbar.arrive.expect_tx [ur2], 128
-        tma.load [ADESC], r14, r10
-        tma.load [BDESC], r14, r13
-        addi  r14, r14, 16
+        tma.load.1d [ur9], [ADESC, ur11], [ur2]
+        tma.load.1d [ur10], [BDESC, ur11], [ur2]
+        uaddi ur11, ur11, 16
         addi  r3, r3, -1
         bra.uni PLOOP
 PDONE:  halt

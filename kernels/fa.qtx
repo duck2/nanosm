@@ -26,7 +26,7 @@
 .equ VBUF1,      32768
 .equ PBUF,       40960
 ; Output staging reuses Q + K stage 0 (bytes 0..16383): sixteen 1024-byte
-; fp32 xor64_a objects. Workers write it only after waiting block 1's PV
+; fp32 xor64 slices. Workers write it only after waiting block 1's PV
 ; commit (OUTPUT_DONE parity 1); a commit arrives only once every earlier MMA
 ; command has retired, so no MMA read of Q (last: QK1) or K0 (last: QK0) is
 ; outstanding, and the only TMA loads into them (prologue) completed long ago.
@@ -113,7 +113,7 @@ ROW_MAX:
         mov   r2, 0
         addi  r4, r7, 0           ; pair-zero address for this row, chunk zero
 
-; Pass 2: exp(score - max), FP32 row sum, packed-half P in MMA's A layout.
+; Pass 2: exp(score - max), FP32 row sum, packed-half P in the MMA's xor64 layout.
 MAKE_P:
         acc.ld.v8 r16, S, ur0
         addi  r24, r9, 0
@@ -210,9 +210,9 @@ PV_READY:
         setp.lt p2, r6, 2
 @p2     bra.uni WORK_BLOCK
 
-; Final normalization, one row per lane, staged in shmem in the fp32 xor64_a
+; Final normalization, one row per lane, staged in shmem in the fp32 xor64
 ; layout (the same byte permutation as the operand tiles, four floats per
-; 16-byte row) for one TMA store of the whole tile:
+; 16-byte row) for one TMA store (an xor64 descriptor) of the whole tile:
 ;   addr(row, col) = OSTAGE + 1024*(col>>2) + 16*row + 4*((col&3) ^ ((row>>2)&1))
 ; With x = 4*((row>>2)&1): even columns sit at OSTAGE + 16*row + x (r30) and
 ; odd columns at that address XOR 4 (r31), plus 8*((col>>1)&1) + 1024*(col>>2).
@@ -264,56 +264,35 @@ NORMALIZE:
 ISSUER:
 ; Issuer uniform registers: ur0 / ur1 the MMA A / B addresses, ur2
 ; INPUT_DONE, ur3 SCORE_DONE, ur4 WORK_DONE, ur5 OUTPUT_DONE, ur6 OSTAGE_DONE,
-; ur7 OSTORE_DONE. The TMA operands stay vector registers (in this slice TMA
-; still reads lane 0 of vector registers).
-; TMA address operands (src/tma.hpp), one per command: the destination / 64
-; in bits 31:16 (the shli by 10 of its 64-byte-aligned address) and the
-; completion mbar / 8 in bits 15:0; in RF bank 1 (register mod 3 == 1) beside
-; the coordinates r8 / r9. The barrier and coordinate movs fill the operand
-; build's dependency gaps; stage set 1's operands and the output store's are
-; built while the prologue lands.
+; ur7 OSTORE_DONE; the TMA's: ur8 / ur9 the tile's coordinates (c0 the head
+; channel, c1 the row: 0, or 64 for block 1's keys), ur10 .. ur14 the stage
+; buffers (Q, K0, V0, K1, V1), ur15 the output staging buffer.
         umov  ur2, INPUT_DONE
-        mov   r24, INPUT_DONE
-        mov   r10, QBUF
-        mov   r13, KBUF0
-        mov   r16, VBUF0
+        umov  ur8, 0
+        umov  ur9, 0
+        umov  ur10, QBUF
+        umov  ur11, KBUF0
+        umov  ur12, VBUF0
         umov  ur3, SCORE_DONE
         umov  ur4, WORK_DONE
-        shri  r24, r24, 3
-        shli  r10, r10, 10
-        shli  r13, r13, 10
-        shli  r16, r16, 10
         umov  ur5, OUTPUT_DONE
-        mov   r8, 0
-        mov   r9, 0
-        or    r10, r10, r24
-        or    r13, r13, r24
-        or    r16, r16, r24
 ; Prologue: Q and block 0's K/V land together — one barrier round trip.
         mbar.arrive.expect_tx [ur2], 24576
-        tma.load [QDESC], r8, r10
-        tma.load [KDESC], r8, r13
-        tma.load [VDESC], r8, r16
-        mov   r19, KBUF1
-        mov   r22, VBUF1
-        mov   r25, OSTAGE
-        mov   r26, OSTORE_DONE
-        shli  r19, r19, 10
-        shli  r22, r22, 10
-        shli  r25, r25, 10
-        shri  r26, r26, 3
-        or    r19, r19, r24
-        or    r22, r22, r24
-        or    r25, r25, r26
+        tma.load.2d [ur10], [QDESC, ur8], [ur2]
+        tma.load.2d [ur11], [KDESC, ur8], [ur2]
+        tma.load.2d [ur12], [VDESC, ur8], [ur2]
+        umov  ur13, KBUF1
+        umov  ur14, VBUF1
+        umov  ur15, OSTAGE
 IN0:
         mbar.try_wait p1, [ur2], 0
 @!p1    bra.uni IN0
 ; Prefetch block 1 into stage set 1: port A fills while MMA reads set 0.
-        mov   r9, 64
+        umov  ur9, 64
         mbar.arrive.expect_tx [ur2], 16384
-        tma.load [KDESC], r8, r19
-        tma.load [VDESC], r8, r22
-        mov   r9, 0
+        tma.load.2d [ur13], [KDESC, ur8], [ur2]
+        tma.load.2d [ur14], [VDESC, ur8], [ur2]
+        umov  ur9, 0
 
         umov  ur0, QBUF
         umov  ur1, KBUF0
@@ -436,7 +415,7 @@ STAGED:
 @!p1    bra.uni STAGED
         umov  ur7, OSTORE_DONE
         mbar.arrive.expect_tx [ur7], 16384
-        tma.store [ODESC], r8, r25
+        tma.store.2d [ODESC, ur8], [ur15], [ur7]
 STORED:
         mbar.try_wait p1, [ur7], 0
 @!p1    bra.uni STORED

@@ -95,7 +95,8 @@ struct ResourceView {
     bool write_slot_free = false;    // the write booking's (bank, cycle) has a free port
     bool write_inhibited = false;    // the RF write decision inhibits new bookings to that bank
     bool wait_slot_free = false;     // an mbar wait slot
-    bool tma_queue_room = false;
+    bool tma_queue_room = false;     // counting the commands the TMA operand read holds
+    bool urf_ports_held = false;     // a tma's operand read has rounds still to start after this cycle
     bool mma_queue_room = false;
     bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
     // shmem (trash/rfc12.md sections 3, 4 and 6), as this cycle's grants leave it:
@@ -113,6 +114,7 @@ struct ResourceView {
 
 enum class Refusal : uint8_t {
     rf_read_inhibited,
+    urf_read_ports_held,
     sfu_busy,
     rf_write_booked,
     rf_write_inhibited,
@@ -147,7 +149,8 @@ RoundRobinGrant round_robin_grant(const std::vector<uint8_t>& ready, uint32_t cu
 // The shmem byte address the MMA reads operand element (outer, k) of a
 // command of `shape` from, its operand starting at `base` (outer: m for A, n
 // for B): the operand fetch's own addressing (src/sim.cpp mma_a_address /
-// mma_b_address), named here so tests can hold a TMA box against it.
+// mma_b_address, in the profile's layout), named here so tests can hold a
+// TMA tile against it.
 uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, bool a_operand,
     uint32_t outer, uint32_t k);
 
@@ -894,17 +897,25 @@ private:
         uint32_t pc = 0;
         Instruction instruction;
         // The instruction's operands: the opcode's direction, the descriptor
-        // (an immediate), the origin (x, y) and the address register's shared
-        // address and completion mbar (src/tma.hpp TmaAddresses).
+        // (a constant), the tile's coordinates c0..c3 (zero past the opcode's
+        // N), the buffer's and the barrier's shared addresses (their low bits
+        // dropped: not wired, src/tma.hpp).
         TmaDirection direction = TmaDirection::load;
         uint32_t descriptor_address = 0;
-        std::array<int32_t, 2> origin{};
+        std::array<int32_t, tma_max_coordinates> coordinates{};
         uint32_t shmem_address = 0;
         uint32_t mbar_address = 0;
         TmaCommandState state = TmaCommandState::descriptor;
         TmaDescriptor descriptor;
         uint64_t logical_bytes = 0;
         uint64_t useful_bytes = 0;
+        // Computed once, when the descriptor is decoded: whether the
+        // coordinates of the two dimensions the tile does not walk are inside
+        // the tensor (if not, every element is out of bounds), and then their
+        // element offset (c_k x s_k summed over those two).
+        bool fixed_in_bounds = true;
+        uint64_t fixed_offset = 0;
+        // The walker: x along the row (dimension 0), y the row.
         uint32_t x = 0;
         uint32_t y = 0;
         uint32_t pending_load_writes = 0;
@@ -1137,6 +1148,53 @@ private:
         // reloading step enters the core, used by the steps after it.
         std::vector<uint16_t> a_held;
         std::deque<MmaResult> results;  // steps in the core and in the tmem write pipeline
+    };
+
+    // The TMA's operand read (trash/rfc17.md section 4; the timing is
+    // src/rf.hpp tma_operand_rounds). It replaces the dispatch pipeline for a
+    // tma, whose N + 2 registers take R rounds of the URF's two read ports,
+    // two per round. Three declared registers:
+    //   - the round counter (TmaReadRounds): the command whose rounds are
+    //     still to start, loaded at accept. Round 0 samples urS / urM in the
+    //     issue register's cycle; round k >= 1 samples coordinates 2(k-1) and
+    //     2(k-1) + 1, one round per cycle; the counter empties after round
+    //     R - 1. In hardware: the warp (4 bits at 16 warps), the round (2
+    //     bits) and the next coordinate register (4 bits); round 0's fields
+    //     are the issue register's. Here it keeps the whole instruction.
+    //   - the URF read stages (TmaReadPairs, Lu stages): each pair sampled
+    //     for a tma travels to the URF output with its tag -- which fields it
+    //     is (the round) and whether it is the last; round 0's also carries
+    //     the instruction's own fields. Without the tag, back-to-back
+    //     commands would put one command's words into the next's.
+    //   - the holding register (TmaReadHolding): the command being read --
+    //     the two addresses, four coordinates, the descriptor address, the
+    //     direction (about 180 bits) -- filled as the pairs arrive. When the
+    //     last pair arrives the command is pushed into the TMA queue. One is
+    //     enough: a command's last words arrive at T + R + Lu, the next
+    //     command's first at T' + 1 + Lu, and T' >= T + R.
+    struct TmaReadHeader {
+        uint64_t issue_cycle = 0;
+        uint32_t warp = 0;
+        uint32_t pc = 0;            // (S) PANIC text: the instruction's own pc
+        uint64_t active_mask = 0;   // (S) the uniform operation's partial-mask PANIC
+        Instruction instruction;    // the descriptor address, the direction and N, the registers
+    };
+    struct TmaReadRounds {
+        TmaReadHeader header;
+        uint32_t round = 0;         // the round sampled next
+    };
+    struct TmaReadPair {
+        uint32_t round = 0;                  // 0: the buffer and the barrier; k >= 1: coordinates 2(k-1) ..
+        bool last = false;                   // the command's last round
+        std::optional<TmaReadHeader> header; // round 0: the instruction's fields
+        std::vector<uint32_t> words;         // the sampled registers' values, in operand order
+    };
+    using TmaReadPairs = std::vector<std::optional<TmaReadPair>>;
+    struct TmaReadHolding {
+        TmaReadHeader header;
+        uint32_t buffer = 0;        // urS as read (its low bits are the sanitizer's)
+        uint32_t barrier = 0;       // urM as read
+        std::array<int32_t, tma_max_coordinates> coordinates{}; // zero until supplied
     };
 
     // The TMA engine's command queue and walker bookkeeping. One group:
@@ -1413,6 +1471,7 @@ private:
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
         std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
+        std::optional<TmaReadRounds> tma_read;           // a tma loads the TMA operand read's round counter
     };
 
     // Everything a dispatched instruction hands to its unit (the unit takes it now).
@@ -1430,7 +1489,6 @@ private:
             std::optional<std::vector<uint32_t>> store_data; // scalar stg: its issue round's read, latched
         };
         std::optional<LsuAdmission> lsu;
-        std::optional<TmaCommand> tma;
     };
 
     // The space the instructions in the dispatch pipeline will take when
@@ -1442,7 +1500,6 @@ private:
         uint32_t probes = 0;
         uint32_t wait_slots = 0;
         uint32_t lsu_commands = 0;
-        uint32_t tma_commands = 0;
         uint32_t mma_commands = 0;
         std::array<uint32_t, 2> acc{}; // [0 acc.ld, 1 acc.st]
     };
@@ -1482,6 +1539,12 @@ private:
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
+        // The TMA operand read's end: the pair at the URF output now goes
+        // into the holding register; with the last one the command is pushed
+        // into the TMA queue (tma_pushed; drive_tma_queue adds it).
+        bool tma_holding_changed = false;
+        std::optional<TmaReadHolding> tma_holding_after;
+        std::optional<TmaCommand> tma_pushed;
         // The dispatch pipeline's end: its unit takes an instruction now.
         bool dispatched = false;
         DispatchDecision dispatch;
@@ -1508,6 +1571,8 @@ private:
         std::optional<UrfWrite> urf_landing;
         std::optional<std::vector<uint32_t>> urf_sample;
         UrfWritePipeline urf_pipe_next;
+        // The TMA operand read's round sampled now (the URF's read ports).
+        std::optional<TmaReadPair> tma_sampled;
     };
 
     // =======================================================================
@@ -1586,6 +1651,11 @@ private:
     Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, "TMA read transaction"};
     Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
     Reg<TmaStoreRegisters> tma_store_registers_{registers_, "TMA store sector registers"};
+    // The TMA operand read (TmaReadRounds above): the round counter, the URF
+    // read stages with their tags (Lu stages), the holding register.
+    Reg<std::optional<TmaReadRounds>> tma_read_rounds_{registers_, "TMA operand read: round counter"};
+    Reg<TmaReadPairs> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
+    Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, "TMA operand read: holding register"};
     // LSU.
     Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
     std::deque<Reg<AssemblyRegister>> staging_;   // the lsu.staging_vectors pool, one register each
@@ -1715,6 +1785,11 @@ private:
     IngressPluck decide_ingress(const Wires& w);
     void step_gmem_controller(Wires& w);
     void step_tma(Wires& w);
+    // ---- the TMA operand read's end: the pair at the URF output now, the push ----
+    void arrive_tma_operands(Wires& w);
+    [[nodiscard]] TmaCommand tma_command_from(const TmaReadHolding& holding, Wires& w);
+    [[nodiscard]] uint32_t tma_commands_being_read() const;
+    [[nodiscard]] bool tma_read_ports_held() const;
     // ---- dispatch: the RF read pipeline's end, the unit takes it ----
     void dispatch_issued(Wires& w);
     void hand_over(const DispatchEntry& op, Wires& w);
@@ -1723,7 +1798,6 @@ private:
     void dispatch_shared_load(const DispatchEntry& op, Wires& w);
     void dispatch_shared_store(const DispatchEntry& op, Wires& w);
     void dispatch_lsu(const DispatchEntry& op, Wires& w);
-    void dispatch_tma(const DispatchEntry& op, Wires& w);
     void dispatch_mbar_rmw(const DispatchEntry& op, Wires& w);
     void dispatch_atomic(const DispatchEntry& op, Wires& w);
     void dispatch_mbar_wait(const DispatchEntry& op, Wires& w);
@@ -1747,6 +1821,8 @@ private:
     // (depbar, the sanitizer's destination and reader records), its read
     // round's bank use, its entry into the dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
+    // An accepted tma: it loads the TMA operand read's round counter.
+    void accept_tma(Warp& warp, const Instruction& inst, Wires& w);
     [[nodiscard]] static bool needs_dispatch(const Instruction& inst, uint64_t active_mask);
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
     void check_issue_hazards(const Warp& warp, const Instruction& inst) const;
@@ -1783,6 +1859,7 @@ private:
     void drive_tma_transactions(const Wires& w);
     void drive_tma_sector(const Wires& w);
     void drive_tma_store_registers(const Wires& w);
+    void drive_tma_operand_read(const Wires& w);
     void drive_lsu_commands(const Wires& w);
     void drive_assembly_pool(const Wires& w);
     void drive_ingress(const Wires& w);
@@ -1902,7 +1979,7 @@ private:
     [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command(const TmaQueue& tma) const;
     [[nodiscard]] std::optional<uint64_t> next_data_complete_tma_command(const TmaQueue& tma) const;
     [[nodiscard]] std::vector<std::vector<TmaPortRequest::Piece>> tma_port_rounds(
-        const std::vector<GmemSectorRequest::TmaFragment>& fragments) const;
+        const std::vector<GmemSectorRequest::TmaFragment>& fragments, bool from_sector_register = false) const;
     [[nodiscard]] TmaWalkerPlan plan_tma_walker(const TmaCommand& command, uint32_t credits_used,
         bool store_register_free) const;
     [[nodiscard]] static bool tma_advance_coordinate(TmaCommand& command);
@@ -1910,6 +1987,7 @@ private:
     [[nodiscard]] uint64_t tma_gmem_address(const TmaCommand& command) const;
     [[nodiscard]] uint32_t tma_shmem_address(const TmaCommand& command) const;
     void validate_tma_runtime_descriptor(const TmaCommand& command) const;
+    void tma_command_start(TmaCommand& command) const;
 
     // Issue.
     // The warp's FIFO head (Q), decoded; "fell off kernel" if its pc is past

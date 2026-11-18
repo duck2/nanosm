@@ -1697,18 +1697,14 @@ void test_i6b1_back_to_back_same_bank_reads() {
 // stall: qtxc and the hand assembler reject the line, kernel load rejects
 // the word -- in both builds, naming the instruction and the registers.
 // Every operand form: the two- and three-source arithmetic, setp, sts's
-// base and value, stg, and tma.load / tma.store's three registers (x, y =
-// x + 1 and the address operand: canonical, the address register in x's or
-// y's bank; with two banks, x and an address register two above it). The
-// kernel-load case carries words a looser profile (more read ports)
-// assembled, restamped for the profile under test. The atomic, the mbar
-// register forms and mma.async's two addresses take uniform registers, which
-// are no RF reads: those forms cannot conflict (and an acc.st's uniform
-// coordinates beside its vector data do not either).
+// base and value, and stg. The kernel-load case carries words a looser
+// profile (more read ports) assembled, restamped for the profile under
+// test. The atomic, the mbar register forms and mma.async's two addresses
+// take uniform registers, which are no RF reads: those forms cannot conflict
+// (and an acc.st's uniform coordinates beside its vector data do not
+// either).
 void test_i6b1_same_bank_sources_are_malformed() {
     const auto& canonical = canonical_profile();
-    auto two_banks = canonical;
-    two_banks.rf_banks = 2;
     struct Case {
         std::string line;
         std::string registers;
@@ -1731,9 +1727,6 @@ void test_i6b1_same_bank_sources_are_malformed() {
         {"setp.eq p0, r0, r3", "r0 and r3", &canonical},
         {"sts [r3 + 64], r6", "r3 and r6", &canonical},
         {"stg [r3], r6", "r3 and r6", &canonical},
-        {"tma.load [1024], r0, r3", "r0 and r3", &canonical},
-        {"tma.store [1024], r0, r4", "r1 and r4", &canonical},
-        {"tma.load [1024], r0, r2", "r0 and r2", &two_banks},
     };
     const auto mentions = [](const std::string& message, const std::string& where, const Case& c) {
         return message.rfind(where, 0) == 0 && message.find(": malformed instruction '") != std::string::npos &&

@@ -42,23 +42,30 @@ NANOSM_CAPI int32_t nanosm_mbar_encode(
     uint64_t* output);
 
 #define NANOSM_TMA_DESCRIPTOR_BYTES UINT32_C(64)
-#define NANOSM_TMA_SWIZZLE_LINEAR UINT32_C(0)
-#define NANOSM_TMA_SWIZZLE_XOR64_A UINT32_C(1)
-#define NANOSM_TMA_SWIZZLE_XOR64_B UINT32_C(2)
-// The descriptor describes the global tensor and the box (rank 1 or 2). The
-// direction, shared address and completion mbar are tma.load / tma.store
-// operands, not descriptor fields.
+#define NANOSM_TMA_LAYOUT_DENSE UINT32_C(0)
+#define NANOSM_TMA_LAYOUT_XOR64 UINT32_C(1)
+// The descriptor (src/tma.hpp): the tensor -- its base, element size,
+// dimensions d0..d3 and strides s1..s3 (elements; dimension 0 is the
+// contiguous one) -- and the tile: `tile_rows` runs of `tile_length`
+// elements along dimension 0, the rows stepping along `row_dimension` (1..3),
+// its shared-memory layout (src/layout.hpp: dense or xor64, the names of the
+// profile's mma.layout) and, for xor64, whether it is transposed (0 or 1).
+// The direction, buffer, barrier and coordinates are the instruction's.
 NANOSM_CAPI int32_t nanosm_tma_descriptor_encode(
-    uint32_t rank,
-    uint32_t transpose,
-    uint64_t gmem_base,
-    uint32_t dim_x,
-    uint32_t dim_y,
-    uint32_t row_stride,
-    uint32_t box_x,
-    uint32_t box_y,
+    uint64_t base,
     uint32_t element_bytes,
-    uint32_t swizzle,
+    uint32_t d0,
+    uint32_t d1,
+    uint32_t d2,
+    uint32_t d3,
+    uint32_t s1,
+    uint32_t s2,
+    uint32_t s3,
+    uint32_t tile_length,
+    uint32_t tile_rows,
+    uint32_t row_dimension,
+    uint32_t layout,
+    uint32_t transposed,
     uint8_t* output,
     uint64_t output_size);
 

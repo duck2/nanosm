@@ -79,12 +79,19 @@ enum class Opcode : uint8_t {
     atom_and_uni = 0x3a,
     atom_xor_uni = 0x3b,
     atom_exch_uni = 0x3c,
-    // tma.load / tma.store [DESC], rXY, rADDR (src/tma.hpp): the direction is
-    // the opcode; rXY / rXY+1 are the box origin's x / y; rADDR packs the
-    // completion mbar (bits 15:0, 8-byte units) and the shared address (bits
-    // 31:16, 64-byte units).
-    tma_load = 0x40,
-    tma_store = 0x41,
+    // tma.load.Nd [urS], [DESC, urC], [urM] and tma.store.Nd [DESC, urC],
+    // [urS], [urM], N = 1..4 (src/tma.hpp, trash/rfc17.md): the direction and
+    // the coordinate count are the opcode; urS the buffer's shared address,
+    // urC .. urC + N - 1 the tile's coordinates, urM the barrier's address,
+    // DESC the descriptor's shared address (a constant).
+    tma_load_1d = 0x40,
+    tma_load_2d = 0x41,
+    tma_load_3d = 0x42,
+    tma_load_4d = 0x43,
+    tma_store_1d = 0x44,
+    tma_store_2d = 0x45,
+    tma_store_3d = 0x46,
+    tma_store_4d = 0x47,
     acc_ld = 0x50,
     acc_ld_v8 = 0x51,
     acc_st = 0x52,
@@ -195,9 +202,10 @@ namespace encoding {
 // A uniform register (ur0..) sits in the same 8-bit register fields: which
 // field names which file is the opcode's (uniform_sources / uniform_destination;
 // trash/urf-slice-2026-11-08.md lists every operand form).
-// tma payload: coordinates[8] (x; y is the next register), address[8] (the
-// mbar / 8 | shared address / 64 << 16, src/tma.hpp), simm[22] (the static
-// 64-byte-aligned shmem descriptor address).
+// tma payload: buffer[8] (urS), coordinates[8] (urC, the first of N),
+// barrier[8] (urM), descriptor[14] (its shared address in 64-byte units,
+// unsigned: 1 MiB of reach). Instruction: src0 urS, src1 urC, src2 urM, imm
+// the descriptor's byte address.
 // stall is 5 bits so a slow FPGA-priced SFU (20+ cycles) can still be a stall count.
 inline constexpr unsigned opcode_shift = 56;
 inline constexpr unsigned predicate_shift = 52;
@@ -216,6 +224,8 @@ inline constexpr uint64_t immediate_mask = 0x3fffff;
 inline constexpr int32_t immediate_min = -(1 << 21);
 inline constexpr int32_t immediate_max = (1 << 21) - 1;
 inline constexpr uint64_t atomic_immediate_mask = 0x3fff;
+inline constexpr uint64_t tma_descriptor_field_mask = 0x3fff;
+inline constexpr uint32_t tma_descriptor_field_unit = 64;
 inline constexpr int32_t atomic_immediate_min = -(1 << 13);
 inline constexpr int32_t atomic_immediate_max = (1 << 13) - 1;
 
@@ -244,7 +254,20 @@ inline constexpr uint8_t mma_block_first = 0x70;
 inline constexpr uint32_t mma_block_shapes = 8;
 
 inline bool is_tma_opcode(Opcode opcode) {
-    return opcode == Opcode::tma_load || opcode == Opcode::tma_store;
+    return opcode >= Opcode::tma_load_1d && opcode <= Opcode::tma_store_4d;
+}
+
+inline bool is_tma_store(Opcode opcode) {
+    return opcode >= Opcode::tma_store_1d && opcode <= Opcode::tma_store_4d;
+}
+
+// A tma opcode's coordinate count N (1..4).
+inline uint32_t tma_coordinate_count(Opcode opcode) {
+    return (static_cast<uint32_t>(opcode) - static_cast<uint32_t>(Opcode::tma_load_1d)) % 4 + 1;
+}
+
+inline Opcode tma_opcode(bool store, uint32_t coordinates) {
+    return static_cast<Opcode>(static_cast<uint32_t>(Opcode::tma_load_1d) + (store ? 4 : 0) + coordinates - 1);
 }
 
 inline bool is_mma_async(Opcode opcode) {
@@ -293,6 +316,10 @@ inline bool writes_uniform_register(Opcode opcode) {
 // issue + 1 (src/rf.hpp), in operand order (a register named twice is listed
 // twice; the round reads it once). At most two: the URF has two read ports.
 // acc.ld / acc.st read a coordinate pair (row in urC, column in urC + 1).
+// The exception is a tma: N + 2 registers read over several rounds, two per
+// round, listed in read order (urS, urM, then urC .. urC + N - 1; see
+// tma_operand_round in src/rf.hpp). It reads by operand position: a register
+// named twice is read twice.
 std::vector<uint8_t> uniform_sources(const Instruction& instruction);
 // The uniform register an instruction writes, if any.
 std::optional<uint8_t> uniform_destination(const Instruction& instruction);
