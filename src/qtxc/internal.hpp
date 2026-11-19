@@ -1,0 +1,54 @@
+#pragma once
+
+// Shared between the toolchain's own files (src/qtxc/*.cpp) and included
+// nowhere else. These lived in compiler.cpp's anonymous namespace; each is
+// now used by more than one file. Not part of the public interface, which is
+// qtxc.hpp. The comment on each function sits with its definition.
+
+#include "qtxc/qtxc.hpp"
+
+#include <cstddef>
+#include <optional>
+#include <stdint.h>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace nanosm {
+namespace qtxc_internal {
+
+// Text helpers (parse.cpp); the hex reader uses them too.
+std::string trim(std::string value);
+std::vector<std::string> operands(const std::string& text);
+void expect_count(const std::vector<std::string>& args, std::size_t count, uint32_t line);
+std::string read_file(const std::string& path);
+
+// The parser qtx and assembly share (parse.cpp). allow_control: assembly,
+// where control blocks and .profile are allowed; qtx refuses both.
+AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile);
+
+// Opcode groups and instruction metadata (metadata.cpp).
+bool is_setp(Opcode opcode);
+bool is_branch(Opcode opcode);
+bool is_mbar_test_wait(Opcode opcode);
+bool is_mbar_try_wait(Opcode opcode);
+bool is_mbar_predicate_writer(Opcode opcode);
+std::vector<uint8_t> sources(const Instruction& inst);
+std::optional<uint8_t> predicate_destination(const Instruction& inst);
+std::optional<uint8_t> destination(const Instruction& inst);
+uint16_t register_count(const AssemblyProgram& program);
+std::vector<uint8_t> issue_sources(const Instruction& inst);
+
+// The per-instruction rules (checks.cpp).
+void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
+void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumulator>& accumulators,
+    const DeviceProfile& profile, const std::string& where);
+
+} // namespace qtxc_internal
+
+// An anonymous namespace is a unique namespace plus a using-directive; this is
+// the same with a name the files can share, so every call reads as it did in
+// compiler.cpp.
+using namespace qtxc_internal;
+
+} // namespace nanosm

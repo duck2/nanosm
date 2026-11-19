@@ -1,18 +1,24 @@
-#include "compiler.hpp"
-#include "rf.hpp"
+// The text parser qtx and assembly share (src/qtxc/): line by line, labels,
+// the .equ / .acc / .profile directives, the predicate prefix, the control
+// block (assembly only) and every instruction's operands, into an
+// AssemblyProgram with its branch displacements resolved. It does not
+// schedule (schedule.cpp), apply the rules an instruction must pass
+// (checks.cpp) or encode (assemble.cpp). read_file, the file reader every
+// *_file entry point uses, is here too.
+
+#include "qtxc/internal.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <fstream>
-#include <iomanip>
 #include <optional>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
 
 namespace nanosm {
-namespace {
+namespace qtxc_internal {
 
 std::string trim(std::string value) {
     const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char c) {
@@ -24,6 +30,34 @@ std::string trim(std::string value) {
     if (first >= last) return {};
     return std::string(first, last);
 }
+
+std::vector<std::string> operands(const std::string& text) {
+    std::vector<std::string> result;
+    std::size_t begin = 0;
+    int brackets = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        brackets += text[i] == '[' ? 1 : 0;
+        brackets -= text[i] == ']' ? 1 : 0;
+        if (text[i] == ',' && brackets == 0) {
+            result.push_back(trim(text.substr(begin, i - begin)));
+            begin = i + 1;
+        }
+    }
+    result.push_back(trim(text.substr(begin)));
+    return result;
+}
+
+void expect_count(const std::vector<std::string>& args, std::size_t count, uint32_t line) {
+    if (args.size() != count) {
+        throw SimError(
+            "line " + std::to_string(line) + ": expected " + std::to_string(count) +
+            " operands, got " + std::to_string(args.size()));
+    }
+}
+
+} // namespace qtxc_internal
+
+namespace {
 
 std::string upper(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -41,22 +75,6 @@ std::vector<std::string> split(const std::string& text, char separator) {
             begin = i + 1;
         }
     }
-    return result;
-}
-
-std::vector<std::string> operands(const std::string& text) {
-    std::vector<std::string> result;
-    std::size_t begin = 0;
-    int brackets = 0;
-    for (std::size_t i = 0; i < text.size(); ++i) {
-        brackets += text[i] == '[' ? 1 : 0;
-        brackets -= text[i] == ']' ? 1 : 0;
-        if (text[i] == ',' && brackets == 0) {
-            result.push_back(trim(text.substr(begin, i - begin)));
-            begin = i + 1;
-        }
-    }
-    result.push_back(trim(text.substr(begin)));
     return result;
 }
 
@@ -118,27 +136,6 @@ std::pair<uint8_t, bool> parse_predicate(const std::string& text, uint32_t line)
         return {static_cast<uint8_t>(value[1] - '0'), invert};
     }
     throw SimError("line " + std::to_string(line) + ": bad predicate '" + text + "'");
-}
-
-bool is_setp(Opcode opcode) {
-    return (opcode >= Opcode::setp_eq && opcode <= Opcode::setp_ge) ||
-        (opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge);
-}
-
-bool is_branch(Opcode opcode) {
-    return opcode == Opcode::bra || opcode == Opcode::bra_uni;
-}
-
-bool is_mbar_test_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_test_wait_i || opcode == Opcode::mbar_test_wait_r;
-}
-
-bool is_mbar_try_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_try_wait_i || opcode == Opcode::mbar_try_wait_r;
-}
-
-bool is_mbar_predicate_writer(Opcode opcode) {
-    return is_mbar_test_wait(opcode) || is_mbar_try_wait(opcode);
 }
 
 // "mma.async.m64n64k8", "mma.async.init.m32n64k8", ...: the mma.async
@@ -322,14 +319,6 @@ bool is_register(const std::string& text) {
     return std::regex_match(text, pattern);
 }
 
-void expect_count(const std::vector<std::string>& args, std::size_t count, uint32_t line) {
-    if (args.size() != count) {
-        throw SimError(
-            "line " + std::to_string(line) + ": expected " + std::to_string(count) +
-            " operands, got " + std::to_string(args.size()));
-    }
-}
-
 uint8_t parse_bar(const std::string& value, uint32_t line) {
     static const std::regex pattern(R"(^sb([0-5])$)");
     std::smatch match;
@@ -377,6 +366,10 @@ Control parse_control(const std::string& text, uint32_t line) {
     }
     return control;
 }
+
+} // namespace
+
+namespace qtxc_internal {
 
 AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile) {
     AssemblyProgram program;
@@ -871,124 +864,6 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     return program;
 }
 
-// The VECTOR registers an instruction reads (its uniform registers:
-// uniform_sources, src/isa.hpp). acc.st and stg.v8 read their data later,
-// beat by beat (issue_sources: only what the issue round reads).
-std::vector<uint8_t> sources(const Instruction& inst) {
-    if (is_mma_async(inst.opcode)) return {};
-    switch (inst.opcode) {
-    case Opcode::add:
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge: return {inst.src0, inst.src1};
-    case Opcode::fma: return {inst.src0, inst.src1, inst.src2};
-    case Opcode::addi:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::andi:
-    case Opcode::ori:
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-    case Opcode::ex2:
-    case Opcode::rcp:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::r2ur: return {inst.src0};
-    case Opcode::sts:
-    case Opcode::stg: return {inst.src0, inst.src1};
-    case Opcode::stg_v8: {
-        std::vector<uint8_t> result{inst.src0};
-        for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
-        return result;
-    }
-    case Opcode::acc_st: return {inst.src1};
-    case Opcode::acc_st_v8: {
-        std::vector<uint8_t> result;
-        for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
-        return result;
-    }
-    default: return {};
-    }
-}
-
-std::optional<uint8_t> predicate_destination(const Instruction& inst) {
-    if (is_setp(inst.opcode) || is_usetp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) return inst.dst;
-    return std::nullopt;
-}
-
-std::optional<uint8_t> destination(const Instruction& inst) {
-    switch (inst.opcode) {
-    case Opcode::sread:
-    case Opcode::mov:
-    case Opcode::add:
-    case Opcode::addi:
-    case Opcode::and_:
-    case Opcode::andi:
-    case Opcode::or_:
-    case Opcode::ori:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::fma:
-    case Opcode::cvt_pack:
-    case Opcode::ex2:
-    case Opcode::rcp:
-    case Opcode::ur2r:
-    case Opcode::lds:
-    case Opcode::lds_uni:
-    case Opcode::ldg: return inst.dst;
-    case Opcode::ldg_v8: return inst.dst;
-    case Opcode::ldg_uni: return inst.dst;
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8: return inst.dst;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni: return inst.dst;
-    default: return std::nullopt;
-    }
-}
-
-uint16_t register_count(const AssemblyProgram& program) {
-    uint16_t count = 0;
-    for (const auto& inst : program.instructions) {
-        for (const auto reg : sources(inst)) {
-            count = std::max<uint16_t>(count, static_cast<uint16_t>(reg) + 1);
-        }
-        if (const auto dst = destination(inst); dst.has_value()) {
-            const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8 : 1;
-            count = std::max<uint16_t>(count, static_cast<uint16_t>(*dst) + width);
-        }
-    }
-    return count;
-}
-
 std::string read_file(const std::string& path) {
     std::ifstream input(path);
     if (!input) throw SimError("cannot open '" + path + "'");
@@ -997,712 +872,5 @@ std::string read_file(const std::string& path) {
     return contents.str();
 }
 
-// The vector registers an instruction's issue reads (acc.st reads its data
-// beat by beat and its coordinates from uniform registers: nothing here;
-// stg.v8 only its base).
-std::vector<uint8_t> issue_sources(const Instruction& inst) {
-    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) return {};
-    if (inst.opcode == Opcode::stg_v8) return {inst.src0};
-    return sources(inst);
-}
-
-// The one-round read rule (src/rf.hpp): distinct sources beyond a bank's read
-// ports make the instruction malformed. `where` is "line N" or "pc N".
-void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
-    if (const auto conflict = rf_read_port_conflict(inst, profile, issue_sources(inst)); conflict.has_value()) {
-        throw SimError(where + ": " + *conflict);
-    }
-}
-
-// An mma.async names a shape the profile lists, and its accumulator is that
-// shape's rows x columns: a property of the instruction, so refused at
-// assembly and at kernel load (both builds). `where` is "line N" or "pc N".
-void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumulator>& accumulators,
-    const DeviceProfile& profile, const std::string& where) {
-    if (!is_mma_async(inst.opcode)) return;
-    const auto shape = mma_shape_of(profile, inst.opcode);
-    const auto name = opcode_name(inst.opcode, &profile.mma_shapes);
-    if (!shape.has_value()) {
-        throw SimError(where + ": " + name + ": this device profile defines no mma shape for it (its list has " +
-            std::to_string(profile.mma_shapes.size()) + " shapes)");
-    }
-    if (inst.dst >= accumulators.size()) {
-        throw SimError(where + ": " + name + ": accumulator id out of range");
-    }
-    const auto& acc = accumulators[inst.dst];
-    if (acc.rows != shape->m || acc.cols != shape->n) {
-        throw SimError(where + ": " + name + " needs a " + std::to_string(shape->m) + "x" +
-            std::to_string(shape->n) + " accumulator; '" + acc.name + "' is " + std::to_string(acc.rows) + "x" +
-            std::to_string(acc.cols));
-    }
-    // The row spacings (src/isa.hpp). swizzle64: a spacing of the layout (a
-    // power of two, 16 or more; the field reaches 1024) that holds the 16-byte
-    // pieces the shape reads in each row (k / 8, rounded up). The dense
-    // diagnostic layout is compact in the command's shape and takes none.
-    const uint32_t row_bytes = (shape->k + 7) / 8 * 16;
-    for (const bool a_operand : {true, false}) {
-        const auto spacing = mma_row_spacing(inst, a_operand);
-        const std::string operand = a_operand ? "A" : "B";
-        if (profile.mma_layout == TileLayout::dense) {
-            if (spacing != mma_default_spacing) {
-                throw SimError(where + ": " + name + ": the dense mma layout takes no row spacing (" + operand +
-                    " names " + std::to_string(spacing) + ")");
-            }
-        } else if (!valid_swizzle64_spacing(spacing) || spacing < row_bytes) {
-            throw SimError(where + ": " + name + ": " + operand + "'s row spacing " + std::to_string(spacing) +
-                " must be a power of two bytes, 16 or more, and at least the " + std::to_string(row_bytes) +
-                " bytes it reads per row");
-        }
-    }
-}
-
-// The fixed-latency part of the virtual issue timeline (vtime: a warp's issue
-// cycles, relative). Every distance comes from src/rf.hpp, the helper the
-// simulator and the sanitizer use:
-//   reg_visible: the vtime from which an RF sample sees a fixed result (async
-//     results are covered by depbars instead);
-//   read_until: the exclusive end of the fixed reads' samples;
-//   predicate_ready: the vtime from which a predicate is in the file (a
-//     conditional branch samples it issue_to_predicate_sample after its issue;
-//     a predicate writer may issue from it). A setp's comes from the
-//     arithmetic pipeline, a usetp's from the URF write pipeline
-//     (issue_to_uniform_predicate_visible);
-//   ureg_visible: the vtime from which a URF sample sees a uniform register
-//     (every uniform-register writer is fixed-latency: issue_to_urf_visible).
-// A consumer is placed so its sample of each source is at or after that
-// source's visibility; a writer so its earliest landing comes after the older
-// write's (WAW) and at or after the older reads' samples (WAR). A uniform
-// register needs no WAR rule: it is read at issue + 1 and written L + Wu
-// later than its writer's issue.
-struct FixedTimeline {
-    std::array<int64_t, 256> reg_visible{};
-    std::array<int64_t, 256> read_until{};
-    std::array<int64_t, 7> predicate_ready{};
-    std::array<int64_t, 256> ureg_visible{};
-
-    // The earliest vtime `inst` may issue at, given the instructions before it.
-    // Every source is sampled (or, read later beat by beat, read-owned) from
-    // issue + issue_to_sample.
-    [[nodiscard]] int64_t required(const Instruction& inst, const DeviceProfile& profile, int64_t vtime) const {
-        int64_t at = vtime;
-        for (const auto source : sources(inst)) {
-            at = std::max(at, reg_visible[source] - int64_t{issue_to_sample}); // RAW
-        }
-        if (const auto dst = destination(inst); dst.has_value()) {
-            const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-            const int64_t earliest = issue_to_visible_min(inst, profile);
-            for (unsigned j = 0; j < width; ++j) {
-                at = std::max(at, reg_visible[*dst + j] - earliest + 1); // WAW: land after the older write
-                at = std::max(at, read_until[*dst + j] - earliest);      // WAR: land at or after older samples
-            }
-        }
-        if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
-            at = std::max(at, predicate_ready[inst.control.predicate] - int64_t{issue_to_predicate_sample});
-        }
-        if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);
-        for (const auto source : uniform_sources(inst)) {
-            at = std::max(at, ureg_visible[source] - int64_t{issue_to_urf_sample}); // uniform RAW
-        }
-        if (const auto dst = uniform_destination(inst); dst.has_value()) {
-            // Uniform WAW: land after the older write (every writer has the same L).
-            at = std::max(at, ureg_visible[*dst] - int64_t{issue_to_urf_visible(profile)} + 1);
-        }
-        return at;
-    }
-
-    // `inst` issues at vtime: its one read round and fixed results.
-    void record(const Instruction& inst, const DeviceProfile& profile, int64_t vtime) {
-        for (const auto reg : rf_read_round(issue_sources(inst))) {
-            read_until[reg] = std::max<int64_t>(read_until[reg], vtime + issue_to_sample + 1);
-        }
-        if (uses_arithmetic_pipeline(inst)) {
-            if (const auto dst = destination(inst); dst.has_value()) {
-                reg_visible[*dst] = vtime + issue_to_visible(inst, profile);
-            }
-            if (const auto dst = predicate_destination(inst); dst.has_value()) {
-                predicate_ready[*dst] = vtime + issue_to_predicate_visible(inst, profile);
-            }
-        } else if (const auto dst = predicate_destination(inst);
-                   dst.has_value() && fixed_latency(inst, profile.timing) != 0) {
-            // mbar.test_wait: its warp issues nothing until the probe is back
-            // and its predicate written, so its one-cycle latency always holds.
-            predicate_ready[*dst] = vtime + fixed_latency(inst, profile.timing);
-        }
-        if (is_usetp(inst.opcode)) predicate_ready[inst.dst] = vtime + issue_to_uniform_predicate_visible(profile);
-        if (const auto dst = uniform_destination(inst); dst.has_value()) {
-            ureg_visible[*dst] = vtime + issue_to_urf_visible(profile);
-        }
-    }
-
-    // The earliest vtime any next instruction may issue at once every fixed
-    // result is visible, every older write landed after, every older sample
-    // passed, every predicate written: a branch's block boundary.
-    [[nodiscard]] int64_t drained(int64_t vtime, const DeviceProfile& profile) const {
-        int64_t all_ready = vtime + 1;
-        const int64_t earliest = earliest_rf_visible(profile);
-        for (const auto visible : reg_visible) all_ready = std::max<int64_t>(all_ready, visible - issue_register_stages);
-        for (const auto end : read_until) all_ready = std::max(all_ready, end - earliest);
-        for (const auto ready : predicate_ready) all_ready = std::max(all_ready, ready);
-        for (const auto visible : ureg_visible) {
-            all_ready = std::max<int64_t>(all_ready, visible - int64_t{issue_to_urf_sample});
-        }
-        return all_ready;
-    }
-
-    void reset() {
-        reg_visible.fill(0);
-        read_until.fill(0);
-        predicate_ready.fill(0);
-        ureg_visible.fill(0);
-    }
-};
-
-} // namespace
-
-AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile) {
-    validate_device_profile(profile);
-    auto program = parse_program(source, false, profile);
-    program.register_count = register_count(program);
-    program.profile_name = profile.name;
-    program.profile_fingerprint = device_profile_fingerprint(profile);
-    std::array<bool, 6> live{};
-    std::array<std::optional<uint8_t>, 256> pending_register{};
-    std::array<uint8_t, 256> pending_async_read_mask{};
-    // tmem order between one warp's transfers (trash/rfc11.md section 0: the
-    // acc.ld and acc.st engines run side by side, nothing orders them): per
-    // accumulator, the depbars of its acc.st and acc.ld still in flight. A
-    // transfer after an acc.st of the same accumulator waits for it (RAW,
-    // WAW); an acc.st after an acc.ld waits for that (WAR). Whole-accumulator
-    // granularity: the coordinates are registers.
-    std::array<uint8_t, 256> acc_store_mask{};
-    std::array<uint8_t, 256> acc_load_mask{};
-    std::optional<uint8_t> store_barrier;
-    std::optional<uint8_t> mma_barrier;
-
-    // Virtual issue timeline. Consecutive same-warp issues are at least max(stall, 1)
-    // apart, and real gaps only grow (scheduler contention, depbar waits, structural
-    // stalls), so any spacing proven here holds on the machine. The fixed-latency
-    // distances are FixedTimeline's (src/rf.hpp). A stall is paid only when a
-    // consumer sits closer than that, and it lands on the instruction just before
-    // the consumer.
-    FixedTimeline timeline;
-    int64_t vtime = 0;
-    int64_t previous_vtime = 0;
-    Instruction* previous = nullptr;
-
-    const auto allocate = [&]() -> uint8_t {
-        for (uint8_t bar = 0; bar < 6; ++bar) {
-            if (!live[bar]) {
-                live[bar] = true;
-                return bar;
-            }
-        }
-        throw SimError("qtx scheduler exhausted six live depbars");
-    };
-
-    for (auto& inst : program.instructions) {
-        if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": mbar.try_wait is unsupported by this device profile");
-        }
-        if (is_tma_opcode(inst.opcode) && profile.tma_queue_commands == 0) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": tma.load / tma.store are unsupported by this device profile");
-        }
-        if ((is_mma_async(inst.opcode) || inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
-            throw SimError("line " + std::to_string(inst.line) + ": MMA is unsupported by this device profile");
-        }
-        if (inst.opcode == Opcode::bra &&
-            (inst.control.predicate != 7 || inst.control.predicate_invert)) {
-            throw SimError("line " + std::to_string(inst.line) + ": bra is unconditional");
-        }
-        if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-            inst.opcode != Opcode::bra_uni) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": only bra.uni may be predicated before divergent execution exists");
-        }
-        uint8_t wait_mask = 0;
-        for (const auto source : sources(inst)) {
-            if (pending_register[source].has_value()) {
-                wait_mask |= static_cast<uint8_t>(1u << *pending_register[source]);
-            }
-        }
-        if (const auto dst = destination(inst); dst.has_value()) {
-            const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-            for (unsigned j = 0; j < width; ++j) {
-                if (pending_register[*dst + j].has_value())
-                    wait_mask |= static_cast<uint8_t>(1u << *pending_register[*dst + j]);
-                wait_mask |= pending_async_read_mask[*dst + j];
-            }
-        }
-        if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
-            inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-            const bool load = inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8;
-            const auto accumulator = load ? inst.src0 : inst.dst;
-            wait_mask |= acc_store_mask[accumulator];
-            if (!load) wait_mask |= acc_load_mask[accumulator];
-        }
-        if (inst.opcode == Opcode::mbar_arrive && store_barrier.has_value()) {
-            // Pinned worker publication sequence: an ordinary arrival following
-            // async stores is not allowed to publish until their counted
-            // completion depbar reaches zero.
-            wait_mask |= static_cast<uint8_t>(1u << *store_barrier);
-        }
-        if (inst.opcode == Opcode::halt || is_branch(inst.opcode)) {
-            for (uint8_t bar = 0; bar < 6; ++bar) {
-                if (live[bar]) wait_mask |= static_cast<uint8_t>(1u << bar);
-            }
-        }
-        inst.control.wait_mask = wait_mask;
-
-        if (wait_mask != 0) {
-            for (auto& pending : pending_register) {
-                if (pending.has_value() && (wait_mask & (1u << *pending)) != 0) pending.reset();
-            }
-            for (auto& mask : pending_async_read_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            for (auto& mask : acc_store_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            for (auto& mask : acc_load_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            for (uint8_t bar = 0; bar < 6; ++bar) {
-                if ((wait_mask & (1u << bar)) != 0) live[bar] = false;
-            }
-            if (store_barrier.has_value() && (wait_mask & (1u << *store_barrier)) != 0) {
-                store_barrier.reset();
-            }
-            if (mma_barrier.has_value() && (wait_mask & (1u << *mma_barrier)) != 0)
-                mma_barrier.reset();
-        }
-
-        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
-        const auto required = timeline.required(inst, profile, vtime);
-        if (required > vtime) {
-            if (previous == nullptr) {
-                throw SimError("internal: first instruction cannot need a stall");
-            }
-            const auto stall = required - previous_vtime;
-            if (stall > static_cast<int64_t>(encoding::stall_mask)) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": required stall exceeds the five-bit field (nop insertion not implemented)");
-            }
-            previous->control.stall = static_cast<uint8_t>(stall);
-            vtime = required;
-        }
-        inst.control.stall = 0;
-        timeline.record(inst, profile, vtime);
-        if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
-            inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
-            const auto bar = allocate();
-            inst.control.set_depbar = bar;
-            const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-            for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
-        } else if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg || inst.opcode == Opcode::stg_v8) {
-            if (!store_barrier.has_value()) store_barrier = allocate();
-            inst.control.set_depbar = *store_barrier;
-            if (inst.opcode == Opcode::stg_v8) {
-                for (unsigned j = 0; j < 8; ++j)
-                    pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
-            }
-        } else if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8) {
-            const auto bar = allocate();
-            inst.control.set_depbar = bar;
-            const auto width = inst.opcode == Opcode::acc_ld_v8 ? 8u : 1u;
-            for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
-            acc_load_mask[inst.src0] |= static_cast<uint8_t>(1u << bar);
-        } else if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-            if (!store_barrier.has_value()) store_barrier = allocate();
-            inst.control.set_depbar = *store_barrier;
-            acc_store_mask[inst.dst] |= static_cast<uint8_t>(1u << *store_barrier);
-            const auto width = inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
-            for (unsigned j = 0; j < width; ++j)
-                pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
-        } else if (is_mma_async(inst.opcode)) {
-            if (!mma_barrier.has_value()) mma_barrier = allocate();
-            inst.control.set_depbar = *mma_barrier;
-        }
-
-        if (is_branch(inst.opcode)) {
-            const auto all_ready = timeline.drained(vtime, profile);
-            if (all_ready > vtime + 1) {
-                const auto stall = all_ready - vtime;
-                if (stall > static_cast<int64_t>(encoding::stall_mask)) {
-                    throw SimError(
-                        "line " + std::to_string(inst.line) +
-                        ": control-flow drain exceeds the five-bit stall field");
-                }
-                inst.control.stall = static_cast<uint8_t>(stall);
-            }
-
-            // Every branch is a conservative block boundary for v0: its wait mask
-            // drains async work, and its stall covers outstanding fixed-latency writes.
-            // Both the target and fallthrough therefore begin with clean timing state.
-            live.fill(false);
-            pending_register.fill(std::nullopt);
-            pending_async_read_mask.fill(0);
-            acc_store_mask.fill(0);
-            acc_load_mask.fill(0);
-            store_barrier.reset();
-            mma_barrier.reset();
-            timeline.reset();
-            previous = nullptr;
-            previous_vtime = 0;
-            vtime = 0;
-            continue;
-        }
-
-        previous = &inst;
-        previous_vtime = vtime;
-        vtime += 1;
-    }
-    return program;
-}
-
-AssemblyProgram compile_qtx_file(const std::string& path, const DeviceProfile& profile) {
-    return compile_qtx(read_file(path), profile);
-}
-
-std::string emit_asm(const AssemblyProgram& program) {
-    std::ostringstream out;
-    out << "; scheduled qtx assembly: controls are part of the instruction word\n";
-    out << "; {pred, stall, set, wait}; six warp-local depbar counters sb0..sb5\n\n";
-    out << ".profile " << program.profile_name << ", 0x"
-        << format_profile_fingerprint(program.profile_fingerprint) << "\n\n";
-    for (const auto& [name, value] : program.constants) {
-        out << ".equ " << name << ", " << value << '\n';
-    }
-    if (!program.constants.empty()) out << '\n';
-    for (const auto& acc : program.accumulators) {
-        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
-    }
-    if (!program.accumulators.empty()) out << '\n';
-    for (std::size_t index = 0; index < program.instructions.size(); ++index) {
-        for (const auto& label : program.labels) {
-            if (label.instruction_index == index) out << label.name << ":\n";
-        }
-        const auto& inst = program.instructions[index];
-        out << "        " << inst.text << ' ' << format_control(inst.control) << '\n';
-    }
-    return out.str();
-}
-
-Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
-    validate_device_profile(profile);
-    const auto program = parse_program(source, true, profile);
-    const auto expected = device_profile_fingerprint(profile);
-    if (program.profile_name.empty()) throw SimError("assembly has no .profile directive");
-    if (program.profile_name != profile.name || program.profile_fingerprint != expected) {
-        throw SimError(
-            "assembly profile '" + program.profile_name + "@" +
-            format_profile_fingerprint(program.profile_fingerprint) + "' does not match '" +
-            profile.name + "@" + format_profile_fingerprint(expected) + "'");
-    }
-    for (std::size_t i = 0; i < program.accumulators.size(); ++i) {
-        const auto& acc = program.accumulators[i];
-        const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
-        if (acc.base_word % profile.tmem_fine_banks != 0 ||
-            acc.rows < profile.lanes || acc.rows % 4 != 0 || acc.cols % 4 != 0 ||
-            static_cast<uint64_t>(acc.base_word) + words >
-                static_cast<uint64_t>(profile.tmem_fine_banks) * profile.tmem_words_per_fine_bank) {
-            throw SimError("accumulator '" + acc.name +
-                "' must fit tmem, align to the fine-bank count, cover one warp, "
-                "and have dimensions divisible by four");
-        }
-        for (std::size_t j = 0; j < i; ++j) {
-            const auto& other = program.accumulators[j];
-            const uint64_t other_end = static_cast<uint64_t>(other.base_word) +
-                static_cast<uint64_t>(other.rows) * other.cols;
-            const uint64_t end = static_cast<uint64_t>(acc.base_word) + words;
-            if (acc.base_word < other_end && other.base_word < end) {
-                throw SimError("overlapping tmem accumulators '" + other.name + "' and '" + acc.name + "'");
-            }
-        }
-    }
-    Kernel kernel;
-    kernel.register_count = register_count(program);
-    kernel.profile_name = program.profile_name;
-    kernel.profile_fingerprint = program.profile_fingerprint;
-    kernel.accumulators = program.accumulators;
-    kernel.words.reserve(program.instructions.size());
-    for (std::size_t index = 0; index < program.instructions.size(); ++index) {
-        const auto& inst = program.instructions[index];
-        if ((inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
-             inst.opcode == Opcode::ldg || inst.opcode == Opcode::stg ||
-             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8 ||
-             inst.opcode == Opcode::ldg_uni || inst.opcode == Opcode::lds_uni ||
-             inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
-             inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 ||
-             is_mma_async(inst.opcode) || is_atomic(inst.opcode)) && inst.control.set_depbar >= 6) {
-            throw SimError("line " + std::to_string(inst.line) + ": memory operation requires set=sb0..sb5");
-        }
-        if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
-            inst.opcode != Opcode::ldg && inst.opcode != Opcode::stg &&
-            inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8 &&
-            inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::lds_uni &&
-            inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
-            inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
-            !is_mma_async(inst.opcode) && !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
-            throw SimError("line " + std::to_string(inst.line) + ": this opcode cannot set a depbar");
-        }
-        if ((is_setp(inst.opcode) || is_usetp(inst.opcode)) && inst.dst >= 7) {
-            throw SimError("line " + std::to_string(inst.line) + ": " + opcode_name(inst.opcode) +
-                " destination must be p0..p6");
-        }
-        if (is_mbar_predicate_writer(inst.opcode) && inst.dst >= 7) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": mbar wait predicate destination must be p0..p6");
-        }
-        if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": mbar.try_wait is unsupported by this device profile");
-        }
-        if (is_tma_opcode(inst.opcode)) {
-            if (profile.tma_queue_commands == 0) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": tma.load / tma.store are unsupported by this device profile");
-            }
-            if (inst.imm < 0 || inst.imm % 64 != 0 ||
-                static_cast<uint64_t>(inst.imm) + 64 > profile.shmem_bytes) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": tma descriptor address must be 64-byte aligned and in shmem");
-            }
-        }
-        if (inst.opcode == Opcode::mbar_init_i && (inst.imm <= 0 || inst.imm > 0x7fff)) {
-            throw SimError("line " + std::to_string(inst.line) + ": mbar expected count must be 1..32767");
-        }
-        if (inst.opcode == Opcode::mbar_arrive_expect_tx_i && inst.imm < 0) {
-            throw SimError("line " + std::to_string(inst.line) + ": mbar tx byte count cannot be negative");
-        }
-        if ((inst.opcode == Opcode::mbar_test_wait_i || inst.opcode == Opcode::mbar_try_wait_i) &&
-            inst.imm != 0 && inst.imm != 1) {
-            throw SimError("line " + std::to_string(inst.line) + ": mbar parity must be 0 or 1");
-        }
-        if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-            inst.opcode != Opcode::bra_uni) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": only bra.uni may be predicated before divergent execution exists");
-        }
-        if (is_branch(inst.opcode)) {
-            const auto target = static_cast<int64_t>(index + 1) * 8 + inst.imm;
-            if (inst.imm % 8 != 0 || target < 0 ||
-                static_cast<uint64_t>(target / 8) >= program.instructions.size()) {
-                throw SimError("line " + std::to_string(inst.line) + ": invalid branch displacement");
-            }
-        }
-        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
-        kernel.words.push_back(encode(inst));
-    }
-    return kernel;
-}
-
-Kernel assemble_asm_file(const std::string& path, const DeviceProfile& profile) {
-    return assemble_asm(read_file(path), profile);
-}
-
-std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shapes) {
-    std::ostringstream out;
-    out << ".profile " << kernel.profile_name << ", 0x"
-        << format_profile_fingerprint(kernel.profile_fingerprint) << '\n';
-    out << ".registers " << kernel.register_count << '\n';
-    for (const auto& acc : kernel.accumulators) {
-        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
-    }
-    for (const auto word : kernel.words) {
-        out << std::hex << std::setw(16) << std::setfill('0') << word
-            << " ; " << format_instruction(decode(word), true, mma_shapes) << '\n';
-    }
-    return out.str();
-}
-
-Kernel load_hex(std::string_view source) {
-    Kernel kernel;
-    bool saw_register_count = false;
-    std::istringstream input{std::string(source)};
-    std::string raw;
-    uint32_t line = 0;
-    while (std::getline(input, raw)) {
-        ++line;
-        const auto comment = raw.find(';');
-        const auto clean = trim(raw.substr(0, comment));
-        if (clean.empty()) continue;
-        if (clean.starts_with(".profile")) {
-            if (!kernel.profile_name.empty()) {
-                throw SimError("line " + std::to_string(line) + ": duplicate .profile");
-            }
-            const auto args = operands(trim(clean.substr(8)));
-            expect_count(args, 2, line);
-            std::size_t consumed = 0;
-            try {
-                kernel.profile_fingerprint = std::stoull(args[1], &consumed, 0);
-                if (consumed != args[1].size()) throw std::invalid_argument("suffix");
-            } catch (const std::exception&) {
-                throw SimError("line " + std::to_string(line) + ": bad profile fingerprint");
-            }
-            kernel.profile_name = args[0];
-            continue;
-        }
-        if (clean.starts_with(".registers")) {
-            if (saw_register_count) {
-                throw SimError("line " + std::to_string(line) + ": duplicate .registers");
-            }
-            saw_register_count = true;
-            const auto value = trim(clean.substr(10));
-            std::size_t consumed = 0;
-            try {
-                const auto count = std::stoul(value, &consumed, 0);
-                if (consumed != value.size() || count > 256) {
-                    throw std::invalid_argument("range or suffix");
-                }
-                kernel.register_count = static_cast<uint16_t>(count);
-            } catch (const std::exception&) {
-                throw SimError("line " + std::to_string(line) + ": bad register count");
-            }
-            continue;
-        }
-        if (clean.starts_with(".acc")) {
-            const auto args = operands(trim(clean.substr(4)));
-            expect_count(args, 4, line);
-            Kernel::Accumulator acc;
-            acc.name = args[0];
-            try {
-                const auto base = std::stoul(args[1], nullptr, 0);
-                const auto rows = std::stoul(args[2], nullptr, 0);
-                const auto cols = std::stoul(args[3], nullptr, 0);
-                if (rows == 0 || rows > 65535 || cols == 0 || cols > 65535 ||
-                    kernel.accumulators.size() >= 256) throw std::invalid_argument("range");
-                acc.base_word = static_cast<uint32_t>(base);
-                acc.rows = static_cast<uint16_t>(rows);
-                acc.cols = static_cast<uint16_t>(cols);
-            } catch (const std::exception&) {
-                throw SimError("line " + std::to_string(line) + ": bad accumulator metadata");
-            }
-            kernel.accumulators.push_back(std::move(acc));
-            continue;
-        }
-        std::size_t consumed = 0;
-        try {
-            const auto word = std::stoull(clean, &consumed, 16);
-            if (consumed != clean.size()) throw std::invalid_argument("suffix");
-            kernel.words.push_back(word);
-        } catch (const std::exception&) {
-            throw SimError("line " + std::to_string(line) + ": bad 64-bit hex word '" + clean + "'");
-        }
-    }
-    if (!saw_register_count) throw SimError("hex kernel has no .registers header");
-    validate_kernel(kernel);
-    return kernel;
-}
-
-void validate_kernel(const Kernel& kernel) {
-    if (kernel.profile_name.empty()) throw SimError("kernel has no profile name");
-    if (kernel.register_count > 256) throw SimError("kernel register count exceeds 256");
-    if (kernel.words.empty()) throw SimError("kernel contains no instructions");
-    AssemblyProgram decoded;
-    decoded.instructions.reserve(kernel.words.size());
-    for (const auto word : kernel.words) decoded.instructions.push_back(decode(word));
-    if (kernel.register_count != register_count(decoded)) {
-        throw SimError("kernel register count does not match its instructions");
-    }
-}
-
-Kernel load_hex_file(const std::string& path) {
-    return load_hex(read_file(path));
-}
-
-void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_mma_shape(decode(kernel.words[index]), kernel.accumulators, profile,
-            "kernel pc " + std::to_string(8 * index));
-    }
-}
-
-void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        const auto inst = decode(kernel.words[index]);
-        if (is_tma_opcode(inst.opcode) &&
-            uint32_t{inst.src1} + tma_coordinate_count(inst.opcode) > profile.urf_registers) {
-            throw SimError("kernel pc " + std::to_string(8 * index) + ": '" + format_instruction(inst, false) +
-                "' names coordinates past this profile's last uniform register, ur" +
-                std::to_string(profile.urf_registers - 1));
-        }
-        auto named = uniform_sources(inst);
-        if (const auto dst = uniform_destination(inst); dst.has_value()) named.push_back(*dst);
-        for (const auto reg : named) {
-            if (reg < profile.urf_registers) continue;
-            throw SimError("kernel pc " + std::to_string(8 * index) + ": '" +
-                format_instruction(inst, false, &profile.mma_shapes) + "' names uniform register ur" +
-                std::to_string(reg) + ", outside this profile's " + std::to_string(profile.urf_registers) +
-                " (urf.registers)");
-        }
-    }
-}
-
-void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_rf_read_round(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
-    }
-}
-
-Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile) {
-    return assemble_asm(emit_asm(compile_qtx(source, profile)), profile);
-}
-
-Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile) {
-    return compile_and_assemble(read_file(path), profile);
-}
-
-// Hand assembly's fixed-latency stalls: each instruction's stall becomes the
-// larger of its own and what the fixed-latency register and predicate
-// dependencies of the instructions after it need under `profile` -- the
-// distances qtxc schedules with (FixedTimeline, src/rf.hpp) -- so the result
-// never trips the sanitizer's RAW / WAW / WAR checks on a fixed result.
-// Depbars, waits and every other field stay the author's. A branch drains
-// like qtxc's block boundary, and the code after it starts clean.
-Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
-    std::vector<Instruction> instructions;
-    for (const auto word : kernel.words) instructions.push_back(decode(word));
-    FixedTimeline timeline;
-    int64_t vtime = 0;
-    int64_t previous_vtime = 0;
-    std::optional<std::size_t> previous;
-    const auto set_stall = [](Instruction& inst, int64_t stall) {
-        if (stall > static_cast<int64_t>(encoding::stall_mask)) {
-            throw SimError("a fixed-latency dependency needs a stall beyond the five-bit field");
-        }
-        inst.control.stall = static_cast<uint8_t>(stall);
-    };
-    for (std::size_t index = 0; index < instructions.size(); ++index) {
-        auto& inst = instructions[index];
-        const auto required = timeline.required(inst, profile, vtime);
-        if (required > vtime) {
-            if (!previous.has_value()) throw SimError("internal: first instruction cannot need a stall");
-            set_stall(instructions[*previous], required - previous_vtime);
-            vtime = required;
-        }
-        timeline.record(inst, profile, vtime);
-        if (is_branch(inst.opcode)) {
-            const auto all_ready = timeline.drained(vtime, profile);
-            if (all_ready - vtime > std::max<int64_t>(inst.control.stall, 1)) set_stall(inst, all_ready - vtime);
-            timeline.reset();
-            previous.reset();
-            previous_vtime = 0;
-            vtime = 0;
-            continue;
-        }
-        previous = index;
-        previous_vtime = vtime;
-        vtime += std::max<int64_t>(inst.control.stall, 1);
-    }
-    for (std::size_t index = 0; index < instructions.size(); ++index) kernel.words[index] = encode(instructions[index]);
-    return kernel;
-}
-
+} // namespace qtxc_internal
 } // namespace nanosm

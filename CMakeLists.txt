@@ -24,7 +24,12 @@ set(NANOSM_SOURCES
     src/image.cpp
     src/profile.cpp
     src/trace.cpp
-    src/compiler.cpp
+    src/qtxc/parse.cpp
+    src/qtxc/metadata.cpp
+    src/qtxc/checks.cpp
+    src/qtxc/schedule.cpp
+    src/qtxc/assemble.cpp
+    src/qtxc/hex.cpp
     src/sim.cpp
     src/sanitizer.cpp
     src/mma_numeric.cpp
