@@ -6,8 +6,9 @@
 ;
 ; 8 tiles x 16 f32 (one lane-width each) per array. C[i] = A[i] + B[i]. Barriers are launch-image objects
 ; (expected=1); stages start free, so the producer peels the first two fills.
-; The barrier addresses and their parities are uniform registers (ur1..ur6);
-; the per-lane addresses and the loop counters stay vector (setp is vector).
+; The barrier addresses, their parities and the loop counters are uniform
+; registers (ur1..ur7; the loops test their counter with usetp); the
+; per-lane addresses stay vector.
 
 .equ A,      0
 .equ B,      4096
@@ -22,8 +23,7 @@
 .equ EMPTY1, 1048
 
         usread ur0, WARP_ID
-        ur2r  r0, ur0
-        setp.eq p0, r0, 0
+        usetp.eq p0, ur0, 0
 @p0     bra.uni PRODUCER
 
 ; ---- consumer: warp 1 ----
@@ -40,8 +40,8 @@
         umov  ur4, EMPTY1
         umov  ur5, 0            ; FULL0 parity
         umov  ur6, 0            ; FULL1 parity
-        mov   r3, 4             ; outer iterations, two tiles each
-CLOOP:  setp.le p1, r3, 0
+        umov  ur7, 4            ; outer iterations, two tiles each
+CLOOP:  usetp.le p1, ur7, 0
 @p1     bra.uni CDONE
 CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
@@ -61,7 +61,7 @@ CF1:    mbar.try_wait p3, [ur2], ur6
         mbar.arrive [ur4]
         stg   [r1], r8
         addi  r1, r1, 64
-        addi  r3, r3, -1
+        uaddi ur7, ur7, -1
         bra.uni CLOOP
 CDONE:  halt
 
@@ -96,8 +96,8 @@ PRODUCER:
         mbar.arrive [ur2]
         addi  r1, r1, 64
         addi  r2, r2, 64
-        mov   r3, 6             ; tiles left after the peel
-PLOOP:  setp.le p1, r3, 0
+        umov  ur7, 6            ; tiles left after the peel
+PLOOP:  usetp.le p1, ur7, 0
 @p1     bra.uni PDONE
 PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
@@ -109,8 +109,8 @@ PE0:    mbar.try_wait p3, [ur3], ur5
         mbar.arrive [ur1]
         addi  r1, r1, 64
         addi  r2, r2, 64
-        addi  r3, r3, -1
-        setp.le p1, r3, 0
+        uaddi ur7, ur7, -1
+        usetp.le p1, ur7, 0
 @p1     bra.uni PDONE
 PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1
@@ -122,6 +122,6 @@ PE1:    mbar.try_wait p3, [ur4], ur6
         mbar.arrive [ur2]
         addi  r1, r1, 64
         addi  r2, r2, 64
-        addi  r3, r3, -1
+        uaddi ur7, ur7, -1
         bra.uni PLOOP
 PDONE:  halt

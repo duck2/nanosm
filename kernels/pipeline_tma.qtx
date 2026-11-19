@@ -2,7 +2,8 @@
 ; Two launch-authored descriptors (A, B: dense one-dimensional tensors, a
 ; 16-element tile); each stage's buffer and full barrier are tma.load.1d
 ; operands (src/tma.hpp). The coordinate advances by one tile. Barriers,
-; parities, buffers and the coordinate are uniform registers (ur1..ur11).
+; parities, buffers and the coordinate are uniform registers (ur1..ur11), and
+; so is each role's loop counter (ur12, tested with usetp).
 
 .equ C,      8192
 .equ SA0,    0
@@ -17,8 +18,7 @@
 .equ BDESC,  1216
 
         usread ur0, WARP_ID
-        ur2r  r0, ur0
-        setp.eq p0, r0, 0
+        usetp.eq p0, ur0, 0
 @p0     bra.uni PRODUCER
 
 ; ---- consumer: warp 1 ----
@@ -35,8 +35,8 @@
         umov  ur4, EMPTY1
         umov  ur5, 0
         umov  ur6, 0
-        mov   r3, 4
-CLOOP:  setp.le p1, r3, 0
+        umov  ur12, 4
+CLOOP:  usetp.le p1, ur12, 0
 @p1     bra.uni CDONE
 CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
@@ -56,7 +56,7 @@ CF1:    mbar.try_wait p3, [ur2], ur6
         mbar.arrive [ur4]
         stg   [r1], r8
         addi  r1, r1, 64
-        addi  r3, r3, -1
+        uaddi ur12, ur12, -1
         bra.uni CLOOP
 CDONE:  halt
 
@@ -86,8 +86,8 @@ PRODUCER:
         tma.load.1d [ur10], [BDESC, ur11], [ur2]
         uaddi ur11, ur11, 16
 
-        mov   r3, 6
-PLOOP:  setp.le p1, r3, 0
+        umov  ur12, 6
+PLOOP:  usetp.le p1, ur12, 0
 @p1     bra.uni PDONE
 PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
@@ -96,8 +96,8 @@ PE0:    mbar.try_wait p3, [ur3], ur5
         tma.load.1d [ur7], [ADESC, ur11], [ur1]
         tma.load.1d [ur8], [BDESC, ur11], [ur1]
         uaddi ur11, ur11, 16
-        addi  r3, r3, -1
-        setp.le p1, r3, 0
+        uaddi ur12, ur12, -1
+        usetp.le p1, ur12, 0
 @p1     bra.uni PDONE
 PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1
@@ -106,6 +106,6 @@ PE1:    mbar.try_wait p3, [ur4], ur6
         tma.load.1d [ur9], [ADESC, ur11], [ur2]
         tma.load.1d [ur10], [BDESC, ur11], [ur2]
         uaddi ur11, ur11, 16
-        addi  r3, r3, -1
+        uaddi ur12, ur12, -1
         bra.uni PLOOP
 PDONE:  halt

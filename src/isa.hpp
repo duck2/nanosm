@@ -101,7 +101,7 @@ enum class Opcode : uint8_t {
     // shape list says what each of these opcodes means.
 
     // The uniform register file (trash/rfc16.md, trash/urf-slice-2026-11-08.md):
-    // sixteen 32-bit registers per warp, ur0..ur15 (urf.registers). The
+    // urf.registers 32-bit registers per warp (canonical 32, ur0..ur31). The
     // uniform arithmetic below runs on the SM's one integer uniform ALU, one
     // value per warp instruction; register operands are uniform registers.
     // Shifts by a register use its low 5 bits; immediates are the signed
@@ -127,6 +127,24 @@ enum class Opcode : uint8_t {
     // register (a fixed-latency vector result, like mov).
     r2ur   = 0x90,
     ur2r   = 0x91,
+    // The uniform compare (trash/uniform-compare-2026-11-18.md): usetp.xx pD,
+    // urA, urB and usetp.xx pD, urA, imm, the vector setp's six comparisons
+    // (unsigned 32-bit) on uniform registers. It runs on the uniform ALU (a
+    // compare is a subtract) and writes predicate pD with the same value in
+    // every lane; register and immediate forms have distinct opcodes, as
+    // setp's do. Its timing: src/rf.hpp issue_to_uniform_predicate_visible.
+    usetp_eq = 0x92,
+    usetp_ne = 0x93,
+    usetp_lt = 0x94,
+    usetp_le = 0x95,
+    usetp_gt = 0x96,
+    usetp_ge = 0x97,
+    usetpi_eq = 0x98,
+    usetpi_ne = 0x99,
+    usetpi_lt = 0x9a,
+    usetpi_le = 0x9b,
+    usetpi_gt = 0x9c,
+    usetpi_ge = 0x9d,
     halt  = 0xff,
 };
 
@@ -195,7 +213,8 @@ namespace encoding {
 // RI payload: dst[8], reserved[8], simm[22]
 // atomic payload: dst[8], base[8], operand[8], simm[14] (the offset is 14 bits:
 // the third register takes the immediate's high bits)
-// setp uses dst as p0..p6; immediate and register RHS forms have distinct opcodes.
+// setp and usetp use dst as p0..p6; immediate and register RHS forms have
+// distinct opcodes (usetp's registers are uniform registers).
 // Branch immediates are signed byte displacements relative to the following PC.
 // mbar addresses are held in a uniform register; mbar immediates and register
 // operands have distinct opcodes, as do setp immediates and register operands.
@@ -340,6 +359,22 @@ inline bool is_uniform_arithmetic(Opcode opcode) {
 // write port urf.issue_to_port_cycles after its issue (src/rf.hpp).
 inline bool writes_uniform_register(Opcode opcode) {
     return is_uniform_arithmetic(opcode) || opcode == Opcode::r2ur;
+}
+
+// The uniform compare, register and immediate forms.
+inline bool is_usetp(Opcode opcode) {
+    return opcode >= Opcode::usetp_eq && opcode <= Opcode::usetpi_ge;
+}
+
+inline bool is_usetp_immediate(Opcode opcode) {
+    return opcode >= Opcode::usetpi_eq && opcode <= Opcode::usetpi_ge;
+}
+
+// What the URF write pipeline carries (src/rf.hpp): the uniform-register
+// writers, and usetp, whose uniform-ALU result leaves it at the write port's
+// stage for the predicate file instead of the URF.
+inline bool uses_urf_pipeline(Opcode opcode) {
+    return writes_uniform_register(opcode) || is_usetp(opcode);
 }
 
 // The uniform registers an instruction reads, all in its one read round at

@@ -220,6 +220,12 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::uand:
     case Opcode::uor:
     case Opcode::uxor:
+    case Opcode::usetp_eq:
+    case Opcode::usetp_ne:
+    case Opcode::usetp_lt:
+    case Opcode::usetp_le:
+    case Opcode::usetp_gt:
+    case Opcode::usetp_ge:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
@@ -230,6 +236,12 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::uandi:
     case Opcode::uori:
     case Opcode::uxori:
+    case Opcode::usetpi_eq:
+    case Opcode::usetpi_ne:
+    case Opcode::usetpi_lt:
+    case Opcode::usetpi_le:
+    case Opcode::usetpi_gt:
+    case Opcode::usetpi_ge:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
@@ -415,6 +427,12 @@ Instruction decode(uint64_t word) {
     case Opcode::uand:
     case Opcode::uor:
     case Opcode::uxor:
+    case Opcode::usetp_eq:
+    case Opcode::usetp_ne:
+    case Opcode::usetp_lt:
+    case Opcode::usetp_le:
+    case Opcode::usetp_gt:
+    case Opcode::usetp_ge:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
@@ -425,6 +443,12 @@ Instruction decode(uint64_t word) {
     case Opcode::uandi:
     case Opcode::uori:
     case Opcode::uxori:
+    case Opcode::usetpi_eq:
+    case Opcode::usetpi_ne:
+    case Opcode::usetpi_lt:
+    case Opcode::usetpi_le:
+    case Opcode::usetpi_gt:
+    case Opcode::usetpi_ge:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
@@ -453,6 +477,12 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::uandi:
     case Opcode::uori:
     case Opcode::uxori:
+    case Opcode::usetpi_eq:
+    case Opcode::usetpi_ne:
+    case Opcode::usetpi_lt:
+    case Opcode::usetpi_le:
+    case Opcode::usetpi_gt:
+    case Opcode::usetpi_ge:
     case Opcode::ur2r:
     case Opcode::lds_uni:
     case Opcode::ldg_uni:
@@ -469,6 +499,12 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::uand:
     case Opcode::uor:
     case Opcode::uxor:
+    case Opcode::usetp_eq:
+    case Opcode::usetp_ne:
+    case Opcode::usetp_lt:
+    case Opcode::usetp_le:
+    case Opcode::usetp_gt:
+    case Opcode::usetp_ge:
     case Opcode::atom_add_uni:
     case Opcode::atom_and_uni:
     case Opcode::atom_xor_uni:
@@ -614,6 +650,18 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::usread: return "usread";
     case Opcode::r2ur: return "r2ur";
     case Opcode::ur2r: return "ur2r";
+    case Opcode::usetp_eq:
+    case Opcode::usetpi_eq: return "usetp.eq";
+    case Opcode::usetp_ne:
+    case Opcode::usetpi_ne: return "usetp.ne";
+    case Opcode::usetp_lt:
+    case Opcode::usetpi_lt: return "usetp.lt";
+    case Opcode::usetp_le:
+    case Opcode::usetpi_le: return "usetp.le";
+    case Opcode::usetp_gt:
+    case Opcode::usetpi_gt: return "usetp.gt";
+    case Opcode::usetp_ge:
+    case Opcode::usetpi_ge: return "usetp.ge";
     case Opcode::halt: return "halt";
     }
     std::ostringstream out;
@@ -791,6 +839,22 @@ std::string format_instruction(
     case Opcode::uxori:
         out << ' ' << ureg(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
         break;
+    case Opcode::usetp_eq:
+    case Opcode::usetp_ne:
+    case Opcode::usetp_lt:
+    case Opcode::usetp_le:
+    case Opcode::usetp_gt:
+    case Opcode::usetp_ge:
+        out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << ureg(inst.src1);
+        break;
+    case Opcode::usetpi_eq:
+    case Opcode::usetpi_ne:
+    case Opcode::usetpi_lt:
+    case Opcode::usetpi_le:
+    case Opcode::usetpi_gt:
+    case Opcode::usetpi_ge:
+        out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
+        break;
     case Opcode::addi:
     case Opcode::shli:
     case Opcode::shri:
@@ -921,6 +985,19 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
         return 0;
     // The uniform register writers are not vector arithmetic: they present at
     // the URF write port urf.issue_to_port_cycles after issue (src/rf.hpp).
+    // usetp rides the same pipeline and presents its predicate then.
+    case Opcode::usetp_eq:
+    case Opcode::usetp_ne:
+    case Opcode::usetp_lt:
+    case Opcode::usetp_le:
+    case Opcode::usetp_gt:
+    case Opcode::usetp_ge:
+    case Opcode::usetpi_eq:
+    case Opcode::usetpi_ne:
+    case Opcode::usetpi_lt:
+    case Opcode::usetpi_le:
+    case Opcode::usetpi_gt:
+    case Opcode::usetpi_ge:
     case Opcode::umov:
     case Opcode::umovi:
     case Opcode::uadd:

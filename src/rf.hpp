@@ -118,6 +118,19 @@
 //     register) is a fixed-latency VECTOR result: its uniform operand is
 //     sampled at c0 + 1 and it rides the arithmetic pipeline like mov, its
 //     write booked on the RF write calendar at issue_to_port.
+//   - usetp pD, urA, urB | imm (the uniform compare;
+//     trash/uniform-compare-2026-11-18.md) is uniform arithmetic whose result
+//     is one bit for the predicate file: it rides the URF write pipeline like
+//     every uniform-ALU instruction (operands sampled at c0 + 1, the ALU at
+//     c0 + 1 + Lu) and at the write port's cycle, c0 + L, presents pD -- the
+//     same value in every lane -- at the predicate file's input instead of
+//     the URF write port, and leaves the pipeline. The predicate file is
+//     flip-flops: pD is in it from c0 + L + 1 (canonical c0 + 4), so a
+//     bra.uni on it issues from c0 + L (canonical 3 cycles later; a vector
+//     setp's is 4). Its write follows the predicate file's one rule (no port,
+//     no calendar): a predicate writer issues only once the older write to
+//     the same predicate is in the file, so one write per predicate is ever in
+//     flight, and writes to different predicates are different flip-flops.
 
 namespace nanosm {
 
@@ -238,6 +251,15 @@ inline uint32_t issue_to_urf_port(const DeviceProfile& profile) {
 // register (canonical 5).
 inline uint32_t issue_to_urf_visible(const DeviceProfile& profile) {
     return issue_to_urf_port(profile) + profile.urf_write_depth_cycles + 1;
+}
+
+// Accepted issue -> the first cycle usetp's predicate is in the file: it is
+// presented at the write port's cycle (L) and the flip-flops take it at that
+// edge. A bra.uni reading it may issue issue_to_predicate_sample earlier: a
+// usetp accepted at c0 (canonical L 3) is in the file from c4, so a bra.uni
+// on it issues from c3 and samples it at c4.
+inline uint32_t issue_to_uniform_predicate_visible(const DeviceProfile& profile) {
+    return issue_to_urf_port(profile) + 1;
 }
 
 // The tma's operand read (trash/rfc17.md section 4). The URF's two read

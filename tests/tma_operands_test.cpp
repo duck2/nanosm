@@ -366,8 +366,15 @@ void test_descriptor_and_toolchain() {
         "the printed forms: " + nanosm::format_instruction(store, false));
     require(compile_error("tma.load.1d [ur0], [4100, ur4], [ur1]\nhalt\n").find("must be 64-byte aligned") !=
             std::string::npos, "an unaligned descriptor address");
-    require(compile_error("tma.load.4d [ur0], [4096, ur13], [ur1]\nhalt\n").find("pass this profile's last uniform register") !=
-            std::string::npos, "coordinates ur13 .. ur16");
+    // Four coordinates from three below the profile's last uniform register
+    // pass it by one; one coordinate in the last register fits.
+    const auto registers = canonical_profile().urf_registers;
+    const auto from = "ur" + std::to_string(registers - 3);
+    require(compile_error("tma.load.4d [ur0], [4096, " + from + "], [ur1]\nhalt\n")
+                    .find("pass this profile's last uniform register") != std::string::npos,
+        "coordinates " + from + " .. ur" + std::to_string(registers));
+    require(compile_error("tma.load.1d [ur0], [4096, ur" + std::to_string(registers - 1) + "], [ur1]\nhalt\n").empty(),
+        "one coordinate in the last uniform register");
     require(compile_error("tma.load [4096], r0, r1\nhalt\n").find("needs its coordinate count") != std::string::npos,
         "the old form");
 }

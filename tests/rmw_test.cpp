@@ -726,7 +726,8 @@ void test_i5_atomic_encoding_and_assembly() {
     rejects("atom.add.uni r3, [ur1]\nhalt\n", false, "expected 3 operands");
     rejects("atom.min.uni r3, [ur1], ur2\nhalt\n", false, "unknown opcode 'atom.min.uni'");
     rejects("atom.add r3, [r1], r2\nhalt\n", false, "unknown opcode 'atom.add'");
-    rejects("atom.add.uni r3, [r1], r2\nhalt\n", false, "expected uniform register (ur0..ur15), got 'r1'");
+    rejects("atom.add.uni r3, [r1], r2\nhalt\n", false,
+        "expected uniform register (ur0..ur" + std::to_string(profile.urf_registers - 1) + "), got 'r1'");
     rejects("atom.exch.uni r3, [ur1], ur2\nhalt\n", true, "memory operation requires set=sb0..sb5");
 }
 

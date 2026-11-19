@@ -10,7 +10,7 @@
     "write_depth_cycles": 2
   },
   "urf": {
-    "registers": 16,
+    "registers": 32,
     "read_latency_cycles": 1,
     "write_depth_cycles": 1,
     "alu_latency_cycles": 1,

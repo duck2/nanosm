@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Optimized by default: the simulator steps every core cycle, and an unoptimized
+# build is several times slower. Pass -DCMAKE_BUILD_TYPE=Debug for a debug build.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 # The Sanitizer (src/sanitizer.hpp) holds shadow state that only decides
 # whether to PANIC. OFF compiles it to no-ops; the machine must compute exactly
 # the same thing either way. With ON (the default) the build also produces an

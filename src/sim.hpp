@@ -436,12 +436,13 @@ private:
     //                    the canonical depths this is the write port's own
     //                    stage). The RF's read stages hold it until then, so
     //                    the write carries it from the sample on.
-    //   stage L - 1      presented at the URF write port
+    //   stage L - 1      presented at the URF write port (a usetp: its
+    //                    predicate at the predicate file; it leaves here)
     //   stage L + Wu - 1 at the RAM: it lands at this cycle's edge
     // One instruction is accepted per cycle, so each stage holds at most one
     // write and the write port sees at most one per cycle: no calendar.
     // Widths: valid, warp (4 bits at 16 warps), the ALU's control (opcode,
-    // destination register: 4 bits at 16, a 22-bit immediate), two 32-bit
+    // destination register: 5 bits at 32, a 22-bit immediate), two 32-bit
     // operand latches, the 32-bit value.
     struct UrfWrite {
         uint32_t warp = 0;

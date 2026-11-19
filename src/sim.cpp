@@ -197,20 +197,33 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
     return a > b ? a_bits : b_bits;
 }
 
+// setp's and usetp's six comparisons: unsigned 32-bit.
 bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     switch (opcode) {
     case Opcode::setp_eq:
-    case Opcode::setpi_eq: return lhs == rhs;
+    case Opcode::setpi_eq:
+    case Opcode::usetp_eq:
+    case Opcode::usetpi_eq: return lhs == rhs;
     case Opcode::setp_ne:
-    case Opcode::setpi_ne: return lhs != rhs;
+    case Opcode::setpi_ne:
+    case Opcode::usetp_ne:
+    case Opcode::usetpi_ne: return lhs != rhs;
     case Opcode::setp_lt:
-    case Opcode::setpi_lt: return lhs < rhs;
+    case Opcode::setpi_lt:
+    case Opcode::usetp_lt:
+    case Opcode::usetpi_lt: return lhs < rhs;
     case Opcode::setp_le:
-    case Opcode::setpi_le: return lhs <= rhs;
+    case Opcode::setpi_le:
+    case Opcode::usetp_le:
+    case Opcode::usetpi_le: return lhs <= rhs;
     case Opcode::setp_gt:
-    case Opcode::setpi_gt: return lhs > rhs;
+    case Opcode::setpi_gt:
+    case Opcode::usetp_gt:
+    case Opcode::usetpi_gt: return lhs > rhs;
     case Opcode::setp_ge:
-    case Opcode::setpi_ge: return lhs >= rhs;
+    case Opcode::setpi_ge:
+    case Opcode::usetp_ge:
+    case Opcode::usetpi_ge: return lhs >= rhs;
     default: throw SimError("internal non-setp comparison");
     }
 }
@@ -242,9 +255,10 @@ std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePl
     // tma_operand_rounds): an instruction whose read round has a uniform
     // register (a tma included) would sample in one of them.
     if (view.urf_ports_held && !plan.uniform_reads.empty()) return Refusal::urf_read_ports_held;
-    // A uniform-register writer needs nothing else: its write port is its
-    // own pipeline stage (src/rf.hpp), its reads the issue register's round.
-    if (writes_uniform_register(opcode)) return std::nullopt;
+    // A uniform-register writer (or usetp) needs nothing else: its write port
+    // is its own pipeline stage (src/rf.hpp; usetp's predicate goes to the
+    // flip-flops at that stage), its reads the issue register's round.
+    if (uses_urf_pipeline(opcode)) return std::nullopt;
     if (uses_arithmetic_pipeline(inst)) {
         if (is_sfu(opcode) && !view.sfu_free) return Refusal::sfu_busy;
         if (plan.write_reg.has_value() && !view.write_slot_free) return Refusal::rf_write_booked;
@@ -3531,7 +3545,7 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     if (uniform_dst.has_value()) {
         sanitizer_.check_uniform_waw(site(warp, inst), *uniform_dst, cycle_ + issue_to_urf_visible(config_));
     }
-    if (is_setp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) {
+    if (is_setp(inst.opcode) || is_usetp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) {
         if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
         sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
     }
@@ -3679,7 +3693,7 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         accept_arithmetic(warp, inst, plan, w);
         return;
     }
-    if (writes_uniform_register(inst.opcode)) {
+    if (uses_urf_pipeline(inst.opcode)) {
         accept_uniform(warp, inst, plan, w);
         return;
     }
@@ -3749,15 +3763,17 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
-// Uniform arithmetic and r2ur: the write enters the URF write pipeline's
-// stage 0 (the issue register's cycle, next cycle), where its operands are
-// sampled; it presents at the URF write port at issue + L and is visible from
-// issue + L + Wu + 1 (src/rf.hpp). r2ur's vector source is part of the round:
-// it owns its bank's read port in the issue register's cycle like any read.
-// No write calendar and no structural check: one issue per cycle is one
-// write per pipeline stage. r2ur reads lane 0, so like every lane-0 operation
-// it is UB under a partial or empty active mask (the sanitizer's PANIC,
-// backlog D12.1); uniform arithmetic reads no lanes.
+// Uniform arithmetic, r2ur and usetp: the write enters the URF write
+// pipeline's stage 0 (the issue register's cycle, next cycle), where its
+// operands are sampled; it presents at the URF write port at issue + L and is
+// visible from issue + L + Wu + 1 (src/rf.hpp). usetp presents its predicate
+// at the predicate file then instead, in the file from issue + L + 1. r2ur's
+// vector source is part of the round: it owns its bank's read port in the
+// issue register's cycle like any read. No write calendar and no structural
+// check: one issue per cycle is one write per pipeline stage. r2ur reads lane
+// 0, so like every lane-0 operation it is UB under a partial or empty active
+// mask (the sanitizer's PANIC, backlog D12.1); uniform arithmetic (usetp
+// included) reads no lanes.
 void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     if (inst.opcode == Opcode::r2ur) sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
@@ -3765,7 +3781,11 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
         ++w.issue.rf_read_banks[reg % config_.rf_banks];
         sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
     }
-    sanitizer_.record_uniform_ready(warp.id, inst.dst, cycle_ + issue_to_urf_visible(config_));
+    if (is_usetp(inst.opcode)) {
+        sanitizer_.record_pred_ready(warp.id, inst.dst, cycle_ + issue_to_uniform_predicate_visible(config_));
+    } else {
+        sanitizer_.record_uniform_ready(warp.id, inst.dst, cycle_ + issue_to_urf_visible(config_));
+    }
     UrfWrite write;
     write.warp = warp.id;
     write.pc = head_pc(warp.id);
@@ -4654,14 +4674,23 @@ void Machine::step_rf_reads(Wires& w) {
 // (the trace's "UR write"); the one in the last stage is at the RAM now and
 // lands at this cycle's clock edge, after every read of the cycle
 // (land_urf_write). Each stage holds at most one write, so the one write
-// port is never contended.
+// port is never contended. A usetp in stage L - 1 presents its predicate at
+// the predicate file instead -- the same bit in every lane, taken by the
+// flip-flops at this cycle's edge (land_rf_writes) -- and leaves (step_urf).
 void Machine::urf_ram_stage(Wires& w) {
     const auto& pipe = urf_pipe_.cur();
     if (const auto& presented = pipe.at(config_.urf_issue_to_port_cycles - 1); presented.has_value()) {
         if (!presented->value.has_value()) {
             throw SimError("internal: a uniform write reached the URF write port without its value");
         }
-        trace_->urf_write(cycle_, presented->warp, presented->instruction.dst, *presented->value);
+        if (is_usetp(presented->instruction.opcode)) {
+            auto predicate = predicate_writeback(warps_.at(presented->warp), presented->instruction.dst, cycle_,
+                std::vector<uint32_t>(config_.lanes, *presented->value));
+            predicate.reason = "usetp";
+            w.rf_landings.push_back(std::move(predicate));
+        } else {
+            trace_->urf_write(cycle_, presented->warp, presented->instruction.dst, *presented->value);
+        }
     }
     if (pipe.back().has_value()) w.urf_landing = pipe.back();
 }
@@ -4675,12 +4704,14 @@ void Machine::urf_ram_stage(Wires& w) {
 // (canonical: Lr 2 = L - 1, the RF output wired to the URF write port); the
 // RF's read stages carry it until then, so the write carries it as its value
 // from the sample on. Issue's accepted writer enters stage 0; the write in
-// the last stage leaves (it lands now).
+// the last stage leaves (it lands now), and so does a usetp at the write
+// port's stage (its predicate is presented now: urf_ram_stage).
 void Machine::step_urf(Wires& w) {
     const auto& pipe = urf_pipe_.cur();
     UrfWritePipeline next(pipe.size());
     for (std::size_t stage = 0; stage + 1 < pipe.size(); ++stage) {
         if (!pipe[stage].has_value()) continue;
+        if (is_usetp(pipe[stage]->instruction.opcode) && stage + 1 == config_.urf_issue_to_port_cycles) continue;
         auto write = *pipe[stage];
         if (stage == 0) write.operands = w.urf_sample.value();
         if (write.instruction.opcode == Opcode::r2ur) {
@@ -4696,7 +4727,8 @@ void Machine::step_urf(Wires& w) {
 
 // The uniform ALU: one 32-bit result from the write's latched operands (its
 // uniform sources in operand order) and its immediate. Register shifts use
-// the low 5 bits, as the vector ALU's.
+// the low 5 bits, as the vector ALU's. A usetp's result is its predicate, 0
+// or 1 (setp's comparisons, unsigned).
 uint32_t Machine::execute_uniform(const UrfWrite& write) const {
     const auto& inst = write.instruction;
     const auto fail = [&](const std::string& reason) {
@@ -4728,7 +4760,11 @@ uint32_t Machine::execute_uniform(const UrfWrite& write) const {
         if (inst.imm == static_cast<int32_t>(SpecialReg::n_warps)) return static_cast<uint32_t>(warps_.size());
         fail("invalid special register for usread");
         break;
-    default: break;
+    default:
+        if (is_usetp(inst.opcode)) {
+            return compare_setp(inst.opcode, a(), is_usetp_immediate(inst.opcode) ? imm : b()) ? 1u : 0u;
+        }
+        break;
     }
     throw_issue_panic(IssueSite{cycle_, write.warp, write.pc, inst, &config_.mma_shapes}, "not uniform arithmetic");
 }

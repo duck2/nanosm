@@ -161,15 +161,20 @@ std::optional<Opcode> mma_async_opcode(const std::string& op, const DeviceProfil
     return mma_opcode(static_cast<uint32_t>(found - profile.mma_shapes.begin()), is_init);
 }
 
-Opcode parse_setp_opcode(std::string op, bool immediate, uint32_t line) {
+// setp.xx / usetp.xx (an optional .u32: the comparison is unsigned 32-bit
+// either way). Each of the four opcode blocks lists eq, ne, lt, le, gt, ge in
+// that order.
+Opcode parse_setp_opcode(std::string op, bool uniform, bool immediate, uint32_t line) {
     if (op.ends_with(".u32")) op.resize(op.size() - 4);
-    if (op == "setp.eq") return immediate ? Opcode::setpi_eq : Opcode::setp_eq;
-    if (op == "setp.ne") return immediate ? Opcode::setpi_ne : Opcode::setp_ne;
-    if (op == "setp.lt") return immediate ? Opcode::setpi_lt : Opcode::setp_lt;
-    if (op == "setp.le") return immediate ? Opcode::setpi_le : Opcode::setp_le;
-    if (op == "setp.gt") return immediate ? Opcode::setpi_gt : Opcode::setp_gt;
-    if (op == "setp.ge") return immediate ? Opcode::setpi_ge : Opcode::setp_ge;
-    throw SimError("line " + std::to_string(line) + ": unknown setp comparison '" + op + "'");
+    const std::string family = uniform ? "usetp." : "setp.";
+    const auto first = uniform ? (immediate ? Opcode::usetpi_eq : Opcode::usetp_eq)
+                               : (immediate ? Opcode::setpi_eq : Opcode::setp_eq);
+    static const std::array<std::string, 6> comparisons = {"eq", "ne", "lt", "le", "gt", "ge"};
+    for (std::size_t i = 0; i < comparisons.size(); ++i) {
+        if (op == family + comparisons[i]) return static_cast<Opcode>(static_cast<uint8_t>(first) + i);
+    }
+    throw SimError("line " + std::to_string(line) + ": unknown " + (uniform ? "usetp" : "setp") +
+        " comparison '" + op + "'");
 }
 
 int32_t parse_value(
@@ -628,9 +633,23 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.dst = predicate;
             inst.src0 = parse_reg(args[1], line_number);
             const bool immediate = !is_register(args[2]);
-            inst.opcode = parse_setp_opcode(op, immediate, line_number);
+            inst.opcode = parse_setp_opcode(op, false, immediate, line_number);
             if (immediate) inst.imm = parse_value(args[2], constants, line_number);
             else inst.src1 = parse_reg(args[2], line_number);
+        } else if (op.starts_with("usetp.")) {
+            // The uniform compare: uniform registers (a vector register is
+            // refused by parse_ureg), the same comparisons as setp.
+            expect_count(args, 3, line_number);
+            const auto [predicate, invert] = parse_predicate(args[0], line_number);
+            if (predicate == 7 || invert) {
+                throw SimError("line " + std::to_string(line_number) + ": usetp destination must be p0..p6");
+            }
+            inst.dst = predicate;
+            inst.src0 = parse_ureg(args[1], line_number, profile);
+            const bool immediate = !is_uniform_register(args[2]) && !is_register(args[2]);
+            inst.opcode = parse_setp_opcode(op, true, immediate, line_number);
+            if (immediate) inst.imm = parse_value(args[2], constants, line_number);
+            else inst.src1 = parse_ureg(args[2], line_number, profile);
         } else if (op == "addi" || op == "shli" || op == "shri" || op == "xori" ||
                    op == "andi" || op == "ori") {
             expect_count(args, 3, line_number);
@@ -912,7 +931,7 @@ std::vector<uint8_t> sources(const Instruction& inst) {
 }
 
 std::optional<uint8_t> predicate_destination(const Instruction& inst) {
-    if (is_setp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) return inst.dst;
+    if (is_setp(inst.opcode) || is_usetp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) return inst.dst;
     return std::nullopt;
 }
 
@@ -1045,7 +1064,9 @@ void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumula
 //   read_until: the exclusive end of the fixed reads' samples;
 //   predicate_ready: the vtime from which a predicate is in the file (a
 //     conditional branch samples it issue_to_predicate_sample after its issue;
-//     a predicate writer may issue from it);
+//     a predicate writer may issue from it). A setp's comes from the
+//     arithmetic pipeline, a usetp's from the URF write pipeline
+//     (issue_to_uniform_predicate_visible);
 //   ureg_visible: the vtime from which a URF sample sees a uniform register
 //     (every uniform-register writer is fixed-latency: issue_to_urf_visible).
 // A consumer is placed so its sample of each source is at or after that
@@ -1107,6 +1128,7 @@ struct FixedTimeline {
             // and its predicate written, so its one-cycle latency always holds.
             predicate_ready[*dst] = vtime + fixed_latency(inst, profile.timing);
         }
+        if (is_usetp(inst.opcode)) predicate_ready[inst.dst] = vtime + issue_to_uniform_predicate_visible(profile);
         if (const auto dst = uniform_destination(inst); dst.has_value()) {
             ureg_visible[*dst] = vtime + issue_to_urf_visible(profile);
         }
@@ -1424,8 +1446,9 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             !is_mma_async(inst.opcode) && !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
             throw SimError("line " + std::to_string(inst.line) + ": this opcode cannot set a depbar");
         }
-        if (is_setp(inst.opcode) && inst.dst >= 7) {
-            throw SimError("line " + std::to_string(inst.line) + ": setp destination must be p0..p6");
+        if ((is_setp(inst.opcode) || is_usetp(inst.opcode)) && inst.dst >= 7) {
+            throw SimError("line " + std::to_string(inst.line) + ": " + opcode_name(inst.opcode) +
+                " destination must be p0..p6");
         }
         if (is_mbar_predicate_writer(inst.opcode) && inst.dst >= 7) {
             throw SimError(

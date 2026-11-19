@@ -53,14 +53,14 @@ struct DeviceProfile {
     // W + Wd + 1 the new one. >= 1.
     uint32_t rf_write_depth_cycles = 2;
     // The uniform register file (trash/rfc16.md, trash/urf-slice-2026-11-08.md):
-    // urf.registers 32-bit registers per warp (canonical 16, LUTRAM), two read
+    // urf.registers 32-bit registers per warp (canonical 32, LUTRAM), two read
     // ports and one write port (src/rf.hpp). Its depths follow the RF's
     // convention: Lu (urf.read_latency_cycles) register stages from a read's
     // sample to its value at the output, Wu (urf.write_depth_cycles) from a
     // write's presentation at the write port to the RAM (canonical 1 each,
     // >= 1). Lu may not exceed rf.read_latency_cycles: an instruction's
     // uniform operands must reach its unit with its vector ones.
-    uint32_t urf_registers = 16;
+    uint32_t urf_registers = 32;
     uint32_t urf_read_latency_cycles = 1;
     uint32_t urf_write_depth_cycles = 1;
     // Eu: the uniform ALU's register stages (canonical 1, >= 1).

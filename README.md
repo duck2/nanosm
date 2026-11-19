@@ -78,22 +78,27 @@ two distinct sources in one bank -- is malformed: qtxc, qtxas and kernel load re
 registers named.
 
 Each warp also has a uniform register file (the profile's `urf` section; trash/rfc16.md and
-trash/urf-slice-2026-11-08.md): sixteen 32-bit registers `ur0`..`ur15`, two read ports, one write
-port. Only uniform arithmetic (`umov`, `uadd`, `uaddi`, `usub`, `ushl`/`ushr`/`ushli`/`ushri`,
-`uand`/`uor`/`uxor` and their immediates, `usread urD, WARP_ID | N_WARPS`) and `r2ur urD, rS` (lane 0
-of a vector register) write it, each presenting its result at the URF write port the same fixed
-`urf.issue_to_port_cycles` after issue, so one issue per cycle is one URF write per cycle: no
-calendar. `ur2r rD, urS` copies a uniform register into every lane of a vector register. An
-instruction reads its uniform registers (at most two) in its one read round; they are not vector
-registers and do not count toward the bank rule. The uniform consumers take them as operands:
-`lds.uni`/`ldg.uni` bases, `atom.*.uni` address and operand, `acc.ld`/`acc.st` coordinates (row in
-`urC`, column in `urC + 1`), mbar addresses and values, MMA operand addresses and `mma.commit`'s mbar.
-The TMA's operands are uniform registers too (below). `bra.uni`'s predicate and the
-`ldg.v8`/`stg.v8` base still come from lane 0 of a vector register. `sread` reads only the
-per-lane `LANE_ID` / `THREAD_ID`.
+trash/urf-slice-2026-11-08.md): `urf.registers` 32-bit registers (32 in the canonical profile,
+`ur0`..`ur31`), two read ports, one write port. Only uniform arithmetic (`umov`, `uadd`, `uaddi`,
+`usub`, `ushl`/`ushr`/`ushli`/`ushri`, `uand`/`uor`/`uxor` and their immediates, `usread urD, WARP_ID
+| N_WARPS`) and `r2ur urD, rS` (lane 0 of a vector register) write it, each presenting its result at
+the URF write port the same fixed `urf.issue_to_port_cycles` after issue, so one issue per cycle is
+one URF write per cycle: no calendar. `ur2r rD, urS` copies a uniform register into every lane of a
+vector register. The uniform compare `usetp.{eq,ne,lt,le,gt,ge} pD, urA, urB | imm`
+(trash/uniform-compare-2026-11-18.md) runs on the same uniform ALU with `setp`'s comparisons
+(unsigned 32-bit) and, at that same fixed cycle, writes predicate `pD` with one value in every lane;
+a `bra.uni` on it may issue `urf.issue_to_port_cycles` (3) later, so a loop can count in a uniform
+register with no vector register at all. An instruction reads its uniform registers (at most two) in
+its one read round; they are not vector registers and do not count toward the bank rule. The
+uniform consumers take them as operands: `lds.uni`/`ldg.uni` bases, `atom.*.uni` address and
+operand, `acc.ld`/`acc.st` coordinates (row in `urC`, column in `urC + 1`), mbar addresses and
+values, MMA operand addresses and `mma.commit`'s mbar. The TMA's operands are uniform registers too
+(below). The `ldg.v8`/`stg.v8` base still comes from lane 0 of a vector register. `sread` reads only
+the per-lane `LANE_ID` / `THREAD_ID`.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
-`setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands, and `@p0 bra.uni label`. A
+`setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands (`usetp` on uniform registers), and
+`@p0 bra.uni label`. A
 `bra.uni` predicate must agree across every lane in its warp or the simulator PANICs. General
 predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
 Qtx conservatively drains live depbars and fixed-latency writes at every branch.
