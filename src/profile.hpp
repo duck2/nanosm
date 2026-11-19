@@ -121,9 +121,9 @@ struct DeviceProfile {
     uint32_t mma_result_latency_cycles = 0;
     // mma.layout in the profile: the layout the tensor core reads both
     // operands in (src/layout.hpp), fixed for a device, not selected by
-    // individual MMA instructions. xor64 is the only supported swizzle; dense
-    // is an unswizzled diagnostic baseline. A slice's spacing follows the
-    // operand's row count.
+    // individual MMA instructions. swizzle64 is the only supported swizzle
+    // (each operand's row spacing is the instruction's); dense is an
+    // unswizzled diagnostic baseline, compact in the command's shape.
     TileLayout mma_layout = TileLayout::dense;
     // SFU: one separate unit whose throughput is independent of lane count.
     // It serves sfu_lanes lanes per cycle, so one warp op occupies it for
@@ -196,8 +196,9 @@ uint32_t mma_blocks_per_k(const DeviceProfile& profile, const MmaShape& shape);
 // shmem port_a_depth + read_latency + mma result_latency + tmem port_depth.
 uint32_t mma_min_blocks_per_k(const DeviceProfile& profile);
 
-// Legal but wasteful profile choices (e.g. an MMA shape that leaves the last
-// 8-deep xor64 K block of its operands partly empty). Warnings, not errors.
+// Legal but wasteful profile choices (e.g. an MMA shape that reads only part
+// of the last 16-byte piece of each swizzle64 operand row). Warnings, not
+// errors.
 std::vector<std::string> device_profile_warnings(const DeviceProfile& profile);
 // Prints each distinct warning to stderr once per process; parse_device_profile
 // calls it after validation.

@@ -90,6 +90,20 @@ inline nanosm::TmaDescriptor plain_tma_1d(uint32_t elements, uint64_t base = 0) 
     return descriptor;
 }
 
+// The swizzle64 layout (src/layout.hpp), written out independently of the
+// production functions (trash/whole_rows_check_astra.py's rule): byte `byte`
+// of row `row` of a tile at `base` (64-byte aligned) whose rows are
+// `spacing` bytes apart. The row stays whole at base + row x spacing; its
+// piece slot is XORed with the row among the row's own slots, its word with
+// (row / 4) & 3.
+inline uint32_t reference_swizzle64(uint32_t base, uint32_t spacing, uint32_t row, uint32_t byte) {
+    const uint32_t slots = std::min(spacing, 64u) / 16;
+    const uint32_t rows_per_line = std::max(1u, 64 / spacing);
+    const uint32_t slot_xor = (row / rows_per_line) & (slots - 1);
+    const uint32_t word_xor = (row / 4) & 3;
+    return base + ((row * spacing + byte) ^ (slot_xor << 4) ^ (word_xor << 2));
+}
+
 // A tma's uniform-register operands as assembly: the buffer's shared address
 // into ur`buffer_ur`, the barrier's into ur`barrier_ur`, and the coordinates
 // into ur`coordinate_ur` onwards. umov's signed 22-bit immediate holds any

@@ -246,6 +246,31 @@ uint8_t parse_mbar_address(const std::string& text, uint32_t line, const DeviceP
     return address.base;
 }
 
+// An mma.async operand (src/isa.hpp): [urA] or [urA, spacing], the spacing a
+// constant in bytes (default 16), a multiple of 16 that fits its 7-bit field.
+// Which spacings the profile's layout takes is check_mma_shape's business.
+std::pair<uint8_t, uint32_t> parse_mma_operand(
+    const std::string& text,
+    const std::unordered_map<std::string, int32_t>& constants,
+    uint32_t line,
+    const DeviceProfile& profile) {
+    const auto inner = text.size() >= 2 && text.front() == '[' && text.back() == ']'
+        ? split(text.substr(1, text.size() - 2), ',') : std::vector<std::string>{};
+    if (inner.empty() || inner.size() > 2) {
+        throw SimError("line " + std::to_string(line) + ": bad mma operand '" + text +
+            "' (expected [urA] or [urA, row spacing])");
+    }
+    const auto base = parse_ureg(inner[0], line, profile);
+    if (inner.size() == 1) return {base, mma_default_spacing};
+    const auto spacing = parse_value(inner[1], constants, line);
+    if (spacing <= 0 || spacing % static_cast<int32_t>(mma_spacing_unit) != 0 ||
+        static_cast<uint32_t>(spacing) > mma_max_spacing) {
+        throw SimError("line " + std::to_string(line) + ": mma operand row spacing " + std::to_string(spacing) +
+            " must be a multiple of 16 bytes in 16.." + std::to_string(mma_max_spacing));
+    }
+    return {base, static_cast<uint32_t>(spacing)};
+}
+
 // "tma.load.2d" -> (store false, 2 coordinates); nullopt for anything else.
 std::optional<std::pair<bool, uint32_t>> tma_mnemonic(const std::string& op) {
     static const std::regex pattern(R"(^tma\.(load|store)\.([1-4])d$)");
@@ -774,10 +799,14 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             const auto acc = accumulator_ids.find(args[0]);
             if (acc == accumulator_ids.end())
                 throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
+            // mma.async ACC, [urA, spacing], [urB, spacing] (src/isa.hpp).
             inst.opcode = *mma;
             inst.dst = acc->second;
-            inst.src0 = parse_mbar_address(args[1], line_number, profile);
-            inst.src1 = parse_mbar_address(args[2], line_number, profile);
+            const auto [a, a_spacing] = parse_mma_operand(args[1], constants, line_number, profile);
+            const auto [b, b_spacing] = parse_mma_operand(args[2], constants, line_number, profile);
+            inst.src0 = a;
+            inst.src1 = b;
+            inst.imm = mma_spacing_immediate(a_spacing, b_spacing);
         } else if (op == "mma.commit") {
             expect_count(args, 1, line_number);
             inst.opcode = Opcode::mma_commit;
@@ -986,6 +1015,25 @@ void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumula
         throw SimError(where + ": " + name + " needs a " + std::to_string(shape->m) + "x" +
             std::to_string(shape->n) + " accumulator; '" + acc.name + "' is " + std::to_string(acc.rows) + "x" +
             std::to_string(acc.cols));
+    }
+    // The row spacings (src/isa.hpp). swizzle64: a spacing of the layout (16,
+    // 32 or a multiple of 64) that holds the 16-byte pieces the shape reads
+    // in each row (k / 8, rounded up). The dense diagnostic layout is compact
+    // in the command's shape and takes none.
+    const uint32_t row_bytes = (shape->k + 7) / 8 * 16;
+    for (const bool a_operand : {true, false}) {
+        const auto spacing = mma_row_spacing(inst, a_operand);
+        const std::string operand = a_operand ? "A" : "B";
+        if (profile.mma_layout == TileLayout::dense) {
+            if (spacing != mma_default_spacing) {
+                throw SimError(where + ": " + name + ": the dense mma layout takes no row spacing (" + operand +
+                    " names " + std::to_string(spacing) + ")");
+            }
+        } else if (!valid_swizzle64_spacing(spacing) || spacing < row_bytes) {
+            throw SimError(where + ": " + name + ": " + operand + "'s row spacing " + std::to_string(spacing) +
+                " must be 16, 32 or a multiple of 64 bytes, and at least the " + std::to_string(row_bytes) +
+                " bytes it reads per row");
+        }
     }
 }
 

@@ -39,12 +39,12 @@
     "core_k": 8,
     "queue_commands": 2,
     "result_latency_cycles": 8,
-    "layout": "xor64",
+    "layout": "swizzle64",
     "numeric_model": "fp16_raw_window25_rz_v1"
   },
   "sync": {
     "mbar_wait_slots": 8,
-    "mbar_try_wait_timeout_cycles": 64
+    "mbar_try_wait_timeout_cycles": 65536
   },
   "tma": {
     "queue_commands": 4,

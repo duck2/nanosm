@@ -312,7 +312,7 @@ std::string compile_error(const std::string& source) {
 }
 
 // The descriptor round-trips through its 64 bytes; reserved element sizes,
-// reserved bytes and a layout byte past xor64 are refused. The assembler's
+// reserved bytes and a layout byte past swizzle64 are refused. The assembler's
 // forms print and parse back;
 // it refuses an unaligned descriptor, coordinates past the last uniform
 // register and the old form without a coordinate count.
@@ -320,7 +320,7 @@ void test_descriptor_and_toolchain() {
     nanosm::TmaDescriptor descriptor = sequence_tiles(4);
     descriptor.base = 0x123456780ull;
     descriptor.element_bytes = 2;
-    descriptor.layout = nanosm::TileLayout::xor64;
+    descriptor.layout = nanosm::TileLayout::swizzle64;
     descriptor.transposed = true;
     descriptor.tile_length = 64;
     descriptor.tile_rows = 16;
@@ -331,7 +331,7 @@ void test_descriptor_and_toolchain() {
     require(nanosm::encode_tma_descriptor(decoded) == bytes && decoded.base == descriptor.base &&
             decoded.dimensions == descriptor.dimensions && decoded.strides == descriptor.strides &&
             decoded.tile_length == 64 && decoded.tile_rows == 16 && decoded.row_dimension == 2 &&
-            decoded.layout == nanosm::TileLayout::xor64 && decoded.transposed,
+            decoded.layout == nanosm::TileLayout::swizzle64 && decoded.transposed,
         "the descriptor does not round-trip");
     const auto refused = [](const std::function<void()>& action, const std::string& needle, const std::string& what) {
         try {

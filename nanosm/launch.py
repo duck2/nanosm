@@ -79,10 +79,12 @@ class SparseMemory:
         tile: (length,) or (length, rows): `rows` runs of `length` elements
         along dimension 0, the rows stepping along `row_dimension` (1..3).
         layout: the tile's shared-memory layout (src/layout.hpp), "dense"
-        (row after row) or "xor64" (slices of 16-byte rows), the names of the
-        profile's mma.layout; transposed (xor64 only): the positions along
-        dimension 0 become the stored rows. The direction, buffer, barrier
-        and coordinates are the instruction's (tma.load.Nd / tma.store.Nd).
+        (row after row) or "swizzle64" (whole rows, packed, shuffled inside
+        each row by the row number), the names of the profile's mma.layout;
+        transposed (swizzle64 only): the positions along dimension 0 become
+        the stored rows and the tile's row index runs along them. The
+        direction, buffer, barrier and coordinates are the instruction's
+        (tma.load.Nd / tma.store.Nd).
         """
         if not 1 <= len(dimensions) <= 4:
             raise ValueError("tma dimensions must have one to four values")
@@ -96,9 +98,9 @@ class SparseMemory:
         if len(tile) not in (1, 2):
             raise ValueError("tma tile must be (length,) or (length, rows)")
         length, rows = (tuple(tile) + (1,))[:2]
-        layout_code = {"dense": 0, "xor64": 1}.get(layout) if isinstance(layout, str) else None
+        layout_code = {"dense": 0, "swizzle64": 1}.get(layout) if isinstance(layout, str) else None
         if layout_code is None:
-            raise ValueError("tma layout must be 'dense' or 'xor64'")
+            raise ValueError("tma layout must be 'dense' or 'swizzle64'")
         for name, values, maximum in [
             ("base", (base,), 0xFFFFFFFFFFFFFFFF),
             ("dimensions", dims, 0xFFFFFFFF),

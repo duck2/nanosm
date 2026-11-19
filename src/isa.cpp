@@ -65,10 +65,15 @@ uint64_t encode(const Instruction& inst) {
         (static_cast<uint64_t>(inst.control.wait_mask) << encoding::wait_mask_shift);
     const auto immediate = static_cast<uint32_t>(inst.imm) & encoding::immediate_mask;
     if (is_mma_async(inst.opcode)) {
-        // ACC id, A and B base registers (the block's opcodes share one form).
+        // ACC id, A and B base registers, A's and B's row spacings (the
+        // block's opcodes share one form).
+        if (inst.imm < 0 || inst.imm >= (1 << (2 * mma_spacing_field_bits))) {
+            throw SimError("mma.async row spacings do not fit their two 7-bit fields: " + format_instruction(inst));
+        }
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        word |= static_cast<uint64_t>(inst.imm);
         return word;
     }
     switch (inst.opcode) {
@@ -260,6 +265,7 @@ Instruction decode(uint64_t word) {
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
+        inst.imm = static_cast<int32_t>(word & ((1u << (2 * mma_spacing_field_bits)) - 1));
         return inst;
     }
     switch (inst.opcode) {
@@ -646,8 +652,14 @@ std::string format_instruction(
     std::ostringstream out;
     out << opcode_name(inst.opcode, mma_shapes);
     if (is_mma_async(inst.opcode)) {
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
-            << "], [" << ureg(inst.src1) << ']';
+        // The spacing is printed when it is not the default (as it is written).
+        const auto operand = [&](uint8_t base, bool a_operand) {
+            const auto spacing = mma_row_spacing(inst, a_operand);
+            return "[" + ureg(base) +
+                (spacing == mma_default_spacing ? std::string() : ", " + std::to_string(spacing)) + "]";
+        };
+        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << operand(inst.src0, true) << ", "
+            << operand(inst.src1, false);
         if (include_control) out << ' ' << format_control(inst.control);
         return out.str();
     }

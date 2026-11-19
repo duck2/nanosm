@@ -67,7 +67,7 @@ json profile_json(const DeviceProfile& p) {
             {"core_m", p.mma_core_m}, {"core_n", p.mma_core_n}, {"core_k", p.mma_core_k},
             {"queue_commands", p.mma_queue_commands},
             {"result_latency_cycles", p.mma_result_latency_cycles},
-            {"layout", p.mma_layout == TileLayout::xor64 ? "xor64" : "dense"},
+            {"layout", p.mma_layout == TileLayout::swizzle64 ? "swizzle64" : "dense"},
             {"numeric_model", mma_numeric_model},
         }},
         {"sync", {
@@ -124,7 +124,7 @@ T field(const json& object, const char* name) {
 } // namespace
 
 void validate_device_profile(const DeviceProfile& p) {
-    if (p.mma_layout != TileLayout::dense && p.mma_layout != TileLayout::xor64) {
+    if (p.mma_layout != TileLayout::dense && p.mma_layout != TileLayout::swizzle64) {
         throw ProfileError("device profile: unsupported MMA layout");
     }
     // The RF's own depths (trash/rfc10.md section 5): nonzero register stages.
@@ -286,8 +286,8 @@ void validate_device_profile(const DeviceProfile& p) {
         // per operand round (at least one each), so the next visit starts at
         // f + r + (blocks - 1) or later: no stall iff
         //   blocks >= D + Lb + R + Dt   (mma_min_blocks_per_k).
-        // The bound holds for any layout; under xor64 each A reload takes one
-        // more round, which only adds slack.
+        // The bound holds for any layout; under swizzle64 each A reload takes
+        // one more round, which only adds slack.
         if (shape.k > p.mma_core_k && mma_blocks_per_k(p, shape) < mma_min_blocks_per_k(p)) {
             throw ProfileError(name + ": k " + std::to_string(shape.k) + " is more than the core's " +
                 std::to_string(p.mma_core_k) + ", so each accumulator block is revisited every " +
@@ -308,14 +308,14 @@ void validate_device_profile(const DeviceProfile& p) {
         throw ProfileError("device profile: mma result_latency_cycles must cover the accumulator read "
             "(tmem port_depth + read_latency_cycles)");
     }
-    // The xor64 layout keeps a 4-row block's 16-byte rows in distinct banks,
-    // which holds for a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8). It
-    // depends on the row only, so any m and n in whole core blocks read one
-    // bank round per block; a shape with k > 8 stacks its 8-deep K blocks as
-    // whole (rows x 16 B) objects (src/sim.cpp mma_a_address).
-    if (p.mma_layout == TileLayout::xor64 && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
+    // The swizzle64 layout puts four neighbouring rows' same 16-byte piece in
+    // four different slots of 16 banks, which serves a core block of 4 rows
+    // by 8 or 4 fp16 of k: a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
+    // It depends on the row only, so any m and n in whole core blocks read
+    // one bank round per block (src/layout.hpp; src/sim.cpp mma_a_address).
+    if (p.mma_layout == TileLayout::swizzle64 && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
                              (p.mma_core_k != 4 && p.mma_core_k != 8))) {
-        throw ProfileError("device profile: xor64 MMA layout needs a 4x4x4 or 4x4x8 core");
+        throw ProfileError("device profile: swizzle64 MMA layout needs a 4x4x4 or 4x4x8 core");
     }
     if (p.tma_sector_credits >= p.gmem_queue_sectors) {
         throw ProfileError("device profile: tma sector credits must be smaller than gmem queue");
@@ -450,9 +450,9 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto layout = field<std::string>(mma, "layout");
     if (field<std::string>(mma, "numeric_model") != mma_numeric_model)
         throw ProfileError("device profile: unsupported MMA numeric_model (expected fp16_raw_window25_rz_v1)");
-    if (layout != "dense" && layout != "xor64")
-        throw ProfileError("device profile: MMA layout must be 'dense' or 'xor64'");
-    p.mma_layout = layout == "xor64" ? TileLayout::xor64 : TileLayout::dense;
+    if (layout != "dense" && layout != "swizzle64")
+        throw ProfileError("device profile: MMA layout must be 'dense' or 'swizzle64'");
+    p.mma_layout = layout == "swizzle64" ? TileLayout::swizzle64 : TileLayout::dense;
     const auto& sync = document.at("sync");
     p.mbar_wait_slots = field<uint32_t>(sync, "mbar_wait_slots");
     p.mbar_try_wait_timeout_cycles = field<uint32_t>(sync, "mbar_try_wait_timeout_cycles");
@@ -556,20 +556,19 @@ uint32_t mma_min_blocks_per_k(const DeviceProfile& profile) {
 
 std::vector<std::string> device_profile_warnings(const DeviceProfile& profile) {
     std::vector<std::string> warnings;
-    // The xor64 layout keeps 8 fp16 of k in each operand row's 16 bytes, so
-    // a shape whose k is not a multiple of 8 leaves the last 8-deep K block
-    // of each operand partly empty (HUMAN 2026-10-22: "it should warn you if
-    // there is a partially occupied storage block"). The storage is still
-    // the whole block: footprints and bounds count it.
-    if (profile.mma_layout == TileLayout::xor64) {
+    // A swizzle64 operand row is read in 16-byte pieces of 8 fp16, so a shape
+    // whose k is not a multiple of 8 reads only part of its last piece in each
+    // row (HUMAN 2026-10-22: "it should warn you if there is a partially
+    // occupied storage block"). The row spacing still counts whole pieces.
+    if (profile.mma_layout == TileLayout::swizzle64) {
         for (const auto& shape : profile.mma_shapes) {
             const uint32_t used = shape.k % 8;
             if (used == 0) continue;
             const uint32_t blocks = shape.k / 8 + 1;
             const uint32_t unused_percent = 100 * (8 - used) / (8 * blocks);
-            warnings.push_back("device profile: mma shape " + mma_shape_name(shape) + " fills only " +
-                std::to_string(used) + " of the 8 fp16 in each operand row of its last xor64 K block; " +
-                std::to_string(unused_percent) + "% of its operands' shared-memory storage is unused");
+            warnings.push_back("device profile: mma shape " + mma_shape_name(shape) + " reads only " +
+                std::to_string(used) + " of the 8 fp16 in the last 16-byte piece of each swizzle64 operand row; " +
+                std::to_string(unused_percent) + "% of the pieces it reads is unused");
         }
     }
     return warnings;

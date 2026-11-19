@@ -314,10 +314,10 @@ void test_autonomous_mma_gemm_and_commit() {
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, 8192);
     auto a_address = [](uint32_t m, uint32_t k) {
-        return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
+        return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 3))) + 2 * (k & 1);
     };
     auto b_address = [](uint32_t k, uint32_t n) { // B stored as n rows of k: A's rule
-        return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
+        return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 3))) + 2 * (k & 1);
     };
     for (uint32_t m = 0; m < 64; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, a_address(m, k), 0x3c00); // 1
@@ -674,8 +674,8 @@ void test_mma_dense_profile_recurrence_bubbles() {
     profile.mma_result_latency_cycles = 4000;
     nanosm::validate_device_profile(profile);
     auto unsupported = profile;
-    unsupported.mma_layout = nanosm::TileLayout::xor64;
-    unsupported.mma_core_n = 2; // xor64 keeps a 4x4 block's rows apart: a 4x4x4 or 4x4x8 core only
+    unsupported.mma_layout = nanosm::TileLayout::swizzle64;
+    unsupported.mma_core_n = 2; // swizzle64 keeps a 4x4 block's rows apart: a 4x4x4 or 4x4x8 core only
     try {
         nanosm::validate_device_profile(unsupported);
         throw std::runtime_error("unsupported generalized XOR MMA layout was accepted");
@@ -885,15 +885,16 @@ void test_mma_varying_round_service() {
 
 // ---- I7: tensor core 4x4x8, hold A / stream B (trash/rfc11.md section 0) ----
 
-// Canonical xor64 operand addresses, restated independently of the
-// production helper: A element (m, k) and B element (k, n) of 64x64x8 tiles
-// at 0 and 1024 (one rule: B is stored as n rows of k, as A is m rows of k).
+// Canonical swizzle64 operand addresses at the default row spacing (16 bytes:
+// a K = 8 tile), restated independently of the production helper: A element
+// (m, k) and B element (k, n) of 64x64x8 tiles at 0 and 1024 (one rule: B is
+// stored as n rows of k, as A is m rows of k).
 uint32_t i7_a_address(uint32_t m, uint32_t k) {
-    return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
+    return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 3))) + 2 * (k & 1);
 }
 
 uint32_t i7_b_address(uint32_t k, uint32_t n) {
-    return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
+    return 1024 + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 3))) + 2 * (k & 1);
 }
 
 // One 64x64x8 tile pair (A = a_k on every row, B = b_k on every column) and
@@ -1022,17 +1023,17 @@ void test_i7_back_to_back_throughput() {
 // ---- I9: MMA shapes as opcodes, the profile's shape list, the 32x64 tile ----
 // (trash/chan.txt 2026-10-19; trash/i9-32x64-tile-proposal-fable-2026-10-19.md)
 
-// Independent restatements (not the production helpers): xor64 operand
-// element addresses for objects at any 64-byte-aligned base (a row is 16 B;
-// rows past 31 simply continue, so a 64-row object is two stacked 32-row
-// ones), the tmem word of an accumulator element (16 fine banks, 4x4
+// Independent restatements (not the production helpers): swizzle64 operand
+// element addresses at the default 16-byte row spacing for objects at any
+// 64-byte-aligned base (rows past 31 simply continue, and the shuffle repeats
+// every 16 rows, so a 64-row object is two stacked 32-row ones), the tmem word of an accumulator element (16 fine banks, 4x4
 // macro-tiles row-major), and small exact FP16 integers.
 uint32_t i9_a_address(uint32_t base, uint32_t m, uint32_t k) {
-    return base + 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 1))) + 2 * (k & 1);
+    return base + 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 3))) + 2 * (k & 1);
 }
 
 uint32_t i9_b_address(uint32_t base, uint32_t k, uint32_t n) {
-    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 1))) + 2 * (k & 1);
+    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 3))) + 2 * (k & 1);
 }
 
 uint32_t i9_tmem_word(uint32_t base, uint32_t cols, uint32_t row, uint32_t col) {
@@ -1098,6 +1099,7 @@ void test_i9_mma_opcodes() {
         inst.dst = 3;
         inst.src0 = 7;
         inst.src1 = 11;
+        inst.imm = nanosm::mma_spacing_immediate(16, 16);
         inst.control.set_depbar = 2;
         const auto decoded = nanosm::decode(nanosm::encode(inst));
         require(decoded.opcode == opcode && decoded.dst == 3 && decoded.src0 == 7 && decoded.src1 == 11 &&
@@ -1105,6 +1107,36 @@ void test_i9_mma_opcodes() {
                     std::string(e.name) + " ACC3, [ur7], [ur11]",
             std::string(e.name) + ": encode / decode / text: " +
                 nanosm::format_instruction(decoded, false, &profile.mma_shapes));
+        // The row spacings (16-byte units in the 14 spare bits): printed when
+        // not the default 16, and the largest one fits.
+        inst.imm = nanosm::mma_spacing_immediate(128, nanosm::mma_max_spacing);
+        const auto spaced = nanosm::decode(nanosm::encode(inst));
+        require(nanosm::mma_row_spacing(spaced, true) == 128 &&
+                nanosm::mma_row_spacing(spaced, false) == nanosm::mma_max_spacing &&
+                nanosm::format_instruction(spaced, false, &profile.mma_shapes) ==
+                    std::string(e.name) + " ACC3, [ur7, 128], [ur11, 2032]",
+            std::string(e.name) + ": row spacings did not survive encode / decode / text: " +
+                nanosm::format_instruction(spaced, false, &profile.mma_shapes));
+    }
+    // The assembly operand: [urA] is spacing 16; [urA, spacing] names it. A
+    // spacing that is not a multiple of 16 or past the field is refused at
+    // assembly; one the layout does not take (or shorter than the row a
+    // shape reads) at assembly and kernel load (check_mma_shape).
+    const auto parsed = nanosm::compile_qtx(".acc C, 0, 64, 64\nmma.async.m64n64k8 C, [ur0, 128], [ur1]\nhalt\n",
+        profile);
+    require(nanosm::mma_row_spacing(parsed.instructions.at(0), true) == 128 &&
+            nanosm::mma_row_spacing(parsed.instructions.at(0), false) == 16,
+        "[ur0, 128], [ur1] did not parse to spacings 128 and 16");
+    for (const auto& [operand, needle] : {std::pair{"[ur0, 24]", "multiple of 16"},
+             std::pair{"[ur0, 2048]", "multiple of 16"}, std::pair{"[ur0, 48]", "16, 32 or a multiple of 64"},
+             std::pair{"[ur0, 1, 2]", "bad mma operand"}}) {
+        try {
+            (void)nanosm::compile_qtx(std::string(".acc C, 0, 64, 64\nmma.async.m64n64k8 C, ") + operand +
+                ", [ur1]\nhalt\n", profile);
+            throw std::runtime_error(std::string("the mma operand ") + operand + " was accepted");
+        } catch (const nanosm::SimError& error) {
+            require_mentions(error.what(), {needle}, std::string("the mma operand ") + operand);
+        }
     }
     require(nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x70)) &&
             nanosm::is_mma_async(static_cast<nanosm::Opcode>(0x7f)) &&
@@ -1569,14 +1601,20 @@ void test_i9_operand_span_follows_the_shape() {
 
 // ---- D15: MMA shapes configurable from the profile (trash/chan.txt 2026-10-22) ----
 
-// Independent restatement of the operand layout for any k: each 8-deep K
-// block is a whole xor64 object of (rows x 16 B), stacked from the base.
-uint32_t d15_a_address(uint32_t base, uint32_t rows, uint32_t m, uint32_t k) {
-    return i9_a_address(base + 16 * rows * (k / 8), m, k % 8);
+// The operand layout for any k: rows of k fp16, whole, `d15_spacing(k)`
+// bytes apart (the smallest swizzle64 spacing that holds them; the command
+// names it), so a shape with k > 8 reads consecutive 16-byte pieces of the
+// same rows.
+uint32_t d15_spacing(uint32_t k) {
+    return std::max(16u, 2 * k);
 }
 
-uint32_t d15_b_address(uint32_t base, uint32_t cols, uint32_t k, uint32_t n) {
-    return i9_b_address(base + 16 * cols * (k / 8), k % 8, n);
+uint32_t d15_a_address(uint32_t base, uint32_t k_extent, uint32_t m, uint32_t k) {
+    return reference_swizzle64(base, d15_spacing(k_extent), m, 2 * k);
+}
+
+uint32_t d15_b_address(uint32_t base, uint32_t k_extent, uint32_t k, uint32_t n) {
+    return reference_swizzle64(base, d15_spacing(k_extent), n, 2 * k);
 }
 
 float d15_reference(uint32_t m, uint32_t n, uint32_t depth) {
@@ -1591,24 +1629,25 @@ float d15_reference(uint32_t m, uint32_t n, uint32_t depth) {
 // trace.
 std::unique_ptr<nanosm::Machine> d15_run_shape(const nanosm::DeviceProfile& profile, const nanosm::MmaShape& shape) {
     const auto name = nanosm::mma_shape_name(shape);
-    const uint32_t a_bytes = shape.m * shape.k * 2;
+    const uint32_t spacing = d15_spacing(shape.k);
+    const uint32_t a_bytes = shape.m * spacing;
     const uint32_t b_base = (a_bytes + 1023) / 1024 * 1024;
-    const uint32_t b_bytes = shape.k * shape.n * 2;
+    const uint32_t b_bytes = shape.n * spacing;
     const uint32_t mbar = 16384;
     std::ostringstream source;
     source << ".acc C, 0, " << shape.m << ", " << shape.n << "\n"
            << "umov ur0, 0\numov ur1, " << b_base << "\numov ur4, " << mbar << "\nmbar.init [ur4], 1\n"
-           << "mma.async.init." << name << " C, [ur0], [ur1]\nmma.commit [ur4]\n"
-           << "wait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\nhalt\n";
+           << "mma.async.init." << name << " C, [ur0, " << spacing << "], [ur1, " << spacing << "]\n"
+           << "mma.commit [ur4]\nwait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\nhalt\n";
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.shmem_image, b_base + b_bytes);
     for (uint32_t m = 0; m < shape.m; ++m)
         for (uint32_t k = 0; k < shape.k; ++k)
-            write_u16(shmem, d15_a_address(0, shape.m, m, k), i9_fp16(i9_a(m, k)));
+            write_u16(shmem, d15_a_address(0, shape.k, m, k), i9_fp16(i9_a(m, k)));
     for (uint32_t k = 0; k < shape.k; ++k)
         for (uint32_t n = 0; n < shape.n; ++n)
-            write_u16(shmem, d15_b_address(b_base, shape.n, k, n), i9_fp16(i9_b(k, n)));
+            write_u16(shmem, d15_b_address(b_base, shape.k, k, n), i9_fp16(i9_b(k, n)));
     auto machine = std::make_unique<nanosm::Machine>(profile, compile(source.str(), profile), std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});
     machine->run(200000);
@@ -1695,13 +1734,14 @@ void test_d15_latency_bound() {
 }
 
 // D15 follow-ups (trash/chan.txt 2026-10-22). On a 4x4x4 core, m16n16k4 is
-// legal (every dimension a power of two and whole core blocks) but fills
-// only 4 of the 8 fp16 in each xor64 operand row: a warning, not an error,
-// and the operand's storage is still whole 16-byte rows (16 x 16 B = 256 B
-// for A), so MMA admission must count 256 B, not 16 x 4 x 2 = 128 B. Codex's
-// reproducer puts A at 65536 - 128: before the fix it passed admission and
-// failed during the operand reads; now it is refused at admission. At
-// 65536 - 256 it runs. k = 12 is not a power of two: refused at load.
+// legal (every dimension a power of two and whole core blocks) but reads
+// only 4 of the 8 fp16 in each 16-byte swizzle64 operand row: a warning, not
+// an error. Admission counts the bytes the walk actually reads: at the
+// default 16-byte spacing rows 12..15 keep their four fp16 in the second
+// half of their row (word XOR 3), so A's last byte read is 256 B past its
+// base, not 15 x 16 + 8. Codex's reproducer puts A at 65536 - 128: refused at
+// admission. At 65536 - 256 it runs. k = 12 is not a power of two: refused
+// at load.
 void test_d15_partial_k_block_footprint_and_warning() {
     auto profile = canonical_profile();
     profile.mma_core_k = 4;
@@ -1709,7 +1749,7 @@ void test_d15_partial_k_block_footprint_and_warning() {
     nanosm::validate_device_profile(profile);
     const auto warnings = nanosm::device_profile_warnings(profile);
     require(warnings.size() == 1, "one partial-K-block warning for m16n16k4");
-    require_mentions(warnings[0], {"mma shape m16n16k4", "fills only 4 of the 8 fp16", "50%"},
+    require_mentions(warnings[0], {"mma shape m16n16k4", "reads only 4 of the 8 fp16", "50%"},
         "the partial-K-block warning");
     require(nanosm::device_profile_warnings(canonical_profile()).empty(), "the canonical profile warns");
     auto twelve = profile;

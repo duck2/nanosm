@@ -64,10 +64,10 @@ int main() {
             "C API tma descriptor bytes are wrong");
         require(
             nanosm_tma_descriptor_encode(
-                0, 2, 64, 64, 1, 1, 64, 0, 0, 64, 8, 1, NANOSM_TMA_LAYOUT_XOR64, 1,
+                0, 2, 64, 64, 1, 1, 64, 0, 0, 64, 8, 1, NANOSM_TMA_LAYOUT_SWIZZLE64, 1,
                 descriptor.data(), descriptor.size()) == NANOSM_OK &&
-                descriptor[2] == NANOSM_TMA_LAYOUT_XOR64 && descriptor[3] == 1,
-            "C API could not encode a transposed xor64 tile");
+                descriptor[2] == NANOSM_TMA_LAYOUT_SWIZZLE64 && descriptor[3] == 1,
+            "C API could not encode a transposed swizzle64 tile");
         require(
             nanosm_tma_descriptor_encode(
                 0, 2, 64, 64, 1, 1, 64, 0, 0, 64, 8, 1, NANOSM_TMA_LAYOUT_DENSE, 1,

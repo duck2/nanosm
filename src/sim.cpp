@@ -2368,35 +2368,53 @@ namespace {
 
 // An operand element's byte address, in the profile's layout through the
 // layout rule the TMA places tiles with (src/layout.hpp); the same rule for
-// A and B. Under xor64 both operands are stored as rows of k -- A as m rows,
-// B as n rows -- with k sliced, 8 fp16 per 16-byte row: the address depends
-// on the row only within a slice, so a 32-row A object is the top half of a
-// 64-row one for k = 8, and a shape with k > 8 stacks its 8-deep K slices as
-// whole (rows x 16 B) pieces, the compact tile of its shape (1024 B for 64
-// rows; an xor64 TMA tile of that many stored rows has the same spacing). The
-// dense diagnostic layout is row-major in the command's shape: A m rows of k,
-// B k rows of n.
-constexpr uint32_t xor64_row_elements = xor64_row_bytes / 2; // fp16
-
-uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t m, uint32_t k) {
+// A and B. Under swizzle64 both operands are rows of k -- A m rows, B n rows
+// -- `spacing` bytes apart (the instruction's), and `base` is the operand's
+// first 16-byte piece in its row 0 (tile + 16 x piece: a logical position,
+// not a shuffled one). Element (row, k) is at the logical address base + row
+// x spacing + 2k, shuffled by the row number counted from the operand's row
+// 0: a K = 8 command reads one piece of every row; a shape with k > 8 reads
+// k / 8 consecutive pieces of the same rows. The address generator walks
+// the rows in order and adds the spacing once per row (an adder, no
+// multiplier); `row * spacing` here is the simulator's shorthand for that
+// running sum. Its row counter starts at the operand's row 0, so an operand
+// that is part of a taller tile must start at a multiple of 16 of its rows
+// (the shuffle's period). The dense diagnostic layout is row-major and
+// compact in the command's shape: A m rows of k, B k rows of n (no spacing).
+uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    uint32_t m, uint32_t k) {
     if (config.mma_layout == TileLayout::dense) return dense_address(base, m, k, shape.k, 2);
-    return xor64_address(base, shape.m, m, k, 2);
+    return swizzle64_shuffle(base + m * spacing + 2 * k, m, spacing);
 }
 
-uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t k, uint32_t n) {
+uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    uint32_t k, uint32_t n) {
     if (config.mma_layout == TileLayout::dense) return dense_address(base, k, n, shape.n, 2);
-    return xor64_address(base, shape.n, n, k, 2);
+    return swizzle64_shuffle(base + n * spacing + 2 * k, n, spacing);
 }
 
-// The shared-memory storage an operand of `shape` occupies from its base:
-// under xor64 every 8-deep K block is a whole object of 16-byte rows, even
-// when the shape's k leaves the last one partly empty (its unused bytes are
-// still the layout's); the dense layout is exactly rows x k fp16.
-uint64_t mma_operand_footprint(const Config& config, const MmaShape& shape, bool a_operand) {
-    const uint64_t rows = a_operand ? shape.m : shape.n;
-    if (config.mma_layout == TileLayout::dense) return rows * shape.k * 2;
-    const uint64_t k_blocks = (shape.k + xor64_row_elements - 1) / xor64_row_elements;
-    return xor64_row_bytes * rows * k_blocks;
+uint32_t mma_operand_element(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    bool a_operand, uint32_t outer, uint32_t k) {
+    return a_operand ? mma_a_address(config, shape, base, spacing, outer, k)
+                     : mma_b_address(config, shape, base, spacing, k, outer);
+}
+
+// The bytes an operand of `shape` reads, as [first, end): the hull of every
+// element it reads (under swizzle64 a later row's piece can sit below or
+// above its logical place, so the ends come from the addresses themselves).
+std::pair<uint64_t, uint64_t> mma_operand_hull(const Config& config, const MmaShape& shape, uint32_t base,
+    uint32_t spacing, bool a_operand) {
+    uint64_t first = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    const uint32_t outer = a_operand ? shape.m : shape.n;
+    for (uint32_t i = 0; i < outer; ++i) {
+        for (uint32_t k = 0; k < shape.k; ++k) {
+            const uint64_t address = mma_operand_element(config, shape, base, spacing, a_operand, i, k);
+            first = std::min(first, address);
+            end = std::max(end, address + 2);
+        }
+    }
+    return {first, end};
 }
 
 uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
@@ -2405,9 +2423,9 @@ uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
 
 } // namespace
 
-uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, bool a_operand,
-    uint32_t outer, uint32_t k) {
-    return a_operand ? mma_a_address(config, shape, base, outer, k) : mma_b_address(config, shape, base, k, outer);
+uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    bool a_operand, uint32_t outer, uint32_t k) {
+    return mma_operand_element(config, shape, base, spacing, a_operand, outer, k);
 }
 
 // The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
@@ -2527,6 +2545,8 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     step.k0 = k_block * config_.mma_core_k;
     step.a_base = command.a_base;
     step.b_base = command.b_base;
+    step.a_spacing = command.a_spacing;
+    step.b_spacing = command.b_spacing;
     step.shape = command.shape;
     step.init_step = command.init && step.k0 == 0;
     step.reload_a = n_block == 0;
@@ -2551,11 +2571,13 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     if (step.reload_a) {
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                elements.push_back(mma_a_address(config_, step.shape, step.a_base, step.m0 + mi, step.k0 + kk));
+                elements.push_back(mma_a_address(config_, step.shape, step.a_base, step.a_spacing,
+                    step.m0 + mi, step.k0 + kk));
     }
     for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-            elements.push_back(mma_b_address(config_, step.shape, step.b_base, step.k0 + kk, step.n0 + ni));
+            elements.push_back(mma_b_address(config_, step.shape, step.b_base, step.b_spacing,
+                step.k0 + kk, step.n0 + ni));
     // Bank rounds: round r reads every bank's r-th distinct word.
     std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
     for (const auto address : elements) {
@@ -2629,8 +2651,8 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
         mma.a_held.assign(config_.mma_core_m * config_.mma_core_k, 0);
         for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
             for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                mma.a_held[mi * config_.mma_core_k + kk] =
-                    value(mma_a_address(config_, step.shape, step.a_base, step.m0 + mi, step.k0 + kk));
+                mma.a_held[mi * config_.mma_core_k + kk] = value(mma_a_address(config_, step.shape,
+                    step.a_base, step.a_spacing, step.m0 + mi, step.k0 + kk));
     }
     if (mma.a_held.size() != config_.mma_core_m * config_.mma_core_k)
         throw SimError("internal MMA step found no held A block");
@@ -2638,8 +2660,8 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
     std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
     for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
         for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            b[ni * config_.mma_core_k + kk] =
-                value(mma_b_address(config_, step.shape, step.b_base, step.k0 + kk, step.n0 + ni));
+            b[ni * config_.mma_core_k + kk] = value(mma_b_address(config_, step.shape,
+                step.b_base, step.b_spacing, step.k0 + kk, step.n0 + ni));
     MmaResult result;
     result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
     result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
@@ -3928,13 +3950,19 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     const auto shape = *mma_shape_of(config_, inst.opcode);
     const auto a = uniform_operand(op, inst.src0);
     const auto b = uniform_operand(op, inst.src1);
-    // The layout's actual storage, not the element count (a partly filled
-    // xor64 K block is still whole 16-byte rows).
-    const uint64_t a_bytes = mma_operand_footprint(config_, shape, true);
-    const uint64_t b_bytes = mma_operand_footprint(config_, shape, false);
-    if ((config_.mma_layout == TileLayout::xor64 && ((a | b) & 63u) != 0) ||
-        static_cast<uint64_t>(a) + a_bytes > shmem_.size() ||
-        static_cast<uint64_t>(b) + b_bytes > shmem_.size())
+    // The spacings are instruction constants, checked at kernel load
+    // (check_mma_shapes): under swizzle64 16, 32 or a multiple of 64.
+    const auto a_spacing = mma_row_spacing(inst, true);
+    const auto b_spacing = mma_row_spacing(inst, false);
+    // A swizzle64 operand starts at a 16-byte piece. Every byte it reads must
+    // be in shmem: the hull of the addresses the walk reads (under swizzle64
+    // a row's piece moves inside its row, so not simply base + rows x spacing).
+    const auto inside = [&](uint32_t base, uint32_t spacing, bool a_operand) {
+        return base < shmem_.size() &&
+            mma_operand_hull(config_, shape, base, spacing, a_operand).second <= shmem_.size();
+    };
+    if ((config_.mma_layout == TileLayout::swizzle64 && ((a | b) & 15u) != 0) ||
+        !inside(a, a_spacing, true) || !inside(b, b_spacing, false))
         panic(op, "MMA operand alignment or footprint is outside shmem");
     MmaCommand command;
     command.id = next_mma_command_id_++;
@@ -3945,8 +3973,10 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     command.depbar = inst.control.set_depbar;
     command.a_base = a;
     command.b_base = b;
-    sanitizer_.record_mma_accept(site(op), command.id, command.accumulator,
-        command.depbar, mma_operand_span(a, true, shape), mma_operand_span(b, false, shape));
+    command.a_spacing = a_spacing;
+    command.b_spacing = b_spacing;
+    sanitizer_.record_mma_accept(site(op), command.id, command.accumulator, command.depbar,
+        mma_operand_span(a, a_spacing, true, shape), mma_operand_span(b, b_spacing, false, shape));
     trace_->mma_command(cycle_, command.id, op.warp, command.init);
     w.dispatch.mma = std::move(command);
 }
@@ -5738,21 +5768,12 @@ std::vector<uint32_t> Machine::lane_values(const Warp& warp, uint8_t reg) const 
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
-    uint32_t base, bool a_operand, const MmaShape& shape) const {
+    uint32_t base, uint32_t spacing, bool a_operand, const MmaShape& shape) const {
     // Ask the operand geometry itself (the same functions the fetch uses):
-    // the hull of every element address of the command's shape.
-    uint64_t first = std::numeric_limits<uint64_t>::max();
-    uint64_t last = 0;
-    const uint32_t outer = a_operand ? shape.m : shape.n;
-    for (uint32_t i = 0; i < outer; ++i) {
-        for (uint32_t k = 0; k < shape.k; ++k) {
-            const uint64_t address = a_operand
-                ? mma_a_address(config_, shape, base, i, k)
-                : mma_b_address(config_, shape, base, k, i);
-            first = std::min(first, address);
-            last = std::max(last, address + 2);
-        }
-    }
+    // the hull of every byte the command's shape reads. Under swizzle64 a
+    // K = 8 operand reads one 16-byte piece per row, but the hull covers
+    // the rows' other pieces too (a conservative owner).
+    const auto [first, last] = mma_operand_hull(config_, shape, base, spacing, a_operand);
     if (last > std::numeric_limits<uint32_t>::max()) return std::nullopt;
     return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
 }

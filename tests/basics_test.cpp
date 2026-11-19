@@ -478,7 +478,8 @@ void test_staged_pipeline_kernel() {
     const auto& summary = machine.trace().summary();
     require(summary.mbar_sleeps != 0, "pipeline never parked a warp");
     require(summary.mbar_wakes != 0, "pipeline never took an exact wake");
-    require(summary.mbar_timeouts != 0, "gmem latency never outlasted the try_wait timeout");
+    // (The canonical timeout is long, a safety net: no wait here reaches it. The
+    // timeout path has its own tests with short timeouts, above.)
     require(summary.gmem_commands == 3 * tiles, "wrong gmem command count for the pipeline");
     uint64_t warp_cycles = 0;
     for (const auto cycles : summary.warp_cycles) warp_cycles += cycles;

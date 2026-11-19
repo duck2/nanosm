@@ -1,11 +1,12 @@
-// The TMA's commands: the direction, xor64 placement and its census against
-// the MMA's operand addressing, the limits of xor64 tiles, a dense tile read
-// by a dense-profile MMA, out-of-bounds handling; and the profile stamp and
-// the DRAM clock. Moved from the original tests/tests.cpp
-// (trash/test-setup-2026-10-22.md). The descriptor (64 bytes in shared
-// memory, src/tma.hpp) holds the global tensor, the tile's shape and its
-// shared-memory layout (dense, or xor64 and whether it is transposed; the
-// rules are src/layout.hpp's, which the MMA reads its operands with). The
+// The TMA's commands: the direction, swizzle64 placement and its census
+// against the MMA's operand addressing, the limits of swizzle64 tiles, the
+// rows-stay-whole smoke tests (trash/whole-rows-2026-11-18.md),
+// out-of-bounds handling; and the profile stamp and the DRAM clock. Moved
+// from the original tests/tests.cpp (trash/test-setup-2026-10-22.md). The
+// descriptor (64 bytes in shared memory, src/tma.hpp) holds the global
+// tensor, the tile's shape and its shared-memory layout (dense, or swizzle64
+// and whether it is transposed; the rules are src/layout.hpp's, which the MMA
+// reads its operands with). The
 // instruction holds the descriptor's shared
 // address as a constant and everything else in uniform registers: the
 // buffer's shared address, the tile's coordinates (one register per
@@ -76,17 +77,11 @@ void test_tma_direction_is_the_opcode() {
     }
 }
 
-// The fp16 xor64 address of element `position` (< 8) of stored row `row`,
-// written out.
-uint32_t reference_xor64_address(uint32_t base, uint32_t row, uint32_t position) {
-    return base + 4 * (4 * row + ((position >> 1) ^ ((row >> 2) & 1))) + 2 * (position & 1);
-}
-
-// One xor64 descriptor, transposed or not, used by a load and then a store:
-// an fp16 tile of 64 stored rows by 8 sliced at (3, 2) of a tensor with row
-// stride 83. Element x of tile row y is position x of stored row y, or
-// (transposed) position y of stored row x.
-void test_tma_xor64_transposed_load_store() {
+// One swizzle64 descriptor, transposed or not, used by a load and then a
+// store: an fp16 tile of 64 stored rows of 8 (16-byte rows) at (3, 2) of a
+// tensor with row stride 83. Element x of tile row y is position x of stored
+// row y, or (transposed) position y of stored row x.
+void test_tma_swizzle64_transposed_load_store() {
     constexpr uint32_t mbar_address = 128;
     constexpr uint32_t tile_address = 1024;
     constexpr uint32_t stride = 83;
@@ -101,15 +96,15 @@ void test_tma_xor64_transposed_load_store() {
         const uint32_t dim_y = 2 + tile_rows + 3;
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = 2;
-        descriptor.layout = nanosm::TileLayout::xor64;
+        descriptor.layout = nanosm::TileLayout::swizzle64;
         descriptor.transposed = transposed;
         descriptor.dimensions = {dim_x, dim_y, 1, 1};
         descriptor.strides = {stride, 0, 0};
         descriptor.tile_length = static_cast<uint16_t>(tile_length);
         descriptor.tile_rows = static_cast<uint16_t>(tile_rows);
         const auto placement = [&](uint32_t x, uint32_t y) {
-            return transposed ? reference_xor64_address(tile_address, x, y)
-                              : reference_xor64_address(tile_address, y, x);
+            return transposed ? reference_swizzle64(tile_address, 16, x, 2 * y)
+                              : reference_swizzle64(tile_address, 16, y, 2 * x);
         };
 
         nanosm::Launch launch;
@@ -128,16 +123,16 @@ void test_tma_xor64_transposed_load_store() {
         std::set<uint32_t> addresses;
         for (uint32_t y = 0; y < tile_rows; ++y) for (uint32_t x = 0; x < tile_length; ++x) {
             const uint32_t address = placement(x, y);
-            require(addresses.insert(address).second, "xor64 map is not bijective");
+            require(addresses.insert(address).second, "swizzle64 map is not bijective");
             const uint32_t gx = 3 + x;
             const uint32_t gy = 2 + y;
             const uint16_t actual = static_cast<uint16_t>(
                 machine.read_shmem_u32(address & ~3u) >> (8 * (address & 3u)));
             require(actual ==
                 static_cast<uint16_t>(0x100 + 3 * gy + 5 * gx),
-                "xor64 load mapped the wrong element");
+                "swizzle64 load mapped the wrong element");
         }
-        require(addresses.size() == 512, "xor64 map did not cover the operand");
+        require(addresses.size() == 512, "swizzle64 map did not cover the operand");
 
         nanosm::Launch store_launch;
         store_launch.active_warps = 1;
@@ -158,12 +153,12 @@ void test_tma_xor64_transposed_load_store() {
             std::memcpy(&actual, store_machine.gmem().data() + address, sizeof(actual));
             require(actual ==
                 static_cast<uint16_t>(0x400 + 7 * y + 11 * x),
-                "xor64 store mapped the wrong element");
+                "swizzle64 store mapped the wrong element");
         }
     }
 }
 
-void test_tma_xor64_feeds_mma_orientations() {
+void test_tma_swizzle64_feeds_mma_orientations() {
     // Period 7: coprime to every origin/box offset in play (8, 24, 56), so a
     // misplaced origin cannot alias to the correct values the way a power-of-two
     // period would. All values are exact halfs with exact fp32 products/sums.
@@ -198,19 +193,20 @@ void test_tma_xor64_feeds_mma_orientations() {
                 for (uint32_t n = 0; n < 64; ++n)
                     write_u16(gmem, base_b + 2 * (k * stride_b_pv + n), half_bits(3 * n + k + 1));
         }
-        // One xor64 descriptor per tensor (A at 0, B at 64), each tile 64
-        // stored rows by K = 8; each chunk's command names its buffer and
-        // mbar: A chunk c at 1024 + 2048c (mbar 512 + 16c), B chunk c at 2048
-        // + 2048c (mbar 520 + 16c). The MMA stores both operands as rows of K
-        // (A: m, B: n). A's K runs along its rows; B's runs along the row
-        // under QK^T (K's rows are keys) and across the rows under PV (V's
-        // rows are keys: transposed).
+        // One swizzle64 descriptor per tensor (A at 0, B at 64), each tile 64
+        // stored rows of K = 8 (16-byte rows, the default spacing the MMA
+        // reads with); each chunk's command names its buffer and mbar: A
+        // chunk c at 1024 + 2048c (mbar 512 + 16c), B chunk c at 2048 + 2048c
+        // (mbar 520 + 16c). The MMA reads both operands as rows of K (A: m,
+        // B: n). A's K runs along its rows; B's runs along the row under
+        // QK^T (K's rows are keys) and across the rows under PV (V's rows
+        // are keys: transposed).
         nanosm::TmaDescriptor a;
-        a.element_bytes = 2; a.layout = nanosm::TileLayout::xor64;
+        a.element_bytes = 2; a.layout = nanosm::TileLayout::swizzle64;
         a.base = base_a; a.dimensions = {16, 64, 1, 1};
         a.strides = {stride_a, 0, 0}; a.tile_length = 8; a.tile_rows = 64;
         nanosm::TmaDescriptor b;
-        b.element_bytes = 2; b.layout = nanosm::TileLayout::xor64; b.base = base_b;
+        b.element_bytes = 2; b.layout = nanosm::TileLayout::swizzle64; b.base = base_b;
         if (!pv) {
             b.dimensions = {16, 64, 1, 1}; b.strides = {stride_b_qk, 0, 0};
             b.tile_length = 8; b.tile_rows = 64;
@@ -305,15 +301,16 @@ void test_tma_xor64_feeds_mma_orientations() {
     }
 }
 
-// The census (trash/tma_generalize_proto.py check 3): for every allowed
-// stored-row count R (the powers of two 4 .. 128) and every fp16 K extent (8
-// .. 64), a TMA load of an xor64 R x K tile writes exactly the compact tile an
-// MMA with m = R (as A) or n = R (as B) and k = K reads: every element where
-// the MMA's own operand addressing (nanosm::mma_operand_address) looks for
-// it, and no byte outside the tile's R x K x 2 bytes. A's global is m rows of
-// K; B's is K rows of n (transposed). The buffer starts on a 64-byte boundary
-// that is not a 1024-byte one.
-void test_tma_xor64_census_against_mma() {
+// The census (trash/tma_generalize_proto.py check 3, for whole rows): for
+// stored-row counts R (4 .. 128) and fp16 K extents 8, 16, 32, 64 (rows of
+// 16, 32, 64, 128 bytes), a TMA load of a swizzle64 R x K tile writes exactly
+// what an MMA with m = R (as A) or n = R (as B), k = K and row spacing 2K
+// reads: every element where the MMA's own operand addressing
+// (nanosm::mma_operand_address) looks for it, and no byte outside the tile's
+// R x K x 2 bytes. A's global is m rows of K; B's is K rows of n
+// (transposed). The buffer starts on a 64-byte boundary that is not a
+// 1024-byte one.
+void test_tma_swizzle64_census_against_mma() {
     const auto& profile = canonical_profile();
     constexpr uint32_t base = 1088;
     constexpr uint32_t mbar_address = 64;
@@ -329,8 +326,8 @@ void test_tma_xor64_census_against_mma() {
     )");
     uint32_t cases = 0;
     for (const bool a_role : {true, false}) {
-        for (uint32_t rows = nanosm::tma_xor64_min_rows; rows <= nanosm::tma_xor64_max_rows; rows *= 2) {
-            for (uint32_t k_extent = 8; k_extent <= nanosm::tma_xor64_max_sliced; k_extent += 8) {
+        for (uint32_t rows = 4; rows <= 128; rows *= 2) {
+            for (const uint32_t k_extent : {8u, 16u, 32u, 64u}) {
                 const auto what = std::string(a_role ? "A" : "B") + ", " + std::to_string(rows) + " rows, K " +
                     std::to_string(k_extent);
                 // Row-major global, the tile the whole tensor: A is rows x K
@@ -339,7 +336,7 @@ void test_tma_xor64_census_against_mma() {
                 const uint32_t height = a_role ? rows : k_extent;
                 nanosm::TmaDescriptor descriptor;
                 descriptor.element_bytes = 2;
-                descriptor.layout = nanosm::TileLayout::xor64;
+                descriptor.layout = nanosm::TileLayout::swizzle64;
                 descriptor.transposed = !a_role;
                 descriptor.dimensions = {length, height, 1, 1};
                 descriptor.strides = {length, 0, 0};
@@ -367,7 +364,8 @@ void test_tma_xor64_census_against_mma() {
                 std::set<uint32_t> addresses;
                 for (uint32_t outer = 0; outer < rows; ++outer) {
                     for (uint32_t k = 0; k < k_extent; ++k) {
-                        const auto address = nanosm::mma_operand_address(profile, shape, base, a_role, outer, k);
+                        const auto address =
+                            nanosm::mma_operand_address(profile, shape, base, 2 * k_extent, a_role, outer, k);
                         require(address >= base && address + 2 <= base + rows * k_extent * 2,
                             what + ": the MMA reads outside the tile's compact object");
                         require(addresses.insert(address).second, what + ": the MMA reads one address twice");
@@ -386,14 +384,14 @@ void test_tma_xor64_census_against_mma() {
             }
         }
     }
-    require(cases == 2 * 6 * 8, "the census did not cover every stored-row count and K extent");
+    require(cases == 2 * 6 * 4, "the census did not cover every stored-row count and K extent");
 }
 
 // The TMA does not know who reads a tile: a TMA-only kernel with explicit
-// xor64 descriptors (one tile not transposed, one transposed) leaves every
-// shared byte identical when only the profile's mma.layout changes (xor64 ->
-// dense).
-void test_tma_xor64_tile_ignores_the_mma_layout() {
+// swizzle64 descriptors (one tile not transposed, one transposed) leaves
+// every shared byte identical when only the profile's mma.layout changes
+// (swizzle64 -> dense).
+void test_tma_swizzle64_tile_ignores_the_mma_layout() {
     constexpr uint32_t mbar_address = 128;
     constexpr uint32_t stride = 83;
     auto dense = canonical_profile();
@@ -410,7 +408,7 @@ void test_tma_xor64_tile_ignores_the_mma_layout() {
         for (const bool transposed : {false, true}) {
             nanosm::TmaDescriptor descriptor;
             descriptor.element_bytes = 2;
-            descriptor.layout = nanosm::TileLayout::xor64;
+            descriptor.layout = nanosm::TileLayout::swizzle64;
             descriptor.transposed = transposed;
             descriptor.dimensions = {stride, 70, 1, 1};
             descriptor.strides = {stride, 0, 0};
@@ -432,20 +430,21 @@ void test_tma_xor64_tile_ignores_the_mma_layout() {
         require(machine.read_mbar_state(mbar_address).phase, "the loads did not complete");
         return machine.shmem();
     };
-    const auto with_xor64 = run(canonical_profile());
+    const auto with_swizzle64 = run(canonical_profile());
     const auto with_dense = run(dense);
-    require(std::any_of(with_xor64.begin() + 1024, with_xor64.begin() + 6144, [](uint8_t b) { return b != 0; }),
+    require(std::any_of(with_swizzle64.begin() + 1024, with_swizzle64.begin() + 6144,
+                [](uint8_t b) { return b != 0; }),
         "the tiles were not loaded");
-    require(with_xor64 == with_dense, "an xor64 TMA tile changed with the profile's mma.layout");
+    require(with_swizzle64 == with_dense, "a swizzle64 TMA tile changed with the profile's mma.layout");
 }
 
-void test_tma_wide_xor64_validation() {
-    // The sliced extent (the tile length, or the rows when transposed): a
-    // multiple of 8 fp16, at most 64. The stored-row count (the other
-    // extent): a power of two 4 .. 128. A dense tile cannot be transposed.
+void test_tma_swizzle64_validation() {
+    // The stored row (the tile length, or the rows when transposed, times
+    // the element bytes): 16, 32 or a multiple of 64 bytes. Any number of
+    // stored rows (the other extent). A dense tile cannot be transposed.
     nanosm::TmaDescriptor descriptor;
     descriptor.element_bytes = 2;
-    descriptor.layout = nanosm::TileLayout::xor64;
+    descriptor.layout = nanosm::TileLayout::swizzle64;
     descriptor.dimensions = {128, 128, 1, 1};
     descriptor.strides = {128, 0, 0};
     const auto rejection = [&](bool transposed, uint32_t tile_length, uint32_t tile_rows) {
@@ -456,23 +455,21 @@ void test_tma_wide_xor64_validation() {
     };
     constexpr bool along = false;
     constexpr bool across = true;
-    for (uint32_t k = 8; k <= 64; k += 8) {
-        require(rejection(along, k, 64).empty() && rejection(across, 64, k).empty(),
-            "an xor64 sliced extent was rejected");
-    }
-    for (const uint32_t k : {4u, 12u, 60u, 72u}) {
-        require(rejection(along, k, 64).find("sliced extent") != std::string::npos &&
-                rejection(across, 64, k).find("sliced extent") != std::string::npos,
-            "xor64 sliced extent " + std::to_string(k) + " was accepted");
-    }
-    for (uint32_t rows = 1; rows <= 256; ++rows) {
-        const bool allowed = rows >= 4 && rows <= 128 && (rows & (rows - 1)) == 0;
-        require(rejection(along, 16, rows).empty() == allowed && rejection(across, rows, 16).empty() == allowed,
-            "xor64 stored-row count " + std::to_string(rows) + " was " + (allowed ? "rejected" : "accepted"));
+    for (uint32_t elements = 1; elements <= 256; ++elements) {
+        const uint32_t bytes = 2 * elements;
+        const bool allowed = bytes == 16 || bytes == 32 || bytes % 64 == 0;
+        require(rejection(along, elements, 64).empty() == allowed &&
+                rejection(across, 64, elements).empty() == allowed,
+            "a swizzle64 stored row of " + std::to_string(bytes) + " bytes was " +
+                (allowed ? "rejected" : "accepted"));
         if (!allowed) {
-            require(rejection(along, 16, rows).find("stored-row count") != std::string::npos,
-                "xor64 stored-row count " + std::to_string(rows) + " rejected with the wrong diagnostic");
+            require(rejection(along, elements, 64).find("stored row must be") != std::string::npos,
+                "a swizzle64 stored row of " + std::to_string(bytes) + " bytes rejected with the wrong diagnostic");
         }
+    }
+    for (const uint32_t rows : {1u, 3u, 5u, 17u, 200u}) {
+        require(rejection(along, 8, rows).empty() && rejection(across, rows, 16).empty(),
+            "a swizzle64 tile of " + std::to_string(rows) + " stored rows was rejected");
     }
     auto dense = descriptor;
     dense.layout = nanosm::TileLayout::dense;
@@ -482,11 +479,11 @@ void test_tma_wide_xor64_validation() {
     require(encode_error(dense).find("dense tiles cannot be transposed") != std::string::npos,
         "a transposed dense tile was accepted");
 
-    // The span is the compact tile, 64 x 64 x 2 = 8192 bytes: at 61440 it
+    // The span is the packed tile, 64 x 64 x 2 = 8192 bytes: at 61440 it
     // ends past the 64 KiB shmem.
     nanosm::TmaDescriptor big;
     big.element_bytes = 2;
-    big.layout = nanosm::TileLayout::xor64;
+    big.layout = nanosm::TileLayout::swizzle64;
     big.dimensions = {128, 128, 1, 1};
     big.strides = {128, 0, 0};
     big.tile_length = 64;
@@ -502,44 +499,39 @@ void test_tma_wide_xor64_validation() {
         std::move(launch));
     try {
         machine.run(20000);
-        throw std::runtime_error("oversized xor64 span was accepted");
+        throw std::runtime_error("oversized swizzle64 span was accepted");
     } catch (const nanosm::SimError& error) {
         require(std::string(error.what()).find("does not fit in shmem") != std::string::npos,
-            "oversized xor64 span rejected with the wrong diagnostic");
+            "oversized swizzle64 span rejected with the wrong diagnostic");
     }
 }
 
-// Independent restatement of the 64-row map: the sliced position k picks the
-// 1024-byte slice (16 bytes x 64 rows) and the position inside the row.
-// Never calls the production helper.
-uint32_t reference_wide_xor64(uint32_t base, uint32_t row, uint32_t k) {
-    return base + 1024 * (k / 8) +
-        4 * (4 * row + (((k % 8) >> 1) ^ ((row >> 2) & 1))) +
-        2 * (k % 2);
-}
-
-// `commands` loads of a K / commands slab each, one descriptor, the tile's
+// `commands` loads of 8192 / commands bytes each, one descriptor, the tile's
 // coordinates in ur8, ur9 (set by the caller, moved on by `step` between
-// commands): command i's buffer (ur4) starts at tile + 1024 x (its K / 8) x
+// commands): command i's buffer (ur4) starts at tile + (8192 / commands) x
 // i. Every command completes into the mbar in ur3, which the wait reads.
-std::string xor64_slab_loads(uint32_t commands, uint32_t tile, uint32_t mbar, const std::string& step) {
-    const uint32_t k_extent = 64 / commands;
+std::string tile_piece_loads(uint32_t commands, uint32_t tile, uint32_t mbar, const std::string& step) {
     std::string source = "umov ur3, " + std::to_string(mbar) + "\n";
     for (uint32_t i = 0; i < commands; ++i) {
         if (i != 0) source += step;
-        source += "umov ur4, " + std::to_string(tile + 1024 * (k_extent / 8) * i) +
+        source += "umov ur4, " + std::to_string(tile + 8192 / commands * i) +
             "\ntma.load.2d [ur4], [0, ur8], [ur3]\n";
     }
     return source + "wait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
 }
 
-void test_tma_wide_xor64_matches_narrow() {
+// A tile's rows count from its own row 0 and the shuffle repeats every 16
+// rows, so four loads of 16 stored rows, each landed 16 rows (16 x 128
+// bytes) after the last, build exactly the 64-row tile one load makes:
+// fp16, 128-byte stored rows, not transposed (the four step along the
+// global rows) and transposed (they step along dimension 0, whose positions
+// are the stored rows).
+void test_tma_swizzle64_pieces_of_16_rows() {
     constexpr uint32_t mbar_address = 576;
     constexpr uint32_t tile_address = 1024;
     constexpr uint32_t stride = 83;
     constexpr uint32_t dim_x = 80;
     constexpr uint32_t dim_y = 70;
-    // Transposed: the sliced origin advances along y per k8 chunk (else along x).
     for (const bool transposed : {false, true}) {
         const auto run_span = [&](uint32_t commands) {
             nanosm::Launch launch;
@@ -550,20 +542,22 @@ void test_tma_wide_xor64_matches_narrow() {
                 for (uint32_t x = 0; x < dim_x; ++x)
                     write_u16(gmem, 2 * (y * stride + x),
                         static_cast<uint16_t>(0x100 + 3 * y + 5 * x));
-            const uint32_t k_extent = 64 / commands;
+            const uint32_t stored_rows = 64 / commands;
             nanosm::TmaDescriptor descriptor;
             descriptor.element_bytes = 2;
-            descriptor.layout = nanosm::TileLayout::xor64;
+            descriptor.layout = nanosm::TileLayout::swizzle64;
             descriptor.transposed = transposed;
             descriptor.dimensions = {dim_x, dim_y, 1, 1};
             descriptor.strides = {stride, 0, 0};
-            descriptor.tile_length = static_cast<uint16_t>(transposed ? 64 : k_extent);
-            descriptor.tile_rows = static_cast<uint16_t>(transposed ? k_extent : 64);
+            descriptor.tile_length = static_cast<uint16_t>(transposed ? stored_rows : 64);
+            descriptor.tile_rows = static_cast<uint16_t>(transposed ? 64 : stored_rows);
             write_tma_descriptor(shmem, 0, descriptor);
             write_u64(shmem, mbar_address,
                 nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
-            const std::string source = "umov ur8, 3\numov ur9, 2\n" + xor64_slab_loads(commands, tile_address,
-                mbar_address, transposed ? "uaddi ur9, ur9, 8\n" : "uaddi ur8, ur8, 8\n");
+            const std::string step = "uaddi ur" + std::string(transposed ? "8" : "9") + ", ur" +
+                (transposed ? "8" : "9") + ", " + std::to_string(stored_rows) + "\n";
+            const std::string source = "umov ur8, 3\numov ur9, 2\n" +
+                tile_piece_loads(commands, tile_address, mbar_address, step);
             nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
             machine.run(200000);
             std::vector<uint32_t> words;
@@ -572,31 +566,29 @@ void test_tma_wide_xor64_matches_narrow() {
                 words.push_back(machine.read_shmem_u32(tile_address + offset));
             return words;
         };
-        const auto wide = run_span(1);
-        const auto narrow = run_span(8);
-        require(wide == narrow, "wide xor64 command disagreed with eight narrow commands");
+        const auto whole = run_span(1);
+        const auto pieces = run_span(4);
+        require(whole == pieces, "one 64-row swizzle64 load disagreed with four 16-row loads");
         std::set<uint32_t> addresses;
         for (uint32_t y = 0; y < 64; ++y) {
             for (uint32_t x = 0; x < 64; ++x) {
-                const uint32_t k = transposed ? y : x;
+                const uint32_t position = transposed ? y : x;
                 const uint32_t row = transposed ? x : y;
-                const auto address = reference_wide_xor64(tile_address, row, k);
-                require(address >= tile_address && address < tile_address + 8192,
-                    "wide xor64 address left the span");
-                require(addresses.insert(address).second, "wide xor64 map is not bijective");
+                const auto address = reference_swizzle64(tile_address, 128, row, 2 * position);
+                require(addresses.insert(address).second, "swizzle64 map is not bijective");
                 const uint32_t gx = 3 + x;
                 const uint32_t gy = 2 + y;
-                const auto word = wide[(address - tile_address) / 4];
+                const auto word = whole[(address - tile_address) / 4];
                 const auto actual = static_cast<uint16_t>(word >> (8 * (address & 3u)));
                 require(actual == static_cast<uint16_t>(0x100 + 3 * gy + 5 * gx),
-                    "wide xor64 load mapped the wrong element");
+                    "swizzle64 load mapped the wrong element");
             }
         }
-        require(addresses.size() == 4096, "wide xor64 map did not cover the span");
+        require(addresses.size() == 4096, "swizzle64 map did not cover the tile");
     }
 }
 
-void test_tma_wide_xor64_sector_economics() {
+void test_tma_swizzle64_sector_economics() {
     constexpr uint32_t mbar_address = 576;
     constexpr uint32_t tile_address = 1024;
     // Natural head-innermost K: 64 keys x 64 fp16, dense 128-byte rows.
@@ -610,7 +602,9 @@ void test_tma_wide_xor64_sector_economics() {
         const uint32_t k_extent = 64 / commands;
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = 2;
-        descriptor.layout = nanosm::TileLayout::xor64; // not transposed: the QK^T orientation of K's natural layout
+        // Not transposed: the QK^T orientation of K's natural layout. The
+        // narrow commands cut K into 16-byte rows, each its own tile.
+        descriptor.layout = nanosm::TileLayout::swizzle64;
         descriptor.dimensions = {64, 64, 1, 1};
         descriptor.strides = {64, 0, 0};
         descriptor.tile_length = static_cast<uint16_t>(k_extent);
@@ -618,7 +612,7 @@ void test_tma_wide_xor64_sector_economics() {
         write_tma_descriptor(shmem, 0, descriptor);
         write_u64(shmem, mbar_address, nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
         const std::string source = "umov ur8, 0\numov ur9, 0\n" +
-            xor64_slab_loads(commands, tile_address, mbar_address, "uaddi ur8, ur8, 8\n");
+            tile_piece_loads(commands, tile_address, mbar_address, "uaddi ur8, ur8, 8\n");
         nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
         machine.run(200000);
         return machine.trace().summary();
@@ -633,33 +627,41 @@ void test_tma_wide_xor64_sector_economics() {
         "narrow chunked load did not show the 2x half-sector refetch");
 }
 
-// The pre-2026-10-03 fp16 operand formula (A's: one rule for every xor64
-// tile since 2026-11-18), written out literally. The byte primitive and the
-// element function (src/layout.hpp) must reproduce it for every fp16 address
-// in play; the element function's slices are 16 x rows bytes apart.
-void test_xor64_byte_primitive_matches_fp16_formula() {
-    for (uint32_t base : {0u, 1024u, 40960u, 65472u}) {
-        for (uint32_t row = 0; row < 64; ++row) {
-            for (uint32_t k = 0; k < 8; ++k) {
-                const uint32_t old = base + 4 * (4 * row + ((k >> 1) ^ ((row >> 2) & 1))) + 2 * (k & 1);
-                require(nanosm::xor64_byte_address(base, row, 2 * k) == old &&
-                        nanosm::xor64_byte_address(base, row, 2 * k + 1) == old + 1,
-                    "xor64 byte primitive diverged from the fp16 formula");
-                for (uint32_t slice = 0; slice < 2; ++slice) {
-                    require(nanosm::xor64_address(base, 64, row, 8 * slice + k, 2) == old + 1024 * slice,
-                        "xor64 element address diverged from the fp16 formula");
+// The layout function (src/layout.hpp) against the rule written out
+// (reference_swizzle64; trash/whole_rows_check_astra.py) for the census's
+// spacings, at a 64-byte-aligned base that is not 0: the same address for
+// every byte, every row keeps exactly its own bytes [row x spacing, (row +
+// 1) x spacing), and the shuffle is a permutation. The tensor core's operand
+// pointer is a logical position: logical byte 16 of row 1 at spacing 128 is
+// stored at 128 (its piece slot XORed with 1), not 16 past where byte 0 is.
+void test_swizzle64_layout_matches_the_rule() {
+    for (const uint32_t spacing : {16u, 32u, 64u, 128u, 192u, 256u}) {
+        for (const uint32_t base : {0u, 1088u}) {
+            std::set<uint32_t> addresses;
+            for (uint32_t row = 0; row < 64; ++row) {
+                for (uint32_t byte = 0; byte < spacing; ++byte) {
+                    const auto address = nanosm::swizzle64_address(base, spacing, row, byte);
+                    const auto what = "spacing " + std::to_string(spacing) + " base " + std::to_string(base) +
+                        " row " + std::to_string(row) + " byte " + std::to_string(byte);
+                    require(address == reference_swizzle64(base, spacing, row, byte), what + ": not the rule");
+                    require(address >= base + row * spacing && address < base + (row + 1) * spacing,
+                        what + ": left its row");
+                    require(addresses.insert(address).second, what + ": two bytes in one place");
                 }
             }
         }
     }
+    require(nanosm::swizzle64_address(0, 128, 1, 16) == 128 && nanosm::swizzle64_address(0, 128, 1, 0) == 144,
+        "logical byte 16 of row 1 is not where the rule puts it");
 }
 
-void test_tma_fp32_xor64_validation() {
-    // The sliced extent runs along the row (a) or, transposed, across the rows (b).
+void test_tma_fp32_swizzle64_validation() {
+    // The stored row runs along the tile's rows (a) or, transposed, across
+    // them (b): 16, 32 or a multiple of 64 bytes.
     const auto rejection = [](uint8_t element_bytes, bool transposed, uint32_t tile_length, uint32_t tile_rows) {
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = element_bytes;
-        descriptor.layout = nanosm::TileLayout::xor64;
+        descriptor.layout = nanosm::TileLayout::swizzle64;
         descriptor.transposed = transposed;
         descriptor.dimensions = {128, 128, 1, 1};
         descriptor.strides = {128, 0, 0};
@@ -669,36 +671,32 @@ void test_tma_fp32_xor64_validation() {
     };
     constexpr bool a = false;
     constexpr bool b = true;
-    // fp32: four elements per 16-byte row; sliced extent a multiple of 4, up to 64.
-    require(rejection(4, a, 64, 64).empty(), "fp32 xor64 64x64 tile was rejected");
-    require(rejection(4, b, 64, 64).empty(), "fp32 transposed xor64 64x64 tile was rejected");
-    require(rejection(4, a, 4, 64).empty() && rejection(4, a, 12, 64).empty(),
-        "fp32 xor64 single/odd slice counts were rejected");
-    require(rejection(4, a, 64, 32).empty() && rejection(4, b, 32, 8).empty(),
-        "fp32 xor64 tiles of other row counts were rejected");
-    for (const uint32_t k : {6u, 2u, 68u}) {
-        require(rejection(4, a, k, 64).find("sliced extent") != std::string::npos,
-            "fp32 xor64 accepted a sliced extent that is not whole slices");
+    // fp32: 4 (16 B), 8 (32 B) or a multiple of 16 elements per stored row.
+    require(rejection(4, a, 64, 64).empty(), "fp32 swizzle64 64x64 tile was rejected");
+    require(rejection(4, b, 64, 64).empty(), "fp32 transposed swizzle64 64x64 tile was rejected");
+    require(rejection(4, a, 4, 64).empty() && rejection(4, a, 8, 64).empty() && rejection(4, a, 48, 64).empty(),
+        "fp32 swizzle64 rows of 16, 32 and 192 bytes were rejected");
+    require(rejection(4, a, 64, 48).empty() && rejection(4, b, 32, 8).empty(),
+        "fp32 swizzle64 tiles of other row counts were rejected");
+    for (const uint32_t k : {2u, 6u, 12u, 20u}) {
+        require(rejection(4, a, k, 64).find("stored row must be") != std::string::npos &&
+                rejection(4, b, 64, k).find("stored row must be") != std::string::npos,
+            "fp32 swizzle64 accepted a stored row of " + std::to_string(4 * k) + " bytes");
     }
-    require(rejection(4, a, 64, 48).find("stored-row count") != std::string::npos,
-        "fp32 xor64 accepted 48 rows");
-    require(rejection(4, b, 64, 6).find("sliced extent") != std::string::npos,
-        "fp32 transposed xor64 accepted a sliced extent that is not whole slices");
-    require(!rejection(8, a, 64, 64).empty(), "8-byte xor64 elements were accepted");
+    require(!rejection(8, a, 64, 64).empty(), "8-byte swizzle64 elements were accepted");
     require(rejection(1, a, 64, 64).find("2- or 4-byte elements") != std::string::npos,
-        "1-byte xor64 elements were accepted");
-    // fp16 keeps its eight-element rows: 12 is whole fp32 slices, not fp16.
-    for (const uint32_t k : {12u, 4u, 72u}) {
-        require(rejection(2, a, k, 64).find("sliced extent") != std::string::npos,
-            "fp16 xor64 wrong sliced extent was accepted after the fp32 generalization");
+        "1-byte swizzle64 elements were accepted");
+    // fp16: 12, 4 and 40 elements are 24, 8 and 80 bytes.
+    for (const uint32_t k : {12u, 4u, 40u}) {
+        require(rejection(2, a, k, 64).find("stored row must be") != std::string::npos,
+            "fp16 swizzle64 accepted a stored row of " + std::to_string(2 * k) + " bytes");
     }
 }
 
-// Independent fp32 xor64 address: slice = col / 4 (four floats per 16-byte
-// row; 1024 bytes for 64 rows), row = the 16-byte row, word-in-row = (col %
-// 4) XOR bit 2 of the row. Never calls the production primitive.
-uint32_t reference_fp32_xor64(uint32_t base, uint32_t row, uint32_t col) {
-    return base + 1024 * (col / 4) + 16 * row + 4 * ((col % 4) ^ ((row / 4) % 2));
+// Independent fp32 swizzle64 address: a 64 x 64 fp32 tile's row is 256
+// bytes.
+uint32_t reference_fp32_swizzle64(uint32_t base, uint32_t row, uint32_t col) {
+    return reference_swizzle64(base, 256, row, 4 * col);
 }
 
 float fp32_tile_value(uint32_t row, uint32_t col) {
@@ -706,7 +704,7 @@ float fp32_tile_value(uint32_t row, uint32_t col) {
     return static_cast<float>(static_cast<int>((row * 17 + col * 11) % 31) - 15);
 }
 
-void test_tma_fp32_xor64_store_and_load() {
+void test_tma_fp32_swizzle64_store_and_load() {
     constexpr uint32_t mbar_address = 128;
     constexpr uint32_t tile_address = 1024;
     constexpr uint32_t tile_bytes = 16384;
@@ -716,16 +714,16 @@ void test_tma_fp32_xor64_store_and_load() {
     std::set<uint32_t> addresses;
     for (uint32_t row = 0; row < 64; ++row) {
         for (uint32_t col = 0; col < 64; ++col) {
-            const auto address = reference_fp32_xor64(tile_address, row, col);
-            require(address % 4 == 0 && address >= tile_address &&
-                    address < tile_address + tile_bytes,
-                "fp32 xor64 address left the 16-slice span");
-            require(addresses.insert(address).second, "fp32 xor64 map is not bijective");
+            const auto address = reference_fp32_swizzle64(tile_address, row, col);
+            require(address % 4 == 0 && address >= tile_address + 256 * row &&
+                    address < tile_address + 256 * (row + 1),
+                "fp32 swizzle64 address left its row");
+            require(addresses.insert(address).second, "fp32 swizzle64 map is not bijective");
         }
     }
-    require(addresses.size() == 4096, "fp32 xor64 map did not cover the 16 slices");
+    require(addresses.size() == 4096, "fp32 swizzle64 map did not cover the tile");
 
-    // A 64 x 64 fp32 tile, the whole tensor: xor64 (not transposed) or dense.
+    // A 64 x 64 fp32 tile, the whole tensor: swizzle64 (not transposed) or dense.
     const auto make_descriptor = [&](nanosm::TileLayout layout) {
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = 4;
@@ -753,8 +751,8 @@ void test_tma_fp32_xor64_store_and_load() {
         std::fill(gmem.begin(), gmem.end(), 0x5a);
         for (uint32_t row = 0; row < 64; ++row)
             for (uint32_t col = 0; col < 64; ++col)
-                write_u32(shmem, layout == nanosm::TileLayout::xor64
-                        ? reference_fp32_xor64(tile_address, row, col)
+                write_u32(shmem, layout == nanosm::TileLayout::swizzle64
+                        ? reference_fp32_swizzle64(tile_address, row, col)
                         : tile_address + 4 * (64 * row + col),
                     nanosm::float_bits(fp32_tile_value(row, col)));
         write_tma_descriptor(shmem, 0, make_descriptor(layout));
@@ -767,7 +765,7 @@ void test_tma_fp32_xor64_store_and_load() {
                 std::memcpy(&actual, machine.gmem().data() + gmem_base + 4 * (64 * row + col),
                     sizeof(actual));
                 require(actual == nanosm::float_bits(fp32_tile_value(row, col)),
-                    "fp32 xor64 TMA store mapped the wrong element at row " +
+                    "fp32 swizzle64 TMA store mapped the wrong element at row " +
                         std::to_string(row) + " col " + std::to_string(col));
             }
         }
@@ -777,18 +775,17 @@ void test_tma_fp32_xor64_store_and_load() {
         }
         return machine.trace().summary();
     };
-    const auto swizzled_store = run_store(nanosm::TileLayout::xor64);
-    // A 32-byte sector is eight consecutive fp32 of one row: four in slice
-    // col/4 and four in the next. Both halves sit in the same row of their
-    // slices, so on the same four banks (1024 B = 256 words = 0 mod 16) at
-    // different words: two port-A rounds per sector. Linear placement of the
-    // same sector is eight adjacent words: one round.
+    const auto swizzled_store = run_store(nanosm::TileLayout::swizzle64);
+    // A 32-byte sector is eight consecutive fp32 of one row: two 16-byte
+    // pieces of one 64-byte line, which the shuffle keeps in two different
+    // slots (eight different banks): one port-A round per sector, as linear
+    // placement (eight adjacent words). The sliced layout took two.
     require(swizzled_store.tma_command_completions == 1 &&
             swizzled_store.tma_useful_bytes == tile_bytes &&
             swizzled_store.tma_sector_bytes == tile_bytes,
-        "fp32 xor64 TMA store was not 1.00x sector traffic");
-    require(swizzled_store.tma_port_requests == 512 && swizzled_store.tma_port_rounds == 1024,
-        "fp32 xor64 TMA store did not read two port-A rounds per sector");
+        "fp32 swizzle64 TMA store was not 1.00x sector traffic");
+    require(swizzled_store.tma_port_requests == 512 && swizzled_store.tma_port_rounds == 512,
+        "fp32 swizzle64 TMA store did not read one port-A round per sector");
     const auto linear_store = run_store(nanosm::TileLayout::dense);
     require(linear_store.tma_port_requests == 512 && linear_store.tma_port_rounds == 512,
         "linear fp32 TMA store did not read one port-A round per sector");
@@ -803,21 +800,152 @@ void test_tma_fp32_xor64_store_and_load() {
         for (uint32_t col = 0; col < 64; ++col)
             write_u32(gmem, static_cast<uint32_t>(gmem_base) + 4 * (64 * row + col),
                 nanosm::float_bits(fp32_tile_value(row, col)));
-    write_tma_descriptor(shmem, 0, make_descriptor(nanosm::TileLayout::xor64));
+    write_tma_descriptor(shmem, 0, make_descriptor(nanosm::TileLayout::swizzle64));
     write_u64(shmem, mbar_address, nanosm::encode_mbar_state(mbar));
     nanosm::Machine machine(canonical_profile(), compile(program(false)), std::move(launch));
     machine.run(200000);
     for (uint32_t row = 0; row < 64; ++row) {
         for (uint32_t col = 0; col < 64; ++col) {
-            require(machine.read_shmem_u32(reference_fp32_xor64(tile_address, row, col)) ==
+            require(machine.read_shmem_u32(reference_fp32_swizzle64(tile_address, row, col)) ==
                     nanosm::float_bits(fp32_tile_value(row, col)),
-                "fp32 xor64 TMA load mapped the wrong element at row " +
+                "fp32 swizzle64 TMA load mapped the wrong element at row " +
                     std::to_string(row) + " col " + std::to_string(col));
         }
     }
     const auto& load_summary = machine.trace().summary();
-    require(load_summary.tma_port_requests == 512 && load_summary.tma_port_rounds == 1024,
-        "fp32 xor64 TMA load did not write two port-A rounds per sector");
+    require(load_summary.tma_port_requests == 512 && load_summary.tma_port_rounds == 512,
+        "fp32 swizzle64 TMA load did not write one port-A round per sector");
+}
+
+// ---- rows stay whole (trash/whole-rows-2026-11-18.md): smoke tests ----
+
+uint16_t whole_rows_fp16(uint32_t value) {
+    static constexpr std::array<uint16_t, 5> bits{0x0000, 0x3c00, 0x4000, 0x4200, 0x4400}; // 0..4
+    return bits.at(value);
+}
+
+// A(m, k) and B(k, n): small integers (exact sums), different in every
+// 16-byte piece of a row (k and k + 8 differ by 24 = 4 mod 5 and 16 = 1 mod
+// 3), so a command that reads the wrong piece is caught.
+uint32_t whole_rows_a(uint32_t m, uint32_t k) { return (m + 3 * k) % 5; }
+
+uint32_t whole_rows_b(uint32_t k, uint32_t n) { return (2 * k + n) % 3; }
+
+// The tensor core reads TMA tiles of 128-byte rows. A (64 x 64 fp16) and B
+// (64 rows of 64 fp16: B's n rows of k, as a K cache) land whole, one load
+// each. Eight m64n64k8 commands step both operand pointers by one 16-byte
+// piece with row spacing 128 (FA's QK^T); eight m32n64k8 commands read A's
+// bottom half, the pointer at row 32 (+ 32 x 128). Bank rounds as with
+// 16-byte rows: 17 per A block and B sweep, and one TMA round per sector.
+void test_swizzle64_mma_reads_a_tma_tile() {
+    constexpr uint32_t a_tile = 1024;
+    constexpr uint32_t b_tile = 9216;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, b_tile + 8192);
+    auto& gmem = image_bytes(launch.gmem_image, 16384);
+    for (uint32_t row = 0; row < 64; ++row) {
+        for (uint32_t k = 0; k < 64; ++k) {
+            write_u16(gmem, 2 * (64 * row + k), whole_rows_fp16(whole_rows_a(row, k)));
+            write_u16(gmem, 8192 + 2 * (64 * row + k), whole_rows_fp16(whole_rows_b(k, row)));
+        }
+    }
+    for (const uint32_t descriptor_address : {0u, 64u}) {
+        nanosm::TmaDescriptor descriptor;
+        descriptor.element_bytes = 2;
+        descriptor.layout = nanosm::TileLayout::swizzle64;
+        descriptor.base = descriptor_address == 0 ? 0 : 8192;
+        descriptor.dimensions = {64, 64, 1, 1};
+        descriptor.strides = {64, 0, 0};
+        descriptor.tile_length = 64;
+        descriptor.tile_rows = 64;
+        write_tma_descriptor(shmem, descriptor_address, descriptor);
+    }
+    write_u64(shmem, 128, nanosm::encode_mbar_state({false, true, 1, 0, 16384}));
+    write_u64(shmem, 136, nanosm::encode_mbar_state({false, true, 1, 1, 0}));
+    std::string source = ".acc C, 0, 64, 64\n.acc H, 4096, 32, 64\n" +
+        tma_operands_asm(1, a_tile, 2, 128, 8, {0, 0}) + "umov ur3, " + std::to_string(b_tile) + "\n" +
+        "tma.load.2d [ur1], [0, ur8], [ur2]\ntma.load.2d [ur3], [64, ur8], [ur2]\n"
+        "loaded:\nmbar.try_wait p0, [ur2], 0\n@!p0 bra.uni loaded\n";
+    for (const auto& [accumulator, shape, a_start] :
+         {std::tuple{"C", "m64n64k8", a_tile}, std::tuple{"H", "m32n64k8", a_tile + 32 * 128}}) {
+        source += "umov ur10, " + std::to_string(a_start) + "\numov ur11, " + std::to_string(b_tile) + "\n";
+        for (uint32_t piece = 0; piece < 8; ++piece) {
+            if (piece != 0) source += "uaddi ur10, ur10, 16\nuaddi ur11, ur11, 16\n";
+            source += std::string("mma.async.") + (piece == 0 ? "init." : "") + shape + " " + accumulator +
+                ", [ur10, 128], [ur11, 128]\n";
+        }
+    }
+    source += "umov ur4, 136\nmma.commit [ur4]\ncommitted:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni committed\n"
+        "acc.ld.v8 r20, C, ur8\numov ur12, 48\numov ur13, 56\nacc.ld.v8 r28, C, ur12\n"
+        "umov ur14, 16\numov ur15, 8\nacc.ld.v8 r36, H, ur14\nhalt\n";
+    nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch), {.timeline = true});
+    machine.run(100000);
+    const auto expected = [](uint32_t m, uint32_t n) {
+        float sum = 0;
+        for (uint32_t k = 0; k < 64; ++k) sum += static_cast<float>(whole_rows_a(m, k) * whole_rows_b(k, n));
+        return nanosm::float_bits(sum);
+    };
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        for (uint32_t j = 0; j < 8; ++j) {
+            require(machine.read_reg(0, lane, 20 + j) == expected(lane, j),
+                "C rows 0..15 are wrong: an operand read the wrong piece or row");
+            require(machine.read_reg(0, lane, 28 + j) == expected(48 + lane, 56 + j), "C's far corner is wrong");
+            require(machine.read_reg(0, lane, 36 + j) == expected(48 + lane, 8 + j),
+                "the m32 command at A's row 32 did not read rows 32..63");
+        }
+    }
+    const auto& summary = machine.trace().summary();
+    require(summary.mma_commands == 16 && summary.mma_a_block_reads == 8 * 16 + 8 * 8 &&
+            summary.mma_shmem_rounds == 8 * 272 + 8 * 136,
+        "128-byte rows did not keep one bank round per B block and per A block: " +
+            std::to_string(summary.mma_shmem_rounds) + " rounds");
+    require(summary.tma_port_requests == 512 && summary.tma_port_rounds == 512,
+        "the TMA did not place one sector per port-A round");
+}
+
+// One transposed load with 128-byte stored rows (V-like: the global rows are
+// keys of 64 fp16; the stored rows are the 64 positions along dimension 0,
+// each holding the 64 keys): element (x, y) at position y of stored row x.
+// A sector's sixteen fp16 go to sixteen neighbouring stored rows, which the
+// shuffle spreads over sixteen banks: one placement round per sector.
+void test_swizzle64_transposed_load() {
+    constexpr uint32_t tile_address = 1024;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, tile_address + 8192);
+    auto& gmem = image_bytes(launch.gmem_image, 8192);
+    const auto value = [](uint32_t x, uint32_t y) { return static_cast<uint16_t>(0x100 + 3 * y + 5 * x); };
+    for (uint32_t y = 0; y < 64; ++y)
+        for (uint32_t x = 0; x < 64; ++x) write_u16(gmem, 2 * (64 * y + x), value(x, y));
+    nanosm::TmaDescriptor descriptor;
+    descriptor.element_bytes = 2;
+    descriptor.layout = nanosm::TileLayout::swizzle64;
+    descriptor.transposed = true;
+    descriptor.dimensions = {64, 64, 1, 1};
+    descriptor.strides = {64, 0, 0};
+    descriptor.tile_length = 64;
+    descriptor.tile_rows = 64;
+    write_tma_descriptor(shmem, 0, descriptor);
+    write_tx_mbar(shmem, 128, 8192);
+    nanosm::Machine machine(canonical_profile(), compile(tma_operands_asm(4, tile_address, 3, 128, 8, {0, 0}) +
+        "tma.load.2d [ur4], [0, ur8], [ur3]\nwait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n"),
+        std::move(launch));
+    machine.run(50000);
+    require(machine.read_mbar_state(128).phase, "the transposed load did not complete");
+    for (uint32_t y = 0; y < 64; ++y) {
+        for (uint32_t x = 0; x < 64; ++x) {
+            const auto address = reference_swizzle64(tile_address, 128, x, 2 * y);
+            uint16_t actual = 0;
+            std::memcpy(&actual, machine.shmem().data() + address, sizeof(actual));
+            require(actual == value(x, y), "transposed element (" + std::to_string(x) + ", " +
+                std::to_string(y) + ") is not at position y of stored row x");
+        }
+    }
+    const auto& summary = machine.trace().summary();
+    require(summary.tma_port_requests == 256 && summary.tma_port_rounds == 256,
+        "the transposed load did not place one sector per port-A round: " +
+            std::to_string(summary.tma_port_rounds) + " rounds for " + std::to_string(summary.tma_port_requests));
 }
 
 // A one-dimensional tensor of 4 fp32 and a tile of 8 at coordinate -4: the
@@ -1029,54 +1157,64 @@ TEST(Tma, tma_direction_is_the_opcode) {
     test_tma_direction_is_the_opcode();
 }
 
-// tma xor64 load/store, transposed or not
-TEST(Tma, tma_xor64_transposed_load_store) {
-    test_tma_xor64_transposed_load_store();
+// tma swizzle64 load/store, transposed or not
+TEST(Tma, tma_swizzle64_transposed_load_store) {
+    test_tma_swizzle64_transposed_load_store();
 }
 
-// an xor64 TMA tile is the same whatever the profile's mma.layout
-TEST(Tma, tma_xor64_tile_ignores_the_mma_layout) {
-    test_tma_xor64_tile_ignores_the_mma_layout();
+// a swizzle64 TMA tile is the same whatever the profile's mma.layout
+TEST(Tma, tma_swizzle64_tile_ignores_the_mma_layout) {
+    test_tma_swizzle64_tile_ignores_the_mma_layout();
 }
 
-// tma xor64 feeds MMA
-TEST(TmaSlow, tma_xor64_feeds_mma_orientations) {
-    test_tma_xor64_feeds_mma_orientations();
+// tma swizzle64 feeds MMA
+TEST(TmaSlow, tma_swizzle64_feeds_mma_orientations) {
+    test_tma_swizzle64_feeds_mma_orientations();
 }
 
-// tma xor64 census: every outer extent and K extent vs the MMA's addressing
-TEST(TmaSlow, tma_xor64_census_against_mma) {
-    test_tma_xor64_census_against_mma();
+// tma swizzle64 census: row counts and K extents vs the MMA's addressing
+TEST(TmaSlow, tma_swizzle64_census_against_mma) {
+    test_tma_swizzle64_census_against_mma();
 }
 
-// tma wide xor64 validation
-TEST(Tma, tma_wide_xor64_validation) {
-    test_tma_wide_xor64_validation();
+// tma swizzle64 validation
+TEST(Tma, tma_swizzle64_validation) {
+    test_tma_swizzle64_validation();
 }
 
-// tma wide xor64 vs narrow
-TEST(TmaSlow, tma_wide_xor64_matches_narrow) {
-    test_tma_wide_xor64_matches_narrow();
+// four 16-row swizzle64 loads build the 64-row tile
+TEST(TmaSlow, tma_swizzle64_pieces_of_16_rows) {
+    test_tma_swizzle64_pieces_of_16_rows();
 }
 
-// tma wide xor64 sectors
-TEST(TmaSlow, tma_wide_xor64_sector_economics) {
-    test_tma_wide_xor64_sector_economics();
+// tma swizzle64 sectors
+TEST(TmaSlow, tma_swizzle64_sector_economics) {
+    test_tma_swizzle64_sector_economics();
 }
 
-// xor64 byte primitive == fp16 formula
-TEST(Tma, xor64_byte_primitive_matches_fp16_formula) {
-    test_xor64_byte_primitive_matches_fp16_formula();
+// the swizzle64 layout function == the rule written out
+TEST(Tma, swizzle64_layout_matches_the_rule) {
+    test_swizzle64_layout_matches_the_rule();
 }
 
-// tma fp32 xor64 validation
-TEST(Tma, tma_fp32_xor64_validation) {
-    test_tma_fp32_xor64_validation();
+// tma fp32 swizzle64 validation
+TEST(Tma, tma_fp32_swizzle64_validation) {
+    test_tma_fp32_swizzle64_validation();
 }
 
-// tma fp32 xor64 store/load
-TEST(TmaSlow, tma_fp32_xor64_store_and_load) {
-    test_tma_fp32_xor64_store_and_load();
+// tma fp32 swizzle64 store/load
+TEST(TmaSlow, tma_fp32_swizzle64_store_and_load) {
+    test_tma_fp32_swizzle64_store_and_load();
+}
+
+// the tensor core reads TMA tiles of 128-byte rows, and an m32 half at row 32
+TEST(TmaSlow, swizzle64_mma_reads_a_tma_tile) {
+    test_swizzle64_mma_reads_a_tma_tile();
+}
+
+// one transposed swizzle64 load with 128-byte stored rows
+TEST(Tma, swizzle64_transposed_load) {
+    test_swizzle64_transposed_load();
 }
 
 // tma rank-1 load and OOB

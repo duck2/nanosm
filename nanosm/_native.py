@@ -63,7 +63,7 @@ lib.nanosm_tma_descriptor_encode.argtypes = [
     ctypes.c_uint32,  # tile_length
     ctypes.c_uint32,  # tile_rows
     ctypes.c_uint32,  # row_dimension
-    ctypes.c_uint32,  # layout (0 dense, 1 xor64)
+    ctypes.c_uint32,  # layout (0 dense, 1 swizzle64)
     ctypes.c_uint32,  # transposed
     ctypes.POINTER(ctypes.c_uint8),
     ctypes.c_uint64,

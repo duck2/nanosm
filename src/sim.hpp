@@ -147,12 +147,12 @@ struct RoundRobinGrant {
 RoundRobinGrant round_robin_grant(const std::vector<uint8_t>& ready, uint32_t cursor, uint32_t ports);
 
 // The shmem byte address the MMA reads operand element (outer, k) of a
-// command of `shape` from, its operand starting at `base` (outer: m for A, n
-// for B): the operand fetch's own addressing (src/sim.cpp mma_a_address /
-// mma_b_address, in the profile's layout), named here so tests can hold a
-// TMA tile against it.
-uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, bool a_operand,
-    uint32_t outer, uint32_t k);
+// command of `shape` from, its operand at `base` with row spacing `spacing`
+// (outer: m for A, n for B): the operand fetch's own addressing (src/sim.cpp
+// mma_a_address / mma_b_address, in the profile's layout), named here so
+// tests can hold a TMA tile against it.
+uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    bool a_operand, uint32_t outer, uint32_t k);
 
 class Machine {
 public:
@@ -562,8 +562,10 @@ private:
         uint32_t warp = 0;
         uint8_t accumulator = 0;
         uint8_t depbar = 0;
-        uint32_t a_base = 0;
+        uint32_t a_base = 0;     // the operand's first 16-byte piece in its row 0
         uint32_t b_base = 0;
+        uint32_t a_spacing = 0;  // bytes from one operand row to the next (the instruction's)
+        uint32_t b_spacing = 0;
         uint32_t mbar_address = 0;
         uint32_t next_step = 0;
         uint32_t outstanding_results = 0;
@@ -605,6 +607,8 @@ private:
         uint32_t k0 = 0;
         uint32_t a_base = 0;
         uint32_t b_base = 0;
+        uint32_t a_spacing = 0;
+        uint32_t b_spacing = 0;
         MmaShape shape;          // the command's: the dense layout's strides follow it
     };
 
@@ -1888,7 +1892,7 @@ private:
         const std::vector<std::vector<LaneAccess>>& rounds);
     [[nodiscard]] std::vector<uint32_t> lane_values(const Warp& warp, uint8_t reg) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
-        uint32_t base, bool a_operand, const MmaShape& shape) const;
+        uint32_t base, uint32_t spacing, bool a_operand, const MmaShape& shape) const;
     [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
     [[nodiscard]] std::array<uint8_t, tma_descriptor_bytes> tma_descriptor_at_accept(
         uint32_t address, const Wires& w) const;

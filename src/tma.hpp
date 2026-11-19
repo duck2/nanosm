@@ -12,8 +12,9 @@
 namespace nanosm {
 
 // The TMA (trash/rfc17.md; trash/rfc17-slice-2026-11-17.md;
-// trash/rfc17-layout-2026-11-18.md). PROVISIONAL: a first iteration, to be
-// looked at through kernels and changed.
+// trash/rfc17-layout-2026-11-18.md; trash/whole-rows-2026-11-18.md).
+// PROVISIONAL: a first iteration, to be looked at through kernels and
+// changed.
 //
 // A descriptor defines one memory movement of a tensor: what the tensor is
 // (base, element size, four dimensions and their strides), how big a tile is
@@ -49,13 +50,14 @@ enum class TmaDirection : uint8_t {
 // descriptor says nothing about who reads the tile: a kernel that feeds the
 // tensor core picks the profile's layout, any other kernel whatever layout
 // it wants.
-//   dense            row after row: tile row y is stored row y.
-//   xor64            the tile's rows are the stored rows; the position along
-//                    the row (dimension 0) is cut into 16-byte pieces, one
-//                    slice per piece.
-//   xor64 transposed the tile's positions along dimension 0 are the stored
-//                    rows; the tile's row index is the direction cut into
-//                    slices.
+//   dense                row after row: tile row y is stored row y.
+//   swizzle64            the tile's rows are the stored rows, whole and
+//                        packed: tile row y at y x (tile length x element
+//                        bytes), shuffled inside its 64-byte lines.
+//   swizzle64 transposed the tile's positions along dimension 0 are the
+//                        stored rows (tile_length of them) and the tile's row
+//                        index runs along the stored row (tile_rows x element
+//                        bytes each).
 // (dense transposed is refused.)
 struct TmaDescriptor {
     uint64_t base = 0;            // global byte address of element (0, 0, 0, 0)
@@ -66,14 +68,14 @@ struct TmaDescriptor {
     uint16_t tile_rows = 1;
     uint8_t row_dimension = 1;    // which of dimensions 1..3 the rows step along
     TileLayout layout = TileLayout::dense;
-    bool transposed = false;      // xor64 only: dimension 0 positions become the stored rows
+    bool transposed = false;      // swizzle64 only: dimension 0 positions become the stored rows
 };
 
 // The 64-byte encoding, little-endian. Bytes 44..63 are reserved and must
 // be zero.
 //     0       element bytes (1, 2, 4; 8 and 16 reserved)
 //     1       row dimension (1..3)
-//     2       layout (0 dense, 1 xor64)
+//     2       layout (0 dense, 1 swizzle64)
 //     3       transposed (0 no, 1 yes; 0 for a dense tile)
 //     4..5    tile length (elements)
 //     6..7    tile rows
@@ -96,7 +98,7 @@ inline constexpr std::size_t used_end = 44;
 } // namespace tma_encoding
 
 // The two address operands' low bits are not wired: the buffer is 64-byte
-// aligned (an xor64 tile needs it; NVIDIA asks 128 of a tensor copy's
+// aligned (a swizzle64 tile needs it; NVIDIA asks 128 of a tensor copy's
 // destination) and the barrier 8-byte aligned. The machine ignores the low
 // 6 and 3 bits; the sanitizer PANICs if they are not zero.
 inline constexpr uint32_t tma_buffer_alignment = 64;
@@ -106,25 +108,18 @@ inline constexpr uint32_t tma_barrier_alignment = 8;
 // 14-bit immediate beside three register fields, src/isa.hpp): 1 MiB of
 // reach.
 
-// An xor64 tile: its stored rows each hold 16 bytes per slice, E = 16 /
-// element_bytes elements; slice s sits at 16 x (stored rows) x s, so the
-// tile is always compact (src/layout.hpp xor64_address, the spacing the
-// tensor core reads an xor64 operand of that many rows with). Stored-row
-// counts: the powers of two 4 .. 128. The sliced extent: a multiple of E, at
-// most 64 elements.
-inline constexpr uint32_t tma_xor64_min_rows = 4;
-inline constexpr uint32_t tma_xor64_max_rows = 128;
-inline constexpr uint32_t tma_xor64_max_sliced = 64;
-
-// An xor64 tile's sliced extent (the direction cut into 16-byte pieces) and
-// its stored-row count: the tile length and rows, or (transposed) the other
-// way round.
-inline uint32_t tma_xor64_sliced_extent(const TmaDescriptor& descriptor) {
-    return descriptor.transposed ? descriptor.tile_rows : descriptor.tile_length;
+// A swizzle64 tile's stored rows: how many, and how many elements each holds
+// -- the tile's rows and length, or (transposed) the other way round. The
+// stored row's bytes are the row spacing (src/layout.hpp), the spacing a
+// tensor-core instruction names to read the tile. Limits: 2- or 4-byte
+// elements; a stored row of 16, 32 or a multiple of 64 bytes; any number of
+// rows (the shuffle never moves a byte out of its row).
+inline uint32_t tma_swizzle64_stored_rows(const TmaDescriptor& descriptor) {
+    return descriptor.transposed ? descriptor.tile_length : descriptor.tile_rows;
 }
 
-inline uint32_t tma_xor64_stored_rows(const TmaDescriptor& descriptor) {
-    return descriptor.transposed ? descriptor.tile_length : descriptor.tile_rows;
+inline uint32_t tma_swizzle64_row_bytes(const TmaDescriptor& descriptor) {
+    return (descriptor.transposed ? descriptor.tile_rows : descriptor.tile_length) * descriptor.element_bytes;
 }
 
 // Elements from one index of `dimension` to the next (dimension 0: 1).
@@ -154,44 +149,31 @@ inline void validate_tma_descriptor(const TmaDescriptor& descriptor) {
     if (descriptor.row_dimension < 1 || descriptor.row_dimension > 3) {
         throw SimError("tma row dimension must be 1, 2 or 3");
     }
-    if (descriptor.layout > TileLayout::xor64) throw SimError("tma layout is invalid");
+    if (descriptor.layout > TileLayout::swizzle64) throw SimError("tma layout is invalid");
     if (descriptor.layout == TileLayout::dense && descriptor.transposed) {
-        throw SimError("tma dense tiles cannot be transposed (only xor64 tiles can)");
+        throw SimError("tma dense tiles cannot be transposed (only swizzle64 tiles can)");
     }
     if (descriptor.base % bytes != 0) throw SimError("tma global base is not element-aligned");
-    if (descriptor.layout == TileLayout::xor64) {
-        if (bytes != 2 && bytes != 4) throw SimError("tma xor64 tiles take 2- or 4-byte elements");
-        // The xor64 layout is a byte permutation within 16-byte rows
-        // (src/layout.hpp); the element type only sets how many elements
-        // share a row: E = 16 / element_bytes (8 fp16, 4 fp32). The sliced
-        // extent spans sliced / E slices (a multiple of E, up to 64
-        // elements); the stored-row count is a power of two, 4 .. 128, so the
-        // tile's bytes = sliced x rows x element_bytes = slices x 16 x rows.
-        const uint32_t row_elements = xor64_row_bytes / bytes;
-        const uint32_t sliced = tma_xor64_sliced_extent(descriptor);
-        const uint32_t rows = tma_xor64_stored_rows(descriptor);
-        if (sliced > tma_xor64_max_sliced || sliced % row_elements != 0) {
-            throw SimError("tma xor64 sliced extent must be a multiple of " + std::to_string(row_elements) +
-                " elements and at most " + std::to_string(tma_xor64_max_sliced) + " (it is " +
-                std::to_string(sliced) + ")");
-        }
-        if (rows < tma_xor64_min_rows || rows > tma_xor64_max_rows || (rows & (rows - 1)) != 0) {
-            throw SimError("tma xor64 stored-row count must be a power of two in " +
-                std::to_string(tma_xor64_min_rows) + ".." + std::to_string(tma_xor64_max_rows) +
-                " (it is " + std::to_string(rows) + ")");
+    if (descriptor.layout == TileLayout::swizzle64) {
+        if (bytes != 2 && bytes != 4) throw SimError("tma swizzle64 tiles take 2- or 4-byte elements");
+        const uint32_t row_bytes = tma_swizzle64_row_bytes(descriptor);
+        if (!valid_swizzle64_spacing(row_bytes)) {
+            throw SimError("tma swizzle64 stored row must be 16, 32 or a multiple of 64 bytes (it is " +
+                std::to_string(row_bytes) + ")");
         }
     }
 }
 
 // Where element x of tile row y lands in the buffer, as a byte offset, in
 // the descriptor's layout (src/layout.hpp: the functions the tensor core reads
-// its operands with). dense: stored row y, position x. xor64: stored row y,
-// position x sliced; transposed: stored row x, position y sliced.
+// its operands with). dense: stored row y, position x. swizzle64: stored row
+// y, position x; transposed: stored row x, position y.
 inline uint32_t tma_tile_offset(const TmaDescriptor& descriptor, uint32_t x, uint32_t y) {
     const uint32_t bytes = descriptor.element_bytes;
     if (descriptor.layout == TileLayout::dense) return dense_address(0, y, x, descriptor.tile_length, bytes);
-    const uint32_t rows = tma_xor64_stored_rows(descriptor);
-    return descriptor.transposed ? xor64_address(0, rows, x, y, bytes) : xor64_address(0, rows, y, x, bytes);
+    const uint32_t spacing = tma_swizzle64_row_bytes(descriptor);
+    return descriptor.transposed ? swizzle64_address(0, spacing, x, y * bytes)
+                                 : swizzle64_address(0, spacing, y, x * bytes);
 }
 
 // The tile's bytes (also what its completion subtracts from the barrier).
@@ -201,9 +183,9 @@ inline uint64_t tma_logical_bytes(const TmaDescriptor& descriptor) {
 }
 
 // The shmem byte span a command's tile occupies: [buffer, buffer + logical
-// bytes). A dense tile fills it row after row; an xor64 tile is a byte
-// permutation of its sliced / E slices of 16 x rows bytes (xor64_byte_address
-// never leaves a 16-byte row), so both cover exactly this span. Load OOB elements are
+// bytes). A dense tile fills it row after row; a swizzle64 tile is its rows
+// packed, each shuffled inside its own bytes, so both cover exactly this
+// span. Load OOB elements are
 // zero-filled inside it; store OOB elements skip their (in-span) source
 // bytes. The machine's runtime "tile fits in shmem" check is the same
 // arithmetic.
@@ -244,8 +226,8 @@ inline TmaDescriptor decode_tma_descriptor(const uint8_t* bytes, std::size_t siz
         if (bytes[offset] != 0) throw SimError("tma descriptor reserved bytes 44..63 are nonzero");
     }
     if (bytes[tma_encoding::transposed] > 1) throw SimError("tma descriptor transposed byte must be 0 or 1");
-    if (bytes[tma_encoding::layout] > static_cast<uint8_t>(TileLayout::xor64)) {
-        throw SimError("tma descriptor layout must be 0 (dense) or 1 (xor64)");
+    if (bytes[tma_encoding::layout] > static_cast<uint8_t>(TileLayout::swizzle64)) {
+        throw SimError("tma descriptor layout must be 0 (dense) or 1 (swizzle64)");
     }
     TmaDescriptor descriptor;
     descriptor.element_bytes = bytes[tma_encoding::element_bytes];

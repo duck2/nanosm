@@ -172,8 +172,8 @@ int32_t nanosm_tma_descriptor_encode(
             throw nanosm::SimError("tma tile length and rows must fit 16 bits");
         }
         if (row_dimension > UINT8_MAX) throw nanosm::SimError("tma row dimension must be 1, 2 or 3");
-        if (layout > NANOSM_TMA_LAYOUT_XOR64) {
-            throw nanosm::SimError("tma layout must be 0 (dense) or 1 (xor64)");
+        if (layout > NANOSM_TMA_LAYOUT_SWIZZLE64) {
+            throw nanosm::SimError("tma layout must be 0 (dense) or 1 (swizzle64)");
         }
         if (transposed > 1) throw nanosm::SimError("tma transposed must be zero or one");
         nanosm::TmaDescriptor descriptor;

@@ -206,6 +206,10 @@ namespace encoding {
 // barrier[8] (urM), descriptor[14] (its shared address in 64-byte units,
 // unsigned: 1 MiB of reach). Instruction: src0 urS, src1 urC, src2 urM, imm
 // the descriptor's byte address.
+// mma.async payload: accumulator[8], A[8] (urA), B[8] (urB), A's row
+// spacing[7], B's row spacing[7] (16-byte units). Instruction: dst the
+// accumulator, src0 urA, src1 urB, imm the two spacing fields as encoded
+// (mma_row_spacing below reads them).
 // stall is 5 bits so a slow FPGA-priced SFU (20+ cycles) can still be a stall count.
 inline constexpr unsigned opcode_shift = 56;
 inline constexpr unsigned predicate_shift = 52;
@@ -286,6 +290,30 @@ inline uint32_t mma_shape_index(Opcode opcode) {
 
 inline Opcode mma_opcode(uint32_t shape_index, bool init) {
     return static_cast<Opcode>(mma_block_first + 2 * shape_index + (init ? 1 : 0));
+}
+
+// An mma.async operand is a uniform register holding the shared address of
+// the 16-byte piece it starts at in the tile's row 0, and a row spacing, an
+// instruction constant (src/layout.hpp; trash/whole-rows-2026-11-18.md).
+// The spacings sit in the 14 bits beside the three register fields: A's in
+// bits 7..13, B's in bits 0..6, each in 16-byte units, so 16 .. 2032 bytes.
+// The assembly operand is [urA] (spacing 16: one 16-byte piece per row, a
+// K = 8 tile) or [urA, spacing].
+inline constexpr uint32_t mma_spacing_unit = 16;
+inline constexpr uint32_t mma_spacing_field_bits = 7;
+inline constexpr uint32_t mma_spacing_field_mask = (1u << mma_spacing_field_bits) - 1;
+inline constexpr uint32_t mma_default_spacing = 16;
+inline constexpr uint32_t mma_max_spacing = mma_spacing_field_mask * mma_spacing_unit;
+
+inline uint32_t mma_row_spacing(const Instruction& instruction, bool a_operand) {
+    const auto fields = static_cast<uint32_t>(instruction.imm);
+    return ((fields >> (a_operand ? mma_spacing_field_bits : 0)) & mma_spacing_field_mask) * mma_spacing_unit;
+}
+
+// The immediate holding spacings `a` and `b` (bytes, multiples of 16 up to
+// mma_max_spacing; the caller checks).
+inline int32_t mma_spacing_immediate(uint32_t a, uint32_t b) {
+    return static_cast<int32_t>((a / mma_spacing_unit) << mma_spacing_field_bits | (b / mma_spacing_unit));
 }
 
 // "m64n64k8": the mnemonic suffix, also the profile's spelling of a shape.

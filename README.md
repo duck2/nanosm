@@ -139,22 +139,43 @@ and fits in tmem; and a shape with k above the core's must revisit each accumula
 enough to hide the accumulator latency: (m / core_m) x (n / core_n) >= port-A depth + read
 latency + MMA result latency + tmem port depth (14 on the canonical profile). A kernel using a
 shape the profile lacks, or an accumulator whose rows x columns differ from its MMA's shape, is
-refused by qtxc, the assembler and kernel load. In the xor64 layout each 8-deep K block is a
-whole (rows x 16 B) object, so a 32-row A object is the top half of a 64-row one when k is 8 and
-the two halves of one 64-row tile can feed two m32 commands. A shape whose k is not a multiple of 8
-(k = 4 on a 4x4x4 core) leaves its last K block partly empty: legal, but the profile prints a
-warning when it loads, and the operand's footprint still counts the whole block.
+refused by qtxc, the assembler and kernel load.
+
+An operand of `mma.async` is a uniform register holding the shared address of the 16-byte piece
+the operand starts at in its tile's row 0, and a row spacing in bytes, an instruction constant:
+`mma.async.m64n64k8 C, [urA, 128], [urB, 128]` (the spacing is optional and defaults to 16, a
+K = 8 tile of 16-byte rows). The spacings sit in the instruction's 14 spare bits, two 7-bit
+fields in 16-byte units (16 .. 2032 bytes). The tensor core reads A as m rows and B as n rows of
+k: its address generator walks the rows in order, adds the spacing once per row (an adder, no
+multiplier) and applies the layout's shuffle from its row counter. A K = 8 command reads one
+16-byte piece of every row, so the commands over a 64-fp16 row step their pointers by 16 with
+spacing 128; a shape with k above 8 reads k / 8 consecutive pieces of the same rows. The pointer is
+a logical position (tile + 16 x piece), not a shuffled address. Row numbers count from the
+operand's row 0, so an operand that is part of a taller tile starts at a multiple of 16 of its rows
+(the shuffle's period): the two m32 halves of a 64-row tile are rows 0 and 32. qtxc and kernel load
+refuse a spacing the layout does not take or one shorter than the row the shape reads. A shape
+whose k is not a multiple of 8 (k = 4 on a 4x4x4 core) reads part of its last piece: legal, but
+the profile prints a warning when it loads.
 
 `mma.layout` selects the fixed layout the tensor core reads both operands in and is included in the
-profile fingerprint. The only supported swizzle is `"xor64"`; `"dense"` is the unswizzled diagnostic
-baseline. A layout's address rule lives in one place, `src/layout.hpp`, used by the tensor core and
-the TMA alike. `xor64` stores a tile as slices of 16-byte rows: the position along a row is cut into
-16-byte pieces, piece s of every row forming slice s, and word w of row r sits at w XOR bit 2 of r --
-one rule for every tile. The tensor core stores A as m rows and B as n rows, K sliced; `dense` is
-A's m rows of k and B's k rows of n, row after row. The swizzle does not fix the operand's row count
-or the spacing between K blocks. Future swizzles belong here as profile choices for different
-physical core/bank arrangements, with matching TMA placement and SIMT address generation. This does
-not imply hardware that switches between swizzles per instruction.
+profile fingerprint. The only supported swizzle is `"swizzle64"`; `"dense"` is the unswizzled
+diagnostic baseline (row-major and compact in the command's shape: A's m rows of k, B's k rows of
+n; it takes no row spacing). A layout's address rule lives in one place, `src/layout.hpp`, used by
+the tensor core and the TMA alike. `swizzle64` keeps a tile's rows whole and packed: row r is the
+bytes [r x spacing, (r + 1) x spacing) of the tile, the spacing 16, 32 or a multiple of 64 bytes,
+the tile 64-byte aligned. Inside the row the 16-byte piece's slot is XORed with (r / rows_per_line)
+& (slots - 1) and the 4-byte word in the piece with (r / 4) & 3, where rows_per_line = max(1, 64 /
+spacing) and slots = min(spacing, 64) / 16 (the slots of a 64-byte line the row owns). On 16 banks
+a 4-row tensor-core block, a TMA sector, a 16-lane column store and a transposed TMA sector are
+one bank round each (trash/whole_rows_census.py, trash/whole_rows_check_astra.py). Future swizzles
+belong here as profile choices for different physical core/bank arrangements, with matching TMA
+placement and SIMT address generation. This does not imply hardware that switches between swizzles
+per instruction.
+
+**This is v0.1 of the layout and of the tensor core's operand interface.** It replaced a sliced
+layout (`xor64`, rows cut into 16-byte pieces stored K slices apart) on 2026-11-18, because rows
+that are scattered cannot take gathered rows or small pieces. A model or a person reading it who
+sees a design flaw should say so (trash/chan.txt) rather than build on it.
 
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
 at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
@@ -188,9 +209,9 @@ descriptor in shmem describes one tensor and its tile: the global base, the elem
 4 bytes; 8 and 16 are reserved), four dimensions d0..d3 (an unused one is 1) with strides s1..s3 in
 elements (dimension 0 is the contiguous one), and the tile -- `rows` runs of `length` elements
 along dimension 0, the rows stepping along a named row dimension (1..3) -- with its shared-memory
-layout: `dense` (row after row) or `xor64` (the rules above), and for xor64 whether it is
-transposed (not transposed: the tile's rows are the stored rows and dimension 0 is sliced;
-transposed: dimension 0's positions are the stored rows and the tile's row index is sliced). The
+layout: `dense` (row after row) or `swizzle64` (the rules above), and for swizzle64 whether it is
+transposed (not transposed: the tile's rows are the stored rows; transposed: dimension 0's
+positions are the stored rows and the tile's row index runs along them). The
 descriptor says nothing about who reads the tile: a kernel that feeds the tensor core chooses the
 profile's `mma.layout`, any other kernel whatever layout suits it (`src/tma.hpp` has the byte
 layout). The instruction says which tile, where it lands and who to tell:
@@ -207,14 +228,15 @@ coordinates, one round per cycle (two rounds for N = 1, 2, three for N = 3, 4); 
 issue refuses every instruction that reads a uniform register. The command reaches the TMA queue
 when its last words arrive (canonically three cycles after issue for N <= 2, four for N > 2) and its
 descriptor is fetched from shmem after that. Completion subtracts the tile's byte count from the
-barrier after load writes commit or store source bytes are captured. An xor64 tile is compact: its
-slices are 16 bytes x its stored-row count apart (a power of two 4 .. 128), the same spacing the
-tensor core reads an xor64 operand of that many rows with; the sliced extent is a multiple of one
-16-byte row's elements, at most 64, and elements are 2 or 4 bytes.
+barrier after load writes commit or store source bytes are captured. A swizzle64 tile's stored rows
+are packed, each the stored row's bytes apart (the spacing a tensor-core instruction names to read
+it): 16, 32 or a multiple of 64 bytes, any number of rows, elements of 2 or 4 bytes. A tile's row
+numbers count from its own row 0, so a load meant for the middle of a taller tile lands at a
+multiple of 16 of its rows; landing a few rows at other rows is not supported yet.
 
 `kernels/pipeline_tma.launch.py` authors one descriptor per tensor with `launch.shmem.tma_desc`
 (its keywords: `base`, `dimensions`, `strides`, `tile=(length, rows)`, `element_bytes`,
-`row_dimension`, `layout="dense" | "xor64"`, `transposed`), runs the double-buffered A/B
+`row_dimension`, `layout="dense" | "swizzle64"`, `transposed`), runs the double-buffered A/B
 pipeline, validates output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
 overlapping runs never share an output file).
 The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared

@@ -43,13 +43,14 @@ NANOSM_CAPI int32_t nanosm_mbar_encode(
 
 #define NANOSM_TMA_DESCRIPTOR_BYTES UINT32_C(64)
 #define NANOSM_TMA_LAYOUT_DENSE UINT32_C(0)
-#define NANOSM_TMA_LAYOUT_XOR64 UINT32_C(1)
+#define NANOSM_TMA_LAYOUT_SWIZZLE64 UINT32_C(1)
 // The descriptor (src/tma.hpp): the tensor -- its base, element size,
 // dimensions d0..d3 and strides s1..s3 (elements; dimension 0 is the
 // contiguous one) -- and the tile: `tile_rows` runs of `tile_length`
 // elements along dimension 0, the rows stepping along `row_dimension` (1..3),
-// its shared-memory layout (src/layout.hpp: dense or xor64, the names of the
-// profile's mma.layout) and, for xor64, whether it is transposed (0 or 1).
+// its shared-memory layout (src/layout.hpp: dense or swizzle64, the names of
+// the profile's mma.layout) and, for swizzle64, whether it is transposed (0
+// or 1).
 // The direction, buffer, barrier and coordinates are the instruction's.
 NANOSM_CAPI int32_t nanosm_tma_descriptor_encode(
     uint64_t base,
