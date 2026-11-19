@@ -221,12 +221,12 @@ void TraceRecorder::depbar(uint64_t cycle, uint32_t warp, uint8_t bar, uint32_t 
     });
 }
 
-void TraceRecorder::tmem_beat(uint64_t cycle, uint32_t warp, bool load, uint32_t column) {
+void TraceRecorder::tmem_beat(uint64_t cycle, uint32_t warp, bool load, uint32_t address) {
     if (load) ++summary_.tmem_load_beats;
     else ++summary_.tmem_store_beats;
     add({TraceEventKind::instant, TraceCategory::tmem, load ? "acc.ld beat" : "acc.st beat",
-        "warp=" + std::to_string(warp) + ", column=" + std::to_string(column),
-        load ? acc_ld_engine_track : acc_st_engine_track, cycle, 0, static_cast<int64_t>(column)});
+        "warp=" + std::to_string(warp) + ", address=" + std::to_string(address),
+        load ? acc_ld_engine_track : acc_st_engine_track, cycle, 0, static_cast<int64_t>(address)});
 }
 
 void TraceRecorder::mma_command(uint64_t cycle, uint64_t command, uint32_t warp, bool init) {
@@ -243,10 +243,10 @@ void TraceRecorder::mma_input(uint64_t cycle, uint64_t command, uint32_t rounds,
         "rounds=" + std::to_string(rounds) + (reads_a ? ", reads A" : ""), 1040, cycle, 0, step, command});
 }
 
-void TraceRecorder::mma_result(uint64_t cycle, uint64_t command, uint32_t step) {
+void TraceRecorder::mma_result(uint64_t cycle, uint64_t command, uint32_t address) {
     ++summary_.mma_result_steps;
     add({TraceEventKind::instant, TraceCategory::mma, "MMA tmem write",
-        {}, 1041, cycle, 0, step, command});
+        "address=" + std::to_string(address), 1041, cycle, 0, address, command});
 }
 
 void TraceRecorder::mma_recurrence_stall() { ++summary_.mma_recurrence_stalls; }

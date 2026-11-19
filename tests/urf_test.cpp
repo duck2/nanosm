@@ -183,7 +183,8 @@ void test_r2ur_under_a_partial_mask_panics() {
 
 // The consumers read uniform registers: lds.uni and ldg.uni bases computed by
 // uniform arithmetic, an atomic's address and operand, the mbar address and
-// parity, and the acc.st / acc.ld coordinate pair.
+// parity, and the acc.st / acc.ld tmem pointer (here row 0, column 3 of a
+// region of 8-word rows).
 void test_consumers_take_uniform_registers() {
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -193,7 +194,6 @@ void test_consumers_take_uniform_registers() {
     auto& gmem = image_bytes(launch.gmem_image, 128);
     write_u32(gmem, 68, 0xbeef);
     nanosm::Machine machine(canonical_profile(), compile(R"(
-        .acc T, 0, 16, 8
         umov  ur1, 256
         uaddi ur2, ur1, 64
         lds.uni r1, [ur2 + 4]
@@ -211,10 +211,9 @@ void test_consumers_take_uniform_registers() {
 skip:
         sread r0, LANE_ID
         addi  r6, r0, 100
-        umov  ur6, 0
-        umov  ur7, 3
-        acc.st T, ur6, r6
-        acc.ld r7, T, ur6
+        umov  ur6, 3
+        acc.st [ur6, 8], r6
+        acc.ld r7, [ur6, 8]
         halt
     )"), std::move(launch));
     machine.run(20000);
@@ -223,7 +222,7 @@ skip:
         require(machine.read_reg(0, lane, 2) == 40, "atom.add.uni returned the old word");
         require(machine.read_reg(0, lane, 8) == 0xbeef, "ldg.uni from a uniform base");
         require(machine.read_reg(0, lane, 5) == 1, "mbar.test_wait with a uniform parity");
-        require(machine.read_reg(0, lane, 7) == lane + 100, "acc.st / acc.ld with uniform coordinates");
+        require(machine.read_reg(0, lane, 7) == lane + 100, "acc.st / acc.ld through a uniform tmem pointer");
     }
     require(machine.read_shmem_u32(256) == 45, "atom.add.uni added its uniform operand");
     require(machine.read_mbar_state(512).phase, "mbar.arrive at a uniform address did not complete the phase");
@@ -237,7 +236,6 @@ skip:
 void test_toolchain_forms_and_refusals() {
     const auto& profile = canonical_profile();
     const auto kernel = compile(R"(
-        .acc T, 0, 16, 8
         usread ur0, WARP_ID
         umov  ur1, ur0
         umov  ur2, -5
@@ -247,8 +245,8 @@ void test_toolchain_forms_and_refusals() {
         ur2r  r1, ur5
         lds.uni r0, [ur3 + 8]
         atom.add.uni r2, [ur0 - 4], ur3
-        acc.ld r1, T, ur6
-        acc.st T, ur6, r1
+        acc.ld r1, [ur6, 8]
+        acc.st [ur6, 8], r1
         mbar.try_wait p1, [ur4], ur5
         usetp.lt.u32 p3, ur3, ur4
         usetp.ge.u32 p4, ur3, -7
@@ -260,7 +258,7 @@ void test_toolchain_forms_and_refusals() {
     const std::vector<std::string> expected = {
         "usread ur0, WARP_ID", "umov ur1, ur0", "umov ur2, -5", "uadd ur3, ur1, ur2", "uxori ur4, ur3, 9",
         "r2ur ur5, r2", "ur2r r1, ur5", "lds.uni r0, [ur3 + 8]", "atom.add.uni r2, [ur0 - 4], ur3",
-        "acc.ld r1, ACC0, ur6", "acc.st ACC0, ur6, r1", "mbar.try_wait p1, [ur4], ur5", "usetp.lt.u32 p3, ur3, ur4",
+        "acc.ld r1, [ur6, 8]", "acc.st [ur6, 8], r1", "mbar.try_wait p1, [ur4], ur5", "usetp.lt.u32 p3, ur3, ur4",
         "usetp.ge.u32 p4, ur3, -7", "usetp.lt.s32 p5, ur8, 0", "usetp.ne.u32 p6, ur3, ur4", "setp.gt.s32 p0, r1, -4",
         "halt"};
     require(kernel.words.size() == expected.size(), "wrong instruction count");
@@ -288,8 +286,9 @@ void test_toolchain_forms_and_refusals() {
     refused("mov r2, 0\nlds.uni r1, [r2]\nhalt\n", "expected uniform register", "a vector lds.uni base");
     refused("mov r2, 0\nmbar.arrive [r2]\nhalt\n", "expected uniform register", "a vector mbar address");
     refused("mbar.try_wait p1, [ur0], r3\nhalt\n", "expected uniform register", "a vector mbar parity");
-    refused(".acc T, 0, 16, 8\nacc.ld r1, T, " + last + "\nhalt\n", "coordinate pair",
-        "an acc coordinate pair past " + last);
+    refused("acc.ld r1, [" + past + ", 8]\nhalt\n", "outside this profile's", "an acc pointer past " + last);
+    refused("acc.ld r1, [ur1, 6]\nhalt\n", "must be a power of two", "an acc row of 6 words");
+    refused(".acc T, 0, 16, 8\nhalt\n", "there is no .acc directive", "the .acc directive");
     refused("umov ur1, r2\nhalt\n", "r2ur", "umov from a vector register");
     refused("usetp.eq.u32 p0, ur1, r2\nhalt\n", "expected uniform register", "usetp of a vector register");
     refused("usetp.eq.u32 PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");

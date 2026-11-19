@@ -887,7 +887,6 @@ void test_i2_tma_placement_on_port_b() {
     write_rank1_load(shmem, 5120, 0, 256, 4104);
     fill_pattern(image_bytes(launch.gmem_image, 1024), 0, 256, 0);
     std::string program = R"(
-        .acc C, 0, 64, 64
         usread ur15, WARP_ID
         ur2r r29, ur15
         setp.ne.u32 p0, r29, 0
@@ -895,8 +894,9 @@ void test_i2_tma_placement_on_port_b() {
         umov ur0, 0
         umov ur1, 1024
         umov ur4, 4096
+        umov ur2, 0
         mbar.init [ur4], 1
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
         mma.commit [ur4]
     )" + tma_operands_asm(10, 2048, 11, 4104, 8) + R"(
         tma.load.1d [ur10], [5120, ur8], [ur11]
@@ -907,8 +907,7 @@ void test_i2_tma_placement_on_port_b() {
         mbar.try_wait p2, [ur4], 0
         @!p2 bra.uni mma_wait
         umov ur12, 0
-        umov ur13, 0
-        acc.ld r16, C, ur12
+        acc.ld r16, [ur12, 64]
         halt
     hammer:
         sread r20, LANE_ID
@@ -1154,15 +1153,14 @@ void test_i2_read_first_across_services() {
         std::ostringstream qtx;
         // I7: the commit mbar is in the image (an mbar.init would be an RMW
         // behind the host's, ordering the sts after its long write).
-        qtx << ".acc C, 0, 32, 64\n"
-            << "umov ur0, 0\numov ur1, 1024\numov ur4, 896\n"
+        qtx << "umov ur0, 0\numov ur1, 1024\numov ur4, 896\numov ur2, 0\n"
             << "sread r20, LANE_ID\nshli r20, r20, 2\n"
             << "mov r21, 16384\nshli r22, r21, 16\nor r21, r21, r22\n" // two fp16 2.0 halves
             << "sts [r20], r21\n";
         for (uint32_t i = 0; i < pad; ++i) qtx << "mov r22, 1\n";
-        qtx << "mma.async.init.m32n64k8 C, [ur0], [ur1]\nmma.commit [ur4]\n"
+        qtx << "mma.async.init.m32n64k8 [ur2], [ur0], [ur1]\nmma.commit [ur4]\n"
             << "wait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\n"
-            << "umov ur8, 0\numov ur9, 0\nacc.ld r10, C, ur8\nhalt\n";
+            << "umov ur8, 0\nacc.ld r10, [ur8, 64]\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& shmem = image_bytes(launch.shmem_image, 2048);
@@ -1189,7 +1187,7 @@ void test_i2_read_first_across_services() {
         }
 #if NANOSM_SANITIZER
         {
-            // The MMA's accept: its dispatch (I6a: its issue, pc = 8 * (9 + pad), +
+            // The MMA's accept: its dispatch (I6a: its issue, pc = 8 * (10 + pad), +
             // issue_to_dispatch), or the PANIC it raised there.
             std::vector<I2Grant> stores;
             for (const auto& grant : i2_grants(mma, "A-write")) {
@@ -1198,7 +1196,7 @@ void test_i2_read_first_across_services() {
             const auto what = "pad " + std::to_string(pad) + ":" + describe(stores);
             const uint64_t accept = panic.has_value()
                 ? std::stoull(panic->substr(panic->find("cycle=") + 6))
-                : issued_at(mma, 8 * (9 + pad)).at(0) + nanosm::issue_to_dispatch(dense);
+                : issued_at(mma, 8 * (10 + pad)).at(0) + nanosm::issue_to_dispatch(dense);
             const bool in_flight = stores.size() < 16 || stores.back().cycle + depth > accept;
             require(panic.has_value() == in_flight, what + ": accepted at c" + std::to_string(accept) +
                 (panic.has_value() ? " with every store round at the RAM, yet: " + *panic
@@ -1729,13 +1727,12 @@ void test_i21_acc_ld_read_ownership() {
     profile.timing.fadd = 16;
     const auto program = [](uint32_t gap) {
         std::string body = R"(
-            .acc C, 0, 64, 64
             sread r0, LANE_ID
             umov ur8, 0
             umov ur9, 0
             umov ur1, 0
             umov ur2, 1024
-        )";
+        )"; // ur8: the acc.ld's tmem pointer, ur9 the matmul's (both 0)
         body += "mov r23, 77\n"; // nonzero: the acc.ld's write of the old (zero) tmem value shows
         for (uint32_t i = 0; i < 6; ++i) body += "setp.eq.u32 p" + std::to_string(5 + i % 2) + ", r0, 0\n";
         body += R"(
@@ -1746,7 +1743,7 @@ void test_i21_acc_ld_read_ownership() {
             setp.eq.u32 p5, r0, 0
             setp.eq.u32 p6, r0, 0
             setp.eq.u32 p5, r0, 0
-            acc.ld.v8 r16, C, ur8 {pred=PT, stall=0, set=sb0, wait=-}
+            acc.ld.v8 r16, [ur8, 64] {pred=PT, stall=0, set=sb0, wait=-}
         )";
         // One filler per cycle: they rotate over six predicates (I6a: a setp
         // waits until the previous write of its predicate is in the file,
@@ -1754,7 +1751,7 @@ void test_i21_acc_ld_read_ownership() {
         // would issue in pairs five cycles apart).
         for (uint32_t i = 0; i < gap; ++i) body += "setp.eq.u32 p" + std::to_string(1 + i % 6) + ", r0, 0\n";
         body += R"(
-            mma.async.init.m64n64k8 C, [ur1], [ur2] {pred=PT, stall=0, set=sb1, wait=-}
+            mma.async.init.m64n64k8 [ur9], [ur1], [ur2] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )";
         return body;
@@ -2082,10 +2079,10 @@ void test_i4_missing_fence_panics() {
         for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
         write_count_mbar(shmem, 896, 1);
         return std::make_unique<nanosm::Machine>(dense, compile(std::string(R"(
-            .acc C, 0, 32, 64
             umov ur0, 0
             umov ur1, 1024
             umov ur4, 896
+            umov ur2, 0
             sread r20, LANE_ID
             shli r20, r20, 2
             mov r21, 16384
@@ -2093,20 +2090,19 @@ void test_i4_missing_fence_panics() {
             or r21, r21, r22
             sts [r20], r21
         )") + (fence ? "fence.sh\n" : "") + R"(
-            mma.async.init.m32n64k8 C, [ur0], [ur1]
+            mma.async.init.m32n64k8 [ur2], [ur0], [ur1]
             mma.commit [ur4]
         wait:
             mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait
             umov ur8, 0
-            umov ur9, 0
-            acc.ld r10, C, ur8
+            acc.ld r10, [ur8, 64]
             halt
         )", dense), std::move(launch));
     };
     message = i4_panic(*mma_machine(false), "sts -> mma.async");
     require_mentions(message, {"reason=missing fence.sh: mma.async #1 A operand bytes [0, 64) overlap this warp's earlier "
-        "sts [r20], r21", "inst='mma.async.init.m32n64k8 ACC0, [ur0], [ur1]"}, "sts -> mma.async");
+        "sts [r20], r21", "inst='mma.async.init.m32n64k8 [ur2], [ur0], [ur1]"}, "sts -> mma.async");
     auto mma = mma_machine(true);
     mma->run(10000);
     require(nanosm::bits_float(mma->read_reg(0, 0, 10)) == 16.0f, "the fenced MMA did not read the stored 2.0 halves");
@@ -2237,26 +2233,25 @@ void test_i4_read_read_overlap_is_clean() {
     for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
     write_count_mbar(shmem, 896, 1);
     nanosm::Machine mma(dense, compile(R"(
-        .acc C, 0, 32, 64
         umov ur0, 0
         umov ur1, 1024
         umov ur4, 896
+        umov ur2, 0
         sread r20, LANE_ID
         shli r20, r20, 2
         lds r21, [r20]
-        mma.async.init.m32n64k8 C, [ur0], [ur1]
+        mma.async.init.m32n64k8 [ur2], [ur0], [ur1]
         mma.commit [ur4]
     wait:
         mbar.try_wait p0, [ur4], 0
         @!p0 bra.uni wait
         umov ur8, 0
-        umov ur9, 0
-        acc.ld r10, C, ur8
+        acc.ld r10, [ur8, 64]
         halt
     )", dense), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
     mma.run(10000);
     const auto reads = i2_grants(mma, "A-read");
-    const auto accept = issued_at(mma, 6 * 8);
+    const auto accept = issued_at(mma, 7 * 8);
     require(reads.size() >= 16 && accept.size() == 1 && reads[15].cycle + dense.shmem_port_a_depth > accept.front(),
         "the lds was not still in flight when the MMA was accepted:" + describe(reads));
     require(nanosm::bits_float(mma.read_reg(0, 0, 10)) == 8.0f && mma.read_reg(0, 3, 21) == 0x3c003c00u,

@@ -222,6 +222,13 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(nanosm_python_fa PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
     add_test(
+        NAME nanosm_python_fa32
+        COMMAND ${CMAKE_COMMAND} -E env
+            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
+            ${Python3_EXECUTABLE} -B -m nanosm kernels/fa32.launch.py
+    )
+    set_tests_properties(nanosm_python_fa32 PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
+    add_test(
         NAME nanosm_python_vadd
         COMMAND ${CMAKE_COMMAND} -E env
             "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"

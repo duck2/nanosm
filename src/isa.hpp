@@ -214,19 +214,13 @@ struct Instruction {
     std::string text;
 };
 
+// A kernel is its words and the profile they were built for. Nothing rides
+// beside the words: an accumulator is a tmem pointer in a uniform register
+// (src/layout.hpp; the accumulator table of a5d0652 is gone).
 struct Kernel {
-    // A declared accumulator region: rows x cols FP32 words from base_word, a
-    // word address in the one tmem (word w is in fine bank w % fine_banks).
-    struct Accumulator {
-        std::string name;
-        uint32_t base_word = 0;
-        uint16_t rows = 0;
-        uint16_t cols = 0;
-    };
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
     uint16_t register_count = 0;
-    std::vector<Accumulator> accumulators;
     std::vector<uint64_t> words;
 };
 
@@ -254,10 +248,14 @@ namespace encoding {
 // barrier[8] (urM), descriptor[14] (its shared address in 64-byte units,
 // unsigned: 1 MiB of reach). Instruction: src0 urS, src1 urC, src2 urM, imm
 // the descriptor's byte address.
-// mma.async payload: accumulator[8], A[8] (urA), B[8] (urB), A's row
-// spacing[7], B's row spacing[7] (16-byte units). Instruction: dst the
-// accumulator, src0 urA, src1 urB, imm the two spacing fields as encoded
-// (mma_row_spacing below reads them).
+// mma.async payload: C[8] (urC, the result's tmem pointer), A[8] (urA),
+// B[8] (urB), A's row spacing[7], B's row spacing[7] (16-byte units).
+// Instruction: src2 urC, src0 urA, src1 urB, imm the two spacing fields as
+// encoded (mma_row_spacing below reads them).
+// acc.ld / acc.ld.v8 rD, [urT, S]: the RRI payload, dst rD, src0 urT, simm
+// the region's words per row S. acc.st / acc.st.v8 [urT, S], rS: the store
+// payload, base urT, value rS, simm S (src/layout.hpp: a power of two, 4 or
+// more, at most tmem's words).
 // stall is 5 bits so a slow FPGA-priced SFU (20+ cycles) can still be a stall count.
 inline constexpr unsigned opcode_shift = 56;
 inline constexpr unsigned predicate_shift = 52;
@@ -420,14 +418,14 @@ inline bool uses_urf_pipeline(Opcode opcode) {
     return writes_uniform_register(opcode) || is_usetp(opcode);
 }
 
-// The uniform registers an instruction reads, all in its one read round at
-// issue + 1 (src/rf.hpp), in operand order (a register named twice is listed
-// twice; the round reads it once). At most two: the URF has two read ports.
-// acc.ld / acc.st read a coordinate pair (row in urC, column in urC + 1).
-// The exception is a tma: N + 2 registers read over several rounds, two per
-// round, listed in read order (urS, urM, then urC .. urC + N - 1; see
-// tma_operand_round in src/rf.hpp). It reads by operand position: a register
-// named twice is read twice.
+// The uniform registers an instruction reads, in operand order (a register
+// named twice is listed twice). Most read at most two, all in one read round
+// at issue + 1 (src/rf.hpp; the round reads a repeated register once): the
+// URF has two read ports. acc.ld / acc.st read their tmem pointer. Two read
+// more over several rounds, two per round, listed in read order and read by
+// operand position (a register named twice is read twice;
+// uniform_read_rounds in src/rf.hpp): a tma, N + 2 registers (urS, urM, then
+// urC .. urC + N - 1), and an mma.async, three (urA, urB, then urC).
 std::vector<uint8_t> uniform_sources(const Instruction& instruction);
 // The uniform register an instruction writes, if any.
 std::optional<uint8_t> uniform_destination(const Instruction& instruction);

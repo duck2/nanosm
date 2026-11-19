@@ -250,11 +250,11 @@ void test_branch_boundary_drains_async_work() {
 void test_wait_on_matmul_operands() {
     const auto& profile = canonical_profile();
     const std::string source = R"(
-        .acc C, 0, 64, 64
         umov ur0, 0
         umov ur1, 1024
         umov ur4, 8192
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        umov ur2, 0
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
         mma.commit [ur4]
         wait
         sread r20, LANE_ID
@@ -264,8 +264,8 @@ void test_wait_on_matmul_operands() {
         halt
     )";
     const auto program = nanosm::compile_qtx(source, profile);
-    const auto& matmul = program.instructions.at(3);
-    const auto& wait = program.instructions.at(5);
+    const auto& matmul = program.instructions.at(4);
+    const auto& wait = program.instructions.at(6);
     require(wait.opcode == nanosm::Opcode::nop && wait.text == "nop", "wait was not emitted as a nop");
     require(matmul.control.set_depbar < 6 && wait.control.wait_mask == 1u << matmul.control.set_depbar,
         "wait does not wait for the matmul's depbar");

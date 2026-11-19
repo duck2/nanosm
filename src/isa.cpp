@@ -65,12 +65,12 @@ uint64_t encode(const Instruction& inst) {
         (static_cast<uint64_t>(inst.control.wait_mask) << encoding::wait_mask_shift);
     const auto immediate = static_cast<uint32_t>(inst.imm) & encoding::immediate_mask;
     if (is_mma_async(inst.opcode)) {
-        // ACC id, A and B base registers, A's and B's row spacings (the
-        // block's opcodes share one form).
+        // urC (the result's tmem pointer), A and B base registers, A's and
+        // B's row spacings (the block's opcodes share one form).
         if (inst.imm < 0 || inst.imm >= (1 << (2 * mma_spacing_field_bits))) {
             throw SimError("mma.async row spacings do not fit their two 7-bit fields: " + format_instruction(inst));
         }
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src2) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
         word |= static_cast<uint64_t>(inst.imm);
@@ -129,6 +129,8 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::ldg_v8:
     case Opcode::ldg_uni:
     case Opcode::lds_uni:
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -179,20 +181,14 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src2) << encoding::reg2_shift;
         word |= static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit;
         break;
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        break;
     case Opcode::mma_commit:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         break;
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::stg_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
         word |= immediate;
@@ -291,7 +287,7 @@ Instruction decode(uint64_t word) {
         immediate |= ~static_cast<uint32_t>(encoding::immediate_mask);
     }
     if (is_mma_async(inst.opcode)) {
-        inst.dst = reg0;
+        inst.src2 = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
         inst.imm = static_cast<int32_t>(word & ((1u << (2 * mma_spacing_field_bits)) - 1));
@@ -350,6 +346,8 @@ Instruction decode(uint64_t word) {
     case Opcode::ldg_v8:
     case Opcode::ldg_uni:
     case Opcode::lds_uni:
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:
     case Opcode::setpi_lt:
@@ -400,20 +398,14 @@ Instruction decode(uint64_t word) {
         inst.src2 = reg2;
         inst.imm = static_cast<int32_t>((word & encoding::tma_descriptor_field_mask) * encoding::tma_descriptor_field_unit);
         break;
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        break;
     case Opcode::mma_commit:
         inst.src0 = reg0;
         break;
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::stg_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8:
         inst.src0 = reg0;
         inst.src1 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
@@ -495,7 +487,7 @@ Instruction decode(uint64_t word) {
 }
 
 std::vector<uint8_t> uniform_sources(const Instruction& inst) {
-    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1};
+    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1, inst.src2};
     if (is_tma_opcode(inst.opcode)) {
         std::vector<uint8_t> result{inst.src0, inst.src2};
         for (uint32_t i = 0; i < tma_coordinate_count(inst.opcode); ++i) {
@@ -529,7 +521,11 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::mbar_arrive_expect_tx_i:
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_try_wait_i:
-    case Opcode::mma_commit: return {inst.src0};
+    case Opcode::mma_commit:
+    case Opcode::acc_ld:
+    case Opcode::acc_ld_v8:
+    case Opcode::acc_st:
+    case Opcode::acc_st_v8: return {inst.src0};
     case Opcode::uadd:
     case Opcode::usub:
     case Opcode::ushl:
@@ -555,10 +551,6 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::mbar_arrive_expect_tx_r:
     case Opcode::mbar_test_wait_r:
     case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8: return {inst.src1, static_cast<uint8_t>(inst.src1 + 1)};
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8: return {inst.src0, static_cast<uint8_t>(inst.src0 + 1)};
     default: return {};
     }
 }
@@ -765,7 +757,7 @@ std::string format_instruction(
             return "[" + ureg(base) +
                 (spacing == mma_default_spacing ? std::string() : ", " + std::to_string(spacing)) + "]";
         };
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << operand(inst.src0, true) << ", "
+        out << " [" << ureg(inst.src2) << "], " << operand(inst.src0, true) << ", "
             << operand(inst.src1, false);
         if (include_control) out << ' ' << format_control(inst.control);
         return out.str();
@@ -865,13 +857,11 @@ std::string format_instruction(
         break;
     case Opcode::acc_ld:
     case Opcode::acc_ld_v8:
-        out << ' ' << reg(inst.dst) << ", ACC" << static_cast<unsigned>(inst.src0)
-            << ", " << ureg(inst.src1);
+        out << ' ' << reg(inst.dst) << ", [" << ureg(inst.src0) << ", " << inst.imm << ']';
         break;
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
-        out << " ACC" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0)
-            << ", " << reg(inst.src1);
+        out << " [" << ureg(inst.src0) << ", " << inst.imm << "], " << reg(inst.src1);
         break;
     case Opcode::mma_commit:
         out << " [" << ureg(inst.src0) << ']';

@@ -52,8 +52,9 @@
 // later.
 //
 // Everything else (memory, engines, mbar operations) reads its operands the
-// same way and reaches its unit at DISPATCH, c0 + 1 + Lr, when its operands
-// exist.
+// same way and reaches its unit at DISPATCH, when its operands exist:
+// c0 + 1 + Lr, unless the profile's URF is as slow as its RF (then one later:
+// issue_to_dispatch).
 //
 // The front end (trash/front-end-2026-10-18.md; two-word packets since
 // trash/front-end-packets-2026-10-18.md): every warp issues from its
@@ -89,9 +90,10 @@
 //     ports always suffice) are sampled in its one read round, at the issue
 //     register's cycle c0 + 1, beside its vector registers; their values are
 //     at the URF output Lu later (no later than the vector operands: Lu <=
-//     Lr, validated). The one exception is a tma (trash/rfc17.md section 4):
-//     it reads N + 2 registers over R rounds, two per round (below), and
-//     holds the two ports for its later rounds.
+//     Lr, validated). The exceptions are a tma (trash/rfc17.md section 4),
+//     which reads N + 2 registers over R rounds, two per round, and an
+//     mma.async, which reads three over two rounds (uniform_read_rounds
+//     below); each holds the two ports for its later rounds.
 //   - Writes: the only writers are uniform arithmetic (the SM's one uniform
 //     ALU, Eu = urf.alu_latency_cycles) and r2ur (lane 0 of a vector
 //     register). Each presents its result at the URF write port at the SAME
@@ -108,8 +110,8 @@
 //     presents at c3, lands at c4, is visible from c5; a dependent uniform
 //     reader (sampling at its issue + 1) issues from c4, four cycles later.
 //   - Reuse of a uniform register while it is still being read cannot
-//     happen: every read is at issue + 1 except a tma's later rounds, the
-//     last at issue + R <= issue + 3; a write issued after the tma (at issue
+//     happen: every read is at issue + 1 except a tma's and an mma.async's
+//     later rounds, the last at issue + R <= issue + 3; a write issued after the tma (at issue
 //     + 1 at the earliest) lands at issue + 1 + L + Wu >= issue + 5 (L >= 3,
 //     Wu >= 1, validated), after the tma's last read. So a tma followed at
 //     once by a rewrite of its operand registers is correct (no rule for
@@ -179,9 +181,22 @@ inline uint32_t issue_to_operands(const DeviceProfile& profile) {
     return issue_to_sample + profile.rf_read_latency_cycles;
 }
 
-// Accepted issue -> a memory / engine instruction reaches its unit.
+// The most uniform read rounds an instruction that travels the dispatch
+// pipeline takes: the mma.async's two (uniform_read_rounds below; its third
+// register, urC, is sampled at issue + 2). The tma's later rounds feed its own
+// holding register, not the dispatch pipeline.
+inline constexpr uint32_t dispatch_uniform_rounds = 2;
+
+// Accepted issue -> a memory / engine instruction reaches its unit, with
+// every operand: its vector operands at the RF output (issue + 1 + Lr), its
+// uniform operands at the URF output (round r's at issue + 1 + r + Lu). The
+// dispatch pipeline is one fixed depth for every instruction (it keeps issue
+// order), so it covers the matmul's second round: 1 + max(Lr, Lu + 1).
+// Canonical (Lr 2, Lu 1): issue + 3, whatever the round; only a profile
+// with Lu = Lr dispatches one cycle later than its vector operands arrive.
 inline uint32_t issue_to_dispatch(const DeviceProfile& profile) {
-    return issue_to_operands(profile);
+    return issue_to_sample + std::max(profile.rf_read_latency_cycles,
+        profile.urf_read_latency_cycles + dispatch_uniform_rounds - 1);
 }
 
 // Accepted issue -> a fixed result's presentation at the RF write port (or
@@ -297,9 +312,15 @@ inline std::vector<uint8_t> tma_operand_round(const Instruction& inst, uint32_t 
     return registers;
 }
 
+// Accepted issue -> the sample of uniform read round `round` (round 0 is the
+// issue register's cycle, like every read).
+inline constexpr uint32_t issue_to_uniform_round_sample(uint32_t round) {
+    return issue_to_urf_sample + round;
+}
+
 // Accepted issue -> the sample of round `round` of a tma.
 inline constexpr uint32_t issue_to_tma_round_sample(uint32_t round) {
-    return issue_to_urf_sample + round;
+    return issue_to_uniform_round_sample(round);
 }
 
 // Accepted issue -> the cycle a tma's last words reach the holding register
@@ -307,6 +328,38 @@ inline constexpr uint32_t issue_to_tma_round_sample(uint32_t round) {
 // next cycle): canonical T + 3 for N = 1, 2 and T + 4 for N = 3, 4.
 inline uint32_t issue_to_tma_command(uint32_t coordinates, const DeviceProfile& profile) {
     return issue_to_tma_round_sample(tma_operand_rounds(coordinates) - 1) + profile.urf_read_latency_cycles;
+}
+
+// Every instruction's uniform reads as rounds of at most two registers (the
+// URF's read ports), round r sampled at issue + 1 + r. One round for every
+// instruction that reads at most two (each distinct register once,
+// rf_read_round below), none for one that reads none. Two instructions read
+// more, by operand position (a register named twice is read twice), with the
+// TMA's round counter (trash/rfc17.md section 4; src/sim.hpp UrfReadRounds):
+//   tma.Nd     urS, urM | c0, c1 | c2, c3     (tma_operand_round)
+//   mma.async  urA, urB | urC                 (2026-11-19: urC, the
+//              result's tmem pointer, joins its dispatch entry from the URF
+//              output at issue + 2 + Lu, by its dispatch: issue_to_dispatch)
+// While an instruction still has rounds to start, issue refuses every
+// instruction that reads a uniform register (its sample would meet a later
+// round); uniform writers that read nothing and vector-only instructions are
+// never refused. qtxc does not model the rounds: every operand register's
+// writer is kept the usual distance from the instruction's issue, so all
+// are visible by its first round.
+inline std::vector<uint8_t> rf_read_round(const std::vector<uint8_t>& sources);
+
+inline std::vector<std::vector<uint8_t>> uniform_read_rounds(const Instruction& inst) {
+    if (is_tma_opcode(inst.opcode)) {
+        std::vector<std::vector<uint8_t>> rounds;
+        for (uint32_t round = 0; round < tma_operand_rounds(tma_coordinate_count(inst.opcode)); ++round) {
+            rounds.push_back(tma_operand_round(inst, round));
+        }
+        return rounds;
+    }
+    if (is_mma_async(inst.opcode)) return {{inst.src0, inst.src1}, {inst.src2}};
+    const auto round = rf_read_round(uniform_sources(inst));
+    if (round.empty()) return {};
+    return {round};
 }
 
 // The registers an instruction reads in its one round, from the source

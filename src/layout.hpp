@@ -98,4 +98,52 @@ inline uint32_t swizzle64_address(uint32_t base, uint32_t spacing, uint32_t row,
     return swizzle64_shuffle(base + row * spacing + byte, spacing);
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core memory (tmem), v0.1 of 2026-11-19 (trash/acc-pointer-2026-11-19.md).
+// An accumulator is no declared object: an instruction names a POINTER (a
+// word address, held in a uniform register) and the words per row S of the
+// region it treats as rows (an instruction constant; the matmul's result
+// rows are its shape's n words). Word (row r, column c) of the region at
+// pointer P has the LOGICAL address L = P + r x S + c. Where L is stored
+// depends on L and S only (keyed by the address, as swizzle64 is): with the
+// absolute row R = L / S and column C = L % S,
+//
+//   physical = ((R / 4) x (S / 4) + C / 4) x 16 + 4 x (R % 4) + ((C % 4) XOR ((R / 4) % 4))
+//
+// i.e. the region is cut into 4x4 macro tiles of 16 words, stored row-major
+// by macro tile (S / 4 of them per four rows), and inside a macro tile word
+// (R % 4, C % 4) sits at 4 x (R % 4) + (C % 4 XOR the band number R / 4 mod
+// 4). Word w is in fine bank w % 16 (tmem.fine_banks is 16): one word per
+// fine bank for
+//   - any 4x4 macro tile (the tensor core's result block, and its C read):
+//     R % 4 picks the bank's high bits, the XOR permutes the low ones;
+//   - any 16 consecutive rows of one column (an acc.ld / acc.st beat, one
+//     row per lane), wherever they start: each R % 4 occurs four times, in
+//     four consecutive bands, whose XOR values differ.
+// With S a power of two the rule is wiring: L's bits are [band | R % 4 |
+// C / 4 | C % 4]; physical swaps the middle two fields to [band | C / 4 | R %
+// 4] and XORs C % 4 with the band's low two bits. No word leaves its band of
+// four rows (4 x S words). A region at a pointer that is a multiple of 16 x S
+// is laid out as the per-accumulator rule of a5d0652 laid out an accumulator
+// at that base.
+inline bool valid_tmem_row_words(uint32_t row_words) {
+    return row_words >= 4 && (row_words & (row_words - 1)) == 0;
+}
+
+inline uint64_t tmem_physical_word(uint64_t logical, uint32_t row_words) {
+    const uint64_t row = logical / row_words;
+    const uint64_t column = logical % row_words;
+    return ((row / 4) * (row_words / 4) + column / 4) * 16 + 4 * (row % 4) + ((column % 4) ^ ((row / 4) % 4));
+}
+
+// The pointer rule (the sanitizer's; the machine addresses any pointer by the
+// rule above): a pointer's row (pointer / S) is a multiple of 4, so a matmul's
+// result blocks are whole macro tiles and a transfer's sixteen rows are four
+// whole bands; and the columns an instruction touches stay inside the
+// pointer's row (pointer % S + columns <= S: a matmul's pointer is at column
+// 0, its rows being S = n words).
+inline bool tmem_pointer_aligned(uint32_t pointer, uint32_t row_words, uint32_t columns) {
+    return (pointer / row_words) % 4 == 0 && pointer % row_words + columns <= row_words;
+}
+
 } // namespace nanosm

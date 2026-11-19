@@ -1,5 +1,5 @@
 // The hex kernel text (src/qtxc/): emit_hex writes a Kernel as a .profile /
-// .registers / .acc header and one 64-bit word per line; load_hex reads it
+// .registers header and one 64-bit word per line; load_hex reads it
 // back and runs validate_kernel (checks.cpp). The encoding of a word is
 // src/isa.cpp's; this is only the text around the words.
 
@@ -15,9 +15,6 @@ std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shap
     out << ".profile " << kernel.profile_name << ", 0x"
         << format_profile_fingerprint(kernel.profile_fingerprint) << '\n';
     out << ".registers " << kernel.register_count << '\n';
-    for (const auto& acc : kernel.accumulators) {
-        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
-    }
     for (const auto word : kernel.words) {
         out << std::hex << std::setw(16) << std::setfill('0') << word
             << " ; " << format_instruction(decode(word), true, mma_shapes) << '\n';
@@ -71,24 +68,9 @@ Kernel load_hex(std::string_view source) {
             continue;
         }
         if (clean.starts_with(".acc")) {
-            const auto args = operands(trim(clean.substr(4)));
-            expect_count(args, 4, line);
-            Kernel::Accumulator acc;
-            acc.name = args[0];
-            try {
-                const auto base = std::stoul(args[1], nullptr, 0);
-                const auto rows = std::stoul(args[2], nullptr, 0);
-                const auto cols = std::stoul(args[3], nullptr, 0);
-                if (rows == 0 || rows > 65535 || cols == 0 || cols > 65535 ||
-                    kernel.accumulators.size() >= 256) throw std::invalid_argument("range");
-                acc.base_word = static_cast<uint32_t>(base);
-                acc.rows = static_cast<uint16_t>(rows);
-                acc.cols = static_cast<uint16_t>(cols);
-            } catch (const std::exception&) {
-                throw SimError("line " + std::to_string(line) + ": bad accumulator metadata");
-            }
-            kernel.accumulators.push_back(std::move(acc));
-            continue;
+            throw SimError("line " + std::to_string(line) +
+                ": a hex kernel has no .acc header since 2026-11-19 (an accumulator is a tmem pointer in a "
+                "uniform register); rebuild it");
         }
         std::size_t consumed = 0;
         try {

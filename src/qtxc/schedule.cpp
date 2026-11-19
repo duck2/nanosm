@@ -130,13 +130,14 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     std::array<std::optional<uint8_t>, 256> pending_register{};
     std::array<uint8_t, 256> pending_async_read_mask{};
     // tmem order between one warp's transfers (trash/rfc11.md section 0: the
-    // acc.ld and acc.st engines run side by side, nothing orders them): per
-    // accumulator, the depbars of its acc.st and acc.ld still in flight. A
-    // transfer after an acc.st of the same accumulator waits for it (RAW,
-    // WAW); an acc.st after an acc.ld waits for that (WAR). Whole-accumulator
-    // granularity: the coordinates are registers.
-    std::array<uint8_t, 256> acc_store_mask{};
-    std::array<uint8_t, 256> acc_load_mask{};
+    // acc.ld and acc.st engines run side by side, nothing orders them): the
+    // depbars of the warp's acc.st and acc.ld still in flight. A transfer
+    // after an acc.st waits for it (RAW, WAW); an acc.st after an acc.ld
+    // waits for that (WAR). One class for all of tmem: the region is a
+    // pointer in a uniform register, so two transfers' words cannot be told
+    // apart here (trash/acc-pointer-2026-11-19.md).
+    uint8_t acc_store_mask = 0;
+    uint8_t acc_load_mask = 0;
     std::optional<uint8_t> store_barrier;
     std::optional<uint8_t> mma_barrier;
 
@@ -202,9 +203,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
             inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
             const bool load = inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8;
-            const auto accumulator = load ? inst.src0 : inst.dst;
-            wait_mask |= acc_store_mask[accumulator];
-            if (!load) wait_mask |= acc_load_mask[accumulator];
+            wait_mask |= acc_store_mask;
+            if (!load) wait_mask |= acc_load_mask;
         }
         if (inst.opcode == Opcode::mbar_arrive && store_barrier.has_value()) {
             // Pinned worker publication sequence: an ordinary arrival following
@@ -227,8 +227,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 if (pending.has_value() && (wait_mask & (1u << *pending)) != 0) pending.reset();
             }
             for (auto& mask : pending_async_read_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            for (auto& mask : acc_store_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            for (auto& mask : acc_load_mask) mask &= static_cast<uint8_t>(~wait_mask);
+            acc_store_mask &= static_cast<uint8_t>(~wait_mask);
+            acc_load_mask &= static_cast<uint8_t>(~wait_mask);
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if ((wait_mask & (1u << bar)) != 0) live[bar] = false;
             }
@@ -240,7 +240,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
 
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
+        check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
+        check_tmem_operand(inst, profile, "line " + std::to_string(inst.line));
         const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (previous == nullptr) {
@@ -275,11 +276,11 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::acc_ld_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
-            acc_load_mask[inst.src0] |= static_cast<uint8_t>(1u << bar);
+            acc_load_mask |= static_cast<uint8_t>(1u << bar);
         } else if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
             if (!store_barrier.has_value()) store_barrier = allocate();
             inst.control.set_depbar = *store_barrier;
-            acc_store_mask[inst.dst] |= static_cast<uint8_t>(1u << *store_barrier);
+            acc_store_mask |= static_cast<uint8_t>(1u << *store_barrier);
             const auto width = inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j)
                 pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
@@ -306,8 +307,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             live.fill(false);
             pending_register.fill(std::nullopt);
             pending_async_read_mask.fill(0);
-            acc_store_mask.fill(0);
-            acc_load_mask.fill(0);
+            acc_store_mask = 0;
+            acc_load_mask = 0;
             store_barrier.reset();
             mma_barrier.reset();
             timeline.reset();

@@ -226,7 +226,7 @@ void test_tma_swizzle64_feeds_mma_orientations() {
         const std::string chunk1_b = pv
             ? "umov ur8, 0\numov ur9, 8\ntma.load.2d [ur14], [64, ur8], [ur15]\n"
             : "tma.load.2d [ur14], [64, ur8], [ur15]\n";
-        const auto kernel = compile(".acc C, 0, 64, 64\n" + tma_operands_asm(1, 1024, 2, 512, 8, {0, 0}) +
+        const auto kernel = compile("umov ur20, 0\n" + tma_operands_asm(1, 1024, 2, 512, 8, {0, 0}) +
             tma_operands_asm(3, 2048, 5, 520, 8, {}) + tma_operands_asm(6, 3072, 7, 528, 8, {}) +
             tma_operands_asm(14, 4096, 15, 536, 8, {}) + R"(
             tma.load.2d [ur1], [0, ur8], [ur2]
@@ -252,21 +252,19 @@ void test_tma_swizzle64_feeds_mma_orientations() {
             @!p0 bra.uni wait3
             umov ur10, 1024
             umov ur11, 2048
-            mma.async.init.m64n64k8 C, [ur10], [ur11]
+            mma.async.init.m64n64k8 [ur20], [ur10], [ur11]
             umov ur10, 3072
             umov ur11, 4096
-            mma.async.m64n64k8 C, [ur10], [ur11]
+            mma.async.m64n64k8 [ur20], [ur10], [ur11]
             umov ur4, 544
             mma.commit [ur4]
         wait_commit:
             mbar.try_wait p0, [ur4], 0
             @!p0 bra.uni wait_commit
             umov ur8, 0
-            umov ur9, 0
-            acc.ld.v8 r20, C, ur8
-            umov ur12, 48
-            umov ur13, 56
-            acc.ld.v8 r28, C, ur12
+            acc.ld.v8 r20, [ur8, 64]
+            umov ur12, 3128            ; row 48, column 56
+            acc.ld.v8 r28, [ur12, 64]
             halt
         )");
         nanosm::Machine machine(canonical_profile(), kernel, std::move(launch), {.timeline = true});
@@ -895,13 +893,14 @@ void test_swizzle64_mma_reads_a_tma_tile() {
     }
     write_u64(shmem, 128, nanosm::encode_mbar_state({false, true, 1, 0, 16384}));
     write_u64(shmem, 136, nanosm::encode_mbar_state({false, true, 1, 1, 0}));
-    std::string source = ".acc C, 0, 64, 64\n.acc H, 4096, 32, 64\n.acc G, 6144, 32, 64\n" +
+    // Three results in tmem: C (64x64) at 0, H and G (32x64) at 4096 and 6144.
+    std::string source = "umov ur20, 0\numov ur21, 4096\numov ur22, 6144\n" +
         tma_operands_asm(1, a_tile, 2, 128, 8, {0, 0}) + "umov ur3, " + std::to_string(b_tile) + "\n" +
         "tma.load.2d [ur1], [0, ur8], [ur2]\ntma.load.2d [ur3], [64, ur8], [ur2]\n"
         "loaded:\nmbar.try_wait p0, [ur2], 0\n@!p0 bra.uni loaded\n";
     for (const auto& [accumulator, shape, a_start] :
-         {std::tuple{"C", "m64n64k8", a_tile}, std::tuple{"H", "m32n64k8", a_tile + 32 * 128},
-          std::tuple{"G", "m32n64k8", a_tile + 21 * 128}}) {
+         {std::tuple{"[ur20]", "m64n64k8", a_tile}, std::tuple{"[ur21]", "m32n64k8", a_tile + 32 * 128},
+          std::tuple{"[ur22]", "m32n64k8", a_tile + 21 * 128}}) {
         source += "umov ur10, " + std::to_string(a_start) + "\numov ur11, " + std::to_string(b_tile) + "\n";
         for (uint32_t piece = 0; piece < 8; ++piece) {
             if (piece != 0) source += "uaddi ur10, ur10, 16\nuaddi ur11, ur11, 16\n";
@@ -910,8 +909,9 @@ void test_swizzle64_mma_reads_a_tma_tile() {
         }
     }
     source += "umov ur4, 136\nmma.commit [ur4]\ncommitted:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni committed\n"
-        "acc.ld.v8 r20, C, ur8\numov ur12, 48\numov ur13, 56\nacc.ld.v8 r28, C, ur12\n"
-        "umov ur14, 16\numov ur15, 8\nacc.ld.v8 r36, H, ur14\nacc.ld.v8 r44, G, ur14\nhalt\n";
+        // C row 0 / row 48 column 56; H and G row 16 column 8 (4096 + 1024 + 8, 6144 + 1024 + 8).
+        "acc.ld.v8 r20, [ur20, 64]\numov ur12, 3128\nacc.ld.v8 r28, [ur12, 64]\n"
+        "umov ur14, 5128\numov ur15, 7176\nacc.ld.v8 r36, [ur14, 64]\nacc.ld.v8 r44, [ur15, 64]\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch), {.timeline = true});
     machine.run(100000);
     const auto expected = [](uint32_t m, uint32_t n) {
@@ -971,7 +971,7 @@ void test_swizzle64_base_rule_panics() {
         launch.active_warps = 1;
         image_bytes(launch.shmem_image, 8192);
         nanosm::Machine machine(canonical_profile(), compile(
-            ".acc C, 0, 64, 64\numov ur0, 1040\numov ur1, 4096\nmma.async.init.m64n64k8 C, [ur0], [ur1]\nhalt\n"),
+            "umov ur0, 1040\numov ur1, 4096\numov ur2, 0\nmma.async.init.m64n64k8 [ur2], [ur0], [ur1]\nhalt\n"),
             std::move(launch));
         expect_sim_panic(machine, "mma operand A at 1040 reads 16 bytes per row at row spacing 16",
             "an operand of 16-byte rows at 1040");

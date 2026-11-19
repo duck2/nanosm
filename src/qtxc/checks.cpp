@@ -1,5 +1,6 @@
 // The rules an instruction must pass whoever wrote it (src/qtxc/): the
-// one-round RF read rule and the mma.async shape rule, applied per source
+// one-round RF read rule, the mma.async shape rule and the acc.ld / acc.st
+// words-per-row rule, applied per source
 // line by qtxc and the assembler and per pc at kernel load, and the other
 // kernel-load checks (validate_kernel, check_uniform_registers). It does not
 // parse or schedule. The refusals that depend on what a profile supports
@@ -22,26 +23,34 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
     }
 }
 
-// An mma.async names a shape the profile lists, and its accumulator is that
-// shape's rows x columns: a property of the instruction, so refused at
-// assembly and at kernel load (both builds). `where` is "line N" or "pc N".
-void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumulator>& accumulators,
-    const DeviceProfile& profile, const std::string& where) {
+// An acc.ld / acc.st names the words per row of its region: a power of two,
+// 4 or more, and at most tmem's words (src/layout.hpp). A property of the
+// instruction, refused at assembly and at kernel load. Where its pointer
+// points is a runtime value: the machine's and the sanitizer's business.
+void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if (inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
+        inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8) {
+        return;
+    }
+    const uint64_t tmem_words = uint64_t{profile.tmem_fine_banks} * profile.tmem_words_per_fine_bank;
+    if (inst.imm <= 0 || !valid_tmem_row_words(static_cast<uint32_t>(inst.imm)) ||
+        static_cast<uint64_t>(inst.imm) > tmem_words) {
+        throw SimError(where + ": " + opcode_name(inst.opcode) + ": words per row " + std::to_string(inst.imm) +
+            " must be a power of two, 4 or more and at most tmem's " + std::to_string(tmem_words) + " words");
+    }
+}
+
+// An mma.async names a shape the profile lists: a property of the
+// instruction, so refused at assembly and at kernel load (both builds). Its
+// result is a tmem pointer whose rows are the shape's n words; where it
+// points is a runtime value. `where` is "line N" or "pc N".
+void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (!is_mma_async(inst.opcode)) return;
     const auto shape = mma_shape_of(profile, inst.opcode);
     const auto name = opcode_name(inst.opcode, &profile.mma_shapes);
     if (!shape.has_value()) {
         throw SimError(where + ": " + name + ": this device profile defines no mma shape for it (its list has " +
             std::to_string(profile.mma_shapes.size()) + " shapes)");
-    }
-    if (inst.dst >= accumulators.size()) {
-        throw SimError(where + ": " + name + ": accumulator id out of range");
-    }
-    const auto& acc = accumulators[inst.dst];
-    if (acc.rows != shape->m || acc.cols != shape->n) {
-        throw SimError(where + ": " + name + " needs a " + std::to_string(shape->m) + "x" +
-            std::to_string(shape->n) + " accumulator; '" + acc.name + "' is " + std::to_string(acc.rows) + "x" +
-            std::to_string(acc.cols));
     }
     // The row spacings (src/isa.hpp). swizzle64: a spacing of the layout (a
     // power of two, 16 or more; the field reaches 1024) that holds the 16-byte
@@ -80,8 +89,10 @@ void validate_kernel(const Kernel& kernel) {
 
 void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_mma_shape(decode(kernel.words[index]), kernel.accumulators, profile,
-            "kernel pc " + std::to_string(8 * index));
+        const auto inst = decode(kernel.words[index]);
+        const auto where = "kernel pc " + std::to_string(8 * index);
+        check_mma_shape(inst, profile, where);
+        check_tmem_operand(inst, profile, where);
     }
 }
 

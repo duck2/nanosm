@@ -91,9 +91,11 @@ a `bra.uni` on it may issue `urf.issue_to_port_cycles` (3) later, so a loop can 
 register with no vector register at all. An instruction reads its uniform registers (at most two) in
 its one read round; they are not vector registers and do not count toward the bank rule. The
 uniform consumers take them as operands: `lds.uni`/`ldg.uni` bases, `atom.*.uni` address and
-operand, `acc.ld`/`acc.st` coordinates (row in `urC`, column in `urC + 1`), mbar addresses and
-values, MMA operand addresses and `mma.commit`'s mbar. The TMA's operands are uniform registers too
-(below). The `ldg.v8`/`stg.v8` base still comes from lane 0 of a vector register. `sread` reads only
+operand, `acc.ld`/`acc.st` tmem pointers, mbar addresses and values, MMA operand addresses and
+result pointer, and `mma.commit`'s mbar. Two instructions read more than the two read ports give
+one round: a TMA command (below) and `mma.async` (urA and urB at issue + 1, its result pointer urC at
+issue + 2); while either has a round left, an instruction that reads a uniform register waits a
+cycle. The TMA's operands are uniform registers too (below). The `ldg.v8`/`stg.v8` base still comes from lane 0 of a vector register. `sread` reads only
 the per-lane `LANE_ID` / `THREAD_ID`.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
@@ -144,16 +146,27 @@ Each MMA shape is its own instruction, `mma.async.mXnYkZ` and `mma.async.init.mX
 starts the accumulator at zero), and the shapes come from the profile: `mma.shapes` lists them
 (canonical: `m64n64k8`, `m32n64k8`), and shape i of the list is opcode `0x70 + 2i` (and `+ 1` for
 init) in the MMA opcode block 0x70..0x7f, so the list's order is part of the profile's fingerprint.
-A shape's m, n and k are powers of two and multiples of the core's; its accumulator has at least one row per lane
+A shape's m, n and k are powers of two and multiples of the core's; its result has at least one row per lane
 and fits in tmem; and a shape with k above the core's must revisit each accumulator block late
 enough to hide the accumulator latency: (m / core_m) x (n / core_n) >= port-A depth + read
 latency + MMA result latency + tmem port depth (14 on the canonical profile). A kernel using a
-shape the profile lacks, or an accumulator whose rows x columns differ from its MMA's shape, is
-refused by qtxc, the assembler and kernel load.
+shape the profile lacks is refused by qtxc, the assembler and kernel load.
+
+An accumulator is not a declared object (2026-11-19, trash/acc-pointer-2026-11-19.md): it is a
+pointer into tmem, a word address in a uniform register. `mma.async.m32n64k8 [urC], [urA, 128],
+[urB, 128]` writes (or adds to) m rows of n words at urC; `acc.ld.v8 rD, [urT, S]` reads, in lane
+l, row l of the region at urT whose rows are S words (eight columns into rD .. rD + 7), and
+`acc.st.v8 [urT, S], rS` writes it (`acc.ld` / `acc.st`: one column). S is an instruction constant,
+a power of two from 4. Word (row r, column c) of a region has the logical address L = pointer +
+r x S + c, and where it is stored depends on L and S only (`src/layout.hpp`, `tmem_physical_word`):
+4x4 macro tiles of 16 words, one word per fine bank, the column XORed with the row's band of four.
+So a 64-row view reads two 32-row results written by two matmuls, and code shared by two tiles
+differs only in its pointer. A pointer's row is a multiple of 4 and the columns it touches stay in
+its row (the sanitizer's PANIC); a word outside tmem is the machine's.
 
 An operand of `mma.async` is a uniform register holding the shared address of the 16-byte piece
 the operand starts at in its row 0, and a row spacing in bytes, an instruction constant:
-`mma.async.m64n64k8 C, [urA, 128], [urB, 128]` (the spacing is optional and defaults to 16, a
+`mma.async.m64n64k8 [urC], [urA, 128], [urB, 128]` (the spacing is optional and defaults to 16, a
 K = 8 tile of 16-byte rows). The spacings sit in the instruction's 14 spare bits, two 7-bit
 fields in 16-byte units (16 .. 2032 bytes; swizzle64 takes the powers of two among them, 16 ..
 1024). The tensor core reads A as m rows and B as n rows of k: its address generator walks the

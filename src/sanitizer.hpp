@@ -74,6 +74,19 @@ enum class AsyncReader : uint8_t { acc_st, stg_v8 };
 // RMW outstanding).
 enum class SimtShmemHolder : uint8_t { load_slot, store_slot, probe, rmw };
 
+// A tmem region an instruction touches (src/layout.hpp): `rows` x `columns`
+// of the region at `pointer` (a logical word) whose rows are row_words words,
+// and the physical words they are, sorted. Ownership and races are decided on
+// `words`; the rest is PANIC text. A matmul's is its m x n result (rows of
+// n words), a transfer's its sixteen rows x one or eight columns.
+struct TmemRegion {
+    uint32_t pointer = 0;
+    uint32_t row_words = 0;
+    uint32_t rows = 0;
+    uint32_t columns = 0;
+    std::vector<uint32_t> words;
+};
+
 #if NANOSM_SANITIZER
 
 class Sanitizer {
@@ -164,6 +177,13 @@ public:
     // descriptor is known.)
     void check_swizzle64_operand(const IssueSite& site, const std::string& operand, uint32_t pointer,
         uint32_t spacing, uint32_t row_bytes) const;
+    // A tmem pointer (src/layout.hpp tmem_pointer_aligned): its row (pointer
+    // / row_words) is a multiple of 4 and the `columns` it touches from it
+    // stay inside its row. The machine addresses any pointer by the layout
+    // rule and checks only that the words are in tmem; a pointer that breaks
+    // this is wrong, diagnosed here. `what` names the operand.
+    void check_tmem_pointer(const IssueSite& site, const std::string& what, uint32_t pointer,
+        uint32_t row_words, uint32_t columns) const;
 
     // ---- same-word stores (HUMAN 2026-10-12, backlog D12) ----
     // Two active lanes of one sts / stg naming one 4-byte word: UB, as on
@@ -253,24 +273,25 @@ public:
         uint64_t command, const TmaDescriptor& decoded, uint32_t shmem_address, bool load);
     void record_tma_data_complete(uint64_t command);
     // Panics on a conflict (first the missing-fence / race check of both
-    // operand spans, port-B reads), else records the A/B operand and
-    // accumulator owners.
+    // operand spans, port-B reads; then its result words against every
+    // transfer that owns one), else records the A/B operand owners and the
+    // result's tmem owner.
     void record_mma_accept(
-        const IssueSite& site, uint64_t command, uint8_t accumulator, uint8_t depbar,
+        const IssueSite& site, uint64_t command, const TmemRegion& result, uint8_t depbar,
         std::optional<std::pair<uint32_t, uint32_t>> a_span,
         std::optional<std::pair<uint32_t, uint32_t>> b_span);
     void record_mma_fetch_start(uint64_t command);
     void record_mma_operands_consumed(uint64_t command);
     void record_mma_retired(uint64_t command);
 
-    // ---- tmem ownership ----
-    void check_acc_transfer_vs_mma(const IssueSite& site, uint8_t accumulator) const;
-    void check_acc_transfer_overlap(
-        const IssueSite& site, uint8_t accumulator, bool load,
-        uint32_t row, uint32_t col, uint32_t width) const;
-    void record_acc_transfer_accept(
-        const IssueSite& site, bool load, uint8_t accumulator,
-        uint32_t row, uint32_t col, uint32_t width, uint8_t depbar);
+    // ---- tmem ownership, by the physical words touched ----
+    // A transfer whose words meet an accepted matmul's result (queued or
+    // running, until its last result retires).
+    void check_acc_transfer_vs_mma(const IssueSite& site, const TmemRegion& region) const;
+    // A transfer whose words meet a transfer of the other engine still in
+    // flight (a load over a store, or a store over a load or a store).
+    void check_acc_transfer_overlap(const IssueSite& site, const TmemRegion& region, bool load) const;
+    void record_acc_transfer_accept(const IssueSite& site, bool load, const TmemRegion& region, uint8_t depbar);
     // The transfer in the acc.ld (load) or acc.st engine made its final tmem access:
     // its tmem ownership ends now -- a store's at its final tmem write, a
     // load's at its final tmem READ (hardware truth: the values are in its
@@ -322,7 +343,7 @@ private:
     };
 
     enum class TmemOwnerKind : uint8_t {
-        mma,    // write-owner (read-modify-write) of the whole accumulator until its last result retires
+        mma,    // write-owner (read-modify-write) of its whole result until its last result retires
         acc_ld, // read-owner of its rows x columns until its final tmem read
         acc_st, // write-owner of its rows x columns until its final tmem write
     };
@@ -330,11 +351,7 @@ private:
     struct TmemOwner {
         TmemOwnerKind kind = TmemOwnerKind::mma;
         uint64_t id = 0; // mma command id or acc transfer id
-        uint8_t accumulator = 0;
-        uint32_t row_begin = 0;
-        uint32_t row_end = 0;
-        uint32_t col_begin = 0;
-        uint32_t col_end = 0;
+        TmemRegion region;
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t issue_cycle = 0;
@@ -399,7 +416,8 @@ private:
     [[nodiscard]] std::string describe_shmem_owner(const ShmemOwner& owner) const;
     [[nodiscard]] std::string shmem_race(
         const std::string& access, uint64_t begin, uint64_t end, const ShmemOwner& owner) const;
-    [[nodiscard]] static bool tmem_overlap(const TmemOwner& a, const TmemOwner& b);
+    [[nodiscard]] static bool tmem_overlap(const TmemRegion& a, const TmemRegion& b);
+    [[nodiscard]] static std::string describe_tmem_region(const TmemRegion& region);
     [[nodiscard]] std::string describe_tmem_owner(const TmemOwner& owner) const;
     void release_tmem_owner(TmemOwnerKind kind, uint64_t id);
     [[nodiscard]] std::string stream_name(uint32_t stream) const;
@@ -410,8 +428,6 @@ private:
     uint32_t gmem_sector_bytes_ = 0;
     uint32_t lsu_staging_vectors_ = 0;
     uint32_t lsu_active_commands_ = 0;
-    std::vector<std::string> accumulator_names_;
-    std::vector<std::pair<uint32_t, uint32_t>> accumulator_shapes_; // rows, cols
 
     // n is tiny (a few outstanding commands); checks are linear scans.
     std::vector<ShmemOwner> shmem_owners_;
@@ -468,6 +484,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_uniform_mask)
     NANOSM_SANITIZER_NOOP(check_tma_operand_alignment)
     NANOSM_SANITIZER_NOOP(check_swizzle64_operand)
+    NANOSM_SANITIZER_NOOP(check_tmem_pointer)
     NANOSM_SANITIZER_NOOP(check_store_word_collision)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)

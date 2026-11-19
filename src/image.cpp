@@ -186,11 +186,6 @@ std::string emit_launch_image(const LaunchImage& image) {
     if (image.launch.active_warps == 0) throw SimError("launch image: active warp count is zero");
     auto words = json::array();
     for (const auto word : image.kernel.words) words.push_back(hex_u64(word));
-    auto accumulators = json::array();
-    for (const auto& acc : image.kernel.accumulators) {
-        accumulators.push_back({{"name", acc.name},
-            {"base_word", acc.base_word}, {"rows", acc.rows}, {"cols", acc.cols}});
-    }
     json document = {
         {"format", "nanosm-launch-v0"},
         {"profile", {
@@ -199,7 +194,6 @@ std::string emit_launch_image(const LaunchImage& image) {
         }},
         {"kernel", {
             {"register_count", image.kernel.register_count},
-            {"accumulators", std::move(accumulators)},
             {"words", std::move(words)},
         }},
         {"active_warps", image.launch.active_warps},
@@ -225,18 +219,11 @@ LaunchImage load_launch_image(std::string_view source) {
         const auto register_count = kernel.at("register_count").get<uint32_t>();
         if (register_count > 256) throw SimError("launch image: register count exceeds 256");
         image.kernel.register_count = static_cast<uint16_t>(register_count);
+        // An image of a kernel built before 2026-11-19 carried an accumulator
+        // table; its mma.async / acc.ld / acc.st words mean something else now.
         if (kernel.contains("accumulators")) {
-            const auto& accumulators = kernel.at("accumulators");
-            if (!accumulators.is_array() || accumulators.size() > 256)
-                throw SimError("launch image: bad accumulator metadata array");
-            for (const auto& item : accumulators) {
-                Kernel::Accumulator acc;
-                acc.name = item.at("name").get<std::string>();
-                acc.base_word = item.at("base_word").get<uint32_t>();
-                acc.rows = item.at("rows").get<uint16_t>();
-                acc.cols = item.at("cols").get<uint16_t>();
-                image.kernel.accumulators.push_back(std::move(acc));
-            }
+            throw SimError("launch image: kernel.accumulators is no longer part of a kernel (an accumulator "
+                "is a tmem pointer in a uniform register since 2026-11-19); rebuild the image");
         }
         const auto& words = kernel.at("words");
         if (!words.is_array()) throw SimError("launch image: kernel.words is not an array");

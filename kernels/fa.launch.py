@@ -1,11 +1,12 @@
-"""First FA proof: 64 queries, 128 keys, head/value width 64; five warps.
+"""FlashAttention over 64 queries and 128 keys with two 32x64 query tiles.
 
 Run from emu2: python -B -m nanosm kernels/fa.launch.py
 Optional trace: --case rising --trace trash/fa-tma-out.perfetto.json
 
 Plain row-major FP16 inputs enter through TMA, not prepacked shared memory, and
-the FP32 output leaves through TMA: workers stage normalized O in shmem as an
-fp32 swizzle64 tile (over the dead Q/K0 stages) and one TMA store writes it.
+the FP32 output leaves through TMA: workers stage normalized O in shmem as
+fp32 swizzle64 tiles over the dead Q/K0 stages. Each worker pair publishes
+32 output rows for its own TMA store.
 The host supplies only descriptors, synchronization state and constants.
 Workers compute P's and O's swizzled addresses and do all softmax, P
 conversion/stores, O correction, normalization and O staging stores.
@@ -24,14 +25,15 @@ from nanosm import Launch
 
 ROOT = Path(__file__).resolve().parents[1]
 Q_GLOBAL, K_GLOBAL, V_GLOBAL, O_GLOBAL = 0, 8192, 24576, 65536
-Q_SHARED, K_SHARED, V_SHARED, P_SHARED = 0, 8192, 16384, 40960
-SCORE_DONE, OUTPUT_DONE, WORK_DONE, INPUT_DONE = 49160, 49168, 49176, 49184
-OSTAGE_DONE, OSTORE_DONE = 49192, 49200
-CONSTANTS, QDESC, KDESC, VDESC, STATS = 49216, 49664, 49728, 49792, 50176
+P_SHARED = 40960
+SCORE, WORK, OUTPUT, STAGED = 49152, 49168, 49184, 49200  # two adjacent mbars each
+INPUT_DONE, OSTORE_DONE = 49216, 49224
+CONSTANTS, QDESC, KDESC, VDESC, STATS = 49280, 49664, 49728, 49792, 50176
 ODESC = 49984
 # O staging reuses the Q + K stage-0 region: 64 fp32 swizzle64 rows of 256 bytes, 16 KiB.
 O_SHARED, O_STAGE_BYTES = 0, 16384
 ROWS, KEYS, WIDTH, BLOCK = 64, 128, 64, 64
+QUERY_TILE = 32
 
 
 def f32(value: float) -> float:
@@ -65,35 +67,27 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
     launch.shmem.write(P_SHARED, struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     launch.shmem.f32(CONSTANTS, [SCALE, -math.inf])
-    # P addresses are computed in-kernel (shri/andi); no host-side layout table.
-    # OUTPUT_DONE is the PV commit barrier (mma.commit, one arrival), so the
-    # staged-output handoff gets its own four-worker barrier.
-    for address, count in [(SCORE_DONE, 1), (OUTPUT_DONE, 1), (WORK_DONE, 4),
-                           (INPUT_DONE, 1), (OSTAGE_DONE, 4), (OSTORE_DONE, 1)]:
-        launch.shmem.mbar(address, expected=count)
-    # Stage-granular tiles (roofline E2): one command per operand stage reads
-    # each source row's full 128 bytes -- full sectors at the NATURAL layout.
-    # One descriptor per tensor: a 64 x 64 tile of fp16 rows (64 channels),
-    # cut at the instruction's coordinates (c0 = 0, c1 = the first row), so K
-    # and V serve both stage sets. Every tile is swizzle64, the profile's
-    # mma.layout, so the tensor core reads them: it reads both operands as
-    # whole rows of K (A: m rows, B: n rows), 128 bytes apart (the spacing its
-    # commands name). Q's and the K cache's rows are those rows (K, the
-    # channels, runs along them); V's K (the keys) runs across its rows, so V
-    # is transposed: its stored rows are the channels, 64 keys each.
-    for desc, gbase, rows, transposed in [
-        (QDESC, Q_GLOBAL, ROWS, False),
-        (KDESC, K_GLOBAL, KEYS, False),
-        (VDESC, V_GLOBAL, KEYS, True),
+    # SCORE and OUTPUT count the issuer's MMA commits. WORK and STAGED count
+    # the two workers that own each query tile.
+    for base, count in [(SCORE, 1), (OUTPUT, 1), (WORK, 2), (STAGED, 2)]:
+        for address in (base, base + 8):
+            launch.shmem.mbar(address, expected=count)
+    for address in (INPUT_DONE, OSTORE_DONE):
+        launch.shmem.mbar(address, expected=1)
+    # Q and O move 32 rows at coordinates 0 and 32. Both query tiles share
+    # the full K/V blocks at 0 and 64. V is transposed so a stored row holds
+    # one output channel across 64 keys.
+    for desc, gbase, rows, tile_rows, transposed in [
+        (QDESC, Q_GLOBAL, ROWS, QUERY_TILE, False),
+        (KDESC, K_GLOBAL, KEYS, BLOCK, False),
+        (VDESC, V_GLOBAL, KEYS, BLOCK, True),
     ]:
         launch.shmem.tma_desc(
-            desc, base=gbase, dimensions=(WIDTH, rows), tile=(WIDTH, BLOCK),
+            desc, base=gbase, dimensions=(WIDTH, rows), tile=(WIDTH, tile_rows),
             element_bytes=2, layout="swizzle64", transposed=transposed,
         )
-    # One store of the whole FP32 tile, swizzle64 as the workers staged it:
-    # 64 rows of 256 bytes.
     launch.shmem.tma_desc(
-        ODESC, base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, ROWS),
+        ODESC, base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, QUERY_TILE),
         element_bytes=4, layout="swizzle64",
     )
     return launch
@@ -264,31 +258,20 @@ def run_case(case: str, trace: Path | None) -> None:
         assert len(staged) == ROWS * WIDTH, "staged O addresses are not a bijection"
         # These are algorithmic counts, not a pinned performance result.
         expected_counters = {
-            # Stage-granular loads plus ONE fp32 swizzle64 store of the 16 KiB
-            # O tile (was 32 per-lane stg.v8 commands): tma commands 5 -> 6
-            # and bytes 40960 -> 57344 (+16384 = O). Port requests: 1280 input
-            # sectors + 512 output sectors; every one is one bank round (a
-            # sector's two 16-byte pieces sit in two slots of one 64-byte
-            # line; V's transposed sector puts its sixteen fp16 in sixteen
-            # rows on sixteen banks): 1792 rounds (the sliced layout: 3584).
-            "tma": {"commands": 6, "completed": 6, "logical_bytes": 57344,
+            # Two Q loads, four K/V loads, two O stores. All 1792 sectors
+            # carry 32 useful bytes and each takes one shared-memory round.
+            "tma": {"commands": 8, "completed": 8, "logical_bytes": 57344,
                     "useful_bytes": 57344, "sector_bytes": 57344,
                     "port_requests": 1792, "port_rounds": 1792},
             # All DRAM traffic is now TMA: no SIMT gmem commands remain. Total
             # traffic unchanged: 1792 sectors = 57344 bytes = useful (1.00x).
             "gmem": {"commands": 0, "sectors": 1792, "beats": 7168, "bytes": 57344},
-            # Every request is one bank round since rows stay whole
-            # (2026-11-18; the sliced layout: 4654 rounds): the 256 P and 256
-            # staging column sts (sixteen rows' same word on sixteen banks),
-            # the 512 TMA store reads and the 1280 TMA placements, one round
-            # each where the sliced layout took two.
-            "shmem": {"requests": 2350, "rounds": 2350},
-            # 4x4x8 core (rfc11 section 0): 256 steps per 64x64x8 command
-            # (was 512 at 4x4x4). Hold A / stream B: each of the 16 A blocks
-            # is read once, with its first B block (two bank rounds); the
-            # other 15 steps read one B block (one round): 16 x 17 = 272
-            # rounds per command.
-            "mma": {"commands": 32, "input_steps": 8192, "result_steps": 8192,
+            # 1792 TMA sector transfers + 8 descriptor reads + 16 constant
+            # loads + 24 statistics stores + 256 P stores + 256 O stores.
+            "shmem": {"requests": 2352, "rounds": 2352},
+            # Each 32x64x8 command walks 8 A blocks x 16 B blocks. Loading
+            # A once per row group gives 8 x 17 shared-memory rounds.
+            "mma": {"commands": 64, "input_steps": 8192, "result_steps": 8192,
                     "shmem_rounds": 8704, "a_block_reads": 512, "recurrence_stalls": 0},
             "tmem": {"load_beats": 1536, "store_beats": 256},
             "sfu": {"ops": 524, "busy_cycles": 2096},

@@ -1302,16 +1302,16 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
         {"tma.store.1d", tma_operands + "umov ur4, 4104\ntma.store.1d [5120, ur8], [ur10], [ur11]\n"
                          "wait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\nhalt\n"},
         {"mma.async.init.m64n64k8",
-         ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\nmma.async.init.m64n64k8 C, [ur0], [ur1]\n" + mma_tail},
+         "umov ur0, 0\numov ur1, 1024\numov ur2, 0\nmma.async.init.m64n64k8 [ur2], [ur0], [ur1]\n" + mma_tail},
         {"mma.async.m64n64k8",
-         ".acc C, 0, 64, 64\numov ur0, 0\numov ur1, 1024\nmma.async.m64n64k8 C, [ur0], [ur1]\n" + mma_tail},
+         "umov ur0, 0\numov ur1, 1024\numov ur2, 0\nmma.async.m64n64k8 [ur2], [ur0], [ur1]\n" + mma_tail},
         {"mma.async.init.m32n64k8",
-         ".acc C, 0, 32, 64\numov ur0, 0\numov ur1, 1024\nmma.async.init.m32n64k8 C, [ur0], [ur1]\n" + mma_tail},
+         "umov ur0, 0\numov ur1, 1024\numov ur2, 0\nmma.async.init.m32n64k8 [ur2], [ur0], [ur1]\n" + mma_tail},
         {"mma.async.m32n64k8",
-         ".acc C, 0, 32, 64\numov ur0, 0\numov ur1, 1024\nmma.async.m32n64k8 C, [ur0], [ur1]\n" + mma_tail},
+         "umov ur0, 0\numov ur1, 1024\numov ur2, 0\nmma.async.m32n64k8 [ur2], [ur0], [ur1]\n" + mma_tail},
         {"mma.commit", "umov ur4, 4096\nmma.commit [ur4]\nhalt\n"},
-        {"acc.ld", ".acc C, 0, 64, 64\numov ur8, 0\numov ur9, 0\nacc.ld r10, C, ur8\nhalt\n"},
-        {"acc.st.v8", ".acc C, 0, 64, 64\numov ur8, 0\numov ur9, 0\nmov r0, 1\nacc.st.v8 C, ur8, r0\nhalt\n"},
+        {"acc.ld", "umov ur8, 0\nacc.ld r10, [ur8, 64]\nhalt\n"},
+        {"acc.st.v8", "umov ur8, 0\nmov r0, 1\nacc.st.v8 [ur8, 64], r0\nhalt\n"},
         {"bra.uni", "usread ur0, WARP_ID\nur2r r0, ur0\nsetp.eq.u32 p0, r0, 0\n@p0 bra.uni out\nmov r1, 1\nout:\nhalt\n"},
         {"bra.uni", "bra.uni out\nmov r1, 1\nout:\nhalt\n"}, // @PT: no operand, still uniform
     };

@@ -34,7 +34,6 @@ struct AssemblyProgram {
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
     uint16_t register_count = 0;
-    std::vector<Kernel::Accumulator> accumulators;
     std::vector<std::pair<std::string, int32_t>> constants;
     std::vector<AssemblyLabel> labels;
     std::vector<Instruction> instructions;
@@ -57,13 +56,12 @@ void validate_kernel(const Kernel& kernel);
 // instruction and the registers. qtxc and the assembler apply the same rule
 // per source line.
 void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: every mma.async names a shape the profile lists, and its
-// accumulator has that shape's rows and columns (qtxc and the assembler
-// apply the same rule per source line).
+// Kernel load: every mma.async names a shape the profile lists (with legal
+// row spacings), and every acc.ld / acc.st a legal words per row (qtxc and
+// the assembler apply the same rules per source line).
 void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
 // Kernel load: every uniform register an instruction names (src/isa.hpp
-// uniform_sources -- a coordinate pair's second register and a tma's last
-// coordinate register included -- and
+// uniform_sources -- a tma's last coordinate register included -- and
 // uniform_destination) is below the profile's urf.registers, else a SimError
 // naming the pc and the instruction (qtxc and the assembler refuse it per
 // source line).

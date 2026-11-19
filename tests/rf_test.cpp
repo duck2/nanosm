@@ -385,16 +385,14 @@ void test_i1_refused_attempts_read_nothing() {
         launch.active_warps = 1;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
         nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, R"(
-            .acc C0, 0, 16, 16
-            .acc C1, 256, 16, 16
             sread r0, LANE_ID
             shli r0, r0, 2
             umov ur8, 0
-            umov ur9, 0
+            umov ur9, 256
             ldg r11, [r0] {pred=PT, stall=0, set=sb0, wait=-}
             ldg r12, [r0 + 64] {pred=PT, stall=0, set=sb1, wait=-}
-            acc.st.v8 C0, ur8, r0 {pred=PT, stall=0, set=sb2, wait=-}
-            acc.st.v8 C1, ur8, r0 {pred=PT, stall=0, set=sb3, wait=-}
+            acc.st.v8 [ur8, 16], r0 {pred=PT, stall=0, set=sb2, wait=-}
+            acc.st.v8 [ur9, 16], r0 {pred=PT, stall=0, set=sb3, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3}
         )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true});
         machine.run();
@@ -598,7 +596,6 @@ void test_i1_rf_round_robin_among_holders() {
     profile.rf_read_ports_per_bank = 2;
     profile.shmem_load_slots = 4;
     const auto body_with = [](uint32_t acc_ld_stall) { return R"(
-        .acc C0, 0, 64, 64
         sread r0, LANE_ID
         addi r0, r0, 1
         addi r1, r0, 100
@@ -611,7 +608,7 @@ void test_i1_rf_round_robin_among_holders() {
         umov ur8, 0
         umov ur9, 0
         umov ur11, 64
-        acc.st.v8 C0, ur8, r0 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.st.v8 [ur8, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
         fadd r25, r10, r10
         fadd r26, r10, r10
         fadd r27, r10, r10
@@ -628,7 +625,7 @@ void test_i1_rf_round_robin_among_holders() {
         lds.uni r41, [ur11 + 4] {pred=PT, stall=0, set=sb2, wait=-}
         lds.uni r42, [ur11 + 8] {pred=PT, stall=0, set=sb3, wait=-}
         lds.uni r43, [ur11 + 12] {pred=PT, stall=0, set=sb4, wait=-}
-        acc.ld.v8 r16, C0, ur8 {pred=PT, stall=)" + std::to_string(acc_ld_stall) + R"(, set=sb5, wait=sb0}
+        acc.ld.v8 r16, [ur8, 64] {pred=PT, stall=)" + std::to_string(acc_ld_stall) + R"(, set=sb5, wait=sb0}
         mov r50, 1
         halt {pred=PT, stall=0, set=-, wait=sb1|sb2|sb3|sb4|sb5}
     )"; };
@@ -761,7 +758,6 @@ void test_i1_acc_ld_pipeline_freeze() {
     // P - A = t + 1 + Dt + Lt; the add r46 issues at P - 3.
     const auto r46_after = t + 1 + dt + lt - 3;
     const std::string body = R"(
-        .acc C, 0, 64, 64
         sread r0, LANE_ID
         addi r0, r0, 1
         addi r1, r0, 100
@@ -773,7 +769,7 @@ void test_i1_acc_ld_pipeline_freeze() {
         addi r7, r0, 700
         umov ur8, 0
         umov ur9, 0
-        acc.st.v8 C, ur8, r0 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.st.v8 [ur8, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
         add r44, r10, r10 {pred=PT, stall=0, set=-, wait=sb0}
         fadd r25, r10, r10
         fadd r28, r10, r10
@@ -781,7 +777,7 @@ void test_i1_acc_ld_pipeline_freeze() {
         fadd r34, r10, r10
         fadd r37, r10, r10
         fadd r40, r10, r10
-        acc.ld.v8 r16, C, ur8 {pred=PT, stall=)" + std::to_string(r46_after) + R"(, set=sb1, wait=-}
+        acc.ld.v8 r16, [ur8, 64] {pred=PT, stall=)" + std::to_string(r46_after) + R"(, set=sb1, wait=-}
         add r46, r10, r10 {pred=PT, stall=2, set=-, wait=-}
         add r43, r10, r10
         halt {pred=PT, stall=0, set=-, wait=sb1}
@@ -1176,7 +1172,7 @@ std::string i6a_what(const nanosm::DeviceProfile& profile) {
 //           issues (the counter is 1 through the RAM cycle, 0 from RAM + 1);
 //   sts:    address and data sampled at i + 1; A-write grant i + t + 1, the
 //           word at the shmem RAM D later;
-//   acc.ld: coordinates (uniform registers) sampled from the URF at i + 1,
+//   acc.ld: its tmem pointer (a uniform register) sampled from the URF at i + 1,
 //           no RF read; tmem read (beat 0) at i + t + 1; RF port i + t + 2;
 //           RAM + Wd; the waiting add at RAM + 1.
 // Every RF write's visibility is at least earliest_rf_visible after its
@@ -1188,7 +1184,6 @@ void test_i6a_helper_contract() {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
         const auto kernel = hand_assemble(i1_asm(profile, R"(
-            .acc C, 0, 64, 64
             mov r1, 7
             mov r2, 0x3f8
             shli r2, r2, 20
@@ -1200,7 +1195,7 @@ void test_i6a_helper_contract() {
             fadd r4, r2, r2
             ex2 r5, r2
             shli r6, r0, 2 {pred=PT, stall=16, set=-, wait=-}
-            acc.ld r11, C, ur8 {pred=PT, stall=0, set=sb2, wait=-}
+            acc.ld r11, [ur8, 64] {pred=PT, stall=0, set=sb2, wait=-}
             lds r7, [r6 + 256] {pred=PT, stall=0, set=sb0, wait=-}
             sts [r6 + 512], r4 {pred=PT, stall=0, set=sb1, wait=-}
             add r14, r11, r11 {pred=PT, stall=0, set=-, wait=sb2}
@@ -1276,7 +1271,7 @@ void test_i6a_helper_contract() {
             require(stored == writes[0].cycle + profile.shmem_port_a_depth, name + "the word did not reach the RAM D after the grant");
         }
 
-        // acc.ld r11, C, ur8: one beat; its depbar waiter is the add r14.
+        // acc.ld r11, [ur8, 64]: one beat; its depbar waiter is the add r14.
         {
             const auto i = issue(11);
             const auto name = what + "acc.ld: ";
@@ -1701,7 +1696,7 @@ void test_i6b1_back_to_back_same_bank_reads() {
 // profile (more read ports) assembled, restamped for the profile under
 // test. The atomic, the mbar register forms and mma.async's two addresses
 // take uniform registers, which are no RF reads: those forms cannot conflict
-// (and an acc.st's uniform coordinates beside its vector data do not
+// (and an acc.st's uniform tmem pointer beside its vector data does not
 // either).
 void test_i6b1_same_bank_sources_are_malformed() {
     const auto& canonical = canonical_profile();
@@ -1734,12 +1729,12 @@ void test_i6b1_same_bank_sources_are_malformed() {
     };
     for (const auto& c : cases) {
         const auto& profile = *c.profile;
-        const auto source = ".acc C, 0, 64, 64\n" + c.line + "\nhalt\n";
+        const auto source = c.line + "\nhalt\n";
         try {
             (void)nanosm::compile_qtx(source, profile);
             throw std::runtime_error("qtxc accepted '" + c.line + "'");
         } catch (const nanosm::SimError& error) {
-            require(mentions(error.what(), "line 2", c), "qtxc's refusal of '" + c.line + "': " + error.what());
+            require(mentions(error.what(), "line 1", c), "qtxc's refusal of '" + c.line + "': " + error.what());
         }
         // The same line through a looser profile (one read port per source),
         // emitted as the profile under test's assembly.
@@ -1769,9 +1764,9 @@ void test_i6b1_same_bank_sources_are_malformed() {
     // accept these forms.
     for (const std::string line : {"atom.add.uni r1, [ur3], ur6", "mbar.init [ur3], ur6",
              "mbar.arrive.expect_tx [ur3], ur6", "mbar.test_wait p0, [ur3], ur6", "mbar.try_wait p0, [ur3], ur6",
-             "mma.async.m64n64k8 C, [ur3], [ur6]", "acc.st C, ur0, r3"}) {
+             "mma.async.m64n64k8 [ur0], [ur3], [ur6]", "acc.st [ur0, 64], r3"}) {
         try {
-            const auto source = ".acc C, 0, 64, 64\n" + line + "\nhalt\n";
+            const auto source = line + "\nhalt\n";
             (void)nanosm::assemble_asm(nanosm::emit_asm(nanosm::compile_qtx(source, canonical)), canonical);
         } catch (const nanosm::SimError& error) {
             throw std::runtime_error("'" + line + "' with uniform operands was refused: " + error.what());
@@ -1819,19 +1814,18 @@ void test_i6b1_same_bank_sources_are_malformed() {
 void test_i6b1_async_reader_gets_the_hole() {
     const auto& profile = canonical_profile();
     auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
-        .acc C, 0, 64, 64
         umov ur2, 0
         umov ur3, 0
         mov r28, 7
         sread r0, LANE_ID
         mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
-        acc.st C, ur2, r0 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.st [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
         addi r1, r27, 1
         addi r2, r27, 2
         addi r5, r27, 3
         add r4, r27, r28
         addi r7, r27, 4
-        acc.ld r10, C, ur2 {pred=PT, stall=0, set=sb1, wait=sb0}
+        acc.ld r10, [ur2, 64] {pred=PT, stall=0, set=sb1, wait=sb0}
         halt {pred=PT, stall=0, set=-, wait=sb1}
     )"), profile));
     std::map<uint64_t, bool> owed;       // Q during each cycle
@@ -1891,14 +1885,12 @@ void test_i6b1_async_readers_round_robin() {
     std::string setup = "sread r0, LANE_ID\naddi r9, r0, 100\n";
     for (uint32_t j = 0; j < 8; ++j) setup += "addi r" + std::to_string(18 + j) + ", r0, " + std::to_string(200 + 10 * j) + "\n";
     auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
-        .acc C0, 0, 64, 64
-        .acc C1, 4096, 64, 64
         umov ur2, 0
         umov ur3, 0
         mov r40, 0
     )" + setup + R"(
         mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
-        acc.st C0, ur2, r0 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.st [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
         stg.v8 [r40], r18 {pred=PT, stall=0, set=sb2, wait=-}
         addi r1, r27, 1
         addi r2, r27, 2
@@ -1924,7 +1916,7 @@ void test_i6b1_async_readers_round_robin() {
         addi r14, r27, 10
         addi r16, r27, 11
         addi r17, r27, 12
-        acc.ld r50, C0, ur2 {pred=PT, stall=0, set=sb3, wait=sb0}
+        acc.ld r50, [ur2, 64] {pred=PT, stall=0, set=sb3, wait=sb0}
         halt {pred=PT, stall=0, set=-, wait=sb2|sb3}
     )"), profile));
     std::map<uint64_t, uint32_t> cursor;
@@ -1974,17 +1966,15 @@ void test_i6b1_persistent_readers_under_pressure() {
     std::string pressure;
     for (uint32_t i = 0; i < 60; ++i) pressure += "addi r41, r27, " + std::to_string(i) + "\n";
     const auto body = R"(
-        .acc C0, 0, 64, 64
-        .acc C1, 4096, 64, 64
         umov ur2, 0
         umov ur3, 0
         mov r40, 0
     )" + setup + R"(
         mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
-        acc.st.v8 C0, ur2, r0 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.st.v8 [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
         stg.v8 [r40], r18 {pred=PT, stall=0, set=sb2, wait=-}
     )" + pressure + R"(
-        acc.ld.v8 r50, C0, ur2 {pred=PT, stall=0, set=sb3, wait=sb0}
+        acc.ld.v8 r50, [ur2, 64] {pred=PT, stall=0, set=sb3, wait=sb0}
         halt {pred=PT, stall=0, set=-, wait=sb2|sb3}
     )";
     const auto kernel = hand_assemble(i1_asm(profile, body), profile);
@@ -2067,7 +2057,6 @@ void test_i6b1_unrelated_banks_proceed() {
     barrier.remaining = 3;
     write_u64(image_bytes(launch.shmem_image, 8192), 4096, nanosm::encode_mbar_state(barrier));
     nanosm::Machine machine(profile, compile(R"(
-        .acc C, 0, 64, 64
         usread ur1, WARP_ID
         ur2r r50, ur1
         mov r27, 5
@@ -2081,7 +2070,7 @@ void test_i6b1_unrelated_banks_proceed() {
         setp.eq.u32 p1, r50, 1
         @p1 bra.uni plain
     )" + meet("meet0") + pad + R"(
-        acc.st C, ur2, r0
+        acc.st [ur2, 64], r0
     )" + bank0 + R"(
         halt
     plain:

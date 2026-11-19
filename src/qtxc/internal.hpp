@@ -41,8 +41,8 @@ std::vector<uint8_t> issue_sources(const Instruction& inst);
 
 // The per-instruction rules (checks.cpp).
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumulator>& accumulators,
-    const DeviceProfile& profile, const std::string& where);
+void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
+void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 
 } // namespace qtxc_internal
 

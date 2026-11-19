@@ -62,15 +62,15 @@ void test_sanitizer_sts_into_mma_operand_stage() {
         auto& shmem = image_bytes(launch.shmem_image, 8192 + 8);
         write_count_mbar(shmem, 8192, 1);
         const auto kernel = compile(std::string(R"(
-            .acc C, 0, 64, 64
             umov ur0, 0
             umov ur1, 1024
             umov ur2, 2048
             umov ur3, 3072
             umov ur4, 8192
-            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            umov ur5, 0
+            mma.async.init.m64n64k8 [ur5], [ur0], [ur1]
             mma.commit [ur4]
-            mma.async.m64n64k8 C, [ur2], [ur3]
+            mma.async.m64n64k8 [ur5], [ur2], [ur3]
             sread r20, LANE_ID
             shli r20, r20, 2
             addi r20, r20, )") + (queued ? "2048" : "0") + R"(
@@ -161,12 +161,12 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 512, 1024);
         const auto message = run_expecting_panic(profile, compile(R"(
-            .acc C, 0, 64, 64
             umov ur0, 0
             umov ur1, 1024
+            umov ur2, 0
         )" + tma_operands_asm(10, 2048, 11, 512, 8) + R"(
-            mma.async.init.m64n64k8 C, [ur0], [ur1]
-            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
+            mma.async.m64n64k8 [ur2], [ur0], [ur1]
             tma.load.1d [ur10], [4096, ur8], [ur11]
             halt
         )"), std::move(launch), "engine complete_tx into an MMA operand stage");
@@ -192,11 +192,11 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
     };
     // TMA load accepted over a stage an active MMA reads.
     auto message = run_expecting_panic(profile, compile(R"(
-        .acc C, 0, 64, 64
         umov ur0, 0
         umov ur1, 1024
+        umov ur2, 0
     )" + tma_operands_asm(10, 0, 11, 4160, 8) + R"(
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
         tma.load.1d [ur10], [4096, ur8], [ur11]
         halt
     )"), launch_with_descriptor(), "TMA load over an active MMA operand");
@@ -205,12 +205,12 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         "wait the operand-consumed depbar sb", "inst='tma.load.1d [ur10], [4096, ur8], [ur11]"}, "TMA load vs MMA");
     // MMA accepted over a pending TMA load destination (the other direction).
     message = run_expecting_panic(profile, compile(R"(
-        .acc C, 0, 64, 64
         umov ur0, 0
         umov ur1, 1024
+        umov ur2, 0
     )" + tma_operands_asm(10, 1024, 11, 4168, 8) + R"(
         tma.load.1d [ur10], [4096, ur8], [ur11]
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
         halt
     )"), launch_with_descriptor(), "MMA over a pending TMA load destination");
     require_mentions(message, {"shmem race: mma.async #1 B operand bytes [1024, 2048)",
@@ -227,11 +227,11 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
         "owned by tma load #0", "wait the TMA completion mbar [4160]"}, "TMA store vs TMA load");
     // Two readers never conflict: a TMA store of an MMA operand stage is legal.
     nanosm::Machine readers(profile, compile(R"(
-        .acc C, 0, 64, 64
         umov ur0, 0
         umov ur1, 1024
+        umov ur2, 0
     )" + tma_operands_asm(10, 1024, 4, 4168, 8) + R"(
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
         tma.store.1d [4096, ur8], [ur10], [ur4]
     wait:
         mbar.try_wait p0, [ur4], 0
@@ -248,78 +248,128 @@ void test_sanitizer_tmem_ownership_both_directions() {
         launch.active_warps = 1;
         return launch;
     };
+    // tmem pointers (src/layout.hpp): ur8 rows 0..15 and ur10 rows 16..31 of a
+    // region of 64-word rows at 0, ur9 the matmul's result (64x64 at 0).
+    // Ownership is by the words touched.
     const std::string header = R"(
-        .acc C, 0, 64, 64
         umov ur0, 0
         umov ur1, 1024
         umov ur8, 0
         umov ur9, 0
-        umov ur10, 16
+        umov ur10, 1024
         umov ur11, 0
     )";
-    // C4, new direction: an MMA accepted while an acc.st on its accumulator
-    // is still writing tmem.
+    // C4, new direction: an MMA accepted while an acc.st on its result is
+    // still writing tmem.
     auto message = run_expecting_panic(profile, compile(header + R"(
-        acc.st.v8 C, ur8, r16
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        acc.st.v8 [ur8, 64], r16
+        mma.async.init.m64n64k8 [ur9], [ur0], [ur1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.st");
-    require_mentions(message, {"tmem race: mma.async #1 on 'C'",
-        "acc.st #0", "write-owner of 'C' rows [0, 16) cols [0, 8) until its final tmem write",
+    require_mentions(message, {"tmem race: mma.async #1 on tmem 0 (64 words per row) rows [0, 64) cols [0, 64)",
+        "acc.st #0", "write-owner of tmem 0 (64 words per row) rows [0, 16) cols [0, 8) until its final tmem write",
         "wait that transfer's depbar sb"}, "MMA vs acc.st");
     // ... and while an acc.ld still reads it (WAR on tmem). I2.1 (F6): the
     // read-ownership ends at the final tmem read (I8: the last beat's tmem
     // sample), not the final RF write.
     message = run_expecting_panic(profile, compile(header + R"(
-        acc.ld.v8 r24, C, ur8
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        acc.ld.v8 r24, [ur8, 64]
+        mma.async.init.m64n64k8 [ur9], [ur0], [ur1]
         halt
     )"), one_warp(), "MMA over an in-flight acc.ld");
-    require_mentions(message, {"tmem race: mma.async #1 on 'C'", "acc.ld #0",
-        "read-owner of 'C' rows [0, 16) cols [0, 8) until its final tmem read"}, "MMA vs acc.ld");
+    require_mentions(message, {"tmem race: mma.async #1 on tmem 0", "acc.ld #0",
+        "read-owner of tmem 0 (64 words per row) rows [0, 16) cols [0, 8) until its final tmem read"},
+        "MMA vs acc.ld");
     // Existing direction, same text plus the owner.
     message = run_expecting_panic(profile, compile(header + R"(
-        mma.async.init.m64n64k8 C, [ur0], [ur1]
-        acc.ld.v8 r24, C, ur8
+        mma.async.init.m64n64k8 [ur9], [ur0], [ur1]
+        acc.ld.v8 r24, [ur8, 64]
         halt
     )"), one_warp(), "acc.ld over accepted MMA work");
-    require_mentions(message, {"accumulator transfer races accepted MMA work on 'C' owned by "
-        "mma.async #1", "write-owner of 'C' rows [0, 64) cols [0, 64) until its last result retires",
-        ": wait on the mma.commit mbar phase first"}, "acc.ld vs MMA");
+    require_mentions(message, {"accumulator transfer of tmem 0 (64 words per row) rows [0, 16) cols [0, 8) "
+        "races accepted MMA work: mma.async #1", "write-owner of tmem 0 (64 words per row) rows [0, 64) cols [0, 64) "
+        "until its last result retires", "wait on the mma.commit mbar phase first"}, "acc.ld vs MMA");
     // Transfer vs transfer (I8): the acc.ld and acc.st engines run side by
     // side and nothing orders them, so an overlapping pair is a race. qtxc
-    // orders one warp's transfers of an accumulator by depbar; hand assembly
-    // without that wait shows the sanitizer's diagnosis.
+    // orders one warp's transfers by depbar; hand assembly without that wait
+    // shows the sanitizer's diagnosis.
     const std::string hand_header = R"(
-        .acc C, 0, 64, 64
         umov ur8, 0
         umov ur9, 0
-        umov ur10, 16
+        umov ur10, 1024
         umov ur11, 0
     )";
     message = run_expecting_panic(profile, hand_assemble(i1_asm(profile, hand_header + R"(
-        acc.st.v8 C, ur8, r16 {pred=PT, stall=0, set=sb0, wait=-}
-        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 [ur8, 64], r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, [ur8, 64] {pred=PT, stall=0, set=sb1, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp(), "acc.ld over an in-flight acc.st");
-    require_mentions(message, {"tmem race: acc.ld reads 'C' rows [0, 16) cols [0, 8)",
+    require_mentions(message, {"tmem race: acc.ld reads tmem 0 (64 words per row) rows [0, 16) cols [0, 8)",
         "overlapping acc.st #0", "wait that transfer's depbar sb"}, "acc.ld vs acc.st");
     message = run_expecting_panic(profile, hand_assemble(i1_asm(profile, hand_header + R"(
-        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
-        acc.st.v8 C, ur8, r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, [ur8, 64] {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 [ur8, 64], r16 {pred=PT, stall=0, set=sb0, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp(), "acc.st over an in-flight acc.ld");
-    require_mentions(message, {"tmem race: acc.st writes 'C' rows [0, 16) cols [0, 8)",
+    require_mentions(message, {"tmem race: acc.st writes tmem 0 (64 words per row) rows [0, 16) cols [0, 8)",
         "overlapping acc.ld #0"}, "acc.st vs acc.ld");
     // Disjoint rows: concurrent, legal, and exact.
     nanosm::Machine disjoint(profile, hand_assemble(i1_asm(profile, hand_header + R"(
         mov r16, 41
-        acc.st.v8 C, ur10, r16 {pred=PT, stall=0, set=sb0, wait=-}
-        acc.ld.v8 r24, C, ur8 {pred=PT, stall=0, set=sb1, wait=-}
+        acc.st.v8 [ur10, 64], r16 {pred=PT, stall=0, set=sb0, wait=-}
+        acc.ld.v8 r24, [ur8, 64] {pred=PT, stall=0, set=sb1, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), one_warp());
     disjoint.run(2000);
     require(disjoint.read_reg(0, 0, 24) == 0, "disjoint acc.ld read the concurrent store's rows");
+}
+
+// Pointers alias (trash/acc-pointer-2026-11-19.md): an m32n64 matmul writes
+// rows 32..63 of a 64-row view at 0 (its pointer 2048). A transfer through a
+// DIFFERENT pointer that names some of those words races it -- acc.ld at row
+// 48 (3072) while the matmul runs PANICs; one at rows 0..15 (pointer 0) and
+// one at rows 16..31 (1024) touch none of its words and pass, concurrently,
+// reading what the matmul does not write.
+void test_sanitizer_tmem_race_by_words() {
+    const auto& profile = canonical_profile();
+    const auto launch = [] {
+        nanosm::Launch result;
+        result.active_warps = 1;
+        image_bytes(result.shmem_image, 4096);
+        return result;
+    };
+    const std::string header = R"(
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur9, 2048
+        sread r16, LANE_ID
+        umov ur10, 0
+        acc.st [ur10, 64], r16
+        umov ur10, 1024
+        acc.st [ur10, 64], r16
+        mma.async.init.m32n64k8 [ur9], [ur0], [ur1]
+    )";
+    auto message = run_expecting_panic(profile, compile(header + R"(
+        umov ur12, 3072
+        acc.ld.v8 r24, [ur12, 64]
+        halt
+    )"), launch(), "acc.ld at row 48 of a 64-row view while an m32 matmul writes rows 32..63");
+    require_mentions(message, {"accumulator transfer of tmem 3072 (64 words per row) rows [0, 16) cols [0, 8) "
+        "races accepted MMA work: mma.async #1", "write-owner of tmem 2048 (64 words per row) rows [0, 32) cols [0, 64)",
+        "wait on the mma.commit mbar phase first"}, "a transfer over a matmul's words through another pointer");
+    nanosm::Machine clean(profile, compile(header + R"(
+        umov ur12, 0
+        acc.ld r24, [ur12, 64]
+        umov ur12, 1024
+        acc.ld r25, [ur12, 64]
+        halt
+    )"), launch());
+    clean.run(20000);
+    require(clean.done(), "the disjoint transfers did not finish");
+    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
+        require(clean.read_reg(0, lane, 24) == lane && clean.read_reg(0, lane, 25) == lane,
+            "a transfer beside a running matmul did not read the words it named");
+    }
 }
 
 void test_sanitizer_double_buffer_and_p_tile_are_clean() {
@@ -343,7 +393,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         write_tma_descriptor(shmem, 4096, descriptor);
         for (uint32_t mbar : {8192u, 8200u, 8208u}) write_count_mbar(shmem, mbar, 1);
         nanosm::Machine machine(profile, compile(R"(
-            .acc C, 0, 64, 64
+            umov ur14, 0
             umov ur5, 0
             umov ur6, 1024
             umov ur7, 2048
@@ -360,7 +410,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L0
             umov ur0, 0
             umov ur1, 1024
-            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.async.init.m64n64k8 [ur14], [ur0], [ur1]
             mbar.arrive.expect_tx [ur3], 2048
             tma.load.1d [ur7], [4096, ur9], [ur3]
             tma.load.1d [ur8], [4096, ur9], [ur3]
@@ -369,7 +419,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L1
             umov ur0, 2048
             umov ur1, 3072
-            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.async.m64n64k8 [ur14], [ur0], [ur1]
             mbar.arrive.expect_tx [ur2], 2048
             tma.load.1d [ur5], [4096, ur9], [ur2]
             tma.load.1d [ur6], [4096, ur9], [ur2]
@@ -378,14 +428,13 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             @!p1 bra.uni L2
             umov ur0, 0
             umov ur1, 1024
-            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.async.m64n64k8 [ur14], [ur0], [ur1]
             mma.commit [ur4]
         L3:
             mbar.try_wait p1, [ur4], 0
             @!p1 bra.uni L3
             umov ur12, 0
-            umov ur13, 0
-            acc.ld.v8 r16, C, ur12
+            acc.ld.v8 r16, [ur12, 64]
             halt
         )"), std::move(launch), {.timeline = true});
         machine.run(50000);
@@ -418,7 +467,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         write_count_mbar(shmem, 8192, 1);
         write_count_mbar(shmem, 8200, 1);
         nanosm::Machine machine(profile, compile(R"(
-            .acc C, 0, 64, 64
+            umov ur14, 0
             umov ur10, 8192
             umov ur11, 8200
             usread ur0, WARP_ID
@@ -459,7 +508,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         READY0:
             mbar.try_wait p1, [ur10], 0
             @!p1 bra.uni READY0
-            mma.async.init.m64n64k8 C, [ur0], [ur1]
+            mma.async.init.m64n64k8 [ur14], [ur0], [ur1]
             mma.commit [ur11]
         WAIT0:
             mbar.try_wait p1, [ur11], 0
@@ -467,14 +516,13 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         READY1:
             mbar.try_wait p1, [ur10], 1
             @!p1 bra.uni READY1
-            mma.async.m64n64k8 C, [ur0], [ur1]
+            mma.async.m64n64k8 [ur14], [ur0], [ur1]
             mma.commit [ur11]
         WAIT1:
             mbar.try_wait p1, [ur11], 1
             @!p1 bra.uni WAIT1
             umov ur12, 0
-            umov ur13, 0
-            acc.ld.v8 r16, C, ur12
+            acc.ld.v8 r16, [ur12, 64]
             halt
         )"), std::move(launch));
         machine.run(50000);
@@ -521,6 +569,13 @@ TEST(Sanitizer, sanitizer_tma_and_mma_accept_conflicts) {
 TEST(Sanitizer, sanitizer_tmem_ownership_both_directions) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_sanitizer_tmem_ownership_both_directions();
+}
+
+// sanitizer: a transfer races a matmul on shared words through another
+// pointer; disjoint words do not
+TEST(Sanitizer, sanitizer_tmem_race_by_words) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_sanitizer_tmem_race_by_words();
 }
 
 // sanitizer: double buffer and P tile clean

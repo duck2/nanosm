@@ -1,5 +1,5 @@
 // The text parser qtx and assembly share (src/qtxc/): line by line, labels,
-// the .equ / .acc / .profile directives, the predicate prefix, the control
+// the .equ / .profile directives, the predicate prefix, the control
 // block (assembly only) and every instruction's operands, into an
 // AssemblyProgram with its branch displacements resolved. It does not
 // schedule (schedule.cpp), apply the rules an instruction must pass
@@ -112,16 +112,41 @@ uint8_t parse_ureg(const std::string& text, uint32_t line, const DeviceProfile& 
     return static_cast<uint8_t>(value);
 }
 
-// A pair of consecutive uniform registers named by its first (acc.ld / acc.st
-// coordinates: row in urC, column in urC + 1).
-uint8_t parse_ureg_pair(const std::string& text, uint32_t line, const DeviceProfile& profile) {
-    const auto first = parse_ureg(text, line, profile);
-    if (static_cast<uint32_t>(first) + 1 >= profile.urf_registers) {
-        throw SimError("line " + std::to_string(line) + ": the coordinate pair " + text + ", ur" +
-            std::to_string(first + 1) + " is outside this profile's " + std::to_string(profile.urf_registers) +
-            " uniform registers");
+int32_t parse_value(
+    const std::string& text, const std::unordered_map<std::string, int32_t>& constants, uint32_t line);
+bool is_register(const std::string& text);
+
+// A tmem operand of acc.ld / acc.st (src/layout.hpp): [urT, S], the pointer
+// in a uniform register and the region's words per row, a constant (which
+// values are legal is check_tmem_operand's business).
+std::pair<uint8_t, int32_t> parse_tmem_operand(
+    const std::string& text,
+    const std::unordered_map<std::string, int32_t>& constants,
+    uint32_t line,
+    const DeviceProfile& profile) {
+    const auto inner = text.size() >= 2 && text.front() == '[' && text.back() == ']'
+        ? split(text.substr(1, text.size() - 2), ',') : std::vector<std::string>{};
+    if (inner.size() != 2) {
+        throw SimError("line " + std::to_string(line) + ": bad tmem operand '" + text +
+            "' (expected [urT, words per row])");
     }
-    return first;
+    return {parse_ureg(inner[0], line, profile), parse_value(inner[1], constants, line)};
+}
+
+// An mma.async's result operand: [urC], the tmem pointer alone (its rows are
+// the shape's n words).
+uint8_t parse_mma_result(const std::string& text, uint32_t line, const DeviceProfile& profile) {
+    const auto inner = text.size() >= 2 && text.front() == '[' && text.back() == ']'
+        ? split(text.substr(1, text.size() - 2), ',') : std::vector<std::string>{};
+    if (inner.size() == 2) {
+        throw SimError("line " + std::to_string(line) + ": mma.async result '" + text +
+            "': its rows are the shape's n words; write [urC] without a row length");
+    }
+    if (inner.size() != 1 || is_register(inner[0]) || !is_uniform_register(inner[0])) {
+        throw SimError("line " + std::to_string(line) + ": bad mma.async result '" + text +
+            "' (expected [urC], a uniform register holding its tmem pointer)");
+    }
+    return parse_ureg(inner[0], line, profile);
 }
 
 std::pair<uint8_t, bool> parse_predicate(const std::string& text, uint32_t line) {
@@ -390,7 +415,6 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     AssemblyProgram program;
     std::unordered_map<std::string, int32_t> constants;
     std::unordered_map<std::string, std::size_t> labels;
-    std::unordered_map<std::string, uint8_t> accumulator_ids;
     struct PendingBranch {
         std::size_t instruction = 0;
         std::string target;
@@ -451,28 +475,10 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             program.profile_name = args[0];
             continue;
         }
-        if (clean.starts_with(".acc")) {
-            const auto args = operands(trim(clean.substr(4)));
-            expect_count(args, 4, line_number);
-            static const std::regex name_pattern(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
-            if (!std::regex_match(args[0], name_pattern) || accumulator_ids.contains(args[0])) {
-                throw SimError("line " + std::to_string(line_number) + ": bad or duplicate accumulator name");
-            }
-            Kernel::Accumulator acc;
-            acc.name = args[0];
-            const auto base = parse_value(args[1], constants, line_number);
-            const auto rows = parse_value(args[2], constants, line_number);
-            const auto cols = parse_value(args[3], constants, line_number);
-            if (base < 0 || rows <= 0 || rows > 65535 ||
-                cols <= 0 || cols > 65535 || program.accumulators.size() >= 256) {
-                throw SimError("line " + std::to_string(line_number) + ": accumulator field out of range");
-            }
-            acc.base_word = static_cast<uint32_t>(base);
-            acc.rows = static_cast<uint16_t>(rows);
-            acc.cols = static_cast<uint16_t>(cols);
-            accumulator_ids.emplace(acc.name, static_cast<uint8_t>(program.accumulators.size()));
-            program.accumulators.push_back(std::move(acc));
-            continue;
+        if (clean.starts_with(".acc") && (clean.size() == 4 || std::isspace(static_cast<unsigned char>(clean[4])))) {
+            throw SimError("line " + std::to_string(line_number) +
+                ": there is no .acc directive: an accumulator is a tmem pointer in a uniform register "
+                "(acc.ld rD, [urT, words per row]; mma.async [urC], [urA, ...], [urB, ...])");
         }
         if (clean.front() == '.') {
             throw SimError("line " + std::to_string(line_number) + ": unsupported directive '" + clean + "'");
@@ -794,44 +800,37 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                     " pass this profile's last uniform register, ur" + std::to_string(profile.urf_registers - 1));
             }
         } else if (op == "acc.ld" || op == "acc.ld.v8") {
-            expect_count(args, 3, line_number);
-            const auto acc = accumulator_ids.find(args[1]);
-            if (acc == accumulator_ids.end()) {
-                throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[1] + "'");
-            }
-            // acc.ld rD, ACC, urC: the coordinates are uniform registers (row
-            // in urC, column in urC + 1).
+            // acc.ld rD, [urT, S] (src/layout.hpp): lane l reads row l of the
+            // region at the pointer in urT, whose rows are S words; .v8 reads
+            // eight columns into rD .. rD + 7.
+            expect_count(args, 2, line_number);
             inst.opcode = op == "acc.ld" ? Opcode::acc_ld : Opcode::acc_ld_v8;
             inst.dst = parse_reg(args[0], line_number);
-            inst.src0 = acc->second;
-            inst.src1 = parse_ureg_pair(args[2], line_number, profile);
+            const auto [pointer, row_words] = parse_tmem_operand(args[1], constants, line_number, profile);
+            inst.src0 = pointer;
+            inst.imm = row_words;
             const auto width = op == "acc.ld.v8" ? 8u : 1u;
             if (static_cast<unsigned>(inst.dst) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
         } else if (op == "acc.st" || op == "acc.st.v8") {
-            expect_count(args, 3, line_number);
-            const auto acc = accumulator_ids.find(args[0]);
-            if (acc == accumulator_ids.end()) {
-                throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
-            }
-            // acc.st ACC, urC, rS: uniform coordinates, vector data.
+            // acc.st [urT, S], rS: the same region, vector data.
+            expect_count(args, 2, line_number);
             inst.opcode = op == "acc.st" ? Opcode::acc_st : Opcode::acc_st_v8;
-            inst.dst = acc->second;
-            inst.src0 = parse_ureg_pair(args[1], line_number, profile);
-            inst.src1 = parse_reg(args[2], line_number);
+            const auto [pointer, row_words] = parse_tmem_operand(args[0], constants, line_number, profile);
+            inst.src0 = pointer;
+            inst.imm = row_words;
+            inst.src1 = parse_reg(args[1], line_number);
             const auto width = op == "acc.st.v8" ? 8u : 1u;
             if (static_cast<unsigned>(inst.src1) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
         } else if (const auto mma = mma_async_opcode(op, profile, line_number); mma.has_value()) {
             expect_count(args, 3, line_number);
-            const auto acc = accumulator_ids.find(args[0]);
-            if (acc == accumulator_ids.end())
-                throw SimError("line " + std::to_string(line_number) + ": unknown accumulator '" + args[0] + "'");
-            // mma.async ACC, [urA, spacing], [urB, spacing] (src/isa.hpp).
+            // mma.async [urC], [urA, spacing], [urB, spacing] (src/isa.hpp):
+            // urC the result's tmem pointer, its rows n words.
             inst.opcode = *mma;
-            inst.dst = acc->second;
+            inst.src2 = parse_mma_result(args[0], line_number, profile);
             const auto [a, a_spacing] = parse_mma_operand(args[1], constants, line_number, profile);
             const auto [b, b_spacing] = parse_mma_operand(args[2], constants, line_number, profile);
             inst.src0 = a;

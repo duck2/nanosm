@@ -53,10 +53,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
     gmem_sector_bytes_ = config.gmem_sector_bytes;
     lsu_staging_vectors_ = config.lsu_staging_vectors;
     lsu_active_commands_ = config.lsu_active_commands;
-    for (const auto& acc : kernel.accumulators) {
-        accumulator_names_.push_back(acc.name);
-        accumulator_shapes_.emplace_back(acc.rows, acc.cols);
-    }
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
     for (auto& warp : warps_) {
@@ -649,7 +645,7 @@ void Sanitizer::record_tma_data_complete(uint64_t command) {
 }
 
 void Sanitizer::record_mma_accept(
-    const IssueSite& site, uint64_t command, uint8_t accumulator, uint8_t depbar,
+    const IssueSite& site, uint64_t command, const TmemRegion& result, uint8_t depbar,
     std::optional<std::pair<uint32_t, uint32_t>> a_span,
     std::optional<std::pair<uint32_t, uint32_t>> b_span) {
     for (const bool a_operand : {true, false}) {
@@ -677,20 +673,18 @@ void Sanitizer::record_mma_accept(
     TmemOwner mma;
     mma.kind = TmemOwnerKind::mma;
     mma.id = command;
-    mma.accumulator = accumulator;
-    mma.row_end = accumulator_shapes_.at(accumulator).first;
-    mma.col_end = accumulator_shapes_.at(accumulator).second;
+    mma.region = result;
     mma.warp = site.warp;
     mma.pc = site.pc;
     mma.issue_cycle = site.cycle;
     mma.depbar = depbar;
-    // MMA after MMA on one accumulator is ordered by the engine queue; only
-    // SIMT transfers race it.
+    // MMA after MMA is ordered by the engine queue (a later command's step
+    // waits for an earlier one's result on the same words); only SIMT
+    // transfers race it.
     for (const auto& owner : tmem_owners_) {
-        if (owner.kind == TmemOwnerKind::mma || !tmem_overlap(owner, mma)) continue;
-        throw_issue_panic(site, "tmem race: mma.async #" + std::to_string(command) + " on '" +
-            accumulator_names_.at(accumulator) +
-            "' (read-modify-write of the whole accumulator) overlaps " +
+        if (owner.kind == TmemOwnerKind::mma || !tmem_overlap(owner.region, mma.region)) continue;
+        throw_issue_panic(site, "tmem race: mma.async #" + std::to_string(command) + " on " +
+            describe_tmem_region(result) + " (read-modify-write of its whole result) overlaps " +
             describe_tmem_owner(owner) + "; wait that transfer's depbar sb" +
             std::to_string(owner.depbar) + " of warp " + std::to_string(owner.warp) +
             " (or an mbar its warp arrives on after it) first");
@@ -722,12 +716,34 @@ void Sanitizer::record_mma_retired(uint64_t command) {
 // Tmem ownership
 // ---------------------------------------------------------------------------
 
-bool Sanitizer::tmem_overlap(const TmemOwner& a, const TmemOwner& b) {
-    // The toolchain rejects overlapping accumulator allocations, so regions
-    // of different accumulators never alias.
-    return a.accumulator == b.accumulator &&
-        a.row_begin < b.row_end && b.row_begin < a.row_end &&
-        a.col_begin < b.col_end && b.col_begin < a.col_end;
+// Two regions overlap when they share a physical tmem word: pointers are
+// runtime values and may alias (a 64-row view over two 32-row results), so
+// nothing but the words decides. Both word lists are sorted.
+bool Sanitizer::tmem_overlap(const TmemRegion& a, const TmemRegion& b) {
+    auto i = a.words.begin();
+    auto j = b.words.begin();
+    while (i != a.words.end() && j != b.words.end()) {
+        if (*i == *j) return true;
+        if (*i < *j) ++i;
+        else ++j;
+    }
+    return false;
+}
+
+// "tmem 2048 (64 words per row) rows [0, 16) cols [8, 16)": the region as the
+// instruction named it, relative to its pointer.
+std::string Sanitizer::describe_tmem_region(const TmemRegion& region) {
+    return "tmem " + std::to_string(region.pointer) + " (" + std::to_string(region.row_words) +
+        " words per row) rows " + half_open(0, region.rows) + " cols " + half_open(0, region.columns);
+}
+
+void Sanitizer::check_tmem_pointer(const IssueSite& site, const std::string& what, uint32_t pointer,
+    uint32_t row_words, uint32_t columns) const {
+    if (tmem_pointer_aligned(pointer, row_words, columns)) return;
+    throw_issue_panic(site, what + ": tmem pointer " + std::to_string(pointer) + " with " +
+        std::to_string(row_words) + " words per row is row " + std::to_string(pointer / row_words) + " column " +
+        std::to_string(pointer % row_words) + "; a pointer's row is a multiple of 4 and the " +
+        std::to_string(columns) + " columns it touches stay inside its row (src/layout.hpp)");
 }
 
 std::string Sanitizer::describe_tmem_owner(const TmemOwner& owner) const {
@@ -752,10 +768,8 @@ std::string Sanitizer::describe_tmem_owner(const TmemOwner& owner) const {
         break;
     }
     return text + " (warp " + std::to_string(owner.warp) + " pc " + std::to_string(owner.pc) +
-        ", accepted cycle " + std::to_string(owner.issue_cycle) + "; " + mode + " of '" +
-        accumulator_names_.at(owner.accumulator) + "' rows " +
-        half_open(owner.row_begin, owner.row_end) + " cols " +
-        half_open(owner.col_begin, owner.col_end) + " " + until + ")";
+        ", accepted cycle " + std::to_string(owner.issue_cycle) + "; " + mode + " of " +
+        describe_tmem_region(owner.region) + " " + until + ")";
 }
 
 void Sanitizer::release_tmem_owner(TmemOwnerKind kind, uint64_t id) {
@@ -764,59 +778,42 @@ void Sanitizer::release_tmem_owner(TmemOwnerKind kind, uint64_t id) {
     });
 }
 
-void Sanitizer::check_acc_transfer_vs_mma(const IssueSite& site, uint8_t accumulator) const {
+void Sanitizer::check_acc_transfer_vs_mma(const IssueSite& site, const TmemRegion& region) const {
     // Racing accepted MMA work is UB (cases 01/02): no ownership hardware
     // exists, but the simulator has global knowledge and diagnoses it. An
-    // accepted MMA (queued or not) write-owns its whole accumulator until its
-    // last result retires.
+    // accepted MMA (queued or not) write-owns every word of its result until
+    // its last result retires; a transfer touching none of them is no race.
     for (const auto& owner : tmem_owners_) {
-        if (owner.kind == TmemOwnerKind::mma && owner.accumulator == accumulator) {
+        if (owner.kind == TmemOwnerKind::mma && tmem_overlap(owner.region, region)) {
             throw_issue_panic(site,
-                "accumulator transfer races accepted MMA work on '" +
-                accumulator_names_.at(accumulator) + "' owned by " +
-                describe_tmem_owner(owner) + ": wait on the mma.commit mbar phase first");
+                "accumulator transfer of " + describe_tmem_region(region) + " races accepted MMA work: " +
+                describe_tmem_owner(owner) + " shares its words; wait on the mma.commit mbar phase first");
         }
     }
 }
 
-void Sanitizer::check_acc_transfer_overlap(
-    const IssueSite& site, uint8_t accumulator, bool load,
-    uint32_t row, uint32_t col, uint32_t width) const {
+void Sanitizer::check_acc_transfer_overlap(const IssueSite& site, const TmemRegion& region, bool load) const {
     // Transfer vs transfer: an acc.ld and an acc.st run in their own engines
     // at the same time, so a load over a store still in flight (or the other
     // way round) is a race. Two stores never overlap in time (one acc.st
     // engine); two loads only read.
-    TmemOwner region;
-    region.accumulator = accumulator;
-    region.row_begin = row;
-    region.col_begin = col;
-    region.row_end = row + lanes_;
-    region.col_end = col + width;
     for (const auto& owner : tmem_owners_) {
         if (owner.kind == TmemOwnerKind::mma) continue;
         if (load && owner.kind == TmemOwnerKind::acc_ld) continue; // two readers
-        if (!tmem_overlap(owner, region)) continue;
-        throw_issue_panic(site, std::string("tmem race: ") + (load ? "acc.ld reads" : "acc.st writes") +
-            " '" + accumulator_names_.at(accumulator) + "' rows " +
-            half_open(region.row_begin, region.row_end) + " cols " +
-            half_open(region.col_begin, region.col_end) + " overlapping " +
+        if (!tmem_overlap(owner.region, region)) continue;
+        throw_issue_panic(site, std::string("tmem race: ") + (load ? "acc.ld reads " : "acc.st writes ") +
+            describe_tmem_region(region) + " overlapping " +
             describe_tmem_owner(owner) + "; wait that transfer's depbar sb" +
             std::to_string(owner.depbar) + " of warp " + std::to_string(owner.warp) + " first");
     }
 }
 
-void Sanitizer::record_acc_transfer_accept(
-    const IssueSite& site, bool load, uint8_t accumulator,
-    uint32_t row, uint32_t col, uint32_t width, uint8_t depbar) {
+void Sanitizer::record_acc_transfer_accept(const IssueSite& site, bool load, const TmemRegion& region, uint8_t depbar) {
     // Conflicts were checked at admission (check_acc_transfer_*).
     TmemOwner owner;
     owner.kind = load ? TmemOwnerKind::acc_ld : TmemOwnerKind::acc_st;
     owner.id = next_acc_transfer_id_++;
-    owner.accumulator = accumulator;
-    owner.row_begin = row;
-    owner.row_end = row + lanes_;
-    owner.col_begin = col;
-    owner.col_end = col + width;
+    owner.region = region;
     owner.warp = site.warp;
     owner.pc = site.pc;
     owner.issue_cycle = site.cycle;

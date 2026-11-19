@@ -261,9 +261,10 @@ std::optional<uint8_t> depbar_wait(const Instruction& inst, const std::array<uin
 std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePlan& plan, const ResourceView& view) {
     const auto opcode = inst.opcode;
     if (view.read_inhibited) return Refusal::rf_read_inhibited;
-    // A tma's later operand rounds own the URF's two read ports (src/rf.hpp
-    // tma_operand_rounds): an instruction whose read round has a uniform
-    // register (a tma included) would sample in one of them.
+    // A tma's or an mma.async's later operand rounds own the URF's two read
+    // ports (src/rf.hpp uniform_read_rounds): an instruction whose read round
+    // has a uniform register (a tma or an mma.async included) would sample in
+    // one of them.
     if (view.urf_ports_held && !plan.uniform_reads.empty()) return Refusal::urf_read_ports_held;
     // A uniform-register writer (or usetp) needs nothing else: its write port
     // is its own pipeline stage (src/rf.hpp; usetp's predicate goes to the
@@ -341,7 +342,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // Distinct sources beyond a bank's read ports are a property of the
     // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
-    // An mma.async's shape is one the profile lists and its accumulator's.
+    // An mma.async's shape is one the profile lists; an acc.ld / acc.st's
+    // words per row are legal (src/layout.hpp).
     check_mma_shapes(kernel_, config_);
     // Every uniform register named is one the profile's URF has.
     check_uniform_registers(kernel_, config_);
@@ -351,15 +353,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     if (launch.active_warps > config_.core_warps) {
         throw SimError("launch of " + std::to_string(launch.active_warps) + " warps exceeds the SM's " +
             std::to_string(config_.core_warps) + " warp slots (core.warps)");
-    }
-    for (const auto& acc : kernel_.accumulators) {
-        const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
-        if (acc.base_word % config_.tmem_fine_banks != 0 ||
-            acc.rows < config_.lanes || acc.rows % 4 != 0 || acc.cols % 4 != 0 ||
-            static_cast<uint64_t>(acc.base_word) + words >
-                static_cast<uint64_t>(config_.tmem_fine_banks) * config_.tmem_words_per_fine_bank) {
-            throw SimError("invalid accumulator metadata for '" + acc.name + "'");
-        }
     }
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
         const auto rows_per_warp = kernel_.register_count <= bank
@@ -652,7 +645,7 @@ bool Machine::done() const {
         read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
         !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
-        tma.credits_used == 0 && empty(tma_read_rounds_) && drained(tma_read_pairs_.cur()) &&
+        tma.credits_used == 0 && empty(urf_read_rounds_) && drained(tma_read_pairs_.cur()) &&
         empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
         dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() && drained(urf_pipe_.cur()) &&
         mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
@@ -2489,12 +2482,8 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
         if (!it->c_sampled && it->c_sample_cycle == cycle_) sample_mma_c(*it);
         if (it->land_cycle != cycle_) { ++it; continue; }
         if (!it->c_sampled) throw SimError("internal MMA result lands before its C sample");
-        const auto& acc = kernel_.accumulators.at(it->accumulator);
-        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-            for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-                w.tmem_writes.emplace_back(static_cast<uint32_t>(tmem_word_index(acc, it->m0 + mi, it->n0 + ni)),
-                    it->values[mi * config_.mma_core_n + ni]);
-        trace_->mma_result(cycle_, it->command, it->m0 * acc.cols + it->n0);
+        for (std::size_t i = 0; i < it->words.size(); ++i) w.tmem_writes.emplace_back(it->words[i], it->values[i]);
+        trace_->mma_result(cycle_, it->command, it->address);
         const auto id = it->command;
         auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
             [id](const auto& candidate) { return candidate.id == id; });
@@ -2563,7 +2552,7 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     const uint32_t m_block = block / blocks_n;
     const uint32_t n_block = block % blocks_n;
     step.command = command.id;
-    step.accumulator = command.accumulator;
+    step.c_pointer = command.c_pointer;
     step.m0 = m_block * config_.mma_core_m;
     step.n0 = n_block * config_.mma_core_n;
     step.k0 = k_block * config_.mma_core_k;
@@ -2576,16 +2565,21 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     step.reload_a = n_block == 0;
     step.last_step = command.next_step + 1 == total_steps;
     // A step whose tile is still in the core or on its way to tmem (a short
-    // sweep) waits: its C must be the earlier step's result.
-    const auto same_tile = [&](uint8_t accumulator, uint32_t m0, uint32_t n0) {
-        return accumulator == step.accumulator && m0 == step.m0 && n0 == step.n0;
+    // sweep) waits: its C must be the earlier step's result. Tiles are told
+    // apart by the tmem words they write (any shared word: the same tile, or
+    // two commands' overlapping results), so pointers may alias freely.
+    const auto words = mma_block_words(step);
+    const auto shares_words = [&](const std::vector<uint32_t>& other) {
+        return std::any_of(other.begin(), other.end(), [&](uint32_t word) {
+            return std::find(words.begin(), words.end(), word) != words.end();
+        });
     };
     const bool tile_in_flight =
         std::any_of(mma.results.begin(), mma.results.end(), [&](const MmaResult& result) {
-            return same_tile(result.accumulator, result.m0, result.n0);
+            return shares_words(result.words);
         }) ||
         std::any_of(mma.reads.begin(), mma.reads.end(), [&](const std::optional<MmaRead>& read) {
-            return read.has_value() && same_tile(read->step.accumulator, read->step.m0, read->step.n0);
+            return read.has_value() && shares_words(mma_block_words(read->step));
         });
     if (tile_in_flight) {
         trace_->mma_recurrence_stall();
@@ -2690,9 +2684,8 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
     result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
     result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
     result.command = step.command;
-    result.accumulator = step.accumulator;
-    result.m0 = step.m0;
-    result.n0 = step.n0;
+    result.address = step.c_pointer + step.m0 * step.shape.n + step.n0;
+    result.words = mma_block_words(step);
     result.init_step = step.init_step;
     result.a = mma.a_held;
     result.b = std::move(b);
@@ -2705,12 +2698,10 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
 // core tmem.read_latency_cycles later, before the core's last stage (profile
 // validation: result_latency >= port_depth + read_latency).
 void Machine::sample_mma_c(MmaResult& result) {
-    const auto& acc = kernel_.accumulators.at(result.accumulator);
     result.values.resize(config_.mma_core_m * config_.mma_core_n);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            const uint32_t c = result.init_step ? 0u : tmem_[
-                tmem_word_index(acc, result.m0 + mi, result.n0 + ni)];
+            const uint32_t c = result.init_step ? 0u : tmem_.at(result.words.at(mi * config_.mma_core_n + ni));
             result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
                 std::span<const uint16_t>(result.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
                 std::span<const uint16_t>(result.b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
@@ -2719,17 +2710,37 @@ void Machine::sample_mma_c(MmaResult& result) {
     result.c_sampled = true;
 }
 
-std::size_t Machine::tmem_word_index(
-    const Kernel::Accumulator& acc, uint32_t row, uint32_t col) const {
-    // Candidate rfc05 fine layout. The row-major 4x4 macro-tile stride is
-    // dimension-aware; chan.txt's 16*(row/4)+(col/4) is only the N=64 case.
-    const uint32_t fine_bank = 4 * (row % 4) + ((col % 4) ^ ((row / 4) % 4));
-    const uint32_t macro_columns = (acc.cols + 3) / 4;
-    const uint64_t bank_address = static_cast<uint64_t>(row / 4) * macro_columns + col / 4;
-    const uint64_t offset = bank_address * config_.tmem_fine_banks + fine_bank;
-    const uint64_t index = static_cast<uint64_t>(acc.base_word) + offset;
+std::size_t Machine::tmem_index(uint64_t logical, uint32_t row_words) const {
+    const uint64_t index = tmem_physical_word(logical, row_words);
     if (index >= tmem_.size()) throw SimError("internal tmem layout overflow");
     return static_cast<std::size_t>(index);
+}
+
+std::optional<std::vector<uint32_t>> Machine::tmem_region_words(
+    uint32_t pointer, uint32_t row_words, uint32_t rows, uint32_t columns) const {
+    std::vector<uint32_t> words;
+    words.reserve(static_cast<std::size_t>(rows) * columns);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t column = 0; column < columns; ++column) {
+            const uint64_t physical = tmem_physical_word(
+                uint64_t{pointer} + uint64_t{row} * row_words + column, row_words);
+            if (physical >= tmem_.size()) return std::nullopt;
+            words.push_back(static_cast<uint32_t>(physical));
+        }
+    }
+    return words;
+}
+
+// The tmem words of a matmul step's core_m x core_n result block, row-major:
+// rows m0.. and columns n0.. of the command's result region (rows of n words).
+std::vector<uint32_t> Machine::mma_block_words(const MmaStep& step) const {
+    std::vector<uint32_t> words;
+    words.reserve(config_.mma_core_m * config_.mma_core_n);
+    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
+            words.push_back(static_cast<uint32_t>(tmem_index(
+                uint64_t{step.c_pointer} + uint64_t{step.m0 + mi} * step.shape.n + step.n0 + ni, step.shape.n)));
+    return words;
 }
 
 // The two accumulator transfer engines (trash/rfc11.md section 0: one acc.ld
@@ -2775,9 +2786,8 @@ std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(std::optional<AccT
     AccLdBeat beat;
     beat.warp = transfer.warp;
     beat.reg = static_cast<uint8_t>(transfer.rf_base + transfer.next_column);
-    beat.accumulator = transfer.accumulator;
-    beat.row_base = transfer.row_base;
-    beat.column = transfer.col_base + transfer.next_column;
+    beat.address = transfer.pointer + transfer.next_column;
+    beat.row_words = transfer.row_words;
     beat.last = transfer.next_column + 1 == transfer.width;
     beat.depbar = transfer.depbar;
     ++transfer.next_column;
@@ -2789,13 +2799,12 @@ std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(std::optional<AccT
 // read now, as tmem is before this cycle's writes land (READ_FIRST). The
 // transfer's last sample ends its tmem read-ownership.
 void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
-    const auto& acc = kernel_.accumulators.at(beat.accumulator);
     beat.values.resize(config_.lanes);
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        beat.values[lane] = tmem_[tmem_word_index(acc, beat.row_base + lane, beat.column)];
+        beat.values[lane] = tmem_[tmem_index(uint64_t{beat.address} + uint64_t{lane} * beat.row_words, beat.row_words)];
     }
     beat.sampled = true;
-    trace_->tmem_beat(cycle_, beat.warp, true, beat.column);
+    trace_->tmem_beat(cycle_, beat.warp, true, beat.address);
     if (beat.last) sanitizer_.record_acc_transfer_final_beat(true);
 }
 
@@ -2808,15 +2817,15 @@ void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
 void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
     if (!engine.has_value()) return;
     auto& transfer = *engine;
-    const auto& acc = kernel_.accumulators.at(transfer.accumulator);
     while (!transfer.in_flight.empty() && transfer.in_flight.front().land_cycle == cycle_) {
         const auto& beat = transfer.in_flight.front();
+        const uint64_t address = uint64_t{transfer.pointer} + beat.column;
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             w.tmem_writes.emplace_back(
-                static_cast<uint32_t>(tmem_word_index(acc, transfer.row_base + lane, transfer.col_base + beat.column)),
+                static_cast<uint32_t>(tmem_index(address + uint64_t{lane} * transfer.row_words, transfer.row_words)),
                 beat.values[lane]);
         }
-        trace_->tmem_beat(cycle_, transfer.warp, false, beat.column);
+        trace_->tmem_beat(cycle_, transfer.warp, false, static_cast<uint32_t>(address));
         transfer.in_flight.pop_front();
         ++transfer.landed;
     }
@@ -3495,8 +3504,8 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
         (inst.opcode == Opcode::stg_v8 && static_cast<unsigned>(inst.src1) + 8 > 256))
         panic(warp, inst, "global vector register encoding wraps");
     if (is_acc_transfer(inst.opcode)) {
-        // (The coordinates are a uniform register pair: check_issue_hazards
-        // checks both against the URF.)
+        // (The pointer is a uniform register: check_issue_hazards checks it
+        // against the URF.)
         const auto base = is_acc_load(inst.opcode) ? inst.dst : inst.src1;
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
         if (static_cast<unsigned>(base) + width > 256) panic(warp, inst, "accumulator register encoding wraps");
@@ -3519,10 +3528,11 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
     }
 }
 
-// Register, predicate and accumulator-id ranges (machine panics: properties
-// of the instruction), then the sanitizer's hazard checks, at the cycles the
-// read round samples and its destination lands at (src/rf.hpp). Neither looks
-// at an operand value.
+// Register and predicate ranges (machine panics: properties of the
+// instruction), then the sanitizer's hazard checks, at the cycles the read
+// rounds sample and its destination lands at (src/rf.hpp). The machine looks
+// at no operand value; the sanitizer's transfer-versus-matmul check looks at
+// the tmem pointer the round will sample (it has global knowledge).
 void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) const {
     for (const auto reg : source_registers(inst)) {
         if (reg >= kernel_.register_count) panic(warp, inst, "source register out of range");
@@ -3542,15 +3552,12 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     if (uniform_dst.has_value() && *uniform_dst >= config_.urf_registers) {
         panic(warp, inst, "uniform destination register out of range");
     }
-    if (is_tma(inst.opcode)) {
-        // A tma's registers are sampled over its rounds (src/rf.hpp): each
-        // must be written by its own round's sample.
-        for (uint32_t round = 0; round < tma_operand_rounds(tma_coordinate_count(inst.opcode)); ++round) {
-            sanitizer_.check_uniform_raw(site(warp, inst), tma_operand_round(inst, round),
-                cycle_ + issue_to_tma_round_sample(round));
-        }
-    } else {
-        sanitizer_.check_uniform_raw(site(warp, inst), uniform_sources_read, cycle_ + issue_to_urf_sample);
+    // Each uniform register must be written by its own round's sample (a
+    // tma's and an mma.async's later rounds sample later: src/rf.hpp
+    // uniform_read_rounds).
+    const auto rounds = uniform_read_rounds(inst);
+    for (uint32_t round = 0; round < rounds.size(); ++round) {
+        sanitizer_.check_uniform_raw(site(warp, inst), rounds[round], cycle_ + issue_to_uniform_round_sample(round));
     }
     if (uniform_dst.has_value()) {
         sanitizer_.check_uniform_waw(site(warp, inst), *uniform_dst, cycle_ + issue_to_urf_visible(config_));
@@ -3564,15 +3571,31 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     }
     check_register_hazards(warp, inst);
     if (is_acc_transfer(inst.opcode)) {
-        const auto accumulator = is_acc_load(inst.opcode) ? inst.src0 : inst.dst;
-        if (accumulator >= kernel_.accumulators.size()) panic(warp, inst, "accumulator id out of range");
         // Racing accepted MMA work is UB (cases 01/02): no ownership hardware
         // exists, but the simulator has global knowledge and diagnoses it, at
         // every attempt (contention must not hide it) and again at dispatch
         // (an MMA command issued just before is accepted by the MMA only
-        // then).
-        sanitizer_.check_acc_transfer_vs_mma(site(warp, inst), accumulator);
+        // then). The words are the ones the pointer the round samples next
+        // cycle names (a region outside tmem is the dispatch PANIC's).
+        const uint32_t width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+        const auto pointer = uniform_at_next_sample(warp.id, inst.src0);
+        if (const auto words = tmem_region_words(pointer, static_cast<uint32_t>(inst.imm), config_.lanes, width);
+            words.has_value()) {
+            sanitizer_.check_acc_transfer_vs_mma(site(warp, inst), tmem_region(pointer, inst, *words));
+        }
     }
+}
+
+// What a transfer touches, for the sanitizer: the region and its tmem words.
+TmemRegion Machine::tmem_region(uint32_t pointer, const Instruction& inst, std::vector<uint32_t> words) const {
+    TmemRegion region;
+    region.pointer = pointer;
+    region.row_words = static_cast<uint32_t>(inst.imm);
+    region.rows = config_.lanes;
+    region.columns = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+    std::sort(words.begin(), words.end());
+    region.words = std::move(words);
+    return region;
 }
 
 // What an accepted instruction books, from metadata and the profile: its one
@@ -3589,9 +3612,10 @@ IssuePlan Machine::issue_plan(const Instruction& inst) const {
         sources = {inst.src0};
     }
     plan.reads = rf_read_round(sources);
-    // A tma's issue round is its operand read's round 0 (src/rf.hpp); its
-    // later rounds are the TMA operand read's own.
-    plan.uniform_reads = is_tma(inst.opcode) ? tma_operand_round(inst, 0) : rf_read_round(uniform_sources(inst));
+    // The issue round's uniform registers: round 0 of src/rf.hpp's plan (a
+    // tma's and an mma.async's later rounds are the round counter's).
+    const auto rounds = uniform_read_rounds(inst);
+    if (!rounds.empty()) plan.uniform_reads = rounds.front();
     const auto destination = destination_register(inst);
     if (uses_arithmetic_pipeline(inst) && destination.has_value()) {
         plan.write_reg = destination;
@@ -3624,7 +3648,7 @@ ResourceView Machine::resource_view(
     // still holds. So the push always fits.
     view.tma_queue_room = w.tma_next.commands.size() + (w.tma_pushed.has_value() ? 1 : 0) +
         tma_commands_being_read() < config_.tma_queue_commands;
-    view.urf_ports_held = tma_read_ports_held();
+    view.urf_ports_held = urf_read_ports_held();
     view.mma_queue_room = w.mma_next.queue.size() + claims.mma_commands < config_.mma_queue_commands;
     if (is_acc_transfer(inst.opcode)) {
         const bool load = is_acc_load(inst.opcode);
@@ -3721,11 +3745,12 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         w.issue.halt = true;
         break;
     default:
-        if (is_tma(inst.opcode)) {
-            accept_tma(warp, inst, w);
-        } else {
-            accept_for_dispatch(warp, inst, plan, w);
-        }
+        // A tma's and an mma.async's later uniform rounds are the round
+        // counter's (src/rf.hpp uniform_read_rounds); a tma reaches its queue
+        // through the TMA operand read, an mma.async through the dispatch
+        // pipeline like every other unit's instruction.
+        if (uniform_read_rounds(inst).size() > 1) load_urf_rounds(warp, inst, w);
+        if (!is_tma(inst.opcode)) accept_for_dispatch(warp, inst, plan, w);
         break;
     }
     check_issue_latency(warp, inst);
@@ -3861,25 +3886,31 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     entry.instruction = inst;
     entry.reads = plan.reads;
     entry.operands.resize(plan.reads.size());
-    entry.uniform_reads = plan.uniform_reads;
-    entry.uniform_operands.resize(plan.uniform_reads.size());
+    // Every round's uniform registers, in read order: the issue round's
+    // (plan.uniform_reads) are latched at its sample, an mma.async's urC by
+    // the round counter's round 1.
+    for (const auto& round : uniform_read_rounds(inst)) {
+        entry.uniform_reads.insert(entry.uniform_reads.end(), round.begin(), round.end());
+    }
+    entry.uniform_operands.resize(entry.uniform_reads.size());
     w.issue.dispatch = std::move(entry);
 }
 
-// A tma accepted now (trash/rfc17.md section 4): it loads the TMA operand
-// read's round counter, whose round 0 samples urS / urM next cycle (the
-// issue register's), and from now on it counts as a slot of the TMA queue
-// (resource_view). It reads no vector register and sets no depbar. Issue
-// accepted it only with the counter free after this cycle (its last round,
-// if any, is sampled now: tma_read_ports_held).
-void Machine::accept_tma(Warp& warp, const Instruction& inst, Wires& w) {
-    TmaReadRounds rounds;
+// A tma or an mma.async accepted now (trash/rfc17.md section 4): it loads the
+// URF's round counter, whose round 0 samples next cycle (the issue
+// register's) and whose later rounds one per cycle after that. A tma from now
+// on counts as a slot of the TMA queue (resource_view); it reads no vector
+// register and sets no depbar. Issue accepted it only with the counter free
+// after this cycle (its last round, if any, is sampled now:
+// urf_read_ports_held).
+void Machine::load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w) {
+    UrfReadRounds rounds;
     rounds.header.issue_cycle = cycle_;
     rounds.header.warp = warp.id;
     rounds.header.pc = head_pc(warp.id);
     rounds.header.active_mask = warp.active_mask;
     rounds.header.instruction = inst;
-    w.issue.tma_read = std::move(rounds);
+    w.issue.urf_rounds = std::move(rounds);
 }
 
 // What the dispatch pipeline's instructions will take when they reach their
@@ -3978,11 +4009,21 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
         return;
     }
     // The shape is the profile's (its list gives each opcode pair a shape);
-    // its existence and its accumulator's match were checked at kernel load
-    // (check_mma_shapes).
+    // its existence was checked at kernel load (check_mma_shapes).
     const auto shape = *mma_shape_of(config_, inst.opcode);
     const auto a = uniform_operand(op, inst.src0);
     const auto b = uniform_operand(op, inst.src1);
+    // urC, from the round counter's round 1 (src/rf.hpp uniform_read_rounds):
+    // the result's tmem pointer, its rows the shape's n words. Every word it
+    // writes must be in tmem (the machine's PANIC, as an operand outside
+    // shmem); a pointer that breaks the alignment rule is the sanitizer's
+    // (src/layout.hpp tmem_pointer_aligned). The machine writes whatever
+    // words the layout names.
+    const auto c = uniform_operand(op, inst.src2);
+    auto c_words = tmem_region_words(c, shape.n, shape.m, shape.n);
+    if (!c_words.has_value()) panic(op, "MMA result region is outside tmem");
+    sanitizer_.check_tmem_pointer(site(op), opcode_name(inst.opcode, &config_.mma_shapes) + " result", c,
+        shape.n, shape.n);
     // The spacings are instruction constants, checked at kernel load
     // (check_mma_shapes): under swizzle64 a power of two, 16 or more.
     const auto a_spacing = mma_row_spacing(inst, true);
@@ -4010,51 +4051,58 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     command.init = is_mma_init(inst.opcode);
     command.shape = shape;
     command.warp = op.warp;
-    command.accumulator = inst.dst;
+    command.c_pointer = c;
     command.depbar = inst.control.set_depbar;
     command.a_base = a;
     command.b_base = b;
     command.a_spacing = a_spacing;
     command.b_spacing = b_spacing;
-    sanitizer_.record_mma_accept(site(op), command.id, command.accumulator, command.depbar,
+    TmemRegion result;
+    result.pointer = c;
+    result.row_words = shape.n;
+    result.rows = shape.m;
+    result.columns = shape.n;
+    std::sort(c_words->begin(), c_words->end());
+    result.words = std::move(*c_words);
+    sanitizer_.record_mma_accept(site(op), command.id, result, command.depbar,
         mma_operand_span(a, a_spacing, true, shape), mma_operand_span(b, b_spacing, false, shape));
     trace_->mma_command(cycle_, command.id, op.warp, command.init);
     w.dispatch.mma = std::move(command);
 }
 
-// acc.ld / acc.st: the coordinates arrive now; the transfer runs one beat per
-// column in its engine (step_acc_transfers, and decide_rf_reads for acc.st).
+// acc.ld / acc.st: the pointer arrives now; the transfer runs one beat per
+// column in its engine (step_acc_transfers, and decide_rf_reads for acc.st):
+// lane l moves row l of the region at the pointer (rows of S words, the
+// instruction's), beat j column j. Every word it touches must be in tmem
+// (the machine's PANIC); the alignment rule is the sanitizer's
+// (src/layout.hpp tmem_pointer_aligned).
 void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool load = is_acc_load(inst.opcode);
     const uint32_t width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
-    const uint8_t acc_id = load ? inst.src0 : inst.dst;
-    const uint8_t coord = load ? inst.src1 : inst.src0;
     const uint8_t rf_base = load ? inst.dst : inst.src1;
-    const auto& acc = kernel_.accumulators[acc_id];
+    const auto row_words = static_cast<uint32_t>(inst.imm);
+    const auto pointer = uniform_operand(op, inst.src0);
+    auto words = tmem_region_words(pointer, row_words, config_.lanes, width);
+    if (!words.has_value() || static_cast<unsigned>(rf_base) + width > kernel_.register_count) {
+        panic(op, "accumulator transfer region outside tmem or RF range out of bounds");
+    }
+    const auto region = tmem_region(pointer, inst, std::move(*words));
+    sanitizer_.check_tmem_pointer(site(op), opcode_name(inst.opcode), pointer, row_words, width);
     // Racing accepted MMA work (check_issue_hazards): an MMA command issued
     // before this transfer was accepted by the MMA before this dispatch
     // (dispatch keeps issue order).
-    sanitizer_.check_acc_transfer_vs_mma(site(op), acc_id);
-    const auto row = uniform_operand(op, coord);
-    const auto col = uniform_operand(op, static_cast<uint8_t>(coord + 1));
-    sanitizer_.check_acc_transfer_overlap(site(op), acc_id, load, row, col, width);
-    if (static_cast<uint64_t>(row) + config_.lanes > acc.rows ||
-        static_cast<uint64_t>(col) + width > acc.cols ||
-        static_cast<unsigned>(rf_base) + width > kernel_.register_count) {
-        panic(op, "accumulator coordinate or RF range out of bounds");
-    }
+    sanitizer_.check_acc_transfer_vs_mma(site(op), region);
+    sanitizer_.check_acc_transfer_overlap(site(op), region, load);
     AccTransfer transfer;
     transfer.load = load;
     transfer.warp = op.warp;
-    transfer.accumulator = acc_id;
     transfer.rf_base = rf_base;
     transfer.depbar = inst.control.set_depbar;
-    transfer.row_base = row;
-    transfer.col_base = col;
+    transfer.pointer = pointer;
+    transfer.row_words = row_words;
     transfer.width = width;
-    sanitizer_.record_acc_transfer_accept(site(op), load, acc_id,
-        row, col, width, inst.control.set_depbar);
+    sanitizer_.record_acc_transfer_accept(site(op), load, region, inst.control.set_depbar);
     w.dispatch.acc = DispatchDecision::AccAdmission{load, std::move(transfer)};
 }
 
@@ -4153,7 +4201,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
 }
 
 // ===========================================================================
-// The TMA operand read's end (TmaReadRounds in src/sim.hpp; the timing is
+// The TMA operand read's end (UrfReadRounds in src/sim.hpp; the timing is
 // src/rf.hpp tma_operand_rounds). The pair in the URF read stages' last stage
 // is at the URF output now: it goes into the holding register (round 0 starts
 // the command: its instruction's fields, the buffer and the barrier, the
@@ -4235,7 +4283,8 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
 // each whose last pair is still in the URF read stages (the pair in the last
 // stage arrives now: tma_pushed).
 uint32_t Machine::tma_commands_being_read() const {
-    uint32_t commands = tma_read_rounds_.cur().has_value() ? 1 : 0;
+    const auto& rounds = urf_read_rounds_.cur();
+    uint32_t commands = rounds.has_value() && is_tma(rounds->header.instruction.opcode) ? 1 : 0;
     const auto& pairs = tma_read_pairs_.cur();
     for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) {
         if (pairs[stage].has_value() && pairs[stage]->last) ++commands;
@@ -4243,13 +4292,21 @@ uint32_t Machine::tma_commands_being_read() const {
     return commands;
 }
 
-// The round counter's command has rounds still to start after the one it
+// The round counter's instruction has rounds still to start after the one it
 // samples now: an instruction accepted now would sample a uniform register
 // in one of them.
-bool Machine::tma_read_ports_held() const {
-    const auto& rounds = tma_read_rounds_.cur();
-    return rounds.has_value() &&
-        rounds->round + 1 < tma_operand_rounds(tma_coordinate_count(rounds->header.instruction.opcode));
+bool Machine::urf_read_ports_held() const {
+    const auto& rounds = urf_read_rounds_.cur();
+    return rounds.has_value() && rounds->round + 1 < uniform_read_rounds(rounds->header.instruction).size();
+}
+
+uint32_t Machine::uniform_at_next_sample(uint32_t warp, uint8_t reg) const {
+    const auto& landing = urf_pipe_.cur().back();
+    if (landing.has_value() && landing->warp == warp && !is_usetp(landing->instruction.opcode) &&
+        landing->instruction.dst == reg && landing->value.has_value()) {
+        return *landing->value;
+    }
+    return warps_.at(warp).urf.at(reg);
 }
 
 // mbar.init / arrive / arrive.expect_tx: a uniform operation, its operands
@@ -4636,7 +4693,9 @@ void Machine::step_rf_reads(Wires& w) {
         if (op.issue_cycle + issue_to_sample != cycle_ || (op.reads.empty() && op.uniform_reads.empty())) continue;
         auto operands = op.operands;
         for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
-        w.dispatch_samples.push_back({index, std::move(operands), sample_uniform(op.warp, op.uniform_reads)});
+        const auto rounds = uniform_read_rounds(op.instruction);
+        w.dispatch_samples.push_back({index, false, std::move(operands), 0,
+            sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front())});
     }
     // The URF write pipeline's stage 0: uniform arithmetic samples its
     // uniform sources (in operand order; a register named twice is one read),
@@ -4653,19 +4712,36 @@ void Machine::step_rf_reads(Wires& w) {
             w.urf_sample = std::move(values);
         }
     }
-    // The TMA operand read's round now (src/rf.hpp tma_operand_round): its
-    // registers by operand position, in the counter's warp. The pair and its
-    // tag enter the URF read stages.
-    if (const auto& rounds = tma_read_rounds_.cur(); rounds.has_value()) {
+    // The round counter's round now (src/rf.hpp uniform_read_rounds): its
+    // registers by operand position, in the counter's warp. A tma's pair and
+    // its tag enter the TMA operand read's URF read stages; an mma.async's
+    // later round (round 0 is its dispatch entry's own sample, above) joins
+    // its dispatch entry, the one issued at the counter's issue cycle.
+    if (const auto& rounds = urf_read_rounds_.cur(); rounds.has_value()) {
         const auto& inst = rounds->header.instruction;
-        const auto registers = tma_operand_round(inst, rounds->round);
-        TmaReadPair pair;
-        pair.round = rounds->round;
-        pair.last = rounds->round + 1 == tma_operand_rounds(tma_coordinate_count(inst.opcode));
-        if (rounds->round == 0) pair.header = rounds->header;
-        for (const auto reg : registers) pair.words.push_back(warps_[rounds->header.warp].urf.at(reg));
-        uniform_reads += static_cast<uint32_t>(registers.size());
-        w.tma_sampled = std::move(pair);
+        const auto plan = uniform_read_rounds(inst);
+        const auto& registers = plan.at(rounds->round);
+        if (is_tma(inst.opcode)) {
+            TmaReadPair pair;
+            pair.round = rounds->round;
+            pair.last = rounds->round + 1 == plan.size();
+            if (rounds->round == 0) pair.header = rounds->header;
+            for (const auto reg : registers) pair.words.push_back(warps_[rounds->header.warp].urf.at(reg));
+            uniform_reads += static_cast<uint32_t>(registers.size());
+            w.tma_sampled = std::move(pair);
+        } else if (rounds->round > 0) {
+            const auto entry = std::find_if(pipe.begin(), pipe.end(), [&](const DispatchEntry& op) {
+                return op.issue_cycle == rounds->header.issue_cycle && op.warp == rounds->header.warp;
+            });
+            if (entry == pipe.end()) throw SimError("internal: a later uniform round lost its dispatch entry");
+            std::size_t first = 0;
+            for (uint32_t round = 0; round < rounds->round; ++round) first += plan[round].size();
+            std::vector<uint32_t> values;
+            for (const auto reg : registers) values.push_back(warps_[rounds->header.warp].urf.at(reg));
+            uniform_reads += static_cast<uint32_t>(registers.size());
+            w.dispatch_samples.push_back({static_cast<std::size_t>(entry - pipe.begin()), true, {}, first,
+                std::move(values)});
+        }
     }
     if (uniform_reads > urf_read_ports) {
         throw SimError("internal: the URF sampled " + std::to_string(uniform_reads) + " uniform registers at cycle " +
@@ -5170,23 +5246,26 @@ void Machine::drive_tma_queue(const Wires& w) {
     tma_.set_next(std::move(next), "drive_tma_queue");
 }
 
-// The TMA operand read's registers: the round counter moves to its next round
-// (it empties after the last) or takes issue's new command; every sampled
-// pair moves one URF read stage on (the one in the last stage arrived now);
-// the holding register takes this cycle's arrival.
+// The URF's round counter moves to its next round (it empties after the
+// last) or takes issue's new instruction; the TMA operand read's sampled
+// pairs move one URF read stage on (the one in the last stage arrived now);
+// its holding register takes this cycle's arrival.
 void Machine::drive_tma_operand_read(const Wires& w) {
-    const auto& rounds = tma_read_rounds_.cur();
-    std::optional<TmaReadRounds> next_rounds;
-    if (tma_read_ports_held()) {
-        next_rounds = rounds;
-        ++next_rounds->round;
+    const auto& rounds = urf_read_rounds_.cur();
+    std::optional<UrfReadRounds> next_rounds;
+    if (rounds.has_value() && urf_read_ports_held()) {
+        UrfReadRounds advanced = *rounds;
+        ++advanced.round;
+        next_rounds = std::move(advanced);
     }
-    if (w.issue.tma_read.has_value()) {
-        if (next_rounds.has_value()) throw SimError("internal: a tma was accepted while the operand read had rounds left");
-        next_rounds = w.issue.tma_read;
+    if (w.issue.urf_rounds.has_value()) {
+        if (next_rounds.has_value()) {
+            throw SimError("internal: a multi-round uniform reader was accepted while the counter had rounds left");
+        }
+        next_rounds = w.issue.urf_rounds;
     }
     if (rounds.has_value() || next_rounds.has_value()) {
-        tma_read_rounds_.set_next(std::move(next_rounds), "drive_tma_operand_read: rounds");
+        urf_read_rounds_.set_next(std::move(next_rounds), "drive_tma_operand_read: URF round counter");
     }
     const auto& pairs = tma_read_pairs_.cur();
     const bool in_flight = std::any_of(pairs.begin(), pairs.end(), [](const auto& stage) { return stage.has_value(); });
@@ -5467,8 +5546,11 @@ void Machine::drive_dispatch_pipe(const Wires& w) {
     if (!w.dispatched && w.dispatch_samples.empty() && !w.issue.dispatch.has_value()) return;
     auto next = dispatch_pipe_.cur();
     for (const auto& sample : w.dispatch_samples) {
-        next.at(sample.index).operands = sample.operands;
-        next.at(sample.index).uniform_operands = sample.uniform_operands;
+        auto& entry = next.at(sample.index);
+        if (!sample.later_round) entry.operands = sample.operands;
+        for (std::size_t i = 0; i < sample.uniform_operands.size(); ++i) {
+            entry.uniform_operands.at(sample.uniform_first + i) = sample.uniform_operands[i];
+        }
     }
     if (w.dispatched) next.pop_front();
     if (w.issue.dispatch.has_value()) next.push_back(*w.issue.dispatch);
@@ -5668,10 +5750,10 @@ uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::s
 }
 
 // A uniform-register operand (lds.uni / ldg.uni bases, atom.*.uni address
-// and operand, acc.ld / acc.st coordinates, mbar addresses and values, MMA
-// addresses, mma.commit's mbar), as the round latched it at its sample
-// (step_rf_reads). Uniform by construction: no lane check. The uniform
-// operation's partial-mask rule stays (the sanitizer's PANIC).
+// and operand, acc.ld / acc.st tmem pointers, mbar addresses and values, MMA
+// addresses and result pointer, mma.commit's mbar), as its round latched it
+// at its sample (step_rf_reads). Uniform by construction: no lane check. The
+// uniform operation's partial-mask rule stays (the sanitizer's PANIC).
 uint32_t Machine::uniform_operand(const DispatchEntry& op, uint8_t ureg) const {
     sanitizer_.check_uniform_mask(site(op), op.active_mask, full_mask());
     for (std::size_t i = 0; i < op.uniform_reads.size(); ++i) {

@@ -262,9 +262,10 @@ void validate_device_profile(const DeviceProfile& p) {
                 std::to_string(p.mma_core_m) + "x" + std::to_string(p.mma_core_n) + "x" +
                 std::to_string(p.mma_core_k));
         }
-        // The accumulator: one row per lane in each acc.ld / acc.st beat, so
-        // an accumulator holds at least `lanes` rows (the .acc rule), and it
-        // fits in tmem.
+        // The result: at least `lanes` rows (an acc.ld / acc.st beat moves one
+        // row per lane; kept from the declared accumulators of a5d0652, though
+        // a pointer could now read 16 rows across two results), and it fits
+        // in tmem.
         if (shape.m < p.lanes) {
             throw ProfileError(name + ": its accumulator has " + std::to_string(shape.m) +
                 " rows; acc.ld / acc.st move one row per lane, so an accumulator needs at least " +

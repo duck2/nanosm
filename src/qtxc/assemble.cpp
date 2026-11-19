@@ -20,10 +20,6 @@ std::string emit_asm(const AssemblyProgram& program) {
         out << ".equ " << name << ", " << value << '\n';
     }
     if (!program.constants.empty()) out << '\n';
-    for (const auto& acc : program.accumulators) {
-        out << ".acc " << acc.name << ", " << acc.base_word << ", " << acc.rows << ", " << acc.cols << '\n';
-    }
-    if (!program.accumulators.empty()) out << '\n';
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         for (const auto& label : program.labels) {
             if (label.instruction_index == index) out << label.name << ":\n";
@@ -45,32 +41,10 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             format_profile_fingerprint(program.profile_fingerprint) + "' does not match '" +
             profile.name + "@" + format_profile_fingerprint(expected) + "'");
     }
-    for (std::size_t i = 0; i < program.accumulators.size(); ++i) {
-        const auto& acc = program.accumulators[i];
-        const uint64_t words = static_cast<uint64_t>(acc.rows) * acc.cols;
-        if (acc.base_word % profile.tmem_fine_banks != 0 ||
-            acc.rows < profile.lanes || acc.rows % 4 != 0 || acc.cols % 4 != 0 ||
-            static_cast<uint64_t>(acc.base_word) + words >
-                static_cast<uint64_t>(profile.tmem_fine_banks) * profile.tmem_words_per_fine_bank) {
-            throw SimError("accumulator '" + acc.name +
-                "' must fit tmem, align to the fine-bank count, cover one warp, "
-                "and have dimensions divisible by four");
-        }
-        for (std::size_t j = 0; j < i; ++j) {
-            const auto& other = program.accumulators[j];
-            const uint64_t other_end = static_cast<uint64_t>(other.base_word) +
-                static_cast<uint64_t>(other.rows) * other.cols;
-            const uint64_t end = static_cast<uint64_t>(acc.base_word) + words;
-            if (acc.base_word < other_end && other.base_word < end) {
-                throw SimError("overlapping tmem accumulators '" + other.name + "' and '" + acc.name + "'");
-            }
-        }
-    }
     Kernel kernel;
     kernel.register_count = register_count(program);
     kernel.profile_name = program.profile_name;
     kernel.profile_fingerprint = program.profile_fingerprint;
-    kernel.accumulators = program.accumulators;
     kernel.words.reserve(program.instructions.size());
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         const auto& inst = program.instructions[index];
@@ -143,7 +117,8 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             }
         }
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, program.accumulators, profile, "line " + std::to_string(inst.line));
+        check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
+        check_tmem_operand(inst, profile, "line " + std::to_string(inst.line));
         kernel.words.push_back(encode(inst));
     }
     return kernel;

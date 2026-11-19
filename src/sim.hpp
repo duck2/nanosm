@@ -96,7 +96,7 @@ struct ResourceView {
     bool write_inhibited = false;    // the RF write decision inhibits new bookings to that bank
     bool wait_slot_free = false;     // an mbar wait slot
     bool tma_queue_room = false;     // counting the commands the TMA operand read holds
-    bool urf_ports_held = false;     // a tma's operand read has rounds still to start after this cycle
+    bool urf_ports_held = false;     // a tma's or an mma.async's uniform read has rounds still to start after this cycle
     bool mma_queue_room = false;
     bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
     // shmem (trash/rfc12.md sections 3, 4 and 6), as this cycle's grants leave it:
@@ -513,9 +513,8 @@ private:
     struct AccLdBeat {
         uint32_t warp = 0;
         uint8_t reg = 0;
-        uint8_t accumulator = 0;
-        uint32_t row_base = 0;
-        uint32_t column = 0;          // the accumulator column this beat reads
+        uint32_t address = 0;         // lane 0's logical tmem word (the pointer + the beat's column)
+        uint32_t row_words = 0;       // the region's words per row: lane l reads address + l x row_words
         bool sampled = false;
         std::vector<uint32_t> values; // the words, from the tmem sample on
         bool last = false;    // the transfer's final beat: its sample ends the read, its RF write clears the depbar
@@ -537,16 +536,17 @@ private:
         std::vector<uint32_t> values;
     };
 
-    // The transfer an engine is running. The sanitizer keys its tmem owner by
-    // the engine (acc.ld or acc.st).
+    // The transfer an engine is running: the region at `pointer` (a logical
+    // tmem word, src/layout.hpp) whose rows are row_words words; lane l moves
+    // row l, beat j column j. The sanitizer keys its tmem owner by the engine
+    // (acc.ld or acc.st).
     struct AccTransfer {
         bool load = false;
         uint32_t warp = 0;
-        uint8_t accumulator = 0;
         uint8_t rf_base = 0;
         uint8_t depbar = 0;
-        uint32_t row_base = 0;
-        uint32_t col_base = 0;
+        uint32_t pointer = 0;
+        uint32_t row_words = 0;
         uint32_t width = 1;
         uint32_t next_column = 0;   // beats launched (acc.ld: tmem reads; acc.st: RF reads)
         // acc.st: its beats in flight to tmem, oldest first, and how many
@@ -561,7 +561,7 @@ private:
         bool init = false;
         MmaShape shape;          // from the opcode (m 32 or 64, n 64, k 8)
         uint32_t warp = 0;
-        uint8_t accumulator = 0;
+        uint32_t c_pointer = 0;  // urC as read: the result's logical tmem word, rows of n words
         uint8_t depbar = 0;
         uint32_t a_base = 0;     // the operand's first 16-byte piece in its row 0
         uint32_t b_base = 0;
@@ -583,9 +583,8 @@ private:
         uint64_t c_sample_cycle = 0;
         uint64_t land_cycle = 0;
         uint64_t command = 0;
-        uint8_t accumulator = 0;
-        uint32_t m0 = 0;
-        uint32_t n0 = 0;
+        uint32_t address = 0;            // the block's first logical tmem word (the trace's)
+        std::vector<uint32_t> words;     // its core_m x core_n physical tmem words, row-major
         bool init_step = false;          // C = 0 instead of the tmem words
         std::vector<uint16_t> a;         // the step's A block, core_m x core_k fp16
         std::vector<uint16_t> b;         // its B block, core_n x core_k fp16 (transposed snapshot)
@@ -599,7 +598,7 @@ private:
     // next A block). It travels with the step's rounds through port B.
     struct MmaStep {
         uint64_t command = 0;
-        uint8_t accumulator = 0;
+        uint32_t c_pointer = 0;  // the command's result pointer (rows of shape.n words)
         bool last_step = false;  // the command's last step: its final sample frees the operands
         bool init_step = false;  // C = 0 instead of the tmem value
         bool reload_a = false;   // this step reads its A block (n block 0); otherwise the held one
@@ -1155,17 +1154,24 @@ private:
         std::deque<MmaResult> results;  // steps in the core and in the tmem write pipeline
     };
 
-    // The TMA's operand read (trash/rfc17.md section 4; the timing is
-    // src/rf.hpp tma_operand_rounds). It replaces the dispatch pipeline for a
-    // tma, whose N + 2 registers take R rounds of the URF's two read ports,
-    // two per round. Three declared registers:
-    //   - the round counter (TmaReadRounds): the command whose rounds are
-    //     still to start, loaded at accept. Round 0 samples urS / urM in the
-    //     issue register's cycle; round k >= 1 samples coordinates 2(k-1) and
-    //     2(k-1) + 1, one round per cycle; the counter empties after round
-    //     R - 1. In hardware: the warp (4 bits at 16 warps), the round (2
-    //     bits) and the next coordinate register (4 bits); round 0's fields
-    //     are the issue register's. Here it keeps the whole instruction.
+    // The URF's multi-round operand read (trash/rfc17.md section 4; the
+    // rounds are src/rf.hpp uniform_read_rounds). Two instructions read more
+    // uniform registers than the two read ports give one round: a tma (N + 2,
+    // R rounds) and, since 2026-11-19, an mma.async (urA, urB | urC). One
+    // declared register serves both:
+    //   - the round counter (UrfReadRounds): the instruction whose rounds are
+    //     still to start, loaded at accept. Round 0 samples in the issue
+    //     register's cycle (a tma's urS / urM; an mma.async's urA / urB, in
+    //     its dispatch entry like any read); round k >= 1 one cycle later
+    //     each (a tma's coordinates 2(k-1) and 2(k-1) + 1; an mma.async's
+    //     urC, which joins its dispatch entry from the URF output, Lu later,
+    //     before its dispatch: src/rf.hpp issue_to_dispatch); the counter
+    //     empties after the last round. While it has rounds left issue
+    //     refuses every uniform reader (urf_read_ports_held). In hardware:
+    //     the warp (4 bits at 16 warps), the round (2 bits) and the next
+    //     register (5 bits); round 0's fields are the issue register's. Here
+    //     it keeps the whole instruction.
+    // The TMA's operand read is that counter and two registers of its own:
     //   - the URF read stages (TmaReadPairs, Lu stages): each pair sampled
     //     for a tma travels to the URF output with its tag -- which fields it
     //     is (the round) and whether it is the last; round 0's also carries
@@ -1177,26 +1183,26 @@ private:
     //     last pair arrives the command is pushed into the TMA queue. One is
     //     enough: a command's last words arrive at T + R + Lu, the next
     //     command's first at T' + 1 + Lu, and T' >= T + R.
-    struct TmaReadHeader {
+    struct UrfReadHeader {
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;            // (S) PANIC text: the instruction's own pc
         uint64_t active_mask = 0;   // (S) the uniform operation's partial-mask PANIC
-        Instruction instruction;    // the descriptor address, the direction and N, the registers
+        Instruction instruction;    // the opcode and its registers (a tma: the descriptor address, the direction and N)
     };
-    struct TmaReadRounds {
-        TmaReadHeader header;
+    struct UrfReadRounds {
+        UrfReadHeader header;
         uint32_t round = 0;         // the round sampled next
     };
     struct TmaReadPair {
         uint32_t round = 0;                  // 0: the buffer and the barrier; k >= 1: coordinates 2(k-1) ..
         bool last = false;                   // the command's last round
-        std::optional<TmaReadHeader> header; // round 0: the instruction's fields
+        std::optional<UrfReadHeader> header; // round 0: the instruction's fields
         std::vector<uint32_t> words;         // the sampled registers' values, in operand order
     };
     using TmaReadPairs = std::vector<std::optional<TmaReadPair>>;
     struct TmaReadHolding {
-        TmaReadHeader header;
+        UrfReadHeader header;
         uint32_t buffer = 0;        // urS as read (its low bits are the sanitizer's)
         uint32_t barrier = 0;       // urM as read
         std::array<int32_t, tma_max_coordinates> coordinates{}; // zero until supplied
@@ -1476,7 +1482,7 @@ private:
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
         std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
-        std::optional<TmaReadRounds> tma_read;           // a tma loads the TMA operand read's round counter
+        std::optional<UrfReadRounds> urf_rounds;         // a tma or an mma.async loads the URF's round counter
     };
 
     // Everything a dispatched instruction hands to its unit (the unit takes it now).
@@ -1563,10 +1569,13 @@ private:
         std::vector<WarpFrontEnd> front_end_next;
         // The RF read stage: dispatch entries' operands latched now (index
         // in the pipeline's Q, operands by read, uniform operands by uniform
-        // read).
+        // read from position uniform_first). A later round of an mma.async
+        // (the round counter's) latches only its uniform operands.
         struct DispatchSample {
             std::size_t index = 0;
+            bool later_round = false;
             std::vector<std::vector<uint32_t>> operands;
+            std::size_t uniform_first = 0;
             std::vector<uint32_t> uniform_operands;
         };
         std::vector<DispatchSample> dispatch_samples;
@@ -1576,7 +1585,7 @@ private:
         std::optional<UrfWrite> urf_landing;
         std::optional<std::vector<uint32_t>> urf_sample;
         UrfWritePipeline urf_pipe_next;
-        // The TMA operand read's round sampled now (the URF's read ports).
+        // The round counter's tma round sampled now (the URF's read ports).
         std::optional<TmaReadPair> tma_sampled;
     };
 
@@ -1656,9 +1665,9 @@ private:
     Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, "TMA read transaction"};
     Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
     Reg<TmaStoreRegisters> tma_store_registers_{registers_, "TMA store sector registers"};
-    // The TMA operand read (TmaReadRounds above): the round counter, the URF
-    // read stages with their tags (Lu stages), the holding register.
-    Reg<std::optional<TmaReadRounds>> tma_read_rounds_{registers_, "TMA operand read: round counter"};
+    // The URF's round counter (UrfReadRounds above), then the TMA operand
+    // read's URF read stages with their tags (Lu stages) and holding register.
+    Reg<std::optional<UrfReadRounds>> urf_read_rounds_{registers_, "URF operand read: round counter"};
     Reg<TmaReadPairs> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
     Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, "TMA operand read: holding register"};
     // LSU.
@@ -1794,7 +1803,11 @@ private:
     void arrive_tma_operands(Wires& w);
     [[nodiscard]] TmaCommand tma_command_from(const TmaReadHolding& holding, Wires& w);
     [[nodiscard]] uint32_t tma_commands_being_read() const;
-    [[nodiscard]] bool tma_read_ports_held() const;
+    [[nodiscard]] bool urf_read_ports_held() const;
+    // The value uniform register `reg` of `warp` will have at a sample next
+    // cycle (the issue register's): its Q, or the write landing at this
+    // cycle's edge. The sanitizer's issue-time look at a tmem pointer.
+    [[nodiscard]] uint32_t uniform_at_next_sample(uint32_t warp, uint8_t reg) const;
     // ---- dispatch: the RF read pipeline's end, the unit takes it ----
     void dispatch_issued(Wires& w);
     void hand_over(const DispatchEntry& op, Wires& w);
@@ -1826,8 +1839,8 @@ private:
     // (depbar, the sanitizer's destination and reader records), its read
     // round's bank use, its entry into the dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
-    // An accepted tma: it loads the TMA operand read's round counter.
-    void accept_tma(Warp& warp, const Instruction& inst, Wires& w);
+    // An accepted tma or mma.async: it loads the URF's round counter.
+    void load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w);
     [[nodiscard]] static bool needs_dispatch(const Instruction& inst, uint64_t active_mask);
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
     void check_issue_hazards(const Warp& warp, const Instruction& inst) const;
@@ -1968,8 +1981,19 @@ private:
     void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
     void enter_mma_core(MmaPipeline& mma, const MmaStep& step);
     void sample_mma_c(MmaResult& result);
-    [[nodiscard]] std::size_t tmem_word_index(
-        const Kernel::Accumulator& acc, uint32_t row, uint32_t col) const;
+    // The physical tmem word of logical word `logical` in a region whose rows
+    // are row_words words (src/layout.hpp); dispatch panicked on any word
+    // outside tmem, so past that this is an internal error.
+    [[nodiscard]] std::size_t tmem_index(uint64_t logical, uint32_t row_words) const;
+    // The physical words of `rows` rows x `columns` columns of the region at
+    // `pointer` (row_words words per row), row-major; nullopt when one lies
+    // outside tmem (the dispatch PANIC).
+    [[nodiscard]] std::optional<std::vector<uint32_t>> tmem_region_words(
+        uint32_t pointer, uint32_t row_words, uint32_t rows, uint32_t columns) const;
+    [[nodiscard]] std::vector<uint32_t> mma_block_words(const MmaStep& step) const;
+    // An acc.ld / acc.st's region for the sanitizer: its pointer, the
+    // instruction's words per row and width, its words (sorted here).
+    [[nodiscard]] TmemRegion tmem_region(uint32_t pointer, const Instruction& inst, std::vector<uint32_t> words) const;
     void execute_arithmetic(ArithmeticRead& pending, Wires& w);
 
     // TMA.
