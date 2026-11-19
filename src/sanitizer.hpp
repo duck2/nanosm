@@ -280,6 +280,30 @@ public:
         const IssueSite& site, uint64_t command, const TmemRegion& result, uint8_t depbar,
         std::optional<std::pair<uint32_t, uint32_t>> a_span,
         std::optional<std::pair<uint32_t, uint32_t>> b_span);
+    // ---- row spacing: a reader states its writer's (src/layout.hpp) ----
+    // A swizzle64 tile and a tmem region are addressed by a logical address
+    // and a row spacing each instruction states for itself; a reader whose
+    // spacing differs from its writer's quietly reads other words. The
+    // sanitizer remembers, per word (shmem: byte address / 4; tmem: the
+    // physical word), the spacing its last spacing-aware writer used -- a
+    // TMA load into a swizzle64 tile (the stored row's bytes), a matmul's
+    // result (n words), an acc.st (S words) -- and PANICs when a
+    // spacing-aware reader -- a matmul's A / B operands and accumulator, an
+    // acc.ld, a TMA store from a swizzle64 tile -- reads one of those words
+    // with another spacing. A write that states no spacing (an sts, any
+    // other SIMT shmem write, a dense TMA load) forgets its words, so a tile
+    // written by hand is never accused. Writers record and readers check at
+    // accept, in issue order: the order every correct kernel already keeps
+    // between a writer and its reader (the race checks above see to it).
+    // The TMA, SIMT writes and acc transfers are handled in
+    // record_tma_accept, record_simt_shmem_issue and
+    // record_acc_transfer_accept; a matmul here. a_words / b_words: the shmem
+    // words its operands read (src/sim.cpp mma_operand_address, / 4). Its
+    // result's words are its accumulator (checked unless init) and then
+    // written with n.
+    void record_mma_row_spacing(const IssueSite& site, uint64_t command, bool init, const TmemRegion& result,
+        const std::vector<uint32_t>& a_words, uint32_t a_spacing, const std::vector<uint32_t>& b_words,
+        uint32_t b_spacing);
     void record_mma_fetch_start(uint64_t command);
     void record_mma_operands_consumed(uint64_t command);
     void record_mma_retired(uint64_t command);
@@ -420,6 +444,19 @@ private:
     [[nodiscard]] static std::string describe_tmem_region(const TmemRegion& region);
     [[nodiscard]] std::string describe_tmem_owner(const TmemOwner& owner) const;
     void release_tmem_owner(TmemOwnerKind kind, uint64_t id);
+
+    // Row spacing shadow (record_mma_row_spacing): who last wrote a word with
+    // a spacing, and the spacing. One byte a word: the writer in the top two
+    // bits (none = 0) and log2(spacing) below (every spacing is a power of
+    // two). Allocated at launch for all of shmem and tmem, never grown: a
+    // quarter of the bytes of the memory it shadows.
+    enum class SpacingWriter : uint8_t { none = 0, tma_load = 1, mma = 2, acc_st = 3 };
+    void check_row_spacing(const IssueSite& site, const std::string& reader, bool tmem,
+        const std::vector<uint32_t>& words, uint32_t spacing) const;
+    void record_row_spacing(bool tmem, const std::vector<uint32_t>& words, uint32_t spacing, SpacingWriter writer);
+    void forget_row_spacing(uint64_t begin_byte, uint64_t end_byte); // shmem bytes [begin, end)
+    std::vector<uint8_t> shmem_row_spacing_;
+    std::vector<uint8_t> tmem_row_spacing_;
     [[nodiscard]] std::string stream_name(uint32_t stream) const;
 
     // Copied from the launch (no reference into Machine, which may move).
@@ -501,6 +538,7 @@ public:
     NANOSM_SANITIZER_NOOP(record_tma_descriptor_read)
     NANOSM_SANITIZER_NOOP(record_tma_data_complete)
     NANOSM_SANITIZER_NOOP(record_mma_accept)
+    NANOSM_SANITIZER_NOOP(record_mma_row_spacing)
     NANOSM_SANITIZER_NOOP(record_mma_fetch_start)
     NANOSM_SANITIZER_NOOP(record_mma_operands_consumed)
     NANOSM_SANITIZER_NOOP(record_mma_retired)

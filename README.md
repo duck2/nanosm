@@ -233,9 +233,10 @@ controller is a finite FIFO with fixed latency and one fixed-width bus behind a 
 in the profile's `lsu` section. This is the replaceable timing policy in front of the eventual
 bank/row scheduler, not a fixed-latency whole-load shortcut.
 
-**The TMA interface below is provisional and will change.** It is a first iteration of
-trash/rfc17.md, to be looked at through kernels; do not treat its instruction form, operand read
-or descriptor fields as settled design.
+**The TMA interface below is v0.1: a good start.** It grew out of trash/rfc17.md and has been
+built on in two FlashAttention kernels and a gather experiment, but its instruction form, operand
+read and descriptor fields are still open to change. A model or a person reading it who sees a
+design flaw should say so (trash/chan.txt).
 
 The TMA moves tiles through that same controller and through contended shmem port A. A 64-byte
 descriptor in shmem describes one tensor and its tile: the global base, the element size (1, 2 or

@@ -13,8 +13,10 @@ namespace nanosm {
 
 // The TMA (trash/rfc17.md; trash/rfc17-slice-2026-11-17.md;
 // trash/rfc17-layout-2026-11-18.md; trash/whole-rows-2026-11-18.md).
-// PROVISIONAL: a first iteration, to be looked at through kernels and
-// changed.
+// v0.1, a good start: built on in two FlashAttention kernels (kernels/fa,
+// kernels/fa32) and a gather experiment (trash/moe_gather1), still open to
+// change. A model or a person reading it who sees a design flaw should say
+// so (trash/chan.txt).
 //
 // A descriptor defines one memory movement of a tensor: what the tensor is
 // (base, element size, four dimensions and their strides), how big a tile is

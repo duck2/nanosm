@@ -4064,6 +4064,25 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     result.columns = shape.n;
     std::sort(c_words->begin(), c_words->end());
     result.words = std::move(*c_words);
+    if constexpr (NANOSM_SANITIZER != 0) {
+        // The shmem words each operand reads, for the row spacing check
+        // (computed for the sanitizer only). The dense diagnostic layout
+        // reads no spacing: none.
+        const auto operand_words = [&](uint32_t base, uint32_t spacing, bool a_operand) {
+            std::vector<uint32_t> words;
+            if (config_.mma_layout != TileLayout::swizzle64) return words;
+            for (uint32_t outer = 0; outer < (a_operand ? shape.m : shape.n); ++outer) {
+                for (uint32_t k = 0; k < shape.k; ++k) {
+                    words.push_back(mma_operand_address(config_, shape, base, spacing, a_operand, outer, k) / 4);
+                }
+            }
+            std::sort(words.begin(), words.end());
+            words.erase(std::unique(words.begin(), words.end()), words.end());
+            return words;
+        };
+        sanitizer_.record_mma_row_spacing(site(op), command.id, command.init, result,
+            operand_words(a, a_spacing, true), a_spacing, operand_words(b, b_spacing, false), b_spacing);
+    }
     sanitizer_.record_mma_accept(site(op), command.id, result, command.depbar,
         mma_operand_span(a, a_spacing, true, shape), mma_operand_span(b, b_spacing, false, shape));
     trace_->mma_command(cycle_, command.id, op.warp, command.init);

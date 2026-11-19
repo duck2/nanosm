@@ -480,6 +480,49 @@ void test_i6b2_setp_to_branch_distance() {
 #endif
 }
 
+// A loop head (src/qtxc/schedule.cpp LoopEntry): what the code before a
+// loop leaves pending is paid once, by the instruction before the head, not
+// by a stall inside the loop on every iteration (trash/fa32-2026-11-19.md
+// section 4a: the branch at the top of this loop carried the ex2's drain).
+// Both passes. The loop body reads the ex2's result on the first pass, so
+// the sanitizer checks the fall-through edge; later passes arrive drained.
+void test_loop_head_pays_the_entry_once() {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+            umov ur1, 0
+            ex2 r2, r1
+        LOOP:
+        @p3 bra.uni SKIP
+            fadd r3, r2, r2
+        SKIP:
+            uaddi ur1, ur1, 1
+            usetp.lt.u32 p2, ur1, 4
+        @p2 bra.uni LOOP
+            halt
+    )";
+    const auto qtx = nanosm::compile_qtx(source, profile);
+    require(qtx.instructions[1].control.stall > 1, "qtxc did not pay the ex2 before the loop head");
+    require(qtx.instructions[2].control.stall == 0, "qtxc's branch at the loop head still carries the ex2");
+    const auto hand = hand_assemble(i1_asm(profile, R"(
+            umov ur1, 0
+            ex2 r2, r1
+        loop: bra.uni skip {pred=p3, stall=0, set=-, wait=-}
+            fadd r3, r2, r2
+        skip: uaddi ur1, ur1, 1
+            usetp.lt.u32 p2, ur1, 4
+            bra.uni loop {pred=p2, stall=0, set=-, wait=-}
+            halt
+    )"), profile);
+    require(nanosm::decode(hand.words[1]).control.stall == qtx.instructions[1].control.stall &&
+            nanosm::decode(hand.words[2]).control.stall == 0,
+        "the hand assembler's stall scheduling does not pay the ex2 before the loop head as qtxc does");
+    for (const auto& kernel : {compile(source, profile), hand}) {
+        auto machine = i6a_machine(profile, kernel);
+        machine->run();
+        require(machine->read_reg(0, 0, 3) == 0x40000000u, "the loop did not compute ex2(0) + ex2(0) = 2");
+    }
+}
+
 // core.warps (16 at canonical) declares the SM's warp slots and is enforced
 // at launch, before the RF rows: a one-register kernel launches 16 warps
 // and is refused at 17 and 32 (before I6b-2 the RF alone decided, and
@@ -845,6 +888,10 @@ TEST(FrontEnd, i6b2_setp_to_branch_distance) {
 }
 
 // I6b-2: warp slots and profile fields
+TEST(FrontEnd, loop_head_pays_the_entry_once) {
+    test_loop_head_pays_the_entry_once();
+}
+
 TEST(FrontEnd, i6b2_warp_slots_and_profile_fields) {
     test_i6b2_warp_slots_and_profile_fields();
 }

@@ -533,7 +533,112 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
     }
 }
 
+// Row spacing (src/sanitizer.hpp record_mma_row_spacing): a reader states the
+// row spacing its region's writer used. Shared memory: a TMA load lands a
+// swizzle64 tile of 64 rows of 128 bytes at 0; a matmul reading it as A with
+// [ur0, 64] PANICs, with [ur0, 128] runs clean; sts over the words it reads
+// makes the tile hand-written, and [ur0, 64] is clean again.
+void test_sanitizer_row_spacing_shmem() {
+    const auto& profile = canonical_profile();
+    const auto launch = [] {
+        nanosm::Launch result;
+        result.active_warps = 1;
+        auto& shmem = image_bytes(result.shmem_image, 9344);
+        auto& gmem = image_bytes(result.gmem_image, 8192);
+        for (uint32_t i = 0; i < 4096; ++i) write_u16(gmem, 2 * i, 0x3c00);
+        nanosm::TmaDescriptor descriptor;
+        descriptor.element_bytes = 2;
+        descriptor.dimensions = {64, 64, 1, 1};
+        descriptor.strides = {64, 0, 0};
+        descriptor.tile_length = 64;
+        descriptor.tile_rows = 64;
+        descriptor.layout = nanosm::TileLayout::swizzle64;
+        write_tma_descriptor(shmem, 9280, descriptor);
+        write_tx_mbar(shmem, 9216, 8192);
+        write_count_mbar(shmem, 9224, 1);
+        return result;
+    };
+    const std::string load = tma_operands_asm(10, 0, 4, 9216, 8, {0, 0}) + R"(
+        tma.load.2d [ur10], [9280, ur8], [ur4]
+    LANDED:
+        mbar.try_wait p0, [ur4], 0
+        @!p0 bra.uni LANDED
+    )";
+    const auto matmul = [](uint32_t spacing) {
+        return R"(
+            umov ur0, 0
+            umov ur1, 8192
+            umov ur5, 0
+            umov ur6, 9224
+            mma.async.init.m64n64k8 [ur5], [ur0, )" + std::to_string(spacing) + R"(], [ur1]
+            mma.commit [ur6]
+        DONE:
+            mbar.try_wait p0, [ur6], 0
+            @!p0 bra.uni DONE
+            halt
+        )";
+    };
+    const auto message = run_expecting_panic(profile, compile(load + matmul(64)), launch(),
+        "a matmul reading a 128-byte-row TMA tile with rows 64 bytes apart");
+    require_mentions(message, {"row spacing mismatch: mma.async #1 A operand reads shmem byte 0",
+        "with rows 64 bytes apart, but a TMA load into a swizzle64 tile wrote it with rows 128 bytes apart"},
+        "shmem row spacing mismatch");
+    for (const auto& clean : {load + matmul(128), load + R"(
+            sread r20, LANE_ID
+            shli r20, r20, 2
+            mov r21, 0
+        HAND:
+            sts [r20], r21
+            addi r20, r20, 64
+            setp.lt.u32 p1, r20, 4096
+            @p1 bra.uni HAND
+            fence.sh
+        )" + matmul(64)}) {
+        nanosm::Machine machine(profile, compile(clean), launch());
+        machine.run(50000);
+        require(machine.done(), "a matmul reading its tile with the writer's spacing (or a hand-written one) did not finish");
+    }
+}
+
+// Tensor-core memory: acc.st with rows 64 words apart, acc.ld of the same
+// pointer with 32 PANICs; with 64 it reads back what was stored.
+void test_sanitizer_row_spacing_tmem() {
+    const auto& profile = canonical_profile();
+    const auto one_warp = [] {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        return launch;
+    };
+    const auto program = [](uint32_t spacing) {
+        return R"(
+            umov ur8, 0
+            sread r16, LANE_ID
+            acc.st [ur8, 64], r16
+            acc.ld r24, [ur8, )" + std::to_string(spacing) + R"(]
+            halt
+        )";
+    };
+    const auto message = run_expecting_panic(profile, compile(program(32)), one_warp(),
+        "acc.ld with rows 32 words apart of what acc.st wrote with 64");
+    require_mentions(message, {"row spacing mismatch: acc.ld reads tmem word",
+        "with rows 32 words apart, but an acc.st wrote it with rows 64 words apart"}, "tmem row spacing mismatch");
+    nanosm::Machine machine(profile, compile(program(64)), one_warp());
+    machine.run(20000);
+    for (uint32_t lane = 0; lane < profile.lanes; ++lane)
+        require(machine.read_reg(0, lane, 24) == lane, "acc.ld with the acc.st's spacing did not read it back");
+}
+
 } // namespace
+
+TEST(Sanitizer, sanitizer_row_spacing_shmem) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_sanitizer_row_spacing_shmem();
+}
+
+TEST(Sanitizer, sanitizer_row_spacing_tmem) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_sanitizer_row_spacing_tmem();
+}
 
 // sanitizer: sts into TMA store source
 TEST(Sanitizer, sanitizer_sts_into_tma_store_source) {

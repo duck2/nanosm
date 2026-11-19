@@ -2,9 +2,9 @@
 // assembly by filling in each instruction's control bits: the stall counts
 // its fixed-latency dependencies need (FixedTimeline, distances from
 // src/rf.hpp), depbar set / wait for the asynchronous ones, a full drain at
-// every branch, and qtx's wait as a nop waiting for every live depbar (no
-// drain). schedule_fixed_stalls is the same stall pass for hand
-// assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
+// every branch, a loop body scheduled as a jump enters it (LoopEntry), and
+// qtx's wait as a nop waiting for every live depbar (no drain).
+// schedule_fixed_stalls is the same stall pass for hand assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
 // encode.
 
 #include "qtxc/internal.hpp"
@@ -118,6 +118,62 @@ struct FixedTimeline {
     }
 };
 
+// Loop heads: the instructions a backward branch (one at or after its
+// target) jumps to. A stall is a constant in the instruction, so a stall
+// inside a loop is paid on every iteration, also when it is owed only by the
+// code before the loop (an ex2 just before the head, say). So both passes
+// schedule a loop body from a clean timeline -- the state every jump to the
+// head arrives with, since every branch drains before it jumps -- and pay
+// what the fall-through edge brings once, on the instruction before the head
+// (LoopEntry).
+std::vector<bool> loop_heads(const std::vector<Instruction>& instructions) {
+    std::vector<bool> heads(instructions.size(), false);
+    for (std::size_t index = 0; index < instructions.size(); ++index) {
+        const auto& inst = instructions[index];
+        if (!is_branch(inst.opcode)) continue;
+        const auto target = static_cast<int64_t>(index) + 1 + inst.imm / 8;
+        if (target >= 0 && target <= static_cast<int64_t>(index)) heads[static_cast<std::size_t>(target)] = true;
+    }
+    return heads;
+}
+
+// The fall-through edge into a loop head: the timeline the code before it
+// left (`before_loop`, in that code's vtime) and the instruction before the
+// head. The loop body's first stretch -- from the head up to its first
+// branch, the next loop head or a halt, where the timeline is reset or
+// nothing runs after -- is scheduled clean, in vtime from the head (0). Then
+// the instruction before the head stalls `extra` cycles more than it does
+// now: the fewest that make every instruction of the stretch legal against
+// before_loop (required) and have before_loop drained by the time the
+// stretch ends. Every path into the head is covered: a jump arrives clean,
+// and the fall-through's leftovers are behind the stretch by its end, so
+// what follows needs no more than the clean schedule gives it. (A register
+// the body rewrites is still checked against before_loop's older write:
+// an over-estimate, never too short.)
+struct LoopEntry {
+    std::size_t before = 0;     // the instruction before the head
+    int64_t before_vtime = 0;   // its vtime and the head's, in before_loop's vtime
+    int64_t head_vtime = 0;
+    FixedTimeline before_loop;
+    int64_t extra = 0;
+
+    // A stretch instruction at body vtime `vtime`.
+    void check(const Instruction& inst, const DeviceProfile& profile, int64_t vtime) {
+        const auto at = head_vtime + vtime;
+        extra = std::max(extra, before_loop.required(inst, profile, at) - at);
+    }
+    // The stretch ends; the next instruction would issue at body vtime `next`.
+    void check_end(const DeviceProfile& profile, int64_t next) {
+        const auto at = head_vtime + next;
+        extra = std::max(extra, before_loop.drained(at - 1, profile) - at);
+    }
+    // The stall the instruction before the head needs, if more than it has.
+    [[nodiscard]] std::optional<int64_t> stall() const {
+        if (extra == 0) return std::nullopt;
+        return head_vtime + extra - before_vtime;
+    }
+};
+
 } // namespace
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile) {
@@ -162,7 +218,42 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         throw SimError("qtx scheduler exhausted six live depbars");
     };
 
-    for (auto& inst : program.instructions) {
+    // A loop head's fall-through edge, until the loop body's first stretch
+    // ends (LoopEntry). Depbars are not part of it: the fall-through's view of
+    // them carries into the loop as before, a sound over-estimate that costs
+    // nothing on later iterations (a wait on a counter at zero is free).
+    std::optional<LoopEntry> entry;
+    const auto settle_entry = [&]() {
+        if (const auto stall = entry->stall(); stall.has_value()) {
+            auto& before = program.instructions[entry->before];
+            if (*stall > static_cast<int64_t>(encoding::stall_mask)) {
+                throw SimError(
+                    "line " + std::to_string(before.line) +
+                    ": the stall before a loop head exceeds the five-bit field");
+            }
+            before.control.stall = static_cast<uint8_t>(*stall);
+        }
+        entry.reset();
+    };
+
+    const auto heads = loop_heads(program.instructions);
+    for (std::size_t index = 0; index < program.instructions.size(); ++index) {
+        auto& inst = program.instructions[index];
+        if (heads[index] && previous != nullptr) {
+            // `previous` is the instruction just before the head. (After a
+            // branch the timeline is clean already.)
+            if (entry.has_value()) {
+                entry->check_end(profile, vtime);
+                settle_entry();
+            }
+            if (previous->opcode != Opcode::halt) {
+                entry = LoopEntry{index - 1, previous_vtime, vtime, timeline};
+            }
+            timeline.reset();
+            previous = nullptr;
+            previous_vtime = 0;
+            vtime = 0;
+        }
         if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
             throw SimError(
                 "line " + std::to_string(inst.line) +
@@ -257,6 +348,10 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             vtime = required;
         }
         inst.control.stall = 0;
+        if (entry.has_value()) {
+            entry->check(inst, profile, vtime);
+            if (inst.opcode == Opcode::halt) settle_entry();
+        }
         timeline.record(inst, profile, vtime);
         if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
@@ -300,6 +395,10 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 }
                 inst.control.stall = static_cast<uint8_t>(stall);
             }
+            if (entry.has_value()) {
+                entry->check_end(profile, vtime + std::max<int64_t>(inst.control.stall, 1));
+                settle_entry();
+            }
 
             // Every branch is a conservative block boundary for v0: its wait mask
             // drains async work, and its stall covers outstanding fixed-latency writes.
@@ -322,6 +421,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         previous_vtime = vtime;
         vtime += 1;
     }
+    if (entry.has_value()) settle_entry(); // the kernel ends inside the stretch
     return program;
 }
 
@@ -335,7 +435,8 @@ AssemblyProgram compile_qtx_file(const std::string& path, const DeviceProfile& p
 // distances qtxc schedules with (FixedTimeline, src/rf.hpp) -- so the result
 // never trips the sanitizer's RAW / WAW / WAR checks on a fixed result.
 // Depbars, waits and every other field stay the author's. A branch drains
-// like qtxc's block boundary, and the code after it starts clean.
+// like qtxc's block boundary, and the code after it starts clean. A loop body
+// starts clean too, its fall-through edge paid before the head (LoopEntry).
 Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
     std::vector<Instruction> instructions;
     for (const auto word : kernel.words) instructions.push_back(decode(word));
@@ -349,18 +450,46 @@ Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
         }
         inst.control.stall = static_cast<uint8_t>(stall);
     };
+    // A loop head's fall-through edge, as in compile_qtx (LoopEntry).
+    std::optional<LoopEntry> entry;
+    const auto settle_entry = [&]() {
+        if (const auto stall = entry->stall(); stall.has_value()) set_stall(instructions[entry->before], *stall);
+        entry.reset();
+    };
+    const auto heads = loop_heads(instructions);
     for (std::size_t index = 0; index < instructions.size(); ++index) {
         auto& inst = instructions[index];
+        if (heads[index] && previous.has_value()) {
+            if (entry.has_value()) {
+                entry->check_end(profile, vtime);
+                settle_entry();
+            }
+            if (instructions[*previous].opcode != Opcode::halt) {
+                entry = LoopEntry{*previous, previous_vtime, vtime, timeline};
+            }
+            timeline.reset();
+            previous.reset();
+            previous_vtime = 0;
+            vtime = 0;
+        }
         const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (!previous.has_value()) throw SimError("internal: first instruction cannot need a stall");
             set_stall(instructions[*previous], required - previous_vtime);
             vtime = required;
         }
+        if (entry.has_value()) {
+            entry->check(inst, profile, vtime);
+            if (inst.opcode == Opcode::halt) settle_entry();
+        }
         timeline.record(inst, profile, vtime);
         if (is_branch(inst.opcode)) {
             const auto all_ready = timeline.drained(vtime, profile);
             if (all_ready - vtime > std::max<int64_t>(inst.control.stall, 1)) set_stall(inst, all_ready - vtime);
+            if (entry.has_value()) {
+                entry->check_end(profile, vtime + std::max<int64_t>(inst.control.stall, 1));
+                settle_entry();
+            }
             timeline.reset();
             previous.reset();
             previous_vtime = 0;
@@ -371,6 +500,7 @@ Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
         previous_vtime = vtime;
         vtime += std::max<int64_t>(inst.control.stall, 1);
     }
+    if (entry.has_value()) settle_entry();
     for (std::size_t index = 0; index < instructions.size(); ++index) kernel.words[index] = encode(instructions[index]);
     return kernel;
 }

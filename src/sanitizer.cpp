@@ -6,6 +6,7 @@
 #include "mbar.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <set>
 
@@ -61,6 +62,8 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
         warp.async_readers.resize(kernel.register_count, 0);
         warp.uniform_ready_cycle.resize(config.urf_registers, 0);
     }
+    shmem_row_spacing_.assign(config.shmem_bytes / 4, 0);
+    tmem_row_spacing_.assign(static_cast<std::size_t>(config.tmem_fine_banks) * config.tmem_words_per_fine_bank, 0);
 }
 
 void Sanitizer::record_cycle_start() {
@@ -377,6 +380,12 @@ void Sanitizer::record_simt_shmem_issue(const IssueSite& site, SimtShmemHolder h
     access.access_bytes = access_bytes;
     for (const auto& addresses : rounds) access.rounds.push_back({addresses, std::nullopt});
     simt_shmem_.push_back(std::move(access));
+    // A write that states no row spacing (record_mma_row_spacing).
+    if (write) {
+        for (const auto& addresses : rounds) {
+            for (const auto address : addresses) forget_row_spacing(address, uint64_t{address} + access_bytes);
+        }
+    }
 }
 
 void Sanitizer::record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, uint32_t index, uint64_t ram_cycle) {
@@ -608,6 +617,26 @@ void Sanitizer::record_tma_accept(
     }
     shmem_owners_.push_back(descriptor_owner);
     if (data_owner.has_value()) shmem_owners_.push_back(*data_owner);
+    // Row spacing (record_mma_row_spacing). A swizzle64 tile is its span's
+    // words, each row's bytes shuffled inside the row: a load writes all of
+    // them with the stored row's bytes, a store reads all of them. A dense
+    // load states no spacing.
+    if (data_owner.has_value()) {
+        const auto [begin, end] = tma_shmem_span(*descriptor, shmem_address);
+        if (descriptor->layout == TileLayout::swizzle64) {
+            std::vector<uint32_t> words;
+            for (uint64_t byte = begin; byte < end; byte += 4) words.push_back(static_cast<uint32_t>(byte / 4));
+            const auto spacing = tma_swizzle64_row_bytes(*descriptor);
+            if (load) {
+                record_row_spacing(false, words, spacing, SpacingWriter::tma_load);
+            } else {
+                check_row_spacing(site, "tma store #" + std::to_string(command) + " (swizzle64 source)", false,
+                    words, spacing);
+            }
+        } else if (load) {
+            forget_row_spacing(begin, end);
+        }
+    }
     if (descriptor.has_value() && completion_mbar_word.has_value()) {
         tma_completion_phases_.emplace_back(command, decode_mbar_state(*completion_mbar_word).phase);
     }
@@ -690,6 +719,46 @@ void Sanitizer::record_mma_accept(
             " (or an mbar its warp arrives on after it) first");
     }
     tmem_owners_.push_back(mma);
+}
+
+void Sanitizer::record_mma_row_spacing(const IssueSite& site, uint64_t command, bool init,
+    const TmemRegion& result, const std::vector<uint32_t>& a_words, uint32_t a_spacing,
+    const std::vector<uint32_t>& b_words, uint32_t b_spacing) {
+    const auto name = "mma.async #" + std::to_string(command);
+    check_row_spacing(site, name + " A operand", false, a_words, a_spacing);
+    check_row_spacing(site, name + " B operand", false, b_words, b_spacing);
+    if (!init) check_row_spacing(site, name + " accumulator", true, result.words, result.row_words);
+    record_row_spacing(true, result.words, result.row_words, SpacingWriter::mma);
+}
+
+void Sanitizer::check_row_spacing(const IssueSite& site, const std::string& reader, bool tmem,
+    const std::vector<uint32_t>& words, uint32_t spacing) const {
+    const auto& shadow = tmem ? tmem_row_spacing_ : shmem_row_spacing_;
+    const auto unit = std::string(tmem ? " words" : " bytes");
+    for (const auto word : words) {
+        if (word >= shadow.size() || shadow[word] == 0) continue; // outside: the machine's PANIC
+        const uint32_t written = 1u << (shadow[word] & 63u);
+        if (written == spacing) continue;
+        static const char* const writers[] = {"", "a TMA load into a swizzle64 tile", "a matmul's result", "an acc.st"};
+        const auto where = tmem ? "tmem word " + std::to_string(word) : "shmem byte " + std::to_string(4 * word);
+        throw_issue_panic(site, "row spacing mismatch: " + reader + " reads " + where + " with rows " +
+            std::to_string(spacing) + unit + " apart, but " + writers[shadow[word] >> 6] + " wrote it with rows " +
+            std::to_string(written) + unit + " apart (a reader states its writer's row spacing; src/layout.hpp)");
+    }
+}
+
+void Sanitizer::record_row_spacing(
+    bool tmem, const std::vector<uint32_t>& words, uint32_t spacing, SpacingWriter writer) {
+    auto& shadow = tmem ? tmem_row_spacing_ : shmem_row_spacing_;
+    const auto code = static_cast<uint8_t>((static_cast<uint32_t>(writer) << 6) | std::countr_zero(spacing));
+    for (const auto word : words) {
+        if (word < shadow.size()) shadow[word] = code;
+    }
+}
+
+void Sanitizer::forget_row_spacing(uint64_t begin_byte, uint64_t end_byte) {
+    const auto end_word = std::min<uint64_t>((end_byte + 3) / 4, shmem_row_spacing_.size());
+    for (uint64_t word = begin_byte / 4; word < end_word; ++word) shmem_row_spacing_[word] = 0;
 }
 
 void Sanitizer::record_mma_fetch_start(uint64_t command) {
@@ -820,6 +889,12 @@ void Sanitizer::record_acc_transfer_accept(const IssueSite& site, bool load, con
     owner.depbar = depbar;
     tmem_owners_.push_back(owner);
     acc_transfer_in_engine_[load ? 0 : 1].push_back(owner.id);
+    // Row spacing (record_mma_row_spacing): S words per row.
+    if (load) {
+        check_row_spacing(site, opcode_name(site.inst.opcode), true, region.words, region.row_words);
+    } else {
+        record_row_spacing(true, region.words, region.row_words, SpacingWriter::acc_st);
+    }
 }
 
 void Sanitizer::record_acc_transfer_final_beat(bool load) {
