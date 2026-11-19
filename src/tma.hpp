@@ -52,8 +52,11 @@ enum class TmaDirection : uint8_t {
 // it wants.
 //   dense                row after row: tile row y is stored row y.
 //   swizzle64            the tile's rows are the stored rows, whole and
-//                        packed: tile row y at y x (tile length x element
-//                        bytes), shuffled inside its 64-byte lines.
+//                        packed: tile row y at buffer + y x (tile length x
+//                        element bytes), shuffled inside its 64-byte lines
+//                        by its address (src/layout.hpp), so a tile of a
+//                        few rows landed inside a taller one is exactly
+//                        those rows of it.
 //   swizzle64 transposed the tile's positions along dimension 0 are the
 //                        stored rows (tile_length of them) and the tile's row
 //                        index runs along the stored row (tile_rows x element
@@ -100,7 +103,10 @@ inline constexpr std::size_t used_end = 44;
 // The two address operands' low bits are not wired: the buffer is 64-byte
 // aligned (a swizzle64 tile needs it; NVIDIA asks 128 of a tensor copy's
 // destination) and the barrier 8-byte aligned. The machine ignores the low
-// 6 and 3 bits; the sanitizer PANICs if they are not zero.
+// 6 and 3 bits; the sanitizer PANICs if they are not zero. A swizzle64
+// tile's buffer is also a multiple of its row spacing when that is above 64
+// (src/layout.hpp): the machine shuffles by address whatever the buffer, and
+// the sanitizer PANICs on a buffer that is not.
 inline constexpr uint32_t tma_buffer_alignment = 64;
 inline constexpr uint32_t tma_barrier_alignment = 8;
 
@@ -112,8 +118,9 @@ inline constexpr uint32_t tma_barrier_alignment = 8;
 // -- the tile's rows and length, or (transposed) the other way round. The
 // stored row's bytes are the row spacing (src/layout.hpp), the spacing a
 // tensor-core instruction names to read the tile. Limits: 2- or 4-byte
-// elements; a stored row of 16, 32 or a multiple of 64 bytes; any number of
-// rows (the shuffle never moves a byte out of its row).
+// elements; a stored row of a power of two bytes, 16 or more; any number of
+// rows, 1 included (the shuffle never moves a byte out of its row, and the
+// row number is the address's, so the tile may be any rows of a taller one).
 inline uint32_t tma_swizzle64_stored_rows(const TmaDescriptor& descriptor) {
     return descriptor.transposed ? descriptor.tile_length : descriptor.tile_rows;
 }
@@ -158,22 +165,29 @@ inline void validate_tma_descriptor(const TmaDescriptor& descriptor) {
         if (bytes != 2 && bytes != 4) throw SimError("tma swizzle64 tiles take 2- or 4-byte elements");
         const uint32_t row_bytes = tma_swizzle64_row_bytes(descriptor);
         if (!valid_swizzle64_spacing(row_bytes)) {
-            throw SimError("tma swizzle64 stored row must be 16, 32 or a multiple of 64 bytes (it is " +
+            throw SimError("tma swizzle64 stored row must be a power of two bytes, 16 or more (it is " +
                 std::to_string(row_bytes) + ")");
         }
     }
 }
 
-// Where element x of tile row y lands in the buffer, as a byte offset, in
-// the descriptor's layout (src/layout.hpp: the functions the tensor core reads
-// its operands with). dense: stored row y, position x. swizzle64: stored row
-// y, position x; transposed: stored row x, position y.
-inline uint32_t tma_tile_offset(const TmaDescriptor& descriptor, uint32_t x, uint32_t y) {
-    const uint32_t bytes = descriptor.element_bytes;
-    if (descriptor.layout == TileLayout::dense) return dense_address(0, y, x, descriptor.tile_length, bytes);
+// Where element x of tile row y lands in (or comes from) shared memory for a
+// tile at `buffer`, in the descriptor's layout (src/layout.hpp: the functions
+// the tensor core reads its operands with). dense: stored row y, position x.
+// swizzle64: stored row y, position x; transposed: stored row x, position y;
+// shuffled by the unshuffled address's own row number, so the buffer takes
+// part. 64-bit: an address past 4 GiB is returned unshuffled for the
+// caller's bounds check.
+inline uint64_t tma_tile_address(const TmaDescriptor& descriptor, uint32_t buffer, uint32_t x, uint32_t y) {
+    const uint64_t bytes = descriptor.element_bytes;
+    if (descriptor.layout == TileLayout::dense) {
+        return buffer + (uint64_t{y} * descriptor.tile_length + x) * bytes;
+    }
     const uint32_t spacing = tma_swizzle64_row_bytes(descriptor);
-    return descriptor.transposed ? swizzle64_address(0, spacing, x, y * bytes)
-                                 : swizzle64_address(0, spacing, y, x * bytes);
+    const uint64_t natural = buffer + (descriptor.transposed ? uint64_t{x} * spacing + y * bytes
+                                                             : uint64_t{y} * spacing + x * bytes);
+    if (natural > UINT32_MAX) return natural;
+    return swizzle64_shuffle(static_cast<uint32_t>(natural), spacing);
 }
 
 // The tile's bytes (also what its completion subtracts from the barrier).

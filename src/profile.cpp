@@ -311,8 +311,12 @@ void validate_device_profile(const DeviceProfile& p) {
     // The swizzle64 layout puts four neighbouring rows' same 16-byte piece in
     // four different slots of 16 banks, which serves a core block of 4 rows
     // by 8 or 4 fp16 of k: a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
-    // It depends on the row only, so any m and n in whole core blocks read
-    // one bank round per block (src/layout.hpp; src/sim.cpp mma_a_address).
+    // It depends on the row only (any four neighbouring rows, wherever the
+    // tile sits), so any m and n in whole core blocks read one bank round per
+    // block (src/layout.hpp; src/sim.cpp mma_a_address). On a 4x4x4 core a
+    // step that reloads A reads half-pieces of A and B together; whether they
+    // share a round depends on the two tiles' row numbers mod 16
+    // (trash/address_keyed_census.py).
     if (p.mma_layout == TileLayout::swizzle64 && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
                              (p.mma_core_k != 4 && p.mma_core_k != 8))) {
         throw ProfileError("device profile: swizzle64 MMA layout needs a 4x4x4 or 4x4x8 core");

@@ -1016,10 +1016,10 @@ void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumula
             std::to_string(shape->n) + " accumulator; '" + acc.name + "' is " + std::to_string(acc.rows) + "x" +
             std::to_string(acc.cols));
     }
-    // The row spacings (src/isa.hpp). swizzle64: a spacing of the layout (16,
-    // 32 or a multiple of 64) that holds the 16-byte pieces the shape reads
-    // in each row (k / 8, rounded up). The dense diagnostic layout is compact
-    // in the command's shape and takes none.
+    // The row spacings (src/isa.hpp). swizzle64: a spacing of the layout (a
+    // power of two, 16 or more; the field reaches 1024) that holds the 16-byte
+    // pieces the shape reads in each row (k / 8, rounded up). The dense
+    // diagnostic layout is compact in the command's shape and takes none.
     const uint32_t row_bytes = (shape->k + 7) / 8 * 16;
     for (const bool a_operand : {true, false}) {
         const auto spacing = mma_row_spacing(inst, a_operand);
@@ -1031,7 +1031,7 @@ void check_mma_shape(const Instruction& inst, const std::vector<Kernel::Accumula
             }
         } else if (!valid_swizzle64_spacing(spacing) || spacing < row_bytes) {
             throw SimError(where + ": " + name + ": " + operand + "'s row spacing " + std::to_string(spacing) +
-                " must be 16, 32 or a multiple of 64 bytes, and at least the " + std::to_string(row_bytes) +
+                " must be a power of two bytes, 16 or more, and at least the " + std::to_string(row_bytes) +
                 " bytes it reads per row");
         }
     }

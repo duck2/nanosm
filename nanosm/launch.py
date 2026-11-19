@@ -80,7 +80,9 @@ class SparseMemory:
         along dimension 0, the rows stepping along `row_dimension` (1..3).
         layout: the tile's shared-memory layout (src/layout.hpp), "dense"
         (row after row) or "swizzle64" (whole rows, packed, shuffled inside
-        each row by the row number), the names of the profile's mma.layout;
+        each row by the row number its address gives; the stored row a power
+        of two bytes, the buffer a multiple of it and of 64), the names of
+        the profile's mma.layout;
         transposed (swizzle64 only): the positions along dimension 0 become
         the stored rows and the tile's row index runs along them. The
         direction, buffer, barrier and coordinates are the instruction's

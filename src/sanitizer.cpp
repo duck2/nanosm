@@ -217,6 +217,17 @@ void Sanitizer::check_tma_operand_alignment(const IssueSite& site, uint32_t buff
     }
 }
 
+void Sanitizer::check_swizzle64_operand(const IssueSite& site, const std::string& operand, uint32_t pointer,
+    uint32_t spacing, uint32_t row_bytes) const {
+    const uint32_t line = pointer - pointer % spacing;
+    if (line % swizzle64_base_alignment(spacing) != 0 || pointer % spacing + row_bytes > spacing) {
+        throw_issue_panic(site, "mma operand " + operand + " at " + std::to_string(pointer) + " reads " +
+            std::to_string(row_bytes) + " bytes per row at row spacing " + std::to_string(spacing) +
+            ": its row 0 must lie in one row starting at a multiple of " +
+            std::to_string(swizzle64_base_alignment(spacing)) + " (src/layout.hpp)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Same-word stores (backlog D12): which lane's word lands is not part of the
 // contract, so two lanes of one store naming one word is UB, diagnosed here.
@@ -558,6 +569,17 @@ void Sanitizer::record_tma_accept(
         (void)tma_shmem_span(*descriptor, shmem_address);
     } catch (const SimError&) {
         descriptor.reset();
+    }
+
+    // A swizzle64 tile's buffer is a multiple of its row spacing and of 64
+    // (src/layout.hpp). The machine shuffles by address whatever the buffer.
+    if (descriptor.has_value() && descriptor->layout == TileLayout::swizzle64) {
+        const auto alignment = swizzle64_base_alignment(tma_swizzle64_row_bytes(*descriptor));
+        if (shmem_address % alignment != 0) {
+            throw_issue_panic(site, "tma #" + std::to_string(command) + " swizzle64 buffer " +
+                std::to_string(shmem_address) + " is not a multiple of " + std::to_string(alignment) +
+                " (its stored row's bytes; src/layout.hpp)");
+        }
     }
 
     std::optional<ShmemOwner> data_owner;

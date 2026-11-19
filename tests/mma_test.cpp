@@ -1025,15 +1025,16 @@ void test_i7_back_to_back_throughput() {
 
 // Independent restatements (not the production helpers): swizzle64 operand
 // element addresses at the default 16-byte row spacing for objects at any
-// 64-byte-aligned base (rows past 31 simply continue, and the shuffle repeats
-// every 16 rows, so a 64-row object is two stacked 32-row ones), the tmem word of an accumulator element (16 fine banks, 4x4
+// 64-byte-aligned base (the word XOR is the address's own row number / 4,
+// base / 16 + m: rows past 31 simply continue, so a 64-row object is two
+// stacked 32-row ones), the tmem word of an accumulator element (16 fine banks, 4x4
 // macro-tiles row-major), and small exact FP16 integers.
 uint32_t i9_a_address(uint32_t base, uint32_t m, uint32_t k) {
-    return base + 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 3))) + 2 * (k & 1);
+    return base + 4 * (4 * m + ((k >> 1) ^ (((base / 16 + m) >> 2) & 3))) + 2 * (k & 1);
 }
 
 uint32_t i9_b_address(uint32_t base, uint32_t k, uint32_t n) {
-    return base + 4 * (4 * n + ((k >> 1) ^ ((n >> 2) & 3))) + 2 * (k & 1);
+    return base + 4 * (4 * n + ((k >> 1) ^ (((base / 16 + n) >> 2) & 3))) + 2 * (k & 1);
 }
 
 uint32_t i9_tmem_word(uint32_t base, uint32_t cols, uint32_t row, uint32_t col) {
@@ -1128,8 +1129,8 @@ void test_i9_mma_opcodes() {
             nanosm::mma_row_spacing(parsed.instructions.at(0), false) == 16,
         "[ur0, 128], [ur1] did not parse to spacings 128 and 16");
     for (const auto& [operand, needle] : {std::pair{"[ur0, 24]", "multiple of 16"},
-             std::pair{"[ur0, 2048]", "multiple of 16"}, std::pair{"[ur0, 48]", "16, 32 or a multiple of 64"},
-             std::pair{"[ur0, 1, 2]", "bad mma operand"}}) {
+             std::pair{"[ur0, 2048]", "multiple of 16"}, std::pair{"[ur0, 48]", "a power of two"},
+             std::pair{"[ur0, 192]", "a power of two"}, std::pair{"[ur0, 1, 2]", "bad mma operand"}}) {
         try {
             (void)nanosm::compile_qtx(std::string(".acc C, 0, 64, 64\nmma.async.m64n64k8 C, ") + operand +
                 ", [ur1]\nhalt\n", profile);

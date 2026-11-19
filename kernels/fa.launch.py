@@ -238,19 +238,25 @@ def run_case(case: str, trace: Path | None) -> None:
                 check_close(actual, values, 1e-5, f"block {block} row statistic {field}")
         p_bytes = result.shmem(P_SHARED, 8192)
         for row in range(ROWS):
+            # The shuffle's row number is the address's own (src/layout.hpp):
+            # P_SHARED // 128 + row. The kernel's per-row constants count from
+            # the tile's row 0, which agrees because P_SHARED and O_SHARED are
+            # multiples of 16 rows (2048 and 4096 bytes).
+            key = P_SHARED // 128 + row
             for col in range(BLOCK):
                 # Independent swizzle64 address (128-byte rows): the row whole,
-                # the 16-byte piece's slot XOR row % 4, the word XOR (row // 4) % 4.
-                offset = 128 * row + ((2 * col) ^ ((row % 4) << 4) ^ (((row // 4) % 4) << 2))
+                # the 16-byte piece's slot XOR key % 4, the word XOR (key // 4) % 4.
+                offset = 128 * row + ((2 * col) ^ ((key % 4) << 4) ^ (((key // 4) % 4) << 2))
                 actual = struct.unpack_from("<e", p_bytes, offset)[0]
                 if actual != ref["p"][row][col]:
                     raise AssertionError(f"P feedback mismatch at row={row}, col={col}")
         o_bytes = result.shmem(O_SHARED, O_STAGE_BYTES)
         staged = set()
         for row in range(ROWS):
+            key = O_SHARED // 256 + row
             for col in range(WIDTH):
                 # Independent fp32 swizzle64 address (256-byte rows), the same rule.
-                offset = 256 * row + ((4 * col) ^ ((row % 4) << 4) ^ (((row // 4) % 4) << 2))
+                offset = 256 * row + ((4 * col) ^ ((key % 4) << 4) ^ (((key // 4) % 4) << 2))
                 staged.add(offset)
                 actual = struct.unpack_from("<f", o_bytes, offset)[0]
                 if actual != ref["model"][row * WIDTH + col]:

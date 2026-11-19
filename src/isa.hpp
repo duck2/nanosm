@@ -293,10 +293,12 @@ inline Opcode mma_opcode(uint32_t shape_index, bool init) {
 }
 
 // An mma.async operand is a uniform register holding the shared address of
-// the 16-byte piece it starts at in the tile's row 0, and a row spacing, an
-// instruction constant (src/layout.hpp; trash/whole-rows-2026-11-18.md).
+// the 16-byte piece it starts at in its row 0 (any row of a taller tile),
+// and a row spacing, an instruction constant (src/layout.hpp;
+// trash/whole-rows-2026-11-18.md, trash/address-keyed-2026-11-18.md).
 // The spacings sit in the 14 bits beside the three register fields: A's in
-// bits 7..13, B's in bits 0..6, each in 16-byte units, so 16 .. 2032 bytes.
+// bits 7..13, B's in bits 0..6, each in 16-byte units, so 16 .. 2032 bytes
+// (swizzle64 takes the powers of two among them: 16 .. 1024).
 // The assembly operand is [urA] (spacing 16: one 16-byte piece per row, a
 // K = 8 tile) or [urA, spacing].
 inline constexpr uint32_t mma_spacing_unit = 16;

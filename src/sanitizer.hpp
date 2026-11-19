@@ -154,6 +154,16 @@ public:
     // 8-byte aligned (src/tma.hpp). The machine does not wire the low bits
     // (it ignores them); a program that sets them is wrong, diagnosed here.
     void check_tma_operand_alignment(const IssueSite& site, uint32_t buffer, uint32_t barrier) const;
+    // A swizzle64 tensor-core operand (src/layout.hpp): `pointer` is a
+    // 16-byte piece of its row 0 and the shape reads `row_bytes` from it in
+    // every row. Those bytes must lie in one row whose line (the pointer
+    // rounded down to the spacing) is a multiple of the spacing and of 64.
+    // The machine reads whatever the address-keyed rule names and checks
+    // none of this; a pointer that breaks it is wrong, diagnosed here. (A
+    // swizzle64 TMA tile's buffer is checked in record_tma_accept, where the
+    // descriptor is known.)
+    void check_swizzle64_operand(const IssueSite& site, const std::string& operand, uint32_t pointer,
+        uint32_t spacing, uint32_t row_bytes) const;
 
     // ---- same-word stores (HUMAN 2026-10-12, backlog D12) ----
     // Two active lanes of one sts / stg naming one 4-byte word: UB, as on
@@ -457,6 +467,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_uniform_mask)
     NANOSM_SANITIZER_NOOP(check_tma_operand_alignment)
+    NANOSM_SANITIZER_NOOP(check_swizzle64_operand)
     NANOSM_SANITIZER_NOOP(check_store_word_collision)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)

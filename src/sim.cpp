@@ -2372,25 +2372,25 @@ namespace {
 // -- `spacing` bytes apart (the instruction's), and `base` is the operand's
 // first 16-byte piece in its row 0 (tile + 16 x piece: a logical position,
 // not a shuffled one). Element (row, k) is at the logical address base + row
-// x spacing + 2k, shuffled by the row number counted from the operand's row
-// 0: a K = 8 command reads one piece of every row; a shape with k > 8 reads
-// k / 8 consecutive pieces of the same rows. The address generator walks
-// the rows in order and adds the spacing once per row (an adder, no
-// multiplier); `row * spacing` here is the simulator's shorthand for that
-// running sum. Its row counter starts at the operand's row 0, so an operand
-// that is part of a taller tile must start at a multiple of 16 of its rows
-// (the shuffle's period). The dense diagnostic layout is row-major and
+// x spacing + 2k, shuffled by that address's own row number (address /
+// spacing, src/layout.hpp): a K = 8 command reads one piece of every row; a
+// shape with k > 8 reads k / 8 consecutive pieces of the same rows. The
+// address generator walks the rows in order and adds the spacing once per
+// row (an adder, no multiplier); `row * spacing` here is the simulator's
+// shorthand for that running sum, and the row number is the running
+// address's bits above the spacing (wires, no counter). An operand may start
+// at any row of a taller tile. The dense diagnostic layout is row-major and
 // compact in the command's shape: A m rows of k, B k rows of n (no spacing).
 uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
     uint32_t m, uint32_t k) {
     if (config.mma_layout == TileLayout::dense) return dense_address(base, m, k, shape.k, 2);
-    return swizzle64_shuffle(base + m * spacing + 2 * k, m, spacing);
+    return swizzle64_shuffle(base + m * spacing + 2 * k, spacing);
 }
 
 uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
     uint32_t k, uint32_t n) {
     if (config.mma_layout == TileLayout::dense) return dense_address(base, k, n, shape.n, 2);
-    return swizzle64_shuffle(base + n * spacing + 2 * k, n, spacing);
+    return swizzle64_shuffle(base + n * spacing + 2 * k, spacing);
 }
 
 uint32_t mma_operand_element(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
@@ -3277,10 +3277,10 @@ uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
 }
 
 // Where the walker's element lands in (load) or comes from (store) shared
-// memory: the buffer plus the tile's offset in its descriptor's layout
-// (src/tma.hpp tma_tile_offset, through src/layout.hpp).
+// memory, in its descriptor's layout (src/tma.hpp tma_tile_address, through
+// src/layout.hpp: a swizzle64 tile is shuffled by the address itself).
 uint32_t Machine::tma_shmem_address(const TmaCommand& command) const {
-    const auto address = uint64_t{command.shmem_address} + tma_tile_offset(command.descriptor, command.x, command.y);
+    const auto address = tma_tile_address(command.descriptor, command.shmem_address, command.x, command.y);
     if (address > shmem_.size() || command.descriptor.element_bytes > shmem_.size() - address) {
         throw SimError("tma shmem access is outside shmem");
     }
@@ -3951,7 +3951,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     const auto a = uniform_operand(op, inst.src0);
     const auto b = uniform_operand(op, inst.src1);
     // The spacings are instruction constants, checked at kernel load
-    // (check_mma_shapes): under swizzle64 16, 32 or a multiple of 64.
+    // (check_mma_shapes): under swizzle64 a power of two, 16 or more.
     const auto a_spacing = mma_row_spacing(inst, true);
     const auto b_spacing = mma_row_spacing(inst, false);
     // A swizzle64 operand starts at a 16-byte piece. Every byte it reads must
@@ -3964,6 +3964,14 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     if ((config_.mma_layout == TileLayout::swizzle64 && ((a | b) & 15u) != 0) ||
         !inside(a, a_spacing, true) || !inside(b, b_spacing, false))
         panic(op, "MMA operand alignment or footprint is outside shmem");
+    // The machine reads whatever the address-keyed rule names; an operand
+    // whose row-0 bytes are not inside one legally placed row is the
+    // sanitizer's PANIC (src/layout.hpp: a row-0 line on a multiple of the
+    // spacing and of 64).
+    if (config_.mma_layout == TileLayout::swizzle64) {
+        sanitizer_.check_swizzle64_operand(site(op), "A", a, a_spacing, 2 * shape.k);
+        sanitizer_.check_swizzle64_operand(site(op), "B", b, b_spacing, 2 * shape.k);
+    }
     MmaCommand command;
     command.id = next_mma_command_id_++;
     command.init = is_mma_init(inst.opcode);

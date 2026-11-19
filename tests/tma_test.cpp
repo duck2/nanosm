@@ -308,11 +308,11 @@ void test_tma_swizzle64_feeds_mma_orientations() {
 // reads: every element where the MMA's own operand addressing
 // (nanosm::mma_operand_address) looks for it, and no byte outside the tile's
 // R x K x 2 bytes. A's global is m rows of K; B's is K rows of n
-// (transposed). The buffer starts on a 64-byte boundary that is not a
-// 1024-byte one.
+// (transposed). The buffer is a multiple of every spacing here (128) but not
+// of 16 rows of any of them, so the tile's row 0 is not row 0 of the shuffle.
 void test_tma_swizzle64_census_against_mma() {
     const auto& profile = canonical_profile();
-    constexpr uint32_t base = 1088;
+    constexpr uint32_t base = 1152;
     constexpr uint32_t mbar_address = 64;
     constexpr uint32_t shmem_bytes = base + 128 * 64 * 2 + 1024;
     constexpr uint8_t poison = 0xa5;
@@ -440,8 +440,9 @@ void test_tma_swizzle64_tile_ignores_the_mma_layout() {
 
 void test_tma_swizzle64_validation() {
     // The stored row (the tile length, or the rows when transposed, times
-    // the element bytes): 16, 32 or a multiple of 64 bytes. Any number of
-    // stored rows (the other extent). A dense tile cannot be transposed.
+    // the element bytes): a power of two bytes, 16 or more. Any number of
+    // stored rows (the other extent), 1 included. A dense tile cannot be
+    // transposed.
     nanosm::TmaDescriptor descriptor;
     descriptor.element_bytes = 2;
     descriptor.layout = nanosm::TileLayout::swizzle64;
@@ -457,7 +458,8 @@ void test_tma_swizzle64_validation() {
     constexpr bool across = true;
     for (uint32_t elements = 1; elements <= 256; ++elements) {
         const uint32_t bytes = 2 * elements;
-        const bool allowed = bytes == 16 || bytes == 32 || bytes % 64 == 0;
+        const bool allowed = bytes == 16 || bytes == 32 || bytes == 64 || bytes == 128 || bytes == 256 ||
+            bytes == 512;
         require(rejection(along, elements, 64).empty() == allowed &&
                 rejection(across, 64, elements).empty() == allowed,
             "a swizzle64 stored row of " + std::to_string(bytes) + " bytes was " +
@@ -520,15 +522,18 @@ std::string tile_piece_loads(uint32_t commands, uint32_t tile, uint32_t mbar, co
     return source + "wait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
 }
 
-// A tile's rows count from its own row 0 and the shuffle repeats every 16
-// rows, so four loads of 16 stored rows, each landed 16 rows (16 x 128
-// bytes) after the last, build exactly the 64-row tile one load makes:
-// fp16, 128-byte stored rows, not transposed (the four step along the
+// The shuffle's row number is the address's, so pieces of a tile land
+// anywhere: 16 loads of 4 stored rows, or 64 loads of ONE stored row, each
+// landed right after the last, build exactly the 64-row tile one load makes:
+// fp16, 128-byte stored rows, not transposed (the pieces step along the
 // global rows) and transposed (they step along dimension 0, whose positions
-// are the stored rows).
-void test_tma_swizzle64_pieces_of_16_rows() {
+// are the stored rows). The tile is at 0x4080, so its row 0 is row 1 of the
+// shuffle (Astra's control, trash/chan.txt "one-row gather control"): its
+// first logical byte is stored at 0x4090 and its logical byte 16 at 0x4080,
+// which a reader or writer still counting rows from the tile would miss.
+void test_tma_swizzle64_pieces_land_anywhere() {
     constexpr uint32_t mbar_address = 576;
-    constexpr uint32_t tile_address = 1024;
+    constexpr uint32_t tile_address = 0x4080;
     constexpr uint32_t stride = 83;
     constexpr uint32_t dim_x = 80;
     constexpr uint32_t dim_y = 70;
@@ -567,8 +572,16 @@ void test_tma_swizzle64_pieces_of_16_rows() {
             return words;
         };
         const auto whole = run_span(1);
-        const auto pieces = run_span(4);
-        require(whole == pieces, "one 64-row swizzle64 load disagreed with four 16-row loads");
+        require(whole == run_span(16), "one 64-row swizzle64 load disagreed with sixteen 4-row loads");
+        require(whole == run_span(64), "one 64-row swizzle64 load disagreed with 64 one-row loads");
+        // Stored row 0's logical bytes 0 and 16, at their physical addresses
+        // written out by hand: element (0, 0), and (8, 0) or transposed (0, 8).
+        const auto halfword = [&](uint32_t address) {
+            return static_cast<uint16_t>(whole[(address - tile_address) / 4] >> (8 * (address & 3u)));
+        };
+        const auto value = [](uint32_t x, uint32_t y) { return static_cast<uint16_t>(0x100 + 3 * (2 + y) + 5 * (3 + x)); };
+        require(halfword(0x4090) == value(0, 0) && halfword(0x4080) == (transposed ? value(0, 8) : value(8, 0)),
+            "stored row 0's logical bytes 0 and 16 are not at 0x4090 and 0x4080");
         std::set<uint32_t> addresses;
         for (uint32_t y = 0; y < 64; ++y) {
             for (uint32_t x = 0; x < 64; ++x) {
@@ -628,15 +641,19 @@ void test_tma_swizzle64_sector_economics() {
 }
 
 // The layout function (src/layout.hpp) against the rule written out
-// (reference_swizzle64; trash/whole_rows_check_astra.py) for the census's
-// spacings, at a 64-byte-aligned base that is not 0: the same address for
-// every byte, every row keeps exactly its own bytes [row x spacing, (row +
-// 1) x spacing), and the shuffle is a permutation. The tensor core's operand
-// pointer is a logical position: logical byte 16 of row 1 at spacing 128 is
-// stored at 128 (its piece slot XORed with 1), not 16 past where byte 0 is.
+// (reference_swizzle64; trash/address_keyed_census.py) for spacings 16 ..
+// 512, at base 0 and at a legal base 17 x max(spacing, 64) that is not a
+// multiple of 16 rows: the same address for every byte, every row keeps
+// exactly its own bytes [base + row x spacing, base + (row + 1) x spacing),
+// and the shuffle is a permutation. Keyed by address: a piece of the tile
+// that starts at row j (base + j x spacing, any j) puts every byte where the
+// tile does. The tensor core's operand pointer is a logical position:
+// logical byte 16 of row 1 at spacing 128 is stored at 128 (its piece slot
+// XORed with 1), not 16 past where byte 0 is. The spacings are the powers
+// of two from 16.
 void test_swizzle64_layout_matches_the_rule() {
-    for (const uint32_t spacing : {16u, 32u, 64u, 128u, 192u, 256u}) {
-        for (const uint32_t base : {0u, 1088u}) {
+    for (const uint32_t spacing : {16u, 32u, 64u, 128u, 256u, 512u}) {
+        for (const uint32_t base : {0u, 17 * std::max(spacing, 64u)}) {
             std::set<uint32_t> addresses;
             for (uint32_t row = 0; row < 64; ++row) {
                 for (uint32_t byte = 0; byte < spacing; ++byte) {
@@ -647,17 +664,28 @@ void test_swizzle64_layout_matches_the_rule() {
                     require(address >= base + row * spacing && address < base + (row + 1) * spacing,
                         what + ": left its row");
                     require(addresses.insert(address).second, what + ": two bytes in one place");
+                    for (const uint32_t first : {1u, 5u, 37u}) {
+                        if (row < first) continue;
+                        require(nanosm::swizzle64_address(base + first * spacing, spacing, row - first, byte) ==
+                                address,
+                            what + ": a piece starting at row " + std::to_string(first) + " puts it elsewhere");
+                    }
                 }
             }
         }
     }
     require(nanosm::swizzle64_address(0, 128, 1, 16) == 128 && nanosm::swizzle64_address(0, 128, 1, 0) == 144,
         "logical byte 16 of row 1 is not where the rule puts it");
+    for (uint32_t spacing = 0; spacing <= 4096; ++spacing) {
+        const bool power = spacing >= 16 && (spacing & (spacing - 1)) == 0;
+        require(nanosm::valid_swizzle64_spacing(spacing) == power,
+            "spacing " + std::to_string(spacing) + (power ? " was refused" : " was accepted"));
+    }
 }
 
 void test_tma_fp32_swizzle64_validation() {
     // The stored row runs along the tile's rows (a) or, transposed, across
-    // them (b): 16, 32 or a multiple of 64 bytes.
+    // them (b): a power of two bytes, 16 or more.
     const auto rejection = [](uint8_t element_bytes, bool transposed, uint32_t tile_length, uint32_t tile_rows) {
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = element_bytes;
@@ -671,14 +699,14 @@ void test_tma_fp32_swizzle64_validation() {
     };
     constexpr bool a = false;
     constexpr bool b = true;
-    // fp32: 4 (16 B), 8 (32 B) or a multiple of 16 elements per stored row.
+    // fp32: 4 (16 B), 8 (32 B), 16, 32, 64 ... elements per stored row.
     require(rejection(4, a, 64, 64).empty(), "fp32 swizzle64 64x64 tile was rejected");
     require(rejection(4, b, 64, 64).empty(), "fp32 transposed swizzle64 64x64 tile was rejected");
-    require(rejection(4, a, 4, 64).empty() && rejection(4, a, 8, 64).empty() && rejection(4, a, 48, 64).empty(),
-        "fp32 swizzle64 rows of 16, 32 and 192 bytes were rejected");
-    require(rejection(4, a, 64, 48).empty() && rejection(4, b, 32, 8).empty(),
+    require(rejection(4, a, 4, 64).empty() && rejection(4, a, 8, 64).empty() && rejection(4, a, 128, 64).empty(),
+        "fp32 swizzle64 rows of 16, 32 and 512 bytes were rejected");
+    require(rejection(4, a, 64, 48).empty() && rejection(4, b, 32, 8).empty() && rejection(4, a, 64, 1).empty(),
         "fp32 swizzle64 tiles of other row counts were rejected");
-    for (const uint32_t k : {2u, 6u, 12u, 20u}) {
+    for (const uint32_t k : {2u, 6u, 12u, 20u, 48u}) {
         require(rejection(4, a, k, 64).find("stored row must be") != std::string::npos &&
                 rejection(4, b, 64, k).find("stored row must be") != std::string::npos,
             "fp32 swizzle64 accepted a stored row of " + std::to_string(4 * k) + " bytes");
@@ -835,14 +863,18 @@ uint32_t whole_rows_b(uint32_t k, uint32_t n) { return (2 * k + n) % 3; }
 // (64 rows of 64 fp16: B's n rows of k, as a K cache) land whole, one load
 // each. Eight m64n64k8 commands step both operand pointers by one 16-byte
 // piece with row spacing 128 (FA's QK^T); eight m32n64k8 commands read A's
-// bottom half, the pointer at row 32 (+ 32 x 128). Bank rounds as with
-// 16-byte rows: 17 per A block and B sweep, and one TMA round per sector.
+// bottom half, the pointer at row 32 (+ 32 x 128), and eight more read rows
+// 21..52 (+ 21 x 128: an operand may start at any row, the shuffle keyed by
+// address). A at 0x4080 starts at row 1 of the shuffle and B at 0x180 at
+// row 3 (multiples of 128, not of 2048): a reader counting rows from the
+// tile would read the wrong pieces. Bank rounds as with 16-byte rows: 17
+// per A block and B sweep, and one TMA round per sector.
 void test_swizzle64_mma_reads_a_tma_tile() {
-    constexpr uint32_t a_tile = 1024;
-    constexpr uint32_t b_tile = 9216;
+    constexpr uint32_t a_tile = 0x4080;
+    constexpr uint32_t b_tile = 0x180;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, b_tile + 8192);
+    auto& shmem = image_bytes(launch.shmem_image, a_tile + 8192);
     auto& gmem = image_bytes(launch.gmem_image, 16384);
     for (uint32_t row = 0; row < 64; ++row) {
         for (uint32_t k = 0; k < 64; ++k) {
@@ -863,12 +895,13 @@ void test_swizzle64_mma_reads_a_tma_tile() {
     }
     write_u64(shmem, 128, nanosm::encode_mbar_state({false, true, 1, 0, 16384}));
     write_u64(shmem, 136, nanosm::encode_mbar_state({false, true, 1, 1, 0}));
-    std::string source = ".acc C, 0, 64, 64\n.acc H, 4096, 32, 64\n" +
+    std::string source = ".acc C, 0, 64, 64\n.acc H, 4096, 32, 64\n.acc G, 6144, 32, 64\n" +
         tma_operands_asm(1, a_tile, 2, 128, 8, {0, 0}) + "umov ur3, " + std::to_string(b_tile) + "\n" +
         "tma.load.2d [ur1], [0, ur8], [ur2]\ntma.load.2d [ur3], [64, ur8], [ur2]\n"
         "loaded:\nmbar.try_wait p0, [ur2], 0\n@!p0 bra.uni loaded\n";
     for (const auto& [accumulator, shape, a_start] :
-         {std::tuple{"C", "m64n64k8", a_tile}, std::tuple{"H", "m32n64k8", a_tile + 32 * 128}}) {
+         {std::tuple{"C", "m64n64k8", a_tile}, std::tuple{"H", "m32n64k8", a_tile + 32 * 128},
+          std::tuple{"G", "m32n64k8", a_tile + 21 * 128}}) {
         source += "umov ur10, " + std::to_string(a_start) + "\numov ur11, " + std::to_string(b_tile) + "\n";
         for (uint32_t piece = 0; piece < 8; ++piece) {
             if (piece != 0) source += "uaddi ur10, ur10, 16\nuaddi ur11, ur11, 16\n";
@@ -878,7 +911,7 @@ void test_swizzle64_mma_reads_a_tma_tile() {
     }
     source += "umov ur4, 136\nmma.commit [ur4]\ncommitted:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni committed\n"
         "acc.ld.v8 r20, C, ur8\numov ur12, 48\numov ur13, 56\nacc.ld.v8 r28, C, ur12\n"
-        "umov ur14, 16\numov ur15, 8\nacc.ld.v8 r36, H, ur14\nhalt\n";
+        "umov ur14, 16\numov ur15, 8\nacc.ld.v8 r36, H, ur14\nacc.ld.v8 r44, G, ur14\nhalt\n";
     nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch), {.timeline = true});
     machine.run(100000);
     const auto expected = [](uint32_t m, uint32_t n) {
@@ -893,15 +926,56 @@ void test_swizzle64_mma_reads_a_tma_tile() {
             require(machine.read_reg(0, lane, 28 + j) == expected(48 + lane, 56 + j), "C's far corner is wrong");
             require(machine.read_reg(0, lane, 36 + j) == expected(48 + lane, 8 + j),
                 "the m32 command at A's row 32 did not read rows 32..63");
+            require(machine.read_reg(0, lane, 44 + j) == expected(37 + lane, 8 + j),
+                "the m32 command at A's row 21 did not read rows 21..52");
         }
     }
     const auto& summary = machine.trace().summary();
-    require(summary.mma_commands == 16 && summary.mma_a_block_reads == 8 * 16 + 8 * 8 &&
-            summary.mma_shmem_rounds == 8 * 272 + 8 * 136,
+    require(summary.mma_commands == 24 && summary.mma_a_block_reads == 8 * 16 + 2 * 8 * 8 &&
+            summary.mma_shmem_rounds == 8 * 272 + 2 * 8 * 136,
         "128-byte rows did not keep one bank round per B block and per A block: " +
             std::to_string(summary.mma_shmem_rounds) + " rounds");
     require(summary.tma_port_requests == 512 && summary.tma_port_rounds == 512,
         "the TMA did not place one sector per port-A round");
+}
+
+// The base rule (src/layout.hpp): a swizzle64 tile's buffer is a multiple of
+// its spacing and of 64, and a tensor-core operand's row 0 lies in one row
+// whose line is. The machine shuffles by address and checks neither; the
+// sanitizer PANICs: a one-row tile of 128-byte rows at 1088 (a multiple of
+// 64, not of 128), and an m64n64k8 A operand of 16-byte rows at 1040 (row
+// 1 of a tile at 1024: the 64 rule).
+void test_swizzle64_base_rule_panics() {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, 4096);
+        image_bytes(launch.gmem_image, 128);
+        nanosm::TmaDescriptor descriptor;
+        descriptor.element_bytes = 2;
+        descriptor.layout = nanosm::TileLayout::swizzle64;
+        descriptor.dimensions = {64, 1, 1, 1};
+        descriptor.strides = {64, 0, 0};
+        descriptor.tile_length = 64;
+        descriptor.tile_rows = 1;
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, 128, 128);
+        nanosm::Machine machine(canonical_profile(), compile(tma_operands_asm(4, 1088, 3, 128, 8, {0, 0}) +
+            "tma.load.2d [ur4], [0, ur8], [ur3]\nwait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n"),
+            std::move(launch));
+        expect_sim_panic(machine, "swizzle64 buffer 1088 is not a multiple of 128", "a 128-byte-row tile at 1088");
+    }
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        image_bytes(launch.shmem_image, 8192);
+        nanosm::Machine machine(canonical_profile(), compile(
+            ".acc C, 0, 64, 64\numov ur0, 1040\numov ur1, 4096\nmma.async.init.m64n64k8 C, [ur0], [ur1]\nhalt\n"),
+            std::move(launch));
+        expect_sim_panic(machine, "mma operand A at 1040 reads 16 bytes per row at row spacing 16",
+            "an operand of 16-byte rows at 1040");
+    }
 }
 
 // One transposed load with 128-byte stored rows (V-like: the global rows are
@@ -1182,9 +1256,14 @@ TEST(Tma, tma_swizzle64_validation) {
     test_tma_swizzle64_validation();
 }
 
-// four 16-row swizzle64 loads build the 64-row tile
-TEST(TmaSlow, tma_swizzle64_pieces_of_16_rows) {
-    test_tma_swizzle64_pieces_of_16_rows();
+// sixteen 4-row and 64 one-row swizzle64 loads build the 64-row tile
+TEST(TmaSlow, tma_swizzle64_pieces_land_anywhere) {
+    test_tma_swizzle64_pieces_land_anywhere();
+}
+
+// a swizzle64 tile or operand off its base rule: the sanitizer's PANIC
+TEST(Tma, swizzle64_base_rule_panics) {
+    test_swizzle64_base_rule_panics();
 }
 
 // tma swizzle64 sectors
@@ -1207,7 +1286,7 @@ TEST(TmaSlow, tma_fp32_swizzle64_store_and_load) {
     test_tma_fp32_swizzle64_store_and_load();
 }
 
-// the tensor core reads TMA tiles of 128-byte rows, and an m32 half at row 32
+// the tensor core reads TMA tiles of 128-byte rows, and m32 operands at rows 32 and 21
 TEST(TmaSlow, swizzle64_mma_reads_a_tma_tile) {
     test_swizzle64_mma_reads_a_tma_tile();
 }

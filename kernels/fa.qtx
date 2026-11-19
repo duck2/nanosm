@@ -16,7 +16,9 @@
 ; base + r x spacing (128 bytes for P, 256 for O), and inside the row byte b
 ; at b XOR the row's constant ((r & 3) << 4 | (r & 12)): the 16-byte piece's
 ; slot XOR r & 3, the word's XOR (r / 4) & 3. One constant per row serves
-; both tiles (rows of 64 bytes or more).
+; both tiles (rows of 64 bytes or more). The rule takes the row number from
+; the address (base / spacing + r); counting r from the tile agrees because
+; PBUF and OSTAGE are multiples of 16 rows (2048 and 4096 bytes).
 ; Worker uniform registers: ur0/ur1 TMEM row/column (the acc coordinate
 ; pair), ur2 constants, ur3 score-ready, ur4 workers-done, ur5 PV-done
 ; (OUTPUT_DONE, the PV commit barrier), ur6 block parity, ur7 staged-output
