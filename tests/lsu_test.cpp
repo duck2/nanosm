@@ -486,7 +486,7 @@ void test_lsu_backpressure_chain() {
         std::string text = R"(
             usread ur0, WARP_ID
             ur2r r29, ur0
-            setp.ne p0, r29, 0
+            setp.ne.u32 p0, r29, 0
             @p0 bra.uni other
             mov r30, 0
             mov r31, 512

@@ -33,6 +33,6 @@ loop:
         stg.v8 [r20 + C], r0
         addi   r20, r20, WARP_STRIDE
         addi   r21, r21, -1
-        setp.ne p0, r21, 0
+        setp.ne.u32 p0, r21, 0
         @p0 bra.uni loop
         halt

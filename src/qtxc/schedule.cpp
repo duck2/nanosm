@@ -1,8 +1,9 @@
 // The qtx scheduler (src/qtxc/): turns a parsed qtx program into scheduled
 // assembly by filling in each instruction's control bits: the stall counts
 // its fixed-latency dependencies need (FixedTimeline, distances from
-// src/rf.hpp), depbar set / wait for the asynchronous ones, and a full drain
-// at every branch. schedule_fixed_stalls is the same stall pass for hand
+// src/rf.hpp), depbar set / wait for the asynchronous ones, a full drain at
+// every branch, and qtx's wait as a nop waiting for every live depbar (no
+// drain). schedule_fixed_stalls is the same stall pass for hand
 // assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
 // encode.
 
@@ -211,7 +212,10 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             // completion depbar reaches zero.
             wait_mask |= static_cast<uint8_t>(1u << *store_barrier);
         }
-        if (inst.opcode == Opcode::halt || is_branch(inst.opcode)) {
+        // halt, every branch and qtx's wait (parsed as a nop, the only nop a
+        // qtx program has) wait for every live depbar. Unlike a branch, the
+        // nop neither drains the fixed-latency timeline nor resets it (below).
+        if (inst.opcode == Opcode::halt || inst.opcode == Opcode::nop || is_branch(inst.opcode)) {
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if (live[bar]) wait_mask |= static_cast<uint8_t>(1u << bar);
             }

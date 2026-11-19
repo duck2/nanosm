@@ -423,7 +423,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             umov ur11, 8200
             usread ur0, WARP_ID
             ur2r r0, ur0
-            setp.eq p0, r0, 0
+            setp.eq.u32 p0, r0, 0
             @p0 bra.uni ISSUER
             sread r20, LANE_ID
             shli r20, r20, 2
@@ -435,7 +435,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             add r26, r20, r25
             sts [r26], r21
             addi r25, r25, 64
-            setp.lt p1, r25, 1024
+            setp.lt.u32 p1, r25, 1024
             @p1 bra.uni FILL1
             mbar.arrive [ur10]
         DONE0:
@@ -449,7 +449,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
             add r26, r20, r25
             sts [r26], r21
             addi r25, r25, 64
-            setp.lt p1, r25, 1024
+            setp.lt.u32 p1, r25, 1024
             @p1 bra.uni FILL2
             mbar.arrive [ur10]
             halt

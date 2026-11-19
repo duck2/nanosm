@@ -84,9 +84,9 @@ trash/urf-slice-2026-11-08.md): `urf.registers` 32-bit registers (32 in the cano
 | N_WARPS`) and `r2ur urD, rS` (lane 0 of a vector register) write it, each presenting its result at
 the URF write port the same fixed `urf.issue_to_port_cycles` after issue, so one issue per cycle is
 one URF write per cycle: no calendar. `ur2r rD, urS` copies a uniform register into every lane of a
-vector register. The uniform compare `usetp.{eq,ne,lt,le,gt,ge} pD, urA, urB | imm`
+vector register. The uniform compare `usetp.{eq,ne,lt,le,gt,ge}.{u32,s32} pD, urA, urB | imm`
 (trash/uniform-compare-2026-11-18.md) runs on the same uniform ALU with `setp`'s comparisons
-(unsigned 32-bit) and, at that same fixed cycle, writes predicate `pD` with one value in every lane;
+and, at that same fixed cycle, writes predicate `pD` with one value in every lane;
 a `bra.uni` on it may issue `urf.issue_to_port_cycles` (3) later, so a loop can count in a uniform
 register with no vector register at all. An instruction reads its uniform registers (at most two) in
 its one read round; they are not vector registers and do not count toward the bank rule. The
@@ -97,11 +97,16 @@ values, MMA operand addresses and `mma.commit`'s mbar. The TMA's operands are un
 the per-lane `LANE_ID` / `THREAD_ID`.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
-`setp.{eq,ne,lt,le,gt,ge}` with register or immediate operands (`usetp` on uniform registers), and
-`@p0 bra.uni label`. A
+`setp.{eq,ne,lt,le,gt,ge}.{u32,s32}` with register or immediate operands (`usetp` on uniform
+registers), and `@p0 bra.uni label`. The type is required, as in PTX: `.u32` compares unsigned
+32-bit, `.s32` signed (for `eq` / `ne` the two are one opcode, printed `.u32`), an immediate being
+the signed 22-bit field sign-extended in both. A
 `bra.uni` predicate must agree across every lane in its warp or the simulator PANICs. General
 predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
-Qtx conservatively drains live depbars and fixed-latency writes at every branch.
+Qtx conservatively drains live depbars and fixed-latency writes at every branch. Qtx's `wait`
+waits for every live depbar as a branch or `halt` does, but transfers no control and drains no
+fixed-latency write (say, a matmul's operand reads before an `mbar.arrive` hands the buffer back);
+it is emitted as `nop` (opcode 0xfe), which has no operands and carries only a stall and a wait mask.
 
 Each warp issues from its own instruction FIFO of fetch packets (`core.instruction_buffer_packets`,
 2; a packet is the two instruction words at an aligned 16-byte address), filled by one

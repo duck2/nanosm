@@ -18,7 +18,7 @@
 .equ BDESC,  1216
 
         usread ur0, WARP_ID
-        usetp.eq p0, ur0, 0
+        usetp.eq.u32 p0, ur0, 0
 @p0     bra.uni PRODUCER
 
 ; ---- consumer: warp 1 ----
@@ -36,7 +36,7 @@
         umov  ur5, 0
         umov  ur6, 0
         umov  ur12, 4
-CLOOP:  usetp.le p1, ur12, 0
+CLOOP:  usetp.le.s32 p1, ur12, 0
 @p1     bra.uni CDONE
 CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
@@ -87,7 +87,7 @@ PRODUCER:
         uaddi ur11, ur11, 16
 
         umov  ur12, 6
-PLOOP:  usetp.le p1, ur12, 0
+PLOOP:  usetp.le.s32 p1, ur12, 0
 @p1     bra.uni PDONE
 PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
@@ -97,7 +97,7 @@ PE0:    mbar.try_wait p3, [ur3], ur5
         tma.load.1d [ur8], [BDESC, ur11], [ur1]
         uaddi ur11, ur11, 16
         uaddi ur12, ur12, -1
-        usetp.le p1, ur12, 0
+        usetp.le.s32 p1, ur12, 0
 @p1     bra.uni PDONE
 PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1

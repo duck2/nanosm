@@ -12,11 +12,6 @@
 namespace nanosm {
 namespace qtxc_internal {
 
-bool is_setp(Opcode opcode) {
-    return (opcode >= Opcode::setp_eq && opcode <= Opcode::setp_ge) ||
-        (opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge);
-}
-
 bool is_branch(Opcode opcode) {
     return opcode == Opcode::bra || opcode == Opcode::bra_uni;
 }
@@ -55,7 +50,11 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::setp_lt:
     case Opcode::setp_le:
     case Opcode::setp_gt:
-    case Opcode::setp_ge: return {inst.src0, inst.src1};
+    case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32: return {inst.src0, inst.src1};
     case Opcode::fma: return {inst.src0, inst.src1, inst.src2};
     case Opcode::addi:
     case Opcode::shli:
@@ -74,6 +73,10 @@ std::vector<uint8_t> sources(const Instruction& inst) {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
     case Opcode::r2ur: return {inst.src0};
     case Opcode::sts:
     case Opcode::stg: return {inst.src0, inst.src1};

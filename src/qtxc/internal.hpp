@@ -27,8 +27,8 @@ std::string read_file(const std::string& path);
 // where control blocks and .profile are allowed; qtx refuses both.
 AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile);
 
-// Opcode groups and instruction metadata (metadata.cpp).
-bool is_setp(Opcode opcode);
+// Opcode groups and instruction metadata (metadata.cpp; is_setp and is_usetp
+// are src/isa.hpp's).
 bool is_branch(Opcode opcode);
 bool is_mbar_test_wait(Opcode opcode);
 bool is_mbar_try_wait(Opcode opcode);

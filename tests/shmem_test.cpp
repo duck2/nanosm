@@ -342,7 +342,7 @@ void test_uniformity_uses_lane_zero() {
                     "stg.v8 did not store at lane 0's block");
             }},
         {"bra.uni predicate",
-            "sread r0, LANE_ID\nsetp.lt p0, r0, 8\n@p0 bra.uni taken\nmov r5, 1\nhalt\ntaken:\nmov r5, 2\nhalt\n",
+            "sread r0, LANE_ID\nsetp.lt.u32 p0, r0, 8\n@p0 bra.uni taken\nmov r5, 1\nhalt\ntaken:\nmov r5, 2\nhalt\n",
             "bra.uni predicate is not warp-uniform",
             [&](const nanosm::Machine& machine) { all_lanes(machine, 5, 2, "bra.uni (lane 0 takes it)"); }},
     };
@@ -402,7 +402,7 @@ std::string i3_with_blocker(const std::string& body) {
     return R"(
         usread ur15, WARP_ID
         ur2r r29, ur15
-        setp.ne p6, r29, 0
+        setp.ne.u32 p6, r29, 0
         bra.uni i3_blocker {pred=p6, stall=0, set=-, wait=-}
     )" + body + R"(
     i3_blocker: sread r20, LANE_ID
@@ -751,7 +751,7 @@ void test_i2_a_read_and_a_write_same_cycle() {
         ur2r r29, ur15
         sread r0, LANE_ID
         shli r0, r0, 6
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         @p0 bra.uni writer
         lds r3, [r0]
         halt
@@ -890,7 +890,7 @@ void test_i2_tma_placement_on_port_b() {
         .acc C, 0, 64, 64
         usread ur15, WARP_ID
         ur2r r29, ur15
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         @p0 bra.uni hammer
         umov ur0, 0
         umov ur1, 1024
@@ -1106,7 +1106,7 @@ void test_i2_read_first_across_services() {
             ur2r r29, ur15
             sread r0, LANE_ID
             shli r0, r0, 2
-            setp.ne p6, r29, 0
+            setp.ne.u32 p6, r29, 0
             bra.uni reader {pred=p6, stall=0, set=-, wait=-}
             mov r5, 0xee
             sts [r0 + 512], r5 {pred=PT, stall=0, set=sb0, wait=-}
@@ -1492,7 +1492,7 @@ void test_i21_stale_probe_after_wake() {
         return R"(
             usread ur15, WARP_ID
             ur2r r29, ur15
-            setp.ne p1, r29, 0
+            setp.ne.u32 p1, r29, 0
             bra.uni w1 {pred=p1, stall=0, set=-, wait=-}
             umov ur4, 4096
             mov r9, 0
@@ -1737,22 +1737,22 @@ void test_i21_acc_ld_read_ownership() {
             umov ur2, 1024
         )";
         body += "mov r23, 77\n"; // nonzero: the acc.ld's write of the old (zero) tmem value shows
-        for (uint32_t i = 0; i < 6; ++i) body += "setp.eq p" + std::to_string(5 + i % 2) + ", r0, 0\n";
+        for (uint32_t i = 0; i < 6; ++i) body += "setp.eq.u32 p" + std::to_string(5 + i % 2) + ", r0, 0\n";
         body += R"(
             fadd r26, r10, r10
             fadd r29, r10, r10
             fadd r32, r10, r10
             fadd r35, r10, r10
-            setp.eq p5, r0, 0
-            setp.eq p6, r0, 0
-            setp.eq p5, r0, 0
+            setp.eq.u32 p5, r0, 0
+            setp.eq.u32 p6, r0, 0
+            setp.eq.u32 p5, r0, 0
             acc.ld.v8 r16, C, ur8 {pred=PT, stall=0, set=sb0, wait=-}
         )";
         // One filler per cycle: they rotate over six predicates (I6a: a setp
         // waits until the previous write of its predicate is in the file,
         // issue_to_predicate_visible after it, so two alternating predicates
         // would issue in pairs five cycles apart).
-        for (uint32_t i = 0; i < gap; ++i) body += "setp.eq p" + std::to_string(1 + i % 6) + ", r0, 0\n";
+        for (uint32_t i = 0; i < gap; ++i) body += "setp.eq.u32 p" + std::to_string(1 + i % 6) + ", r0, 0\n";
         body += R"(
             mma.async.init.m64n64k8 C, [ur1], [ur2] {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
@@ -2151,7 +2151,7 @@ void test_i4_cross_warp_race() {
         return R"(
             usread ur15, WARP_ID
             ur2r r29, ur15
-            setp.ne p6, r29, 0
+            setp.ne.u32 p6, r29, 0
             bra.uni other {pred=p6, stall=0, set=-, wait=-}
             umov ur10, 1024
             umov ur11, 4104
@@ -2195,7 +2195,7 @@ void test_i4_cross_warp_race() {
     auto handoff = i4_machine(profile, R"(
             usread ur15, WARP_ID
             ur2r r29, ur15
-            setp.ne p6, r29, 0
+            setp.ne.u32 p6, r29, 0
             bra.uni producer {pred=p6, stall=0, set=-, wait=-}
         )" + i4_tma_operands(1024) + R"(
             umov ur4, 4104

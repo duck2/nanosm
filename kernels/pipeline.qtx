@@ -23,7 +23,7 @@
 .equ EMPTY1, 1048
 
         usread ur0, WARP_ID
-        usetp.eq p0, ur0, 0
+        usetp.eq.u32 p0, ur0, 0
 @p0     bra.uni PRODUCER
 
 ; ---- consumer: warp 1 ----
@@ -41,7 +41,7 @@
         umov  ur5, 0            ; FULL0 parity
         umov  ur6, 0            ; FULL1 parity
         umov  ur7, 4            ; outer iterations, two tiles each
-CLOOP:  usetp.le p1, ur7, 0
+CLOOP:  usetp.le.s32 p1, ur7, 0
 @p1     bra.uni CDONE
 CF0:    mbar.try_wait p3, [ur1], ur5
 @!p3    bra.uni CF0
@@ -97,7 +97,7 @@ PRODUCER:
         addi  r1, r1, 64
         addi  r2, r2, 64
         umov  ur7, 6            ; tiles left after the peel
-PLOOP:  usetp.le p1, ur7, 0
+PLOOP:  usetp.le.s32 p1, ur7, 0
 @p1     bra.uni PDONE
 PE0:    mbar.try_wait p3, [ur3], ur5
 @!p3    bra.uni PE0
@@ -110,7 +110,7 @@ PE0:    mbar.try_wait p3, [ur3], ur5
         addi  r1, r1, 64
         addi  r2, r2, 64
         uaddi ur7, ur7, -1
-        usetp.le p1, ur7, 0
+        usetp.le.s32 p1, ur7, 0
 @p1     bra.uni PDONE
 PE1:    mbar.try_wait p3, [ur4], ur6
 @!p3    bra.uni PE1

@@ -99,6 +99,10 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::setp_le:
     case Opcode::setp_gt:
     case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
@@ -131,6 +135,10 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
@@ -226,6 +234,10 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::usetp_le:
     case Opcode::usetp_gt:
     case Opcode::usetp_ge:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetp_ge_s32:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
@@ -242,11 +254,16 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::usetpi_le:
     case Opcode::usetpi_gt:
     case Opcode::usetpi_ge:
+    case Opcode::usetpi_lt_s32:
+    case Opcode::usetpi_le_s32:
+    case Opcode::usetpi_gt_s32:
+    case Opcode::usetpi_ge_s32:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
         break;
     case Opcode::fence_sh:
+    case Opcode::nop:
     case Opcode::halt:
         break;
     }
@@ -303,6 +320,10 @@ Instruction decode(uint64_t word) {
     case Opcode::setp_le:
     case Opcode::setp_gt:
     case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
@@ -335,6 +356,10 @@ Instruction decode(uint64_t word) {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
@@ -433,6 +458,10 @@ Instruction decode(uint64_t word) {
     case Opcode::usetp_le:
     case Opcode::usetp_gt:
     case Opcode::usetp_ge:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetp_ge_s32:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
@@ -449,11 +478,16 @@ Instruction decode(uint64_t word) {
     case Opcode::usetpi_le:
     case Opcode::usetpi_gt:
     case Opcode::usetpi_ge:
+    case Opcode::usetpi_lt_s32:
+    case Opcode::usetpi_le_s32:
+    case Opcode::usetpi_gt_s32:
+    case Opcode::usetpi_ge_s32:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::fence_sh:
+    case Opcode::nop:
     case Opcode::halt:
         break;
     }
@@ -483,6 +517,10 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::usetpi_le:
     case Opcode::usetpi_gt:
     case Opcode::usetpi_ge:
+    case Opcode::usetpi_lt_s32:
+    case Opcode::usetpi_le_s32:
+    case Opcode::usetpi_gt_s32:
+    case Opcode::usetpi_ge_s32:
     case Opcode::ur2r:
     case Opcode::lds_uni:
     case Opcode::ldg_uni:
@@ -505,6 +543,10 @@ std::vector<uint8_t> uniform_sources(const Instruction& inst) {
     case Opcode::usetp_le:
     case Opcode::usetp_gt:
     case Opcode::usetp_ge:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetp_ge_s32:
     case Opcode::atom_add_uni:
     case Opcode::atom_and_uni:
     case Opcode::atom_xor_uni:
@@ -583,18 +625,26 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::cvt_pack: return "cvt.pack.f16x2";
     case Opcode::ex2: return "ex2";
     case Opcode::rcp: return "rcp";
-    case Opcode::setp_eq: return "setp.eq";
-    case Opcode::setp_ne: return "setp.ne";
-    case Opcode::setp_lt: return "setp.lt";
-    case Opcode::setp_le: return "setp.le";
-    case Opcode::setp_gt: return "setp.gt";
-    case Opcode::setp_ge: return "setp.ge";
-    case Opcode::setpi_eq: return "setp.eq";
-    case Opcode::setpi_ne: return "setp.ne";
-    case Opcode::setpi_lt: return "setp.lt";
-    case Opcode::setpi_le: return "setp.le";
-    case Opcode::setpi_gt: return "setp.gt";
-    case Opcode::setpi_ge: return "setp.ge";
+    case Opcode::setp_eq:
+    case Opcode::setpi_eq: return "setp.eq.u32";
+    case Opcode::setp_ne:
+    case Opcode::setpi_ne: return "setp.ne.u32";
+    case Opcode::setp_lt:
+    case Opcode::setpi_lt: return "setp.lt.u32";
+    case Opcode::setp_le:
+    case Opcode::setpi_le: return "setp.le.u32";
+    case Opcode::setp_gt:
+    case Opcode::setpi_gt: return "setp.gt.u32";
+    case Opcode::setp_ge:
+    case Opcode::setpi_ge: return "setp.ge.u32";
+    case Opcode::setp_lt_s32:
+    case Opcode::setpi_lt_s32: return "setp.lt.s32";
+    case Opcode::setp_le_s32:
+    case Opcode::setpi_le_s32: return "setp.le.s32";
+    case Opcode::setp_gt_s32:
+    case Opcode::setpi_gt_s32: return "setp.gt.s32";
+    case Opcode::setp_ge_s32:
+    case Opcode::setpi_ge_s32: return "setp.ge.s32";
     case Opcode::mbar_init_i:
     case Opcode::mbar_init_r: return "mbar.init";
     case Opcode::mbar_arrive: return "mbar.arrive";
@@ -626,6 +676,7 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::ldg_uni: return "ldg.uni";
     case Opcode::lds_uni: return "lds.uni";
     case Opcode::fence_sh: return "fence.sh";
+    case Opcode::nop: return "nop";
     case Opcode::atom_add_uni: return "atom.add.uni";
     case Opcode::atom_and_uni: return "atom.and.uni";
     case Opcode::atom_xor_uni: return "atom.xor.uni";
@@ -651,17 +702,25 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::r2ur: return "r2ur";
     case Opcode::ur2r: return "ur2r";
     case Opcode::usetp_eq:
-    case Opcode::usetpi_eq: return "usetp.eq";
+    case Opcode::usetpi_eq: return "usetp.eq.u32";
     case Opcode::usetp_ne:
-    case Opcode::usetpi_ne: return "usetp.ne";
+    case Opcode::usetpi_ne: return "usetp.ne.u32";
     case Opcode::usetp_lt:
-    case Opcode::usetpi_lt: return "usetp.lt";
+    case Opcode::usetpi_lt: return "usetp.lt.u32";
     case Opcode::usetp_le:
-    case Opcode::usetpi_le: return "usetp.le";
+    case Opcode::usetpi_le: return "usetp.le.u32";
     case Opcode::usetp_gt:
-    case Opcode::usetpi_gt: return "usetp.gt";
+    case Opcode::usetpi_gt: return "usetp.gt.u32";
     case Opcode::usetp_ge:
-    case Opcode::usetpi_ge: return "usetp.ge";
+    case Opcode::usetpi_ge: return "usetp.ge.u32";
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetpi_lt_s32: return "usetp.lt.s32";
+    case Opcode::usetp_le_s32:
+    case Opcode::usetpi_le_s32: return "usetp.le.s32";
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetpi_gt_s32: return "usetp.gt.s32";
+    case Opcode::usetp_ge_s32:
+    case Opcode::usetpi_ge_s32: return "usetp.ge.s32";
     case Opcode::halt: return "halt";
     }
     std::ostringstream out;
@@ -745,6 +804,10 @@ std::string format_instruction(
     case Opcode::setp_le:
     case Opcode::setp_gt:
     case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
             << ", " << reg(inst.src1);
         break;
@@ -754,6 +817,10 @@ std::string format_instruction(
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
             << ", " << inst.imm;
         break;
@@ -845,6 +912,10 @@ std::string format_instruction(
     case Opcode::usetp_le:
     case Opcode::usetp_gt:
     case Opcode::usetp_ge:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetp_ge_s32:
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << ureg(inst.src1);
         break;
     case Opcode::usetpi_eq:
@@ -853,6 +924,10 @@ std::string format_instruction(
     case Opcode::usetpi_le:
     case Opcode::usetpi_gt:
     case Opcode::usetpi_ge:
+    case Opcode::usetpi_lt_s32:
+    case Opcode::usetpi_le_s32:
+    case Opcode::usetpi_gt_s32:
+    case Opcode::usetpi_ge_s32:
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
         break;
     case Opcode::addi:
@@ -888,6 +963,7 @@ std::string format_instruction(
         out << ' ' << (inst.imm >= 0 ? "+" : "") << inst.imm;
         break;
     case Opcode::fence_sh:
+    case Opcode::nop:
     case Opcode::halt:
         break;
     }
@@ -942,6 +1018,14 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
         return timing.alu;
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_test_wait_r:
@@ -981,6 +1065,7 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::atom_and_uni:
     case Opcode::atom_xor_uni:
     case Opcode::atom_exch_uni:
+    case Opcode::nop:
     case Opcode::halt:
         return 0;
     // The uniform register writers are not vector arithmetic: they present at
@@ -998,6 +1083,14 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::usetpi_le:
     case Opcode::usetpi_gt:
     case Opcode::usetpi_ge:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetp_ge_s32:
+    case Opcode::usetpi_lt_s32:
+    case Opcode::usetpi_le_s32:
+    case Opcode::usetpi_gt_s32:
+    case Opcode::usetpi_ge_s32:
     case Opcode::umov:
     case Opcode::umovi:
     case Opcode::uadd:

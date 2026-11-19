@@ -146,7 +146,7 @@ void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
     auto machine = i6b2_machine(profile, R"(
         usread ur1, WARP_ID
         ur2r r29, ur1
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         bra.uni waiter {pred=p0, stall=0, set=-, wait=-}
     )" + i6b2_independent_movs(30) + R"(
         halt
@@ -247,7 +247,7 @@ void test_i6b2_conditional_branch() {
     const auto& profile = canonical_profile();
     for (const bool taken : {true, false}) {
         const auto what = std::string(taken ? "taken: " : "not taken: ");
-        auto machine = i6b2_machine(profile, std::string("setp.eq p0, r0, ") + (taken ? "0" : "1") + R"(
+        auto machine = i6b2_machine(profile, std::string("setp.eq.u32 p0, r0, ") + (taken ? "0" : "1") + R"(
             mov r1, 1
             mov r2, 2
             mov r3, 3
@@ -265,7 +265,7 @@ void test_i6b2_conditional_branch() {
         const uint64_t t = nanosm::fetch_to_issue + 6;
         require(t + nanosm::issue_to_predicate_sample >=
                     nanosm::fetch_to_issue + nanosm::issue_to_predicate_visible(
-                        nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq p0, r0, 0\nhalt"), profile).words[0]),
+                        nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq.u32 p0, r0, 0\nhalt"), profile).words[0]),
                         profile),
             "the scenario's bra.uni would sample p0 before the setp wrote it");
         std::map<uint64_t, std::tuple<std::size_t, std::optional<uint32_t>, uint32_t, uint32_t>> after; // Q after each tick
@@ -449,14 +449,14 @@ void test_i6b2_prefetch_through_waits() {
 // the old predicate).
 void test_i6b2_setp_to_branch_distance() {
     const auto& profile = canonical_profile();
-    const auto setp = nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq p0, r0, r0\nhalt"), profile).words[0]);
+    const auto setp = nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq.u32 p0, r0, r0\nhalt"), profile).words[0]);
     const auto distance = nanosm::issue_to_predicate_visible(setp, profile) - nanosm::issue_to_predicate_sample;
     require(distance == 1 + profile.rf_read_latency_cycles + profile.timing.alu + 1 - 1 && distance == 4,
         "the canonical setp -> bra.uni distance is not 4");
-    const auto qtx = nanosm::compile_qtx("setp.eq p0, r0, r0\n@p0 bra.uni target\nmov r5, 1\ntarget: halt\n", profile);
+    const auto qtx = nanosm::compile_qtx("setp.eq.u32 p0, r0, r0\n@p0 bra.uni target\nmov r5, 1\ntarget: halt\n", profile);
     require(qtx.instructions[0].control.stall == distance, "qtxc did not place the bra.uni at the distance");
     const auto program = [&](uint32_t stall) {
-        return "setp.eq p0, r0, r0 {pred=PT, stall=" + std::to_string(stall) + R"(, set=-, wait=-}
+        return "setp.eq.u32 p0, r0, r0 {pred=PT, stall=" + std::to_string(stall) + R"(, set=-, wait=-}
             bra.uni target {pred=p0, stall=0, set=-, wait=-}
             mov r5, 1
             halt
@@ -554,7 +554,7 @@ void test_i6b2_warp_slots_and_profile_fields() {
 void test_i6b2_trace_supply_state() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         mov r1, 1
         mov r2, 2
         mov r3, 3

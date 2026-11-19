@@ -247,7 +247,7 @@ void test_i3_rmw_store_alternation() {
     auto machine = i21_machine(profile, R"(
         usread ur9, WARP_ID
         ur2r r29, ur9
-        setp.eq p6, r29, 1
+        setp.eq.u32 p6, r29, 1
         bra.uni stores {pred=p6, stall=0, set=-, wait=-}
         umov ur4, 4160 {pred=PT, stall=10, set=-, wait=-}
     )" + arrives + R"(
@@ -965,7 +965,7 @@ void test_i5_store_pause_and_resume() {
     auto machine = i5_machine(profile, R"(
         usread ur9, WARP_ID
         ur2r r29, ur9
-        setp.ne p6, r29, 0
+        setp.ne.u32 p6, r29, 0
         bra.uni other {pred=p6, stall=0, set=-, wait=-}
         umov ur1, 0
         umov ur5, 1 {pred=PT, stall=14, set=-, wait=-}
@@ -1024,7 +1024,7 @@ void test_i5_read_after_the_store_under_way() {
     auto machine = i5_machine(profile, R"(
         usread ur9, WARP_ID
         ur2r r29, ur9
-        setp.ne p6, r29, 0
+        setp.ne.u32 p6, r29, 0
         bra.uni other {pred=p6, stall=0, set=-, wait=-}
         umov ur1, 0
         umov ur5, 1
@@ -1243,7 +1243,7 @@ void test_d12_sts_over_an_mbar_with_a_live_waiter() {
         umov ur1, 64
         usread ur0, WARP_ID
         ur2r r0, ur0
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         @p0 bra.uni waiter
         sread r3, LANE_ID
         shli r3, r3, 2
@@ -1312,7 +1312,7 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
         {"mma.commit", "umov ur4, 4096\nmma.commit [ur4]\nhalt\n"},
         {"acc.ld", ".acc C, 0, 64, 64\numov ur8, 0\numov ur9, 0\nacc.ld r10, C, ur8\nhalt\n"},
         {"acc.st.v8", ".acc C, 0, 64, 64\numov ur8, 0\numov ur9, 0\nmov r0, 1\nacc.st.v8 C, ur8, r0\nhalt\n"},
-        {"bra.uni", "usread ur0, WARP_ID\nur2r r0, ur0\nsetp.eq p0, r0, 0\n@p0 bra.uni out\nmov r1, 1\nout:\nhalt\n"},
+        {"bra.uni", "usread ur0, WARP_ID\nur2r r0, ur0\nsetp.eq.u32 p0, r0, 0\n@p0 bra.uni out\nmov r1, 1\nout:\nhalt\n"},
         {"bra.uni", "bra.uni out\nmov r1, 1\nout:\nhalt\n"}, // @PT: no operand, still uniform
     };
     for (const auto& [name, program] : cases) {
@@ -1357,7 +1357,7 @@ void test_d12_1_mbar_init_over_a_live_waiter() {
         umov ur1, 64
         usread ur0, WARP_ID
         ur2r r0, ur0
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         @p0 bra.uni waiter
         mbar.init [ur1], 3
         halt
@@ -1413,7 +1413,7 @@ void test_d12_1_tma_load_over_a_live_waiter() {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         usread ur0, WARP_ID
         ur2r r0, ur0
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         @p0 bra.uni waiter
         mov r20, 0
         addi r20, r20, 1

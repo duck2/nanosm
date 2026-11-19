@@ -159,7 +159,7 @@ void test_assembly_contract_drain_denied() {
     std::string text = R"(
         usread ur0, WARP_ID
         ur2r r29, ur0
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
         ldg.v8 r8, [r30]
@@ -244,7 +244,7 @@ void test_assembly_contract_wide_pluck() {
     std::string text = R"(
         usread ur0, WARP_ID
         ur2r r29, ur0
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
         ldg.v8 r8, [r30]
@@ -615,7 +615,7 @@ void test_simultaneous_ingress_push_and_pop() {
     std::string text = R"(
         usread ur0, WARP_ID
         ur2r r29, ur0
-        setp.ne p0, r29, 0
+        setp.ne.u32 p0, r29, 0
         @p0 bra.uni other
         mov r30, 0
         ldg.v8 r8, [r30]
@@ -679,7 +679,7 @@ void test_driver_shuffle_unit_kernels() {
         nanosm::Launch launch;
         launch.active_warps = 2;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-        std::string text = "usread ur0, WARP_ID\nur2r r29, ur0\nsetp.ne p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
+        std::string text = "usread ur0, WARP_ID\nur2r r29, ur0\nsetp.ne.u32 p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
             "mov r28, 2048\nldg.v8 r0, [r30]\nldg.v8 r8, [r31]\nldg r16, [r28]\nstg.v8 [r28], r0\nhalt\nother:\n";
         text += booking_stream(0, 150);
         text += "halt\n";
@@ -733,7 +733,7 @@ void test_driver_shuffle_unit_kernels() {
         return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
             usread ur0, WARP_ID
             ur2r r29, ur0
-            setp.ne p0, r29, 0
+            setp.ne.u32 p0, r29, 0
             @p0 bra.uni other
         )" + tma_operands_asm(10, 1024, 3, 128, 8) + R"(
             tma.store.1d [0, ur8], [ur10], [ur3]

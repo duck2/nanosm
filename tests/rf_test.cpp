@@ -1017,7 +1017,7 @@ void test_i1_lsu_one_rf_write_per_cycle() {
     nanosm::Machine machine(config, compile(R"(
         usread ur2, WARP_ID
         ur2r r2, ur2
-        setp.ne p0, r2, 0
+        setp.ne.u32 p0, r2, 0
 @p0     bra.uni ARITH
         umov ur0, 0
         umov ur1, 512
@@ -1593,7 +1593,7 @@ void test_i6b1_back_to_back_same_bank_reads() {
         stg [r9 + 4096], r1 {pred=PT, stall=0, set=sb1, wait=-}
         add r17, r6, r6
         lds r19, [r9 + 2048] {pred=PT, stall=0, set=sb2, wait=-}
-        setp.ne p0, r9, 0
+        setp.ne.u32 p0, r9, 0
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2}
     )";
     const std::vector<std::vector<uint32_t>> arithmetic_sources{{0, 1}, {3, 2}, {6}, {9}, {6}, {9}};
@@ -1603,7 +1603,7 @@ void test_i6b1_back_to_back_same_bank_reads() {
         xori r13, r6, 5
         addi r14, r9, 1
         add r17, r6, r6
-        setp.ne p0, r9, 0
+        setp.ne.u32 p0, r9, 0
         halt
     )";
     for (const uint32_t lr : {1u, 2u, 3u}) {
@@ -1724,7 +1724,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
         {"shr r2, r0, r3", "r0 and r3", &canonical},
         {"fma r1, r2, r5, r8", "r2, r5 and r8", &canonical},
         {"fma r1, r0, r3, r4", "r0 and r3", &canonical},
-        {"setp.eq p0, r0, r3", "r0 and r3", &canonical},
+        {"setp.eq.u32 p0, r0, r3", "r0 and r3", &canonical},
         {"sts [r3 + 64], r6", "r3 and r6", &canonical},
         {"stg [r3], r6", "r3 and r6", &canonical},
     };
@@ -1789,7 +1789,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
         mov r4, 0x3f8
         shli r4, r4, 20
         fma r5, r4, r4, r4
-        setp.eq p0, r3, r3
+        setp.eq.u32 p0, r3, r3
         sts [r3 + 64], r3
         halt
     )", canonical), std::move(launch), {.timeline = true, .debug = true});
@@ -2076,9 +2076,9 @@ void test_i6b1_unrelated_banks_proceed() {
         umov ur3, 0
         umov ur6, 4096
         sread r0, LANE_ID
-        setp.eq p0, r50, 2
+        setp.eq.u32 p0, r50, 2
         @p0 bra.uni other
-        setp.eq p1, r50, 1
+        setp.eq.u32 p1, r50, 1
         @p1 bra.uni plain
     )" + meet("meet0") + pad + R"(
         acc.st C, ur2, r0

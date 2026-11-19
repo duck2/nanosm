@@ -70,15 +70,6 @@ uint16_t float_to_half_bits(uint32_t bits) {
 
 namespace {
 
-bool is_setp(Opcode opcode) {
-    return (opcode >= Opcode::setp_eq && opcode <= Opcode::setp_ge) ||
-        (opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge);
-}
-
-bool is_setp_immediate(Opcode opcode) {
-    return opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge;
-}
-
 bool is_mbar_test_wait(Opcode opcode) {
     return opcode == Opcode::mbar_test_wait_i || opcode == Opcode::mbar_test_wait_r;
 }
@@ -197,8 +188,11 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
     return a > b ? a_bits : b_bits;
 }
 
-// setp's and usetp's six comparisons: unsigned 32-bit.
+// setp's and usetp's comparisons: unsigned 32-bit, the .s32 ones signed. An
+// immediate arrives sign-extended from its 22-bit field either way.
 bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
+    const auto signed_lhs = static_cast<int32_t>(lhs);
+    const auto signed_rhs = static_cast<int32_t>(rhs);
     switch (opcode) {
     case Opcode::setp_eq:
     case Opcode::setpi_eq:
@@ -224,6 +218,22 @@ bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     case Opcode::setpi_ge:
     case Opcode::usetp_ge:
     case Opcode::usetpi_ge: return lhs >= rhs;
+    case Opcode::setp_lt_s32:
+    case Opcode::setpi_lt_s32:
+    case Opcode::usetp_lt_s32:
+    case Opcode::usetpi_lt_s32: return signed_lhs < signed_rhs;
+    case Opcode::setp_le_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::usetp_le_s32:
+    case Opcode::usetpi_le_s32: return signed_lhs <= signed_rhs;
+    case Opcode::setp_gt_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::usetp_gt_s32:
+    case Opcode::usetpi_gt_s32: return signed_lhs > signed_rhs;
+    case Opcode::setp_ge_s32:
+    case Opcode::setpi_ge_s32:
+    case Opcode::usetp_ge_s32:
+    case Opcode::usetpi_ge_s32: return signed_lhs >= signed_rhs;
     default: throw SimError("internal non-setp comparison");
     }
 }
@@ -3685,8 +3695,9 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
 // moves to the next word: step_front_end). Fixed arithmetic books its
 // bundle; a branch goes into the issue register, where it resolves next
 // cycle (resolve_branch); a halt stops the warp's front end now (its FIFO is
-// cleared, nothing more is fetched or issued); fence.sh is complete now;
-// everything else books its operand reads and enters the dispatch pipeline.
+// cleared, nothing more is fetched or issued); fence.sh and nop are complete
+// now; everything else books its operand reads and enters the dispatch
+// pipeline.
 void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     w.issue.popped = warp.id;
     if (uses_arithmetic_pipeline(inst)) {
@@ -3704,6 +3715,8 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         break;
     case Opcode::fence_sh:
         break; // its admission was the whole of it (own_shmem_at_ram)
+    case Opcode::nop:
+        break; // its wait mask held it until now; its stall is set below
     case Opcode::halt:
         w.issue.halt = true;
         break;
@@ -4381,7 +4394,7 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
                !is_tma(opcode) && !is_acc_transfer(opcode) && !is_mma_command(opcode) &&
                opcode != Opcode::bra && opcode != Opcode::bra_uni && opcode != Opcode::fence_sh &&
                !is_mbar_rmw(opcode) && !is_mbar_try_wait(opcode) && !is_atomic(opcode) &&
-               opcode != Opcode::halt) {
+               opcode != Opcode::nop && opcode != Opcode::halt) {
         panic(warp, inst, "zero-latency RF writer is unsupported");
     }
 }
@@ -4549,6 +4562,14 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             const auto rhs = is_setp_immediate(inst.opcode)
                 ? static_cast<uint32_t>(inst.imm)
@@ -4728,7 +4749,7 @@ void Machine::step_urf(Wires& w) {
 // The uniform ALU: one 32-bit result from the write's latched operands (its
 // uniform sources in operand order) and its immediate. Register shifts use
 // the low 5 bits, as the vector ALU's. A usetp's result is its predicate, 0
-// or 1 (setp's comparisons, unsigned).
+// or 1 (setp's comparisons: unsigned, the .s32 ones signed).
 uint32_t Machine::execute_uniform(const UrfWrite& write) const {
     const auto& inst = write.instruction;
     const auto fail = [&](const std::string& reason) {
@@ -5506,7 +5527,11 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::setp_lt:
     case Opcode::setp_le:
     case Opcode::setp_gt:
-    case Opcode::setp_ge: return {inst.src0, inst.src1};
+    case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32: return {inst.src0, inst.src1};
     case Opcode::fma: return {inst.src0, inst.src1, inst.src2};
     case Opcode::and_:
     case Opcode::or_:
@@ -5530,6 +5555,10 @@ std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     case Opcode::setpi_le:
     case Opcode::setpi_gt:
     case Opcode::setpi_ge:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
     case Opcode::r2ur: return {inst.src0};
     case Opcode::sts:
     case Opcode::stg: return {inst.src0, inst.src1};

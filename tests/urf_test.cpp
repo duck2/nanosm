@@ -250,15 +250,19 @@ void test_toolchain_forms_and_refusals() {
         acc.ld r1, T, ur6
         acc.st T, ur6, r1
         mbar.try_wait p1, [ur4], ur5
-        usetp.lt p3, ur3, ur4
+        usetp.lt.u32 p3, ur3, ur4
         usetp.ge.u32 p4, ur3, -7
+        usetp.lt.s32 p5, ur8, 0
+        usetp.ne.s32 p6, ur3, ur4
+        setp.gt.s32 p0, r1, -4
         halt
     )");
     const std::vector<std::string> expected = {
         "usread ur0, WARP_ID", "umov ur1, ur0", "umov ur2, -5", "uadd ur3, ur1, ur2", "uxori ur4, ur3, 9",
         "r2ur ur5, r2", "ur2r r1, ur5", "lds.uni r0, [ur3 + 8]", "atom.add.uni r2, [ur0 - 4], ur3",
-        "acc.ld r1, ACC0, ur6", "acc.st ACC0, ur6, r1", "mbar.try_wait p1, [ur4], ur5", "usetp.lt p3, ur3, ur4",
-        "usetp.ge p4, ur3, -7", "halt"};
+        "acc.ld r1, ACC0, ur6", "acc.st ACC0, ur6, r1", "mbar.try_wait p1, [ur4], ur5", "usetp.lt.u32 p3, ur3, ur4",
+        "usetp.ge.u32 p4, ur3, -7", "usetp.lt.s32 p5, ur8, 0", "usetp.ne.u32 p6, ur3, ur4", "setp.gt.s32 p0, r1, -4",
+        "halt"};
     require(kernel.words.size() == expected.size(), "wrong instruction count");
     for (std::size_t i = 0; i < expected.size(); ++i) {
         const auto text = nanosm::format_instruction(nanosm::decode(kernel.words[i]), false);
@@ -287,9 +291,26 @@ void test_toolchain_forms_and_refusals() {
     refused(".acc T, 0, 16, 8\nacc.ld r1, T, " + last + "\nhalt\n", "coordinate pair",
         "an acc coordinate pair past " + last);
     refused("umov ur1, r2\nhalt\n", "r2ur", "umov from a vector register");
-    refused("usetp.eq p0, ur1, r2\nhalt\n", "expected uniform register", "usetp of a vector register");
-    refused("usetp.eq PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");
-    refused("usetp.lo p0, ur1, 0\nhalt\n", "unknown usetp comparison", "an unknown usetp comparison");
+    refused("usetp.eq.u32 p0, ur1, r2\nhalt\n", "expected uniform register", "usetp of a vector register");
+    refused("usetp.eq.u32 PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");
+    refused("usetp.lo.u32 p0, ur1, 0\nhalt\n", "unknown usetp comparison", "an unknown usetp comparison");
+    // Every compare says its type (trash/typed-compare-and-wait-2026-11-18.md);
+    // the refusal names the two choices, in qtx and in assembly alike.
+    refused("setp.lt p0, r1, r2\nhalt\n", "'setp.lt' needs its type: setp.lt.u32 (unsigned) or setp.lt.s32 (signed)",
+        "an untyped setp");
+    refused("usetp.eq p0, ur1, 0\nhalt\n", "usetp.eq.u32 (unsigned) or usetp.eq.s32 (signed)", "an untyped usetp");
+    refused("usetp.ge.f32 p0, ur1, 0\nhalt\n", "usetp.ge.u32 (unsigned) or usetp.ge.s32 (signed)", "a float usetp");
+    try {
+        (void)nanosm::assemble_asm(i1_asm(profile, "setp.ne p0, r1, r2\nhalt"), profile);
+        throw std::runtime_error("assembly accepted an untyped setp");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("setp.ne.u32 (unsigned)") != std::string::npos,
+            std::string("assembly's untyped setp: wrong error: ") + error.what());
+    }
+    // eq / ne written .s32 is the .u32 opcode and is printed so in scheduled asm.
+    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx("usetp.ne.s32 p6, ur3, ur4\nhalt\n", profile));
+    require(scheduled.find("        usetp.ne.u32 p6, ur3, ur4 {") != std::string::npos,
+        "scheduled asm does not print usetp.ne.s32 as usetp.ne.u32");
 
     nanosm::Instruction bad;
     bad.opcode = nanosm::Opcode::umovi;
@@ -416,10 +437,10 @@ void test_uniform_compare_values() {
         const auto bit = std::to_string(1u << i);
         const auto rhs = std::to_string(c.rhs);
         source += "umov ur1, " + std::to_string(c.lhs) + "\numov ur2, " + rhs + "\n";
-        source += "usetp." + c.comparison + " p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
+        source += "usetp." + c.comparison + ".u32 p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
         source += "@!p1 bra.uni u" + n + "\nuori ur31, ur31, " + bit + "\nu" + n + ":\n";
         source += "ur2r r1, ur1\nur2r r2, ur2\n";
-        source += "setp." + c.comparison + " p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
+        source += "setp." + c.comparison + ".u32 p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
         source += "@!p2 bra.uni v" + n + "\nuori ur30, ur30, " + bit + "\nv" + n + ":\n";
     }
     source += "halt\n";
@@ -451,7 +472,7 @@ void test_uniform_compare_loop_and_timing() {
     loop:
         uaddi ur2, ur2, 3
         uaddi ur1, ur1, 1
-        usetp.lt p0, ur1, 10
+        usetp.lt.u32 p0, ur1, 10
 @p0     bra.uni loop
         halt
     )";
@@ -465,7 +486,7 @@ void test_uniform_compare_loop_and_timing() {
     nanosm::Machine machine(profile, kernel, std::move(launch), {.timeline = true});
     machine.run(20000);
     require(machine.read_ureg(0, 1) == 10 && machine.read_ureg(0, 2) == 30, "the uniform loop ran the wrong count");
-    const auto compares = issues_of(machine, "usetp.lt");
+    const auto compares = issues_of(machine, "usetp.lt.u32");
     const auto branches = issues_of(machine, "bra.uni");
     require(compares.size() == 10 && branches.size() == 10, "ten iterations: ten compares and ten branches");
     for (std::size_t i = 0; i < compares.size(); ++i) {
@@ -482,7 +503,7 @@ void test_early_uniform_compare_or_branch_panics() {
     const auto& profile = canonical_profile();
     const auto machine = [&](uint32_t write_stall, uint32_t compare_stall) {
         const auto program = "umov ur1, 7 {pred=PT, stall=" + std::to_string(write_stall) + ", set=-, wait=-}\n" +
-            "usetp.eq p0, ur1, 7 {pred=PT, stall=" + std::to_string(compare_stall) + ", set=-, wait=-}\n" + R"(
+            "usetp.eq.u32 p0, ur1, 7 {pred=PT, stall=" + std::to_string(compare_stall) + ", set=-, wait=-}\n" + R"(
             bra.uni target {pred=p0, stall=0, set=-, wait=-}
             umov ur2, 1
             halt
@@ -513,7 +534,7 @@ void test_thirty_two_uniform_registers() {
     nanosm::Machine machine(profile, compile(R"(
         umov  ur31, 1234
         uaddi ur30, ur31, 1
-        usetp.eq p0, ur31, 1234
+        usetp.eq.u32 p0, ur31, 1234
 @!p0    bra.uni skip
         umov  ur16, 1
 skip:
@@ -525,6 +546,90 @@ skip:
         "ur31 / ur30 / ur16");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine.read_reg(0, lane, 1) == 1235, "ur2r from ur30");
+    }
+}
+
+// The signed compare (trash/signed-compare-2026-11-18.md): lt, le, gt, ge
+// .s32 in both forms, uniform and vector -- each of the sixteen opcodes once
+// -- on values whose signed and unsigned orders differ. Each usetp's
+// predicate, gathered into a bit of ur31 through @!p1 bra.uni, and each
+// setp's (ur30) equals the host's signed comparison.
+void test_signed_compare_values() {
+    struct Case {
+        std::string comparison;
+        int32_t lhs = 0;
+        int32_t rhs = 0;
+        bool immediate = false;
+    };
+    const std::vector<Case> cases = {
+        {"lt", -3, 5, false}, {"lt", 5, -3, true},
+        {"le", -1, 0, false}, {"le", 1, -1, true},
+        {"gt", -1, 1, false}, {"gt", 0, -2, true},
+        {"ge", 0, -2, false}, {"ge", -5, 3, true},
+    };
+    std::string source = "umov ur30, 0\numov ur31, 0\n";
+    uint32_t expected = 0;
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const auto& c = cases[i];
+        const auto holds = [&](auto a, auto b) {
+            return c.comparison == "lt" ? a < b : c.comparison == "le" ? a <= b : c.comparison == "gt" ? a > b : a >= b;
+        };
+        const bool signed_holds = holds(c.lhs, c.rhs);
+        require(signed_holds != holds(static_cast<uint32_t>(c.lhs), static_cast<uint32_t>(c.rhs)),
+            "case " + std::to_string(i) + " does not tell signed from unsigned");
+        if (signed_holds) expected |= 1u << i;
+        const auto n = std::to_string(i);
+        const auto bit = std::to_string(1u << i);
+        const auto rhs = std::to_string(c.rhs);
+        source += "umov ur1, " + std::to_string(c.lhs) + "\numov ur2, " + rhs + "\n";
+        source += "usetp." + c.comparison + ".s32 p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
+        source += "@!p1 bra.uni u" + n + "\nuori ur31, ur31, " + bit + "\nu" + n + ":\n";
+        source += "ur2r r1, ur1\nur2r r2, ur2\n";
+        source += "setp." + c.comparison + ".s32 p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
+        source += "@!p2 bra.uni v" + n + "\nuori ur30, ur30, " + bit + "\nv" + n + ":\n";
+    }
+    source += "halt\n";
+    nanosm::Launch launch;
+    launch.active_warps = 2;
+    nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
+    machine.run(20000);
+    for (uint32_t warp = 0; warp < 2; ++warp) {
+        require(machine.read_ureg(warp, 31) == expected, "warp " + std::to_string(warp) +
+            ": usetp.s32's predicates differ from the signed comparisons (got " +
+            std::to_string(machine.read_ureg(warp, 31)) + ", expected " + std::to_string(expected) + ")");
+        require(machine.read_ureg(warp, 30) == expected, "warp " + std::to_string(warp) +
+            ": setp.s32's predicates differ from the signed comparisons (got " +
+            std::to_string(machine.read_ureg(warp, 30)) + ")");
+    }
+}
+
+// A TMA-style coordinate that goes negative: each warp's tile starts one
+// 8-row tile above its own (a halo), so warp 0's first row is -8.
+// usetp.lt.s32 against 0 sees it, and that warp branches into the clamp
+// (row 0, ur9 = 1); warp 1's row 0 and warp 2's row 8 do not. The unsigned
+// usetp.lt.u32 would read -8 as 0xfffffff8 and never clamp.
+void test_signed_coordinate_branch() {
+    nanosm::Launch launch;
+    launch.active_warps = 3;
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        usread ur1, WARP_ID
+        ushli ur8, ur1, 3
+        uaddi ur8, ur8, -8
+        umov  ur9, 0
+        usetp.lt.s32 p0, ur8, 0
+@!p0    bra.uni inside
+        umov  ur8, 0
+        umov  ur9, 1
+inside:
+        halt
+    )"), std::move(launch));
+    machine.run(20000);
+    for (uint32_t warp = 0; warp < 3; ++warp) {
+        const uint32_t row = warp == 0 ? 0 : 8 * (warp - 1);
+        const uint32_t clamped = warp == 0 ? 1 : 0;
+        require(machine.read_ureg(warp, 8) == row && machine.read_ureg(warp, 9) == clamped,
+            "warp " + std::to_string(warp) + ": row " + std::to_string(machine.read_ureg(warp, 8)) +
+            ", clamped " + std::to_string(machine.read_ureg(warp, 9)));
     }
 }
 
@@ -588,4 +693,14 @@ TEST(Urf, early_uniform_compare_or_branch_panics) {
 // the canonical 32 uniform registers: ur31
 TEST(Urf, thirty_two_uniform_registers) {
     test_thirty_two_uniform_registers();
+}
+
+// setp / usetp .s32: lt, le, gt, ge, both forms, signed
+TEST(Urf, signed_compare_values) {
+    test_signed_compare_values();
+}
+
+// a negative TMA-style coordinate: usetp.lt.s32 against 0 and a branch
+TEST(Urf, signed_coordinate_branch) {
+    test_signed_coordinate_branch();
 }

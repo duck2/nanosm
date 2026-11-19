@@ -179,7 +179,7 @@ void test_uniform_role_dispatch() {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         usread ur0, WARP_ID
         ur2r r0, ur0
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         @p0 bra.uni warp_zero
         mov r1, 11
         bra done
@@ -200,7 +200,7 @@ void test_nonuniform_bra_uni_panics() {
     launch.active_warps = 1;
     nanosm::Machine machine(canonical_profile(), compile(R"(
         sread r0, LANE_ID
-        setp.lt p0, r0, 8
+        setp.lt.u32 p0, r0, 8
         @p0 bra.uni split
         halt
     split:
@@ -241,6 +241,123 @@ void test_branch_boundary_drains_async_work() {
             nanosm::issue_to_visible(fixed.instructions[1], canonical_profile()) -
                 nanosm::issue_register_stages - 1,
         "branch did not drain a live fadd writeback");
+}
+
+// qtx's wait (trash/typed-compare-and-wait-2026-11-18.md) is a nop that waits
+// for every live depbar, here the matmul's operand-consumed one. The sts
+// after it overwrites the A operand the matmul was reading: ordered by the
+// wait, so the sanitizer stays quiet and the store lands.
+void test_wait_on_matmul_operands() {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+        .acc C, 0, 64, 64
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur4, 8192
+        mma.async.init.m64n64k8 C, [ur0], [ur1]
+        mma.commit [ur4]
+        wait
+        sread r20, LANE_ID
+        shli r20, r20, 2
+        mov r21, 7
+        sts [r20], r21
+        halt
+    )";
+    const auto program = nanosm::compile_qtx(source, profile);
+    const auto& matmul = program.instructions.at(3);
+    const auto& wait = program.instructions.at(5);
+    require(wait.opcode == nanosm::Opcode::nop && wait.text == "nop", "wait was not emitted as a nop");
+    require(matmul.control.set_depbar < 6 && wait.control.wait_mask == 1u << matmul.control.set_depbar,
+        "wait does not wait for the matmul's depbar");
+    require(nanosm::emit_asm(program).find("        nop {pred=PT, stall=0, set=-, wait=sb") != std::string::npos,
+        "the scheduled asm does not show the nop");
+
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 8192 + 8);
+    write_count_mbar(shmem, 8192, 1);
+    nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
+    machine.run(20000);
+    require(machine.read_shmem_u32(0) == 7, "the sts after the wait did not land");
+}
+
+// wait with a live load depbar: the load's register is used right after it
+// with no second wait, and a fixed-latency result still in flight (the fadd)
+// costs the nop no drain stall, as it would cost a branch.
+void test_wait_on_load_then_use() {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+        mov r0, 0
+        ldg r1, [r0]
+        fadd r2, r0, r0
+        wait
+        add r3, r1, r1
+        halt
+    )";
+    const auto program = nanosm::compile_qtx(source, profile);
+    const auto& load = program.instructions.at(1);
+    const auto& wait = program.instructions.at(3);
+    const auto& use = program.instructions.at(4);
+    require(wait.opcode == nanosm::Opcode::nop && wait.control.wait_mask == 1u << load.control.set_depbar,
+        "wait does not wait for the load's depbar");
+    require(use.control.wait_mask == 0, "the use after wait waited again");
+    require(wait.control.stall == 0, "wait drained the fadd like a branch");
+
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    write_u32(gmem, 0, 21);
+    nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
+    machine.run(20000);
+    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
+        require(machine.read_reg(0, lane, 3) == 42, "lane " + std::to_string(lane) + ": wrong sum after the wait");
+    }
+}
+
+// nop in hand assembly: it carries a wait and a stall like any instruction
+// and nothing else. Its word round-trips; a load's register is read after
+// the nop's wait for it; qtx's wait and assembly's nop are each refused on
+// the other side.
+void test_nop_in_hand_assembly() {
+    const auto& profile = canonical_profile();
+    const auto kernel = nanosm::assemble_asm(i1_asm(profile, R"(
+        mov r0, 0
+        ldg r1, [r0] {pred=PT, stall=0, set=sb2, wait=-}
+        nop {pred=PT, stall=3, set=-, wait=sb2}
+        add r3, r1, r1
+        halt
+    )"), profile);
+    const auto nop = nanosm::decode(kernel.words.at(2));
+    require(nop.opcode == nanosm::Opcode::nop && static_cast<uint8_t>(nop.opcode) == 0xfe, "nop is not opcode 0xfe");
+    require(nanosm::format_instruction(nop) == "nop {pred=PT, stall=3, set=-, wait=sb2}",
+        "nop formats as '" + nanosm::format_instruction(nop) + "'");
+    require(nanosm::encode(nop) == kernel.words.at(2), "nop encode / decode");
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "nop hex round trip");
+
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    write_u32(gmem, 0, 5);
+    nanosm::Machine machine(profile, nanosm::schedule_fixed_stalls(kernel, profile), std::move(launch));
+    machine.run(20000);
+    require(machine.read_reg(0, 0, 3) == 10, "wrong sum after the nop's wait");
+
+    const auto refused = [](const std::function<void()>& build, const std::string& needle, const std::string& what) {
+        try {
+            build();
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find(needle) != std::string::npos,
+                what + ": wrong error: " + error.what());
+            return;
+        }
+        throw std::runtime_error(what + " was accepted");
+    };
+    refused([&] { nanosm::assemble_asm(i1_asm(profile, "nop r1\nhalt"), profile); }, "expected 0 operands",
+        "nop with an operand");
+    refused([&] { nanosm::assemble_asm(i1_asm(profile, "nop {pred=PT, stall=0, set=sb0, wait=-}\nhalt"), profile); },
+        "cannot set a depbar", "nop setting a depbar");
+    refused([&] { nanosm::assemble_asm(i1_asm(profile, "wait\nhalt"), profile); }, "nop {wait=", "wait in assembly");
+    refused([&] { nanosm::compile_qtx("nop\nhalt\n", profile); }, "qtx has no nop", "nop in qtx");
 }
 
 void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
@@ -544,7 +661,7 @@ void test_warp_handoff_through_mbar() {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         usread ur0, WARP_ID
         ur2r r0, ur0
-        setp.eq p0, r0, 0
+        setp.eq.u32 p0, r0, 0
         @p0 bra.uni producer
         umov ur1, 256
     consume_wait:
@@ -688,6 +805,19 @@ TEST(Basics, nonuniform_bra_uni_panics) {
 // branch drains async work
 TEST(Basics, branch_boundary_drains_async_work) {
     test_branch_boundary_drains_async_work();
+}
+
+// qtx wait / nop
+TEST(Basics, wait_on_matmul_operands) {
+    test_wait_on_matmul_operands();
+}
+
+TEST(Basics, wait_on_load_then_use) {
+    test_wait_on_load_then_use();
+}
+
+TEST(Basics, nop_in_hand_assembly) {
+    test_nop_in_hand_assembly();
 }
 
 // mbar sleep and wake

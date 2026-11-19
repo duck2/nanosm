@@ -92,6 +92,20 @@ enum class Opcode : uint8_t {
     tma_store_2d = 0x45,
     tma_store_3d = 0x46,
     tma_store_4d = 0x47,
+    // The signed vector compare (trash/signed-compare-2026-11-18.md):
+    // setp.xx.s32 pD, rA, rB | imm for lt, le, gt, ge compares as signed
+    // 32-bit; everything else is setp.xx.u32's (encoding, timing, predicate
+    // write). eq and ne need no signed form. The immediate is the signed
+    // 22-bit field, sign-extended to 32 bits, as for setp.xx.u32 (whose
+    // compare is then unsigned).
+    setp_lt_s32 = 0x48,
+    setp_le_s32 = 0x49,
+    setp_gt_s32 = 0x4a,
+    setp_ge_s32 = 0x4b,
+    setpi_lt_s32 = 0x4c,
+    setpi_le_s32 = 0x4d,
+    setpi_gt_s32 = 0x4e,
+    setpi_ge_s32 = 0x4f,
     acc_ld = 0x50,
     acc_ld_v8 = 0x51,
     acc_st = 0x52,
@@ -127,9 +141,10 @@ enum class Opcode : uint8_t {
     // register (a fixed-latency vector result, like mov).
     r2ur   = 0x90,
     ur2r   = 0x91,
-    // The uniform compare (trash/uniform-compare-2026-11-18.md): usetp.xx pD,
-    // urA, urB and usetp.xx pD, urA, imm, the vector setp's six comparisons
-    // (unsigned 32-bit) on uniform registers. It runs on the uniform ALU (a
+    // The uniform compare (trash/uniform-compare-2026-11-18.md): usetp.xx.u32
+    // pD, urA, urB and usetp.xx.u32 pD, urA, imm, the vector setp's six
+    // comparisons (unsigned 32-bit) on uniform registers, and their signed lt,
+    // le, gt, ge (usetp.xx.s32, 0x9e..0xa5). It runs on the uniform ALU (a
     // compare is a subtract) and writes predicate pD with the same value in
     // every lane; register and immediate forms have distinct opcodes, as
     // setp's do. Its timing: src/rf.hpp issue_to_uniform_predicate_visible.
@@ -145,6 +160,20 @@ enum class Opcode : uint8_t {
     usetpi_le = 0x9b,
     usetpi_gt = 0x9c,
     usetpi_ge = 0x9d,
+    usetp_lt_s32 = 0x9e,
+    usetp_le_s32 = 0x9f,
+    usetp_gt_s32 = 0xa0,
+    usetp_ge_s32 = 0xa1,
+    usetpi_lt_s32 = 0xa2,
+    usetpi_le_s32 = 0xa3,
+    usetpi_gt_s32 = 0xa4,
+    usetpi_ge_s32 = 0xa5,
+    // No operands, no result, no unit (trash/typed-compare-and-wait-2026-11-18.md):
+    // it issues like any instruction and only its control fields act -- a wait
+    // mask holds it until those depbars are zero, a stall delays the next
+    // issue. qtx's `wait` is a nop that waits for every live depbar. Not 0x00:
+    // a fetch past the kernel's end fills its packet with zero words.
+    nop   = 0xfe,
     halt  = 0xff,
 };
 
@@ -361,13 +390,27 @@ inline bool writes_uniform_register(Opcode opcode) {
     return is_uniform_arithmetic(opcode) || opcode == Opcode::r2ur;
 }
 
-// The uniform compare, register and immediate forms.
+// The vector compare, register and immediate forms, unsigned and signed.
+inline bool is_setp(Opcode opcode) {
+    return (opcode >= Opcode::setp_eq && opcode <= Opcode::setp_ge) ||
+        (opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge) ||
+        (opcode >= Opcode::setp_lt_s32 && opcode <= Opcode::setpi_ge_s32);
+}
+
+inline bool is_setp_immediate(Opcode opcode) {
+    return (opcode >= Opcode::setpi_eq && opcode <= Opcode::setpi_ge) ||
+        (opcode >= Opcode::setpi_lt_s32 && opcode <= Opcode::setpi_ge_s32);
+}
+
+// The uniform compare, register and immediate forms, unsigned and signed.
 inline bool is_usetp(Opcode opcode) {
-    return opcode >= Opcode::usetp_eq && opcode <= Opcode::usetpi_ge;
+    return (opcode >= Opcode::usetp_eq && opcode <= Opcode::usetpi_ge) ||
+        (opcode >= Opcode::usetp_lt_s32 && opcode <= Opcode::usetpi_ge_s32);
 }
 
 inline bool is_usetp_immediate(Opcode opcode) {
-    return opcode >= Opcode::usetpi_eq && opcode <= Opcode::usetpi_ge;
+    return (opcode >= Opcode::usetpi_eq && opcode <= Opcode::usetpi_ge) ||
+        (opcode >= Opcode::usetpi_lt_s32 && opcode <= Opcode::usetpi_ge_s32);
 }
 
 // What the URF write pipeline carries (src/rf.hpp): the uniform-register

@@ -1146,7 +1146,7 @@ void test_tma_rank2_strides_planes_in_software() {
         uaddi ur9, ur9, 6
         uaddi ur4, ur4, 64
         addi r4, r4, 1
-        setp.lt p0, r4, 2
+        setp.lt.u32 p0, r4, 2
         @p0 bra.uni plane
     wait:
         mbar.try_wait p0, [ur3], 0

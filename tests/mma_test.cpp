@@ -1825,7 +1825,7 @@ void test_i8_mma_beside_transfers() {
         .acc O, 4096, 64, 64
         usread ur12, WARP_ID
         ur2r r20, ur12
-        setp.eq p0, r20, 0
+        setp.eq.u32 p0, r20, 0
         @p0 bra.uni MMA_WARP
         sread r0, LANE_ID
         addi r1, r0, 100
@@ -1842,7 +1842,7 @@ void test_i8_mma_beside_transfers() {
         acc.st.v8 O, ur8, r0
         acc.ld.v8 r16, O, ur8
         addi r30, r30, 1
-        setp.lt p1, r30, 12
+        setp.lt.u32 p1, r30, 12
         @p1 bra.uni LOOP
         halt
     MMA_WARP:

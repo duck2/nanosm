@@ -158,20 +158,35 @@ std::optional<Opcode> mma_async_opcode(const std::string& op, const DeviceProfil
     return mma_opcode(static_cast<uint32_t>(found - profile.mma_shapes.begin()), is_init);
 }
 
-// setp.xx / usetp.xx (an optional .u32: the comparison is unsigned 32-bit
-// either way). Each of the four opcode blocks lists eq, ne, lt, le, gt, ge in
-// that order.
-Opcode parse_setp_opcode(std::string op, bool uniform, bool immediate, uint32_t line) {
-    if (op.ends_with(".u32")) op.resize(op.size() - 4);
-    const std::string family = uniform ? "usetp." : "setp.";
+// setp.xx.TYPE / usetp.xx.TYPE: the type is required, as in PTX. .u32
+// compares unsigned 32-bit, .s32 signed. eq and ne are one comparison either
+// way, so .s32 on them names the .u32 opcode. Each of the four unsigned
+// opcode blocks lists eq, ne, lt, le, gt, ge in that order, each signed block
+// lt, le, gt, ge.
+Opcode parse_setp_opcode(const std::string& written, bool uniform, bool immediate, uint32_t line) {
+    const std::string family = uniform ? "usetp" : "setp";
+    const auto where = "line " + std::to_string(line) + ": ";
+    static const std::array<std::string, 6> comparisons = {"eq", "ne", "lt", "le", "gt", "ge"};
+    const auto parts = split(written, '.');
+    const auto found = parts.size() >= 2 ? std::find(comparisons.begin(), comparisons.end(), parts[1])
+                                         : comparisons.end();
+    if (found == comparisons.end() || parts.size() > 3) {
+        throw SimError(where + "unknown " + family + " comparison '" + written + "'");
+    }
+    const auto untyped = family + "." + parts[1];
+    if (parts.size() == 2 || (parts[2] != "u32" && parts[2] != "s32")) {
+        throw SimError(where + "'" + written + "' needs its type: " + untyped + ".u32 (unsigned) or " + untyped +
+            ".s32 (signed)");
+    }
+    const auto i = static_cast<uint8_t>(found - comparisons.begin());
+    if (parts[2] == "s32" && i >= 2) {
+        const auto first = uniform ? (immediate ? Opcode::usetpi_lt_s32 : Opcode::usetp_lt_s32)
+                                   : (immediate ? Opcode::setpi_lt_s32 : Opcode::setp_lt_s32);
+        return static_cast<Opcode>(static_cast<uint8_t>(first) + i - 2);
+    }
     const auto first = uniform ? (immediate ? Opcode::usetpi_eq : Opcode::usetp_eq)
                                : (immediate ? Opcode::setpi_eq : Opcode::setp_eq);
-    static const std::array<std::string, 6> comparisons = {"eq", "ne", "lt", "le", "gt", "ge"};
-    for (std::size_t i = 0; i < comparisons.size(); ++i) {
-        if (op == family + comparisons[i]) return static_cast<Opcode>(static_cast<uint8_t>(first) + i);
-    }
-    throw SimError("line " + std::to_string(line) + ": unknown " + (uniform ? "usetp" : "setp") +
-        " comparison '" + op + "'");
+    return static_cast<Opcode>(static_cast<uint8_t>(first) + i);
 }
 
 int32_t parse_value(
@@ -627,6 +642,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = parse_reg(args[1], line_number);
             const bool immediate = !is_register(args[2]);
             inst.opcode = parse_setp_opcode(op, false, immediate, line_number);
+            // The text names the opcode: eq / ne written .s32 reads .u32.
+            inst.text = opcode_name(inst.opcode) + clean.substr(op.size());
             if (immediate) inst.imm = parse_value(args[2], constants, line_number);
             else inst.src1 = parse_reg(args[2], line_number);
         } else if (op.starts_with("usetp.")) {
@@ -641,6 +658,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = parse_ureg(args[1], line_number, profile);
             const bool immediate = !is_uniform_register(args[2]) && !is_register(args[2]);
             inst.opcode = parse_setp_opcode(op, true, immediate, line_number);
+            inst.text = opcode_name(inst.opcode) + clean.substr(op.size());
             if (immediate) inst.imm = parse_value(args[2], constants, line_number);
             else inst.src1 = parse_ureg(args[2], line_number, profile);
         } else if (op == "addi" || op == "shli" || op == "shri" || op == "xori" ||
@@ -836,6 +854,27 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             // instruction and never inserts one.
             expect_count(args, 0, line_number);
             inst.opcode = Opcode::fence_sh;
+        } else if (op == "nop") {
+            // The machine instruction that only carries control fields
+            // (src/isa.hpp). qtx has no control fields to give it: it says
+            // wait, which the scheduler emits as a nop.
+            if (!allow_control) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": qtx has no nop; wait waits for the warp's outstanding asynchronous work");
+            }
+            expect_count(args, 0, line_number);
+            inst.opcode = Opcode::nop;
+        } else if (op == "wait") {
+            // qtx: issue nothing further until every outstanding asynchronous
+            // operation of this warp has completed. The scheduler gives the
+            // nop a wait for every live depbar (schedule.cpp).
+            if (allow_control) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": wait is qtx; assembly writes nop {wait=sb0|...}");
+            }
+            expect_count(args, 0, line_number);
+            inst.opcode = Opcode::nop;
+            inst.text = "nop";
         } else if (op == "halt") {
             expect_count(args, 0, line_number);
             inst.opcode = Opcode::halt;
