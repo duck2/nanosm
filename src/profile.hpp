@@ -33,6 +33,13 @@ struct DeviceProfile {
     // Canonical 2 (HUMAN 10-18: two packet entries per warp, configurable,
     // down to one). 1..16.
     uint32_t core_instruction_buffer_packets = 2;
+    // Entries of each warp's divergence stack (core.divergence_stack_entries;
+    // trash/divergence-2026-11-21.md): (mask, pc) entries of 48 bits, one
+    // memory of core.warps x entries for the SM. Canonical 8 (HUMAN
+    // 2026-11-21: "a divergence stack exists in the default machine"). 0 is
+    // legal and means no stack: a kernel with ssy, sync or a predicated bra
+    // is refused by qtxc, the assembler and kernel load. 0..64.
+    uint32_t core_divergence_stack_entries = 8;
     // One row of one bank holds one lane-wide register (lanes x 4 B). A
     // launch fits when active warps x the kernel's rows in every bank fit
     // (and the warps fit core.warps). Canonical 352: 3 x 352 x 64 B = 66 KiB,

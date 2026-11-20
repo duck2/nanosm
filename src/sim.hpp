@@ -100,7 +100,6 @@ struct ResourceView {
     bool mma_queue_room = false;
     bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
     // shmem (trash/rfc12.md sections 3, 4 and 6), as this cycle's grants leave it:
-    bool no_active_lanes = false;    // the warp's active mask is empty: its lds / sts is absent (no slot)
     bool unserviced_read = false;    // the warp holds a load slot with rounds not yet granted
     bool unserviced_write = false;   // ... a store slot, or a SIMT RMW (mbar op or atomic) whose write is not yet granted
     bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM by now
@@ -196,19 +195,11 @@ public:
         return slot.has_value() && slot->complete();
     }
     [[nodiscard]] bool store_slot_held(uint32_t index) const { return store_slots_.at(index).cur().has_value(); }
-    // SHMEM-TEST-ONLY seam (between ticks): warp `warp`'s active-lane mask.
-    // It exists so the shmem tests can build divergent accesses before
-    // divergence exists. Read ONLY by the shmem path: lds / sts build their
-    // bank rounds from the active lanes (an lds writes only those lanes),
-    // and lds.uni / atom.*.uni write only their active destination lanes.
-    // Every uniform operation under a partial mask is the SANITIZER's PANIC
-    // (backlog D12.1). Arithmetic, global memory, TMA, MMA, acc transfers,
-    // branches and everything else ignore it and run all lanes (backlog S10:
-    // making every instruction honor it is divergence work). It is NOT divergence:
-    // real divergence (design.md's pre-Volta reconvergence stack, reserved) is
-    // future work, and this mask is only a stand-in for that stack's top
-    // entry. Never used by launches or kernels.
-    void test_set_active_mask(uint32_t warp, uint64_t mask);
+    // Test seams (Q, between ticks): a warp's active mask and its divergence
+    // stack's depth (trash/divergence-2026-11-21.md). The mask is set only by
+    // the machine (ssy / divergent bra / sync); there is no seam to set it.
+    [[nodiscard]] uint64_t active_mask(uint32_t warp) const { return divergence_.cur().warps.at(warp).active; }
+    [[nodiscard]] uint32_t divergence_depth(uint32_t warp) const { return divergence_.cur().warps.at(warp).depth; }
     // Test seams (Q, between ticks): a warp's front end -- its FIFO's valid
     // packets, its pc (the next instruction's) and fetch pc (the next packet
     // to read) -- and the warp whose packet is at the instruction memory's
@@ -297,7 +288,7 @@ private:
     // WarpFrontEnd), which fetch reads.
     struct Warp {
         uint32_t id = 0;
-        uint64_t active_mask = 0; // all lanes; shmem-test-only (see test_set_active_mask)
+        // (The warp's active mask is a register: divergence_, below.)
         // The stall count's end: the warp issues again from this cycle. Only
         // the scheduler reads it (before it accepts anything) and writes it
         // (at its acceptance, for the warp it accepted), so the in-place write
@@ -350,14 +341,55 @@ private:
         bool operator==(const FetchRead&) const = default;
     };
 
-    // The issue register's control part: a branch accepted last cycle. It
-    // resolves now (src/rf.hpp issue_to_branch_resolve): a conditional
-    // branch's predicate is read, and the one target adder adds the branch's
-    // pc + 8 and its offset. Its warp neither issues nor fetches meanwhile.
+    // The issue register's control part: a control instruction accepted last
+    // cycle -- bra, bra.uni, ssy or sync. It resolves now (src/rf.hpp
+    // issue_to_branch_resolve): a conditional branch's predicate is read (every
+    // lane of it for a divergent bra), the one target adder adds the
+    // instruction's pc + 8 and its offset, and the divergence stack is pushed
+    // or popped. A branch's or a sync's warp neither issues nor fetches
+    // meanwhile; an ssy's does (it changes neither pc nor mask).
     struct IssuedBranch {
         uint32_t warp = 0;
-        uint32_t pc = 0;         // the branch's own pc (32 bits)
+        uint32_t pc = 0;         // the instruction's own pc (32 bits)
         Instruction instruction; // opcode, predicate, invert, offset
+    };
+
+    // The divergence stack (trash/divergence-2026-11-21.md). Every entry is
+    // the same thing, a (mask, pc) pair, whoever pushed it (an ssy: the
+    // active mask and its label; a divergent bra whose lanes went both ways:
+    // the taken lanes and its target); a sync pops one and switches to it.
+    // 48 bits as held: pc (a 32-bit byte pc; its low three bits are always
+    // zero) and mask (core.lanes bits, 16).
+    struct DivergenceEntry {
+        uint32_t pc = 0;    // where the warp goes when it is popped
+        uint64_t mask = 0;  // the lanes it makes active when popped
+        bool operator==(const DivergenceEntry&) const = default;
+    };
+    // Per warp slot (core.warps): the active mask (core.lanes bits; every
+    // per-lane writer's lane enables), the stack's depth (entries held,
+    // 0..core.divergence_stack_entries: 4 bits at 8) and a registered copy of
+    // the top entry (48 bits; meaningless at depth 0), so a sync resolves in
+    // the issue register's cycle without reading the stack memory.
+    struct WarpDivergence {
+        uint64_t active = 0;
+        uint32_t depth = 0;
+        DivergenceEntry top;
+        bool operator==(const WarpDivergence&) const = default;
+    };
+    // The stack memory's read in flight: a pop presented the address of the
+    // new top (its warp, entry depth - 1) at the resolve cycle's edge; the
+    // entry is at the memory output the next cycle and the top copy takes it
+    // at that edge (valid + 4-bit warp; the address sits in the memory's own
+    // address register). The warp's next stack operation resolves two cycles
+    // after the pop at the soonest, so it always sees the refilled copy.
+    struct DivergenceRefill {
+        uint32_t warp = 0;
+        uint32_t index = 0;
+        bool operator==(const DivergenceRefill&) const = default;
+    };
+    struct DivergenceState {
+        std::vector<WarpDivergence> warps;
+        std::optional<DivergenceRefill> refill;
     };
 
     // One write through the RF write port (src/rf.hpp): PRESENTED at
@@ -373,7 +405,9 @@ private:
         std::optional<uint8_t> dst;
         std::optional<uint8_t> predicate_dst;
         std::vector<uint32_t> values;
-        std::optional<uint64_t> lane_enables; // an lds under a partial mask writes its active lanes only
+        // The writer's active lanes (its issue cycle's mask): only they are
+        // written. None: every lane (the LSU's vector and uniform loads, acc.ld).
+        std::optional<uint64_t> lane_enables;
         // Cleared as the write lands: the waiting warp's counter is 0 from
         // its visibility (land + 1) on.
         std::optional<uint8_t> clear_depbar;
@@ -394,6 +428,7 @@ private:
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;                             // (S) PANIC text: the instruction's own pc
+        uint64_t active_mask = 0;                    // the issue cycle's: its result's lane enables (16 bits)
         Instruction instruction;
         std::vector<uint8_t> reads;                  // the round's registers
         std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
@@ -443,10 +478,13 @@ private:
     // write and the write port sees at most one per cycle: no calendar.
     // Widths: valid, warp (4 bits at 16 warps), the ALU's control (opcode,
     // destination register: 5 bits at 32, a 22-bit immediate), two 32-bit
-    // operand latches, the 32-bit value.
+    // operand latches, the 32-bit value, and the issue cycle's active mask
+    // (16 bits: a usetp's lane enables at the predicate file; a URF write
+    // ignores it).
     struct UrfWrite {
         uint32_t warp = 0;
         uint32_t pc = 0;                  // (S) PANIC text: the instruction's own pc
+        uint64_t active_mask = 0;
         Instruction instruction;          // the opcode, its registers and immediate
         std::vector<uint32_t> operands;   // from the sample: the uniform sources in operand order, or r2ur's lane 0
         std::optional<uint32_t> value;    // the result, from its execution on
@@ -872,16 +910,20 @@ private:
         uint8_t depbar = 0;
         uint32_t assembly = 0;      // index into staging_
         uint64_t base = 0;          // vector: 64 B-aligned block address
-        // scalar: one per lane (lanes entries); uniform: one; vector: none.
-        // Hardware: the lanes' addresses latched at admission (16 x 64 bits
-        // as held here; a sector address and a word offset each).
+        // scalar: the issue cycle's active mask (16 bits): an inactive lane
+        // makes no request, a load writes only the active lanes (vector and
+        // uniform commands are uniform operations: all lanes).
+        uint64_t lanes = 0;
+        // scalar: one per ACTIVE lane, in lane order; uniform: one; vector:
+        // none. Hardware: the lanes' addresses latched at admission (16 x 64
+        // bits as held here; a sector address and a word offset each).
         std::vector<LsuSector> sectors;
         uint32_t stream = 0;        // vector load: its ordered read stream (1..read_streams-1)
         uint32_t requests_total = 0;
         uint32_t requests_emitted = 0;
         uint32_t chunks_done = 0;   // vector load: RF writes; vector store: RF reads
         uint32_t chunks_plucked = 0; // vector store: chunks moved into the egress FIFO
-        uint32_t words_plucked = 0; // stores: words of the current chunk (vector) / lanes (scalar) in egress
+        uint32_t words_plucked = 0; // stores: words of the current chunk (vector) / sectors (scalar) in egress
         uint32_t acks = 0;
     };
 
@@ -1583,8 +1625,15 @@ private:
     };
     struct BranchResolution {
         uint32_t warp = 0;
-        bool taken = false;
+        bool taken = false;           // a redirect: a taken branch, or a sync popping a pc other than its own + 8
         uint32_t target = 0;          // taken: the warp's pc and fetch pc from the next cycle
+        // The divergence stack (drive_divergence): the warp's active mask from
+        // the next cycle; an entry written into the stack memory at entry
+        // `depth` at this edge (and into the top copy); the top entry leaving.
+        std::optional<uint64_t> mask;
+        std::optional<DivergenceEntry> push;
+        std::size_t push_slot = 0;    // its memory word: warp x entries + depth
+        bool pop = false;
     };
 
     // What an accepted instruction changes outside the issue unit now.
@@ -1636,6 +1685,9 @@ private:
         FetchGrant fetch;
         std::optional<FetchedPacket> fetched;
         std::optional<BranchResolution> branch;
+        // The divergence stack memory's output now: a pop's read of the new
+        // top, for its warp's top copy (warp, entry).
+        std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_refilled;
         // The RF write port: async grants and SIMT inhibition.
         RfWriteDecision rf_write;
         std::vector<uint64_t> released_lsu_commands;  // their last write / ack at the port now
@@ -1728,6 +1780,13 @@ private:
     // w % fine_banks. Each fine bank's two read and two write services belong
     // to the MMA (C read, result write) and to the acc.ld and acc.st engines.
     std::vector<uint32_t> tmem_;
+    // The divergence stack memory: core.warps x core.divergence_stack_entries
+    // entries of 48 bits (DivergenceEntry), warp w's entry i at w x entries
+    // + i (16 x 8 x 48 = 6144 bits canonical). One access per cycle: the one
+    // control instruction resolving in the issue register writes a push or
+    // presents a pop's read (its output is the next cycle's). A write lands at
+    // the clock edge of its resolve cycle.
+    std::vector<DivergenceEntry> divergence_stack_;
 
     // ---- Registers: the declared storage boundaries ----
     // The front end (trash/front-end-2026-10-18.md): per warp slot its FIFO,
@@ -1737,6 +1796,9 @@ private:
     Reg<std::optional<FetchRead>> fetch_read_{registers_, "instruction memory read (address, tag)"};
     Reg<uint32_t> fetch_cursor_{registers_, "fetch round-robin cursor"};
     Reg<std::optional<IssuedBranch>> issue_branch_{registers_, "issue register: branch"};
+    // Per warp slot its active mask, stack depth and top copy; the stack
+    // memory's read in flight (DivergenceState above).
+    Reg<DivergenceState> divergence_{registers_, "active masks, divergence stack depths and tops"};
     // Scheduler-visible state other units complete.
     Reg<DepbarCounters> depbar_{registers_, "depbar counters"};
     Reg<WaitSlots> mbar_wait_slots_{registers_, "mbar wait slots"};
@@ -1883,6 +1945,10 @@ private:
     [[nodiscard]] FetchGrant decide_fetch() const;
     [[nodiscard]] std::optional<FetchedPacket> instruction_memory_output() const;
     [[nodiscard]] std::optional<BranchResolution> resolve_branch() const;
+    [[nodiscard]] std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_memory_output() const;
+    // Whether the control instruction in the issue register holds its warp
+    // (no issue, no fetch) until it resolves: every one but ssy.
+    [[nodiscard]] static bool holds_its_warp(const IssuedBranch& branch);
     // After issue: every warp's front end after this cycle (pop, landing,
     // halt, redirect, fetch pc), and its trace.
     void step_front_end(Wires& w);
@@ -1974,7 +2040,6 @@ private:
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     // An accepted tma or mma.async: it loads the URF's round counter.
     void load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w);
-    [[nodiscard]] static bool needs_dispatch(const Instruction& inst, uint64_t active_mask);
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
     void check_issue_hazards(const Warp& warp, const Instruction& inst) const;
     void check_issue_latency(const Warp& warp, const Instruction& inst) const;
@@ -1992,6 +2057,7 @@ private:
     void drive_front_end(const Wires& w);
     void drive_fetch(const Wires& w);
     void drive_issue_branch(const Wires& w);
+    void drive_divergence(const Wires& w);
     void drive_depbar(const Wires& w);
     void drive_wait_slots(const Wires& w);
     void drive_store_slots(const Wires& w);

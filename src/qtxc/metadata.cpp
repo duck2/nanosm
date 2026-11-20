@@ -12,8 +12,24 @@
 namespace nanosm {
 namespace qtxc_internal {
 
+// bra and bra.uni: a target (a displacement) and a control transfer.
 bool is_branch(Opcode opcode) {
     return opcode == Opcode::bra || opcode == Opcode::bra_uni;
+}
+
+// Where control may go somewhere other than the next instruction: the
+// branches, and sync (trash/divergence-2026-11-21.md), whose implicit edge
+// goes to the pc of the entry it pops: a divergent bra's target or an ssy's
+// label (the instruction after the sync when that is the pc). The
+// scheduler drains at each of them.
+bool transfers_control(Opcode opcode) {
+    return is_branch(opcode) || opcode == Opcode::sync;
+}
+
+// The instructions whose immediate is a displacement to a label: the
+// branches and ssy (its label).
+bool has_displacement(Opcode opcode) {
+    return is_branch(opcode) || opcode == Opcode::ssy;
 }
 
 bool is_mbar_test_wait(Opcode opcode) {

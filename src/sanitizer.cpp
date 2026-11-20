@@ -9,6 +9,7 @@
 #include <bit>
 #include <limits>
 #include <set>
+#include <sstream>
 
 namespace nanosm {
 
@@ -202,6 +203,18 @@ void Sanitizer::check_uniform_mask(const IssueSite& site, uint64_t active_mask, 
     if (active_mask != full_mask) {
         throw_issue_panic(site, opcode_name(site.inst.opcode, site.mma_shapes) +
             " is a uniform operation under a partial active mask");
+    }
+}
+
+void Sanitizer::check_halt_converged(const IssueSite& site, uint32_t stack_depth, uint64_t active_mask,
+    uint64_t full_mask) const {
+    if (stack_depth != 0 || active_mask != full_mask) {
+        throw_issue_panic(site, "halt inside a divergent region (" + std::to_string(stack_depth) +
+            " divergence stack entries left, active mask 0x" + [&] {
+                std::ostringstream out;
+                out << std::hex << active_mask;
+                return out.str();
+            }() + ")");
     }
 }
 

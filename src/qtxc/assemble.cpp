@@ -103,13 +103,8 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             inst.imm != 0 && inst.imm != 1) {
             throw SimError("line " + std::to_string(inst.line) + ": mbar parity must be 0 or 1");
         }
-        if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-            inst.opcode != Opcode::bra_uni) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": only bra.uni may be predicated before divergent execution exists");
-        }
-        if (is_branch(inst.opcode)) {
+        check_divergence(inst, profile, "line " + std::to_string(inst.line));
+        if (has_displacement(inst.opcode)) {
             const auto target = static_cast<int64_t>(index + 1) * 8 + inst.imm;
             if (inst.imm % 8 != 0 || target < 0 ||
                 static_cast<uint64_t>(target / 8) >= program.instructions.size()) {

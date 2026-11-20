@@ -572,26 +572,28 @@ void test_i2_same_warp_order_with_reordered_reads() {
     }
 }
 
-// Divergence (rfc12 section 3): rounds come from active lanes only; a masked
-// lane is no access (its word, and an lds's destination lane, are
-// untouched); an lds / sts with no active lane takes no slot, sets no depbar
-// and makes no request; a uniform operation under a partial mask is the
-// sanitizer's PANIC (backlog D12; the machine's quiet lane-0 behavior:
-// "D12: uniform ops under a partial mask").
+// Divergence (rfc12 section 3; trash/divergence-2026-11-21.md): rounds come
+// from active lanes only; a masked lane is no access (its word, and an lds's
+// destination lane, are untouched); a uniform operation under a partial
+// mask is the sanitizer's PANIC (backlog D12; the machine's quiet lane-0
+// behavior: "D12: uniform ops under a partial mask"). The mask is a real
+// divergent region (masked_region). A warp's mask is never empty, so the
+// old "no active lane: absent access" case is gone.
 void test_i2_divergence() {
     const std::string body = R"(
         sread r0, LANE_ID
         shli r0, r0, 6
         mov r3, 0x77
         mov r5, 0x55
+    )" + masked_region(0x00f0, R"(
         sts [r0], r5 {pred=PT, stall=0, set=sb0, wait=-}
         lds r3, [r0 + 4] {pred=PT, stall=0, set=sb1, wait=-}
+    )") + R"(
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
-    )"; // every lane on bank 0: a full mask is sixteen rounds
+    )"; // every lane on bank 0: a full mask is sixteen rounds; lanes 4..7 active in the region
     const auto& profile = canonical_profile();
     {
         auto machine = i2_machine(profile, body);
-        machine->test_set_active_mask(0, 0x00f0); // lanes 4..7
         machine->run();
         require(shmem_request_rounds(*machine) == std::vector<uint32_t>{4, 4}, "four active lanes are four rounds");
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -600,30 +602,10 @@ void test_i2_divergence() {
             require(machine->read_reg(0, lane, 3) == (active ? 0x100 + 16 * lane + 1 : 0x77), "lds lane");
         }
     }
-    {
-        auto machine = i2_machine(profile, body);
-        machine->test_set_active_mask(0, 0);
-        bool slot_taken = false;
-        while (!machine->done()) {
-            tick_capped(*machine);
-            slot_taken |= machine->load_slot_held(0) || machine->load_slot_held(1) || machine->store_slot_held(0) ||
-                machine->store_slot_held(1);
-        }
-        require(!slot_taken, "an access with no active lane took a slot");
-        require(shmem_request_rounds(*machine).empty() && i2_grants(*machine).empty(), "an absent access was served");
-        const auto lds_issue = issued_at(*machine, 5 * 8);
-        require(lds_issue.size() == 1 && issued_at(*machine, 6 * 8) == std::vector<uint64_t>{lds_issue[0] + 1},
-            "the halt waited on a depbar nothing set");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_shmem_u32(64 * lane) == 0x100 + 16 * lane && machine->read_reg(0, lane, 3) == 0x77,
-                "an absent access changed memory or its destination");
-        }
-    }
 #if NANOSM_SANITIZER
     for (const std::string uniform : {"lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [ur2]",
              "mbar.test_wait p0, [ur2], 0"}) {
-        auto machine = i2_machine(profile, "umov ur2, 4096\n" + uniform + "\nhalt\n");
-        machine->test_set_active_mask(0, 0xfffe);
+        auto machine = i2_machine(profile, "umov ur2, 4096\n" + masked_region(0xfffe, uniform) + "halt\n");
         try {
             machine->run();
             throw std::runtime_error(uniform + " ran under a partial mask");

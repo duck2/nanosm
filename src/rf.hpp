@@ -78,6 +78,16 @@
 // Not taken: the buffered fall-through issues from c0 + 2. Taken: the FIFO is
 // cleared, the target is fetched from c0 + 2 and issues from c0 + 4 (at the
 // soonest: the target's fetch competes with the other warps' fetches).
+// Divergence (trash/divergence-2026-11-21.md) uses the same stage: a
+// divergent bra reads every lane of its predicate at c0 + 1 and either
+// pushes the taken lanes and falls through (c0 + 2), or moves the whole mask
+// (c0 + 2 or c0 + 4); a sync pops at c0 + 1 from a registered copy of the
+// stack's top and switches to it -- a popped pc equal to the sync's pc + 8
+// goes on with the words already fetched (c0 + 2), any other pc is a
+// redirect (c0 + 4); an ssy pushes at c0 + 1 and does not hold its warp
+// (c0 + 1). A
+// pop's refill of the top copy is a one-cycle stack-memory read the warp's
+// next control instruction (c0 + 3 at the soonest) never waits for.
 //
 // qtxc models none of this (issuing later is always safe); only the
 // predicate's sample point enters its distances (issue_to_predicate_sample).

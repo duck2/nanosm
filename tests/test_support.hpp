@@ -188,6 +188,28 @@ inline void fill_pattern(std::vector<uint8_t>& image, uint32_t byte_address, uin
     for (uint32_t i = 0; i < words; ++i) write_u32(image, byte_address + 4 * i, pattern_word(first_index + i));
 }
 
+// A divergent region (trash/divergence-2026-11-21.md): `body` runs with only
+// the lanes of `mask` active; the others wait on the divergence stack. An
+// if with an empty other arm: the body's sync pops the waiting lanes, whose
+// arm is the second sync alone, which pops the ssy's entry (both pcs are the
+// next instruction: no redirect). The warp goes on converged at an ordinary
+// instruction. It uses r60, r61 and p6 (keep them out of `body`). The text
+// suits qtx and i1_asm alike (every label shares its line with an
+// instruction).
+inline std::string masked_region(uint64_t mask, const std::string& body) {
+    return "mov r60, " + std::to_string(mask) + "\n"
+           "sread r61, LANE_ID\n"
+           "shr r60, r60, r61\n"
+           "andi r60, r60, 1\n"
+           "setp.eq.u32 p6, r60, 0\n"
+           "ssy masked_join\n"
+           "@p6 bra masked_skip\n" +
+        body + "\n"
+               "sync\n"
+               "masked_skip: sync\n"
+               "masked_join: mov r60, 0\n";
+}
+
 inline void expect_sim_panic(nanosm::Machine& machine, const std::string& needle, const std::string& what) {
     try {
         machine.run();

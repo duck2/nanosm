@@ -472,6 +472,7 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
         const bool load = inst.opcode == Opcode::ldg_v8;
         command.kind = load ? LsuKind::vector_load : LsuKind::vector_store;
         command.reg = load ? inst.dst : inst.src1;
+        command.lanes = full_mask();
         const auto address = checked_address(
             uniform_reg(op, inst.src0, opcode_name(inst.opcode) + " base address"));
         if (address % lane_bytes != 0) {
@@ -488,12 +489,16 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     }
     case Opcode::ldg:
     case Opcode::stg: {
+        // Only the active lanes: an inactive lane's address is never
+        // checked, it makes no request, and a load leaves its lane unwritten.
         const bool load = inst.opcode == Opcode::ldg;
         command.kind = load ? LsuKind::scalar_load : LsuKind::scalar_store;
         command.reg = load ? inst.dst : inst.src1;
+        command.lanes = op.active_mask;
         std::vector<uint64_t> words;
         const auto bases = capture(op, inst.src0);
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if ((op.active_mask >> lane & 1) == 0) continue;
             const auto address = checked_address(bases[lane]);
             if (address % 4 != 0) panic(op, "unaligned 32-bit gmem access");
             if (address > gmem_.size() || gmem_.size() - address < 4) {
@@ -504,12 +509,13 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
             command.sectors.push_back({sector, lane, static_cast<uint32_t>(address - sector)});
         }
         if (!load) sanitizer_.check_store_word_collision(site(op), words, "gmem");
-        command.requests_total = config_.lanes;
+        command.requests_total = static_cast<uint32_t>(command.sectors.size());
         break;
     }
     case Opcode::ldg_uni: {
         command.kind = LsuKind::uniform_load;
         command.reg = inst.dst;
+        command.lanes = full_mask();
         const auto address = checked_address(uniform_operand(op, inst.src0));
         if (address % 4 != 0) panic(op, "unaligned 32-bit gmem access");
         if (address > gmem_.size() || gmem_.size() - address < 4) {
@@ -887,7 +893,7 @@ Machine::EgressWrite Machine::decide_egress_write() {
         const LsuCommand* lsu = nullptr;
         for (const auto& command : lsu_commands_.cur()) {
             if ((command.kind == LsuKind::vector_store && command.chunks_plucked < 8) ||
-                (command.kind == LsuKind::scalar_store && command.words_plucked < config_.lanes)) {
+                (command.kind == LsuKind::scalar_store && command.words_plucked < command.sectors.size())) {
                 lsu = &command;
                 break;
             }
@@ -953,17 +959,21 @@ Machine::EgressWrite Machine::decide_egress_write() {
         const auto* command = find_lsu_command(open->command);
         if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(open->command));
         const auto& assembly = staging_.at(command->assembly).cur();
-        sanitizer_.check_assembly_lanes_valid(
-            cycle_, command->assembly, assembly.valid, command->words_plucked, words, "egress write port");
         write.lsu_command = command->id;
         write.lsu_assembly = command->assembly;
         for (uint32_t word = 0; word < words; ++word) {
-            const uint32_t lane = command->words_plucked + word;
+            const uint32_t index = command->words_plucked + word;
             if (command->kind == LsuKind::vector_store) {
-                write.words.emplace_back(lane * 4 % config_.gmem_sector_bytes, assembly.words[lane]);
-                if (lane + 1 == config_.lanes) write.lsu_chunk_drained = true; // refillable now (d)
+                sanitizer_.check_assembly_lanes_valid(cycle_, command->assembly, assembly.valid, index, 1,
+                    "egress write port");
+                write.words.emplace_back(index * 4 % config_.gmem_sector_bytes, assembly.words[index]);
+                if (index + 1 == config_.lanes) write.lsu_chunk_drained = true; // refillable now (d)
             } else {
-                write.words.emplace_back(command->sectors.at(lane).word_offset, assembly.words[lane]);
+                // A scatter's sectors are its active lanes', in lane order.
+                const auto& sector = command->sectors.at(index);
+                sanitizer_.check_assembly_lanes_valid(cycle_, command->assembly, assembly.valid, sector.lane, 1,
+                    "egress write port");
+                write.words.emplace_back(sector.word_offset, assembly.words[sector.lane]);
             }
         }
     }

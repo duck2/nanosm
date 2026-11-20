@@ -175,9 +175,8 @@ void test_r2ur_under_a_partial_mask_panics() {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     nanosm::Launch launch;
     launch.active_warps = 1;
-    nanosm::Machine machine(canonical_profile(), compile("sread r0, LANE_ID\nr2ur ur1, r0\nhalt\n"),
-        std::move(launch));
-    machine.test_set_active_mask(0, 0xfffe);
+    nanosm::Machine machine(canonical_profile(),
+        compile("sread r0, LANE_ID\n" + masked_region(0xfffe, "r2ur ur1, r0") + "halt\n"), std::move(launch));
     expect_sim_panic(machine, "r2ur is a uniform operation under a partial active mask", "r2ur under a partial mask");
 }
 

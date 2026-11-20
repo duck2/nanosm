@@ -30,6 +30,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
 // Opcode groups and instruction metadata (metadata.cpp; is_setp and is_usetp
 // are src/isa.hpp's).
 bool is_branch(Opcode opcode);
+bool transfers_control(Opcode opcode);
+bool has_displacement(Opcode opcode);
 bool is_mbar_test_wait(Opcode opcode);
 bool is_mbar_try_wait(Opcode opcode);
 bool is_mbar_predicate_writer(Opcode opcode);
@@ -43,6 +45,7 @@ std::vector<uint8_t> issue_sources(const Instruction& inst);
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
+void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 
 } // namespace qtxc_internal
 

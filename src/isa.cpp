@@ -204,6 +204,7 @@ uint64_t encode(const Instruction& inst) {
         break;
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::ssy:
         word |= immediate;
         break;
     case Opcode::umov:
@@ -259,6 +260,7 @@ uint64_t encode(const Instruction& inst) {
         word |= immediate;
         break;
     case Opcode::fence_sh:
+    case Opcode::sync:
     case Opcode::nop:
     case Opcode::halt:
         break;
@@ -424,6 +426,7 @@ Instruction decode(uint64_t word) {
     }
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::ssy:
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::umov:
@@ -479,6 +482,7 @@ Instruction decode(uint64_t word) {
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::fence_sh:
+    case Opcode::sync:
     case Opcode::nop:
     case Opcode::halt:
         break;
@@ -675,6 +679,8 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
     case Opcode::atom_exch_uni: return "atom.exch.uni";
     case Opcode::bra: return "bra";
     case Opcode::bra_uni: return "bra.uni";
+    case Opcode::ssy: return "ssy";
+    case Opcode::sync: return "sync";
     case Opcode::umov:
     case Opcode::umovi: return "umov";
     case Opcode::uadd: return "uadd";
@@ -950,9 +956,11 @@ std::string format_instruction(
         break;
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::ssy:
         out << ' ' << (inst.imm >= 0 ? "+" : "") << inst.imm;
         break;
     case Opcode::fence_sh:
+    case Opcode::sync:
     case Opcode::nop:
     case Opcode::halt:
         break;
@@ -1030,6 +1038,8 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::lds_uni:
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::ssy:
+    case Opcode::sync:
     case Opcode::mbar_init_i:
     case Opcode::mbar_init_r:
     case Opcode::mbar_arrive:

@@ -158,11 +158,18 @@ public:
     // A uniform operation -- every instruction with a declared-uniform
     // operand (the list above and every uniform-register operand of a ".uni"
     // consumer; the machine calls this from uniform_reg and uniform_operand)
-    // and bra.uni -- under a partial or empty active mask. Hardware reads lane 0
+    // and bra.uni -- under a partial active mask (inside a divergent arm; a
+    // mask is never empty). Hardware reads lane 0
     // whatever the mask, so this is UB, diagnosed here (HUMAN 2026-10-12,
     // backlog D12 / D12.1, rfc13 section 2); what the machine does then is
     // no contract.
     void check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const;
+    // ---- divergence (trash/divergence-2026-11-21.md) ----
+    // A halt must find its warp converged: an empty divergence stack and
+    // every lane active. Halting inside an arm drops the other lanes' work;
+    // the machine just halts the warp.
+    void check_halt_converged(const IssueSite& site, uint32_t stack_depth, uint64_t active_mask,
+        uint64_t full_mask) const;
     // A tma's buffer address must be 64-byte aligned and its barrier address
     // 8-byte aligned (src/tma.hpp). The machine does not wire the low bits
     // (it ignores them); a program that sets them is wrong, diagnosed here.
@@ -541,6 +548,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_issue_capture)
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_uniform_mask)
+    NANOSM_SANITIZER_NOOP(check_halt_converged)
     NANOSM_SANITIZER_NOOP(check_tma_operand_alignment)
     NANOSM_SANITIZER_NOOP(check_swizzle64_operand)
     NANOSM_SANITIZER_NOOP(check_tmem_pointer)

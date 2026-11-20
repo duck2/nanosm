@@ -59,6 +59,17 @@ enum class Opcode : uint8_t {
     setpi_le = 0x2b,
     setpi_gt = 0x2c,
     setpi_ge = 0x2d,
+    // Divergence (trash/divergence-2026-11-21.md), written by the kernel
+    // author, never inferred. Every divergence stack entry is a (mask, pc)
+    // pair. ssy LABEL (a branch displacement like bra's; any instruction)
+    // pushes (the warp's active mask, LABEL). A predicated bra (0x20 with a
+    // predicate) is the divergent branch: taken = active AND p, fall =
+    // active AND NOT p; one side empty moves the whole mask, both non-empty
+    // push (taken, target) and run the fall-through arm under fall. sync
+    // (no operands) pops the top entry and switches to it, whoever pushed
+    // it: the mask becomes the entry's, the warp goes to the entry's pc.
+    ssy = 0x2e,
+    sync = 0x2f,
     mbar_init_i = 0x30,
     mbar_init_r = 0x31,
     mbar_arrive = 0x32,
@@ -238,7 +249,8 @@ namespace encoding {
 // the third register takes the immediate's high bits)
 // setp and usetp use dst as p0..p6; immediate and register RHS forms have
 // distinct opcodes (usetp's registers are uniform registers).
-// Branch immediates are signed byte displacements relative to the following PC.
+// Branch immediates (bra, bra.uni, and ssy's label) are signed byte
+// displacements relative to the following PC; sync has no payload.
 // mbar addresses are held in a uniform register; mbar immediates and register
 // operands have distinct opcodes, as do setp immediates and register operands.
 // A uniform register (ur0..) sits in the same 8-bit register fields: which
@@ -369,6 +381,22 @@ std::string mma_shape_name(const MmaShape& shape);
 // The inverse: "m32n64k8" -> {32, 64, 8}; nullopt unless the text is exactly
 // m<digits>n<digits>k<digits> with nonzero values.
 std::optional<MmaShape> parse_mma_shape_name(const std::string& name);
+
+// A bra with a predicate (anything but plain PT) is the divergent branch;
+// plain bra moves every active lane and bra.uni is a promise about the whole
+// warp.
+inline bool is_divergent_branch(const Instruction& instruction) {
+    return instruction.opcode == Opcode::bra &&
+        (instruction.control.predicate != 7 || instruction.control.predicate_invert);
+}
+
+// The instructions that use the divergence stack: refused by qtxc, the
+// assembler and kernel load when the profile has none
+// (core.divergence_stack_entries = 0).
+inline bool uses_divergence_stack(const Instruction& instruction) {
+    return instruction.opcode == Opcode::ssy || instruction.opcode == Opcode::sync ||
+        is_divergent_branch(instruction);
+}
 
 // The uniform shared atomics (trash/rfc13.md): atom.add/and/xor/exch.uni.
 inline bool is_atomic(Opcode opcode) {

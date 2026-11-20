@@ -40,6 +40,24 @@ void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, c
     }
 }
 
+// Predication and the divergence stack (trash/divergence-2026-11-21.md):
+// only bra (the divergent branch) and bra.uni take a predicate -- there are
+// no guards on other instructions -- and ssy, sync and a predicated bra
+// need a stack, which a profile with core.divergence_stack_entries = 0 does
+// not have. Kernel load refuses the latter too (src/sim.cpp).
+void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
+        inst.opcode != Opcode::bra && inst.opcode != Opcode::bra_uni) {
+        throw SimError(where + ": only bra and bra.uni may be predicated (there are no guards on other "
+            "instructions)");
+    }
+    if (profile.core_divergence_stack_entries == 0 && uses_divergence_stack(inst)) {
+        throw SimError(where + ": " + (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
+            " needs the divergence stack, which this device profile does not have "
+            "(core.divergence_stack_entries = 0)");
+    }
+}
+
 // An mma.async names a shape the profile lists: a property of the
 // instruction, so refused at assembly and at kernel load (both builds). Its
 // result is a tmem pointer whose rows are the shape's n words; where it

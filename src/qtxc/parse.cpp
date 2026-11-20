@@ -840,14 +840,20 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             expect_count(args, 1, line_number);
             inst.opcode = Opcode::mma_commit;
             inst.src0 = parse_mbar_address(args[0], line_number, profile);
-        } else if (op == "bra" || op == "bra.uni") {
+        } else if (op == "bra" || op == "bra.uni" || op == "ssy") {
+            // bra / bra.uni TARGET; @p bra TARGET is the divergent branch.
+            // ssy LABEL (trash/divergence-2026-11-21.md): the pc its entry
+            // holds, where a sync that pops it sends the warp; any instruction.
             expect_count(args, 1, line_number);
             static const std::regex target_pattern(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
             if (!std::regex_match(args[0], target_pattern)) {
                 throw SimError("line " + std::to_string(line_number) + ": bad branch target '" + args[0] + "'");
             }
-            inst.opcode = op == "bra" ? Opcode::bra : Opcode::bra_uni;
+            inst.opcode = op == "bra" ? Opcode::bra : op == "bra.uni" ? Opcode::bra_uni : Opcode::ssy;
             pending_branches.push_back({program.instructions.size(), args[0], line_number});
+        } else if (op == "sync") {
+            expect_count(args, 0, line_number);
+            inst.opcode = Opcode::sync;
         } else if (op == "fence.sh") {
             // rfc12 section 10: explicit only. qtxc schedules it like any
             // instruction and never inserts one.

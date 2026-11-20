@@ -103,9 +103,25 @@ The current control-flow slice supports labels, unconditional `bra`, per-lane pr
 registers), and `@p0 bra.uni label`. The type is required, as in PTX: `.u32` compares unsigned
 32-bit, `.s32` signed (for `eq` / `ne` the two are one opcode, printed `.u32`), an immediate being
 the signed 22-bit field sign-extended in both. A
-`bra.uni` predicate must agree across every lane in its warp or the simulator PANICs. General
-predicated execution, active masks, divergent `bra`, and reconvergence are not implemented yet.
-Qtx conservatively drains live depbars and fixed-latency writes at every branch. Qtx's `wait`
+`bra.uni` predicate must agree across every lane in its warp or the simulator PANICs.
+
+Divergence is pre-Volta (trash/divergence-2026-11-21.md): one warp, one pc, a per-warp active mask
+and a divergence stack (`core.divergence_stack_entries`, 8; 0 means none, and qtxc, the assembler
+and kernel load then refuse the three forms below). The kernel author writes them; qtxc infers
+nothing. Every stack entry is a (mask, pc) pair. `ssy L` pushes (the active mask, L); L may be
+any instruction. `@p bra T` / `@!p bra T` is the divergent branch: the active lanes with the
+predicate are taken, the others fall; if one side is empty the whole mask goes the other way,
+otherwise (taken lanes, T) is pushed and the fall-through arm runs first. `sync` always pops an
+entry and switches to it: the mask becomes the entry's and the warp goes to its pc. So an if / else
+is `ssy L; @p bra T; <else arm>; sync; T: <then arm>; sync; L: ...`: each arm ends in its own
+`sync` and L is an ordinary instruction. Every per-lane writer (arithmetic, moves, conversions,
+special registers, the SFU, `ur2r`, predicates, `lds` / `sts`, scalar `ldg` / `stg`) writes only
+the active lanes; fixed timing ignores the mask. A uniform operation (and `bra.uni`) under a
+partial mask and a halt inside an arm are the sanitizer's PANICs; stack overflow and a `sync` on
+an empty stack are the machine's. There are no guards: only `bra` and `bra.uni` take a predicate.
+`kernels/diverge.launch.py` counts Collatz steps per lane.
+
+Qtx conservatively drains live depbars and fixed-latency writes at every branch and `sync`. Qtx's `wait`
 waits for every live depbar as a branch or `halt` does, but transfers no control and drains no
 fixed-latency write (say, a matmul's operand reads before an `mbar.arrive` hands the buffer back);
 it is emitted as `nop` (opcode 0xfe), which has no operands and carries only a stall and a wait mask.
@@ -117,6 +133,10 @@ with room. A branch into a packet's second half starts there.
 A branch resolves one cycle after it issues -- a conditional `bra.uni` reads its predicate then --
 and nothing after it issues before that: a not-taken branch continues with the words already
 fetched, a taken one clears its warp's FIFO and fetches the target (`src/rf.hpp` has the cycles).
+A divergent `bra` and a `sync` resolve there too (a `sync` reads a registered copy of the stack's
+top); a `sync` whose popped pc is the instruction after it continues like a not-taken branch (one
+address compare), any other popped pc redirects like a taken one. An `ssy` pushes there without
+holding its warp.
 
 Mbar instructions currently take an address in a uniform register with no encoded offset:
 `mbar.init`, `mbar.arrive`, `mbar.arrive.expect_tx`, `mbar.test_wait`, and bounded

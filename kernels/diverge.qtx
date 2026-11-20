@@ -1,0 +1,42 @@
+; Per-lane Collatz step counts: a loop whose trip count is each lane's own
+; data (trash/divergence-2026-11-21.md). Lane l of warp w reads n = IN[16 w + l]
+; (n >= 1) and counts the steps n -> n / 2 (n even) or 3 n + 1 (n odd) until
+; n is 1. Each step is a per-lane if / else whose arms each end in a sync;
+; the loop sheds lanes as they reach 1. Every sync pops a (mask, pc) entry
+; and switches to it. The loop is laid out as in
+; trash/divergence-loop-astra.py: the first pass goes to the test, and the
+; lanes that leave fall into the sync, which switches to the lanes that stay
+; (back at STEP); when none stays it pops the ssy's entry, DONE. So the stack
+; holds at most the loop's entry and, inside a step, the step's entry and
+; the even lanes': three entries.
+; Launch: kernels/diverge.launch.py.
+
+.equ IN, 0
+.equ OUT, 1024
+
+        usread ur0, WARP_ID
+        ushli  ur0, ur0, 6            ; 64 bytes per warp
+        ur2r   r1, ur0
+        sread  r2, LANE_ID
+        shli   r2, r2, 2
+        add    r1, r1, r2             ; this lane's byte offset
+        ldg    r3, [r1 + IN]          ; n
+        mov    r5, 0                  ; steps
+        ssy    DONE                   ; (every lane, DONE)
+        bra    TEST                   ; a lane that starts at 1 never steps
+STEP:   andi   r6, r3, 1
+        setp.eq.u32 p1, r6, 0         ; n even
+        ssy    NEXT                   ; (this step's lanes, NEXT)
+        @p1 bra EVEN                  ; odd lanes fall through first; (even lanes, EVEN)
+        shli   r7, r3, 1              ; odd: n = 3 n + 1
+        add    r3, r3, r7
+        addi   r3, r3, 1
+        sync                          ; odd lanes done: switch to the even ones
+EVEN:   shri   r3, r3, 1              ; even: n = n / 2
+        sync                          ; even lanes done: every lane of the step, at NEXT
+NEXT:   addi   r5, r5, 1
+TEST:   setp.ne.u32 p0, r3, 1         ; lanes not yet at 1 go round again
+        @p0 bra STEP                  ; (staying lanes, STEP); the leavers fall through
+        sync                          ; leavers switch to the stayers; the last pops (every lane, DONE)
+DONE:   stg    [r1 + OUT], r5         ; every lane, once
+        halt

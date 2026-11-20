@@ -134,11 +134,9 @@ bool uses_shmem(Opcode opcode) {
 // once its warp's own lds / sts are serviced. A uniform atomic (rfc13
 // section 4) needs its RETURN load slot as well as the SIMT RMW register: it
 // is admitted with both or not at all, so it never takes the store pause with
-// nowhere to put its old value. An lds / sts with no active lane is absent:
-// no slot, no order. (A uniform operation ignores the mask: it is never
-// absent.)
+// nowhere to put its old value. (A warp's active mask is never empty: every
+// lds / sts has at least one lane, trash/divergence-2026-11-21.md.)
 std::optional<Refusal> shmem_refusal(Opcode opcode, const ResourceView& view) {
-    if ((opcode == Opcode::lds || opcode == Opcode::sts) && view.no_active_lanes) return std::nullopt;
     const bool write = opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
     if (view.unserviced_write || (write && view.unserviced_read)) return Refusal::shmem_ordered;
     if ((is_shared_load(opcode) || is_atomic(opcode)) && !view.load_slot_free) return Refusal::load_slots_full;
@@ -339,6 +337,16 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             }
         }
     }
+    if (config_.core_divergence_stack_entries == 0) {
+        for (std::size_t index = 0; index < kernel_.words.size(); ++index) {
+            const auto inst = decode(kernel_.words[index]);
+            if (!uses_divergence_stack(inst)) continue;
+            throw SimError("kernel pc " + std::to_string(8 * index) + ": " +
+                (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
+                " needs the divergence stack, which this device profile does not have "
+                "(core.divergence_stack_entries = 0)");
+        }
+    }
     // Distinct sources beyond a bank's read ports are a property of the
     // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
@@ -413,7 +421,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
             Warp warp;
             warp.id = id;
-            warp.active_mask = full_mask();
             warp.rf.resize(static_cast<std::size_t>(config_.lanes) * kernel_.register_count, 0);
             for (auto& predicate : warp.predicates) predicate.resize(config_.lanes, 0);
             warp.urf.resize(config_.urf_registers, 0);
@@ -426,6 +433,12 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         std::vector<WarpFrontEnd> front_end(config_.core_warps);
         for (uint32_t slot = launch.active_warps; slot < config_.core_warps; ++slot) front_end[slot].halted = true;
         front_end_.poke(std::move(front_end));
+        // Every warp slot starts converged: all lanes active, an empty stack.
+        DivergenceState divergence;
+        divergence.warps.assign(config_.core_warps, WarpDivergence{full_mask(), 0, {}});
+        divergence_.poke(std::move(divergence));
+        divergence_stack_.assign(static_cast<std::size_t>(config_.core_warps) * config_.core_divergence_stack_entries,
+            DivergenceEntry{});
         depbar_.poke(DepbarCounters(launch.active_warps));
         shmem_to_ram_.poke(std::vector<uint32_t>(launch.active_warps, 0));
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
@@ -527,10 +540,13 @@ void Machine::tick() {
     Wires w;
 
     // The front end, from Q only (i): the fetch grant, the word at the
-    // instruction memory's output, the branch in the issue register resolved.
+    // instruction memory's output, the control instruction in the issue
+    // register resolved (with its divergence-stack push or pop and the warp's
+    // next active mask), and the stack memory's output (a pop's refill).
     w.fetch = decide_fetch();
     w.fetched = instruction_memory_output();
     w.branch = resolve_branch();
+    w.divergence_refilled = divergence_memory_output();
 
     // The RF write path, from Q and before any SIMT candidate: the one RF
     // write decision (the ready async holders share this cycle's unbooked
@@ -608,6 +624,7 @@ void Machine::tick() {
         std::memcpy(shmem_.data() + write.address, write.bytes.data(), write.bytes.size());
     }
     for (const auto& [word, value] : w.tmem_writes) tmem_[word] = value;
+    if (w.branch.has_value() && w.branch->push.has_value()) divergence_stack_.at(w.branch->push_slot) = *w.branch->push;
     land_rf_writes(w);
     land_urf_write(w);
     ++cycle_;
@@ -627,7 +644,7 @@ bool Machine::done() const {
     const auto& front_end = front_end_.cur();
     const bool warps_halted = std::all_of(front_end.begin(), front_end.end(), [](const WarpFrontEnd& warp) {
         return warp.halted;
-    }) && !fetch_read_.cur().has_value();
+    }) && !fetch_read_.cur().has_value() && !divergence_.cur().refill.has_value();
     const auto& waits = mbar_wait_slots_.cur();
     const bool wait_slots_empty = std::all_of(
         waits.begin(), waits.end(), [](const auto& slot) { return !slot.has_value(); });
@@ -703,12 +720,6 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
     tma_mbar_event_.poke(std::move(request)); // between ticks: held from the next cycle on
 }
 
-// Shmem-test-only (sim.hpp): nothing but the shmem path reads the mask.
-void Machine::test_set_active_mask(uint32_t warp, uint64_t mask) {
-    if (warp >= warps_.size() || (mask & ~full_mask()) != 0) throw SimError("invalid active mask");
-    warps_[warp].active_mask = mask;
-}
-
 void Machine::test_set_fetch_pc(uint32_t warp, uint32_t pc) {
     auto front_end = front_end_.cur();
     front_end.at(warp).fetch_pc = pc;
@@ -736,7 +747,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 
 // One instruction-memory read per cycle: one packet, the two words at an
 // aligned 16-byte address. A warp asks for one when it has not halted, its
-// next pc is known (no branch of its in the issue register) and its FIFO has
+// next pc is known (no branch or sync of its in the issue register) and its FIFO has
 // room: valid packets + its read in flight < the FIFO's depth (a read in
 // flight owns its entry until it lands or is dropped, so two reads never
 // count on one free entry, and a landing always finds room).
@@ -751,7 +762,7 @@ Machine::FetchGrant Machine::decide_fetch() const {
     for (uint32_t warp = 0; warp < front_end.size(); ++warp) {
         const auto& slot = front_end[warp];
         const std::size_t in_flight = read.has_value() && read->warp == warp ? 1 : 0;
-        const bool branch_unresolved = branch.has_value() && branch->warp == warp;
+        const bool branch_unresolved = branch.has_value() && branch->warp == warp && holds_its_warp(*branch);
         has_space[warp] = !slot.halted && !branch_unresolved &&
             slot.fifo.size() + in_flight < config_.core_instruction_buffer_packets ? 1 : 0;
     }
@@ -782,38 +793,124 @@ std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() const
     return packet;
 }
 
-// The branch in the issue register (accepted last cycle) resolves now
-// (issue_to_branch_resolve). bra and bra.uni @PT are taken and bra.uni @!PT
-// is not; any other bra.uni reads its predicate from the file now, like an
-// operand through the issue register: lane 0 (a declared-uniform operand;
-// the sanitizer checks the other lanes, and the active mask -- bra.uni is a
-// uniform operation in every form, backlog D12.1). Taken: the one target
-// adder, the branch's pc + 8 + its offset.
+// The control instruction in the issue register (accepted last cycle)
+// resolves now (issue_to_branch_resolve; trash/divergence-2026-11-21.md),
+// from the warp's divergence registers' Q (its active mask, stack depth and
+// top copy) and the predicate file:
+//   - bra.uni: @PT taken, @!PT not; otherwise its predicate is read like an
+//     operand through the issue register, lane 0 (a declared-uniform operand;
+//     the sanitizer checks the other lanes, and the active mask -- bra.uni is
+//     a uniform operation in every form, backlog D12.1).
+//   - bra (plain): every active lane goes; taken.
+//   - bra with a predicate (the divergent branch): all its lanes are read;
+//     taken = active AND p, fall = active AND NOT p. No taken lane: not
+//     taken. No falling lane: taken, the mask unchanged. Both: (taken,
+//     target) is pushed and the warp falls through under fall.
+//   - ssy: (the active mask, its label) is pushed.
+//   - sync: the top entry is popped (from the top copy, no memory read now)
+//     and switched to, whoever pushed it: its mask becomes active and the
+//     warp goes to its pc. If that pc is the sync's pc + 8 (one compare),
+//     the words already fetched are the right ones: it continues like a
+//     not-taken branch; any other pc is a redirect like a taken one.
+// A push onto a full stack and a sync on an empty one are the machine's
+// PANICs. Taken: the one target adder, the instruction's pc + 8 + its
+// offset (an ssy's label too).
 std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
     const auto& branch = issue_branch_.cur();
     if (!branch.has_value()) return std::nullopt;
     const auto& inst = branch->instruction;
     const auto& warp = warps_.at(branch->warp);
+    const auto& divergence = divergence_.cur();
+    const auto& state = divergence.warps.at(branch->warp);
     const IssueSite here{cycle_, branch->warp, branch->pc, inst};
-    if (inst.opcode == Opcode::bra_uni) sanitizer_.check_uniform_mask(here, warp.active_mask, full_mask());
-    bool take = true;
-    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+    if (divergence.refill.has_value() && divergence.refill->warp == branch->warp) {
+        throw SimError("internal: warp " + std::to_string(branch->warp) +
+            " resolves a control instruction while its stack top is being refilled, at cycle " +
+            std::to_string(cycle_));
+    }
+    const auto target = [&]() {
+        const auto address = static_cast<int64_t>(branch->pc) + 8 + inst.imm;
+        if (inst.imm % 8 != 0 || address < 0 || static_cast<uint64_t>(address / 8) >= kernel_.words.size()) {
+            throw_issue_panic(here, "branch target is outside the kernel");
+        }
+        return static_cast<uint32_t>(address);
+    };
+    BranchResolution resolution;
+    resolution.warp = branch->warp;
+    const auto push = [&](DivergenceEntry entry) {
+        if (state.depth >= config_.core_divergence_stack_entries) {
+            throw_issue_panic(here, "divergence stack overflow: warp " + std::to_string(branch->warp) +
+                " already holds " + std::to_string(state.depth) + " entries (core.divergence_stack_entries)");
+        }
+        resolution.push = entry;
+        resolution.push_slot = static_cast<std::size_t>(branch->warp) * config_.core_divergence_stack_entries +
+            state.depth;
+    };
+    switch (inst.opcode) {
+    case Opcode::ssy:
+        push(DivergenceEntry{target(), state.active});
+        return resolution;
+    case Opcode::sync:
+        if (state.depth == 0) throw_issue_panic(here, "sync with an empty divergence stack");
+        resolution.pop = true;
+        resolution.mask = state.top.mask;
+        // One address compare: an entry whose pc is the next instruction
+        // continues with the words already fetched; any other is a redirect.
+        if (state.top.pc != branch->pc + 8) {
+            resolution.taken = true;
+            resolution.target = state.top.pc;
+        }
+        return resolution;
+    case Opcode::bra:
+        if (is_divergent_branch(inst)) {
+            uint64_t predicate = 0;
+            const auto lanes = inst.control.predicate == 7 ? std::vector<uint32_t>(config_.lanes, 1)
+                                                          : capture_predicate(warp, inst.control.predicate);
+            for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+                if ((lanes[lane] != 0) != inst.control.predicate_invert) predicate |= uint64_t{1} << lane;
+            }
+            const uint64_t taken = state.active & predicate;
+            const uint64_t fall = state.active & ~predicate;
+            if (taken == 0) return resolution;
+            const auto destination = target();
+            if (fall == 0) {
+                resolution.taken = true;
+                resolution.target = destination;
+                return resolution;
+            }
+            push(DivergenceEntry{destination, taken});
+            resolution.mask = fall;
+            return resolution;
+        }
+        resolution.taken = true;
+        resolution.target = target();
+        return resolution;
+    default:
+        break;
+    }
+    sanitizer_.check_uniform_mask(here, state.active, full_mask()); // bra.uni
+    bool take = !inst.control.predicate_invert; // @PT taken, @!PT not
+    if (inst.control.predicate != 7) {
         const auto lanes = capture_predicate(warp, inst.control.predicate);
         sanitizer_.check_warp_uniform(here, lanes, "bra.uni predicate");
         take = (lanes[0] != 0) != inst.control.predicate_invert;
-    } else if (inst.opcode == Opcode::bra_uni && inst.control.predicate_invert) {
-        take = false; // @!PT
     }
-    BranchResolution resolution;
-    resolution.warp = branch->warp;
     resolution.taken = take;
-    if (!take) return resolution;
-    const auto target = static_cast<int64_t>(branch->pc) + 8 + inst.imm;
-    if (inst.imm % 8 != 0 || target < 0 || static_cast<uint64_t>(target / 8) >= kernel_.words.size()) {
-        throw_issue_panic(here, "branch target is outside the kernel");
-    }
-    resolution.target = static_cast<uint32_t>(target);
+    if (take) resolution.target = target();
     return resolution;
+}
+
+// A pop presented the new top's address last cycle (DivergenceRefill): the
+// entry is at the stack memory's output now.
+std::optional<std::pair<uint32_t, Machine::DivergenceEntry>> Machine::divergence_memory_output() const {
+    const auto& refill = divergence_.cur().refill;
+    if (!refill.has_value()) return std::nullopt;
+    return std::make_pair(refill->warp, divergence_stack_.at(
+        static_cast<std::size_t>(refill->warp) * config_.core_divergence_stack_entries + refill->index));
+}
+
+bool Machine::holds_its_warp(const IssuedBranch& branch) {
+    return branch.instruction.opcode != Opcode::ssy;
 }
 
 // Every warp's front end after this cycle, in one calculation per warp
@@ -1066,6 +1163,9 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         sanitizer_.check_assembly_lanes_valid(cycle_, write.index, assembly.valid, 0, config_.lanes, "RF drain");
         writeback.values = assembly.words;
         writeback.reason = opcode_name(command.instruction.opcode);
+        // A gather writes its active lanes only (their assembly lanes were
+        // filled; the inactive ones were valid from admission).
+        if (command.kind == LsuKind::scalar_load) writeback.lane_enables = command.lanes;
         const bool vector = command.kind == LsuKind::vector_load;
         if (!vector || command.chunks_done + 1 == 8) {
             // rD..rD+7 count as in flight until the last write lands.
@@ -3525,8 +3625,9 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::stall_count, "stall count"};
             continue;
         }
-        // Nothing after a branch issues until it resolves (no prediction).
-        if (branch.has_value() && branch->warp == index) {
+        // Nothing after a branch or a sync issues until it resolves (no
+        // prediction); after an ssy the warp goes on.
+        if (branch.has_value() && branch->warp == index && holds_its_warp(*branch)) {
             states[index] = {WarpState::no_instruction, "branch unresolved"};
             continue;
         }
@@ -3596,7 +3697,8 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
 }
 
 // Panics on the instruction word alone: register encodings that wrap, and
-// predication outside bra.uni.
+// predication outside bra and bra.uni (there are no guards on other
+// instructions; a predicated bra is the divergent branch).
 void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) const {
     if ((inst.opcode == Opcode::ldg_v8 && static_cast<unsigned>(inst.dst) + 8 > 256) ||
         (inst.opcode == Opcode::stg_v8 && static_cast<unsigned>(inst.src1) + 8 > 256))
@@ -3608,13 +3710,9 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
         if (static_cast<unsigned>(base) + width > 256) panic(warp, inst, "accumulator register encoding wraps");
     }
-    if (inst.opcode == Opcode::bra &&
-        (inst.control.predicate != 7 || inst.control.predicate_invert)) {
-        panic(warp, inst, "bra is unconditional");
-    }
     if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-        inst.opcode != Opcode::bra_uni) {
-        panic(warp, inst, "only bra.uni may be predicated before divergent execution exists");
+        inst.opcode != Opcode::bra_uni && inst.opcode != Opcode::bra) {
+        panic(warp, inst, "only bra and bra.uni may be predicated");
     }
     if (inst.opcode == Opcode::sread && inst.imm != static_cast<int32_t>(SpecialReg::lane_id) &&
         inst.imm != static_cast<int32_t>(SpecialReg::thread_id)) {
@@ -3664,7 +3762,7 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
         if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
         sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
     }
-    if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+    if ((inst.opcode == Opcode::bra_uni || inst.opcode == Opcode::bra) && inst.control.predicate != 7) {
         sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate, cycle_ + issue_to_predicate_sample);
     }
     check_register_hazards(warp, inst);
@@ -3752,7 +3850,6 @@ ResourceView Machine::resource_view(
         const bool load = is_acc_load(inst.opcode);
         view.acc_engine_free = acc_engine_available(w, load) && claims.acc[load ? 0 : 1] == 0;
     }
-    view.no_active_lanes = warp.active_mask == 0;
     view.unserviced_read = warp_unserviced_read(w, warp.id);
     view.unserviced_write = warp_unserviced_write(w, warp.id);
     if (inst.opcode == Opcode::fence_sh) view.own_shmem_at_ram = own_shmem_at_ram(w, warp.id);
@@ -3815,11 +3912,12 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
 
 // An accepted instruction leaves its FIFO (the head pops, the warp's pc
 // moves to the next word: step_front_end). Fixed arithmetic books its
-// bundle; a branch goes into the issue register, where it resolves next
-// cycle (resolve_branch); a halt stops the warp's front end now (its FIFO is
-// cleared, nothing more is fetched or issued); fence.sh and nop are complete
-// now; everything else books its operand reads and enters the dispatch
-// pipeline.
+// bundle; a branch, ssy or sync goes into the issue register, where it
+// resolves next cycle (resolve_branch); a halt stops the warp's front end now
+// (its FIFO is cleared, nothing more is fetched or issued; halting inside an
+// arm, with stack entries left or a partial mask, is the sanitizer's PANIC);
+// fence.sh and nop are complete now; everything else books its operand reads
+// and enters the dispatch pipeline.
 void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     w.issue.popped = warp.id;
     if (uses_arithmetic_pipeline(inst)) {
@@ -3833,15 +3931,20 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
     switch (inst.opcode) {
     case Opcode::bra:
     case Opcode::bra_uni:
+    case Opcode::ssy:
+    case Opcode::sync:
         w.issue.branch = IssuedBranch{warp.id, head_pc(warp.id), inst};
         break;
     case Opcode::fence_sh:
         break; // its admission was the whole of it (own_shmem_at_ram)
     case Opcode::nop:
         break; // its wait mask held it until now; its stall is set below
-    case Opcode::halt:
+    case Opcode::halt: {
+        const auto& divergence = divergence_.cur().warps.at(warp.id);
+        sanitizer_.check_halt_converged(site(warp, inst), divergence.depth, divergence.active, full_mask());
         w.issue.halt = true;
         break;
+    }
     default:
         // A tma's and an mma.async's later uniform rounds are the round
         // counter's (src/rf.hpp uniform_read_rounds); a tma reaches its queue
@@ -3889,6 +3992,7 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     pending.issue_cycle = cycle_;
     pending.warp = warp.id;
     pending.pc = head_pc(warp.id);
+    pending.active_mask = active_mask(warp.id);
     pending.instruction = inst;
     pending.reads = plan.reads;
     pending.operands.resize(plan.reads.size());
@@ -3907,11 +4011,12 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
 // vector source is part of the round: it owns its bank's read port in the
 // issue register's cycle like any read. No write calendar and no structural
 // check: one issue per cycle is one write per pipeline stage. r2ur reads lane
-// 0, so like every lane-0 operation it is UB under a partial or empty active
-// mask (the sanitizer's PANIC, backlog D12.1); uniform arithmetic (usetp
-// included) reads no lanes.
+// 0, so like every lane-0 operation it is UB under a partial active mask (the
+// sanitizer's PANIC, backlog D12.1); uniform arithmetic reads and writes no
+// lanes (it runs once in every arm that issues it). usetp writes the
+// predicate file, per lane: its active lanes only.
 void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
-    if (inst.opcode == Opcode::r2ur) sanitizer_.check_uniform_mask(site(warp, inst), warp.active_mask, full_mask());
+    if (inst.opcode == Opcode::r2ur) sanitizer_.check_uniform_mask(site(warp, inst), active_mask(warp.id), full_mask());
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
     for (const auto reg : plan.reads) {
         ++w.issue.rf_read_banks[reg % config_.rf_banks];
@@ -3925,17 +4030,11 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
     UrfWrite write;
     write.warp = warp.id;
     write.pc = head_pc(warp.id);
+    write.active_mask = active_mask(warp.id);
     write.instruction = inst;
     w.issue.urf_write = std::move(write);
     warp.stall_until = cycle_ + inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
-}
-
-// An lds / sts with no active lane is absent (rfc12 section 3): no slot, no
-// depbar, no order, no dispatch. Everything else that reaches here goes to
-// its unit.
-bool Machine::needs_dispatch(const Instruction& inst, uint64_t active_mask) {
-    return !((inst.opcode == Opcode::lds || inst.opcode == Opcode::sts) && active_mask == 0);
 }
 
 // A memory / engine / mbar instruction accepted now. What depends on
@@ -3958,7 +4057,6 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
         if (is_lsu_opcode(opcode)) panic(warp, inst, "global memory operation has no depbar");
         panic(warp, inst, opcode_name(opcode) + " has no depbar");
     }
-    if (!needs_dispatch(inst, warp.active_mask)) return;
     if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
     const auto not_ready = std::numeric_limits<uint64_t>::max();
     if (const auto dst = destination_register(inst); dst.has_value()) {
@@ -3980,7 +4078,7 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     entry.issue_cycle = cycle_;
     entry.warp = warp.id;
     entry.pc = head_pc(warp.id);
-    entry.active_mask = warp.active_mask;
+    entry.active_mask = active_mask(warp.id);
     entry.instruction = inst;
     entry.reads = plan.reads;
     entry.operands.resize(plan.reads.size());
@@ -4006,7 +4104,7 @@ void Machine::load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w) {
     rounds.header.issue_cycle = cycle_;
     rounds.header.warp = warp.id;
     rounds.header.pc = head_pc(warp.id);
-    rounds.header.active_mask = warp.active_mask;
+    rounds.header.active_mask = active_mask(warp.id);
     rounds.header.instruction = inst;
     w.issue.urf_rounds = std::move(rounds);
 }
@@ -4228,8 +4326,8 @@ void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
 // takes the load slot admission secured; A-read serves it from the next
 // cycle; its gathered vector waits in the slot for the RF write decision. No
 // RF booking: the depbar completes it. lds.uni ignores the mask (its base is
-// a uniform register; the mask gates only its RF write's lanes): a partial or
-// empty mask is the sanitizer's PANIC (backlog D12, in uniform_operand).
+// a uniform register; the mask gates only its RF write's lanes): a partial
+// mask is the sanitizer's PANIC (backlog D12, in uniform_operand).
 void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool uniform = inst.opcode == Opcode::lds_uni;
@@ -4293,7 +4391,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
         break;
     case LsuKind::scalar_load:
         ++counters.lsu_scalar_loads;
-        counters.lsu_useful_bytes += 4ull * config_.lanes;
+        counters.lsu_useful_bytes += 4ull * command.sectors.size(); // its active lanes
         break;
     case LsuKind::scalar_store:
         // Its RF read beat (booked with the address operand) lands the store
@@ -4301,7 +4399,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
         admission.store_data = capture(op, inst.src1);
         probe(LsuEdge::rf_read_beat, command.id, inst.src1, config_.lanes * 4);
         ++counters.lsu_scalar_stores;
-        counters.lsu_useful_bytes += 4ull * config_.lanes;
+        counters.lsu_useful_bytes += 4ull * command.sectors.size(); // its active lanes
         break;
     case LsuKind::uniform_load:
         ++counters.lsu_uniform_loads;
@@ -4566,7 +4664,8 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
         panic(warp, inst, "fixed-latency opcode bypassed the arithmetic read pipeline");
     } else if (!is_shared_load(opcode) && opcode != Opcode::sts && !is_lsu_opcode(opcode) &&
                !is_tma(opcode) && !is_acc_transfer(opcode) && !is_mma_command(opcode) &&
-               opcode != Opcode::bra && opcode != Opcode::bra_uni && opcode != Opcode::fence_sh &&
+               opcode != Opcode::bra && opcode != Opcode::bra_uni && opcode != Opcode::ssy &&
+               opcode != Opcode::sync && opcode != Opcode::fence_sh &&
                !is_mbar_rmw(opcode) && !is_mbar_try_wait(opcode) && !is_atomic(opcode) &&
                opcode != Opcode::nop && opcode != Opcode::halt) {
         panic(warp, inst, "zero-latency RF writer is unsupported");
@@ -4753,14 +4852,16 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
         break;
     default: fail("non-arithmetic instruction in RF read pipeline");
     }
-    // The execution pipeline's E cycles, then the write port it booked.
+    // The execution pipeline's E cycles, then the write port it booked. Every
+    // lane computes; the issue cycle's active mask is the write's lane
+    // enables (the port, its cycle and the booking are the same whatever the
+    // mask).
     const auto port_cycle = pending.issue_cycle + issue_to_port(inst, config_);
-    if (is_setp(inst.opcode)) {
-        w.new_writebacks.push_back(predicate_writeback(warp, inst.dst, port_cycle, std::move(result)));
-    } else {
-        w.new_writebacks.push_back(
-            register_writeback(warp, inst.dst, port_cycle, std::move(result), opcode_name(inst.opcode)));
-    }
+    auto writeback = is_setp(inst.opcode)
+        ? predicate_writeback(warp, inst.dst, port_cycle, std::move(result))
+        : register_writeback(warp, inst.dst, port_cycle, std::move(result), opcode_name(inst.opcode));
+    writeback.lane_enables = pending.active_mask;
+    w.new_writebacks.push_back(std::move(writeback));
 }
 
 // The RF read stage (src/rf.hpp): the round of the instruction in the issue
@@ -4901,6 +5002,7 @@ void Machine::urf_ram_stage(Wires& w) {
             auto predicate = predicate_writeback(warps_.at(presented->warp), presented->instruction.dst, cycle_,
                 std::vector<uint32_t>(config_.lanes, *presented->value));
             predicate.reason = "usetp";
+            predicate.lane_enables = presented->active_mask;
             w.rf_landings.push_back(std::move(predicate));
         } else {
             trace_->urf_write(cycle_, presented->warp, presented->instruction.dst, *presented->value);
@@ -5002,10 +5104,11 @@ void Machine::land_urf_write(const Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 38> canonical = {
+    static constexpr std::array<Driver, 39> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
+        &Machine::drive_divergence,
         &Machine::drive_depbar,
         &Machine::drive_wait_slots,
         &Machine::drive_load_slots,
@@ -5069,6 +5172,37 @@ void Machine::drive_fetch(const Wires& w) {
 void Machine::drive_issue_branch(const Wires& w) {
     if (!w.issue.branch.has_value() && !issue_branch_.cur().has_value()) return;
     issue_branch_.set_next(w.issue.branch, "drive_issue_branch");
+}
+
+// The warps' divergence registers (trash/divergence-2026-11-21.md), in one
+// calculation: the stack memory's output now lands in its warp's top copy (a
+// pop's refill); the control instruction resolving now pushes (the top copy
+// takes the entry the memory takes at this edge, the depth grows), pops (the
+// depth shrinks and, if an entry is left, its address is presented: the
+// memory's read in flight for the next cycle) and sets its warp's active
+// mask. A refill and a resolution never touch one warp in one cycle
+// (resolve_branch checks it).
+void Machine::drive_divergence(const Wires& w) {
+    const auto& cur = divergence_.cur();
+    const bool stack_effect =
+        w.branch.has_value() && (w.branch->mask.has_value() || w.branch->push.has_value() || w.branch->pop);
+    if (!cur.refill.has_value() && !stack_effect) return;
+    auto next = cur;
+    next.refill.reset();
+    if (w.divergence_refilled.has_value()) next.warps.at(w.divergence_refilled->first).top = w.divergence_refilled->second;
+    if (stack_effect) {
+        auto& warp = next.warps.at(w.branch->warp);
+        if (w.branch->push.has_value()) {
+            warp.top = *w.branch->push;
+            ++warp.depth;
+        }
+        if (w.branch->pop) {
+            --warp.depth;
+            if (warp.depth > 0) next.refill = DivergenceRefill{w.branch->warp, warp.depth - 1};
+        }
+        if (w.branch->mask.has_value()) warp.active = *w.branch->mask;
+    }
+    divergence_.set_next(std::move(next), "drive_divergence");
 }
 
 // depbar: next = Q - this cycle's completions + issue's admission. (The
@@ -5572,6 +5706,15 @@ void Machine::drive_assembly_pool(const Wires& w) {
                 std::fill(next->valid.begin(), next->valid.end(), 1);
                 next->valid_count = config_.lanes;
             }
+            // A gather under a partial mask: its inactive lanes get no word,
+            // so they start valid (the RF write's lane enables skip them).
+            if (const auto& command = w.dispatch.lsu->command; command.kind == LsuKind::scalar_load) {
+                for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+                    if ((command.lanes >> lane & 1) != 0) continue;
+                    next->valid[lane] = 1;
+                    ++next->valid_count;
+                }
+            }
         }
 
         // 3. This cycle's fills.
@@ -5914,7 +6057,7 @@ std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predi
 // whatever the active mask (even when lane 0
 // is inactive). Two things are UB and the sanitizer panics on them: a value
 // that differs across lanes (named by the operand: "... is not
-// warp-uniform"), and any uniform operation under a partial or empty mask
+// warp-uniform"), and any uniform operation under a partial mask
 // (backlog D12.1, rfc13 section 2: a program with a partial mask uses the
 // per-lane instruction). bra.uni checks the mask in resolve_branch.
 uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const {

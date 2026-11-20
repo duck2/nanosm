@@ -1124,28 +1124,31 @@ void test_i5_same_warp_order() {
 //     1..15 get 0x300, lane 0 keeps 0xdead;
 //   lds.uni r3 from the same address: lanes 1..15 get 0x301;
 //   mbar.arrive and mbar.test_wait on a count-1 mbar: the phase completes.
-// An EMPTY mask still performs the atomic (word 512 = 0x301) and writes no
-// lane of rD. (Before the URF these operands were vector registers read at
-// lane 0, l-dependent in the other lanes; a uniform register has no lanes.)
+// (A warp's mask is never empty since divergence: the empty-mask case is
+// gone. Before the URF these operands were vector registers read at lane 0,
+// l-dependent in the other lanes; a uniform register has no lanes.)
 void test_d12_uniform_ops_under_a_partial_mask() {
     const auto& profile = canonical_profile();
+    // Lane 0 waits on the divergence stack while lanes 1..15 run the uniform
+    // operations (masked_region); the mask is never empty.
     const std::string program = R"(
         umov ur1, 0
         umov ur5, 1
         mov r7, 0xdead
         mov r3, 0xbeef
         umov ur4, 4160
+    )" + masked_region(0xfffe, R"(
         atom.add.uni r7, [ur1 + 2048], ur5 {pred=PT, stall=0, set=sb0, wait=-}
         lds.uni r3, [ur1 + 2048] {pred=PT, stall=0, set=sb1, wait=sb0}
         mbar.arrive [ur4]
         mbar.test_wait p0, [ur4], 0
+    )") + R"(
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )";
     const auto mbar = [](nanosm::Launch& launch) { write_count_mbar(launch.shmem_image.at(0).bytes, 4160, 1); };
-    for (const uint64_t mask : {uint64_t{0xfffe}, uint64_t{0}}) {
+    for (const uint64_t mask : {uint64_t{0xfffe}}) {
         const auto what = "mask " + std::to_string(mask);
         auto machine = i5_machine(profile, program, 1, mbar);
-        machine->test_set_active_mask(0, mask);
 #if NANOSM_SANITIZER
         const auto message = i4_panic(*machine, what);
         require_mentions(message, {"atom.add.uni is a uniform operation under a partial active mask"}, what);
@@ -1164,8 +1167,8 @@ void test_d12_uniform_ops_under_a_partial_mask() {
 #if NANOSM_SANITIZER
     for (const std::string uniform :
              {"lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}", "mbar.arrive [ur2]", "mbar.test_wait p0, [ur2], 0"}) {
-        auto machine = i5_machine(profile, "umov ur1, 0\numov ur2, 4160\n" + uniform + "\nhalt\n", 1, mbar);
-        machine->test_set_active_mask(0, 0xfffe);
+        auto machine =
+            i5_machine(profile, "umov ur1, 0\numov ur2, 4160\n" + masked_region(0xfffe, uniform) + "halt\n", 1, mbar);
         require_mentions(i4_panic(*machine, uniform), {"uniform operation under a partial active mask"}, uniform);
     }
 #endif
@@ -1184,10 +1187,7 @@ void test_d12_sts_two_lanes_on_one_word() {
             sread r1, LANE_ID
             addi r2, r1, 1
             mov r0, 0
-            sts [r0], r2
-            halt
-        )"), std::move(launch));
-        machine.test_set_active_mask(0, mask);
+        )" + masked_region(mask, "sts [r0], r2") + "halt\n"), std::move(launch));
 #if NANOSM_SANITIZER
         require_mentions(i4_panic(machine, "same-word sts"), {"multiple lanes write the same shmem word"},
             "same-word sts");
@@ -1322,8 +1322,12 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
             nanosm::Launch launch;
             launch.active_warps = 1;
             setup(launch);
-            nanosm::Machine machine(profile, compile(program, profile), std::move(launch));
-            machine.test_set_active_mask(0, mask);
+            // The partial mask: the program, less its final halt, runs inside
+            // a divergent region (lane 0 waits on the stack); the warp halts
+            // after the region (a halt inside it is the sanitizer's own PANIC).
+            const auto body = program.substr(0, program.rfind("halt\n"));
+            const auto text = mask == 0xffff ? program : masked_region(mask, body) + "halt\n";
+            nanosm::Machine machine(profile, compile(text, profile), std::move(launch));
 #if NANOSM_SANITIZER
             if (mask != 0xffff) {
                 require_mentions(i4_panic(machine, what), {name + " is a uniform operation under a partial active mask"},

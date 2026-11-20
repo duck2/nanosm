@@ -4,7 +4,7 @@
 // src/rf.hpp), depbar set / wait for the asynchronous ones (with all six
 // live, an instruction that needs a new one waits for the oldest and reuses
 // it), a full drain at
-// every branch, a loop body scheduled as a jump enters it (LoopEntry), and
+// every branch and sync, a loop body scheduled as a jump enters it (LoopEntry), and
 // qtx's wait as a nop waiting for every live depbar (no drain).
 // schedule_fixed_stalls is the same stall pass for hand assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
 // encode.
@@ -59,7 +59,7 @@ struct FixedTimeline {
                 at = std::max(at, read_until[*dst + j] - earliest);      // WAR: land at or after older samples
             }
         }
-        if (inst.opcode == Opcode::bra_uni && inst.control.predicate != 7) {
+        if ((inst.opcode == Opcode::bra_uni || inst.opcode == Opcode::bra) && inst.control.predicate != 7) {
             at = std::max(at, predicate_ready[inst.control.predicate] - int64_t{issue_to_predicate_sample});
         }
         if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);
@@ -127,7 +127,12 @@ struct FixedTimeline {
 // schedule a loop body from a clean timeline -- the state every jump to the
 // head arrives with, since every branch drains before it jumps -- and pay
 // what the fall-through edge brings once, on the instruction before the head
-// (LoopEntry).
+// (LoopEntry). A divergent bra (@p bra) is a branch like any: a backward one
+// makes a loop head. A sync's implicit edge -- to a divergent bra's target or
+// an ssy's label, whichever entry it pops -- makes none: every jump into a
+// label drains first, and a label that is not a loop head is scheduled from
+// the fall-through's timeline, which is never too short (only, in a loop,
+// slower).
 std::vector<bool> loop_heads(const std::vector<Instruction>& instructions) {
     std::vector<bool> heads(instructions.size(), false);
     for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -299,16 +304,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         if ((is_mma_async(inst.opcode) || inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
             throw SimError("line " + std::to_string(inst.line) + ": MMA is unsupported by this device profile");
         }
-        if (inst.opcode == Opcode::bra &&
-            (inst.control.predicate != 7 || inst.control.predicate_invert)) {
-            throw SimError("line " + std::to_string(inst.line) + ": bra is unconditional");
-        }
-        if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-            inst.opcode != Opcode::bra_uni) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": only bra.uni may be predicated before divergent execution exists");
-        }
+        check_divergence(inst, profile, "line " + std::to_string(inst.line));
         uint8_t wait_mask = 0;
         for (const auto source : sources(inst)) {
             if (pending_register[source].has_value()) {
@@ -335,10 +331,11 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             // completion depbar reaches zero.
             wait_mask |= static_cast<uint8_t>(1u << *store_barrier);
         }
-        // halt, every branch and qtx's wait (parsed as a nop, the only nop a
-        // qtx program has) wait for every live depbar. Unlike a branch, the
-        // nop neither drains the fixed-latency timeline nor resets it (below).
-        if (inst.opcode == Opcode::halt || inst.opcode == Opcode::nop || is_branch(inst.opcode)) {
+        // halt, every branch, sync and qtx's wait (parsed as a nop, the only
+        // nop a qtx program has) wait for every live depbar. Unlike a branch,
+        // the nop neither drains the fixed-latency timeline nor resets it
+        // (below).
+        if (inst.opcode == Opcode::halt || inst.opcode == Opcode::nop || transfers_control(inst.opcode)) {
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if (live[bar]) wait_mask |= static_cast<uint8_t>(1u << bar);
             }
@@ -401,7 +398,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = *mma_barrier;
         }
 
-        if (is_branch(inst.opcode)) {
+        if (transfers_control(inst.opcode)) {
             const auto all_ready = timeline.drained(vtime, profile);
             if (all_ready > vtime + 1) {
                 const auto stall = all_ready - vtime;
@@ -417,9 +414,11 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
                 settle_entry();
             }
 
-            // Every branch is a conservative block boundary for v0: its wait mask
-            // drains async work, and its stall covers outstanding fixed-latency writes.
-            // Both the target and fallthrough therefore begin with clean timing state.
+            // Every branch and sync is a conservative block boundary for v0: its
+            // wait mask drains async work, and its stall covers outstanding
+            // fixed-latency writes. Every way on -- the target, the
+            // fall-through, whatever pc a sync pops --
+            // therefore begins with clean timing state.
             live.fill(false);
             pending_register.fill(std::nullopt);
             pending_async_read_mask.fill(0);
@@ -500,7 +499,7 @@ Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile) {
             if (inst.opcode == Opcode::halt) settle_entry();
         }
         timeline.record(inst, profile, vtime);
-        if (is_branch(inst.opcode)) {
+        if (transfers_control(inst.opcode)) {
             const auto all_ready = timeline.drained(vtime, profile);
             if (all_ready - vtime > std::max<int64_t>(inst.control.stall, 1)) set_stall(inst, all_ready - vtime);
             if (entry.has_value()) {

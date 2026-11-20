@@ -141,6 +141,7 @@ set(NANOSM_TEST_SOURCES
     tests/rmw_test.cpp
     tests/frontend_test.cpp
     tests/urf_test.cpp
+    tests/divergence_test.cpp
 )
 
 function(add_nanosm_tests NAME LIBRARY)
@@ -235,6 +236,13 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE} -B -m nanosm kernels/vadd.launch.py
     )
     set_tests_properties(nanosm_python_vadd PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(
+        NAME nanosm_python_diverge
+        COMMAND ${CMAKE_COMMAND} -E env
+            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
+            ${Python3_EXECUTABLE} -B -m nanosm kernels/diverge.launch.py
+    )
+    set_tests_properties(nanosm_python_diverge PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # The stepping discipline's regression guard: register drivers run in a
     # random order every cycle (NANOSM_DRIVER_SHUFFLE_SEED); every launch's
     # stdout and Perfetto trace must be byte-identical to the unshuffled run.
