@@ -408,6 +408,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         TmaStoreRegisters stores;
         stores.ring.resize(config_.tma_store_sector_registers);
         tma_store_registers_.poke(std::move(stores));
+        tma_walker_start_pipe_.poke(TmaWalkerStartPipeline(config_.tma_walker_start_cycles));
         warps_.reserve(launch.active_warps);
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
             Warp warp;
@@ -645,7 +646,8 @@ bool Machine::done() const {
         read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
         !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
-        tma.credits_used == 0 && empty(urf_read_rounds_) && drained(tma_read_pairs_.cur()) &&
+        tma.credits_used == 0 && drained(tma_walker_start_pipe_.cur()) && empty(urf_read_rounds_) &&
+        drained(tma_read_pairs_.cur()) &&
         empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
         dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() && drained(urf_pipe_.cur()) &&
         mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
@@ -1543,7 +1545,7 @@ bool Machine::store_slot_waiting() const {
 
 bool Machine::tma_read_in_service() const {
     const auto& transaction = tma_read_txn_.cur();
-    return transaction.has_value() && transaction->request.next_round < transaction->request.rounds.size();
+    return transaction.has_value() && transaction->request.next_round < transaction->request.rounds;
 }
 
 // ---- The selects: one per shared resource (rfc12 sections 5 and 6) ----
@@ -1773,11 +1775,12 @@ const char* tma_port_label(int kind) {
 // carries its store register's index; descriptor rounds return to the
 // frontend latch.
 Machine::ReadBeat Machine::tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register) {
-    const auto rounds = static_cast<uint32_t>(request.rounds.size());
+    const auto rounds = request.rounds;
+    const auto command = request.run.command;
     if (start) {
         trace_->shmem_begin(ShmemService::a_read, cycle_, tma_port_label(static_cast<int>(request.kind)),
-            "command=" + std::to_string(request.command) + ", rounds=" + std::to_string(rounds),
-            TraceCategory::tma, request.command);
+            "command=" + std::to_string(command) + ", rounds=" + std::to_string(rounds),
+            TraceCategory::tma, command);
         if (request.kind == TmaPortKind::store_read) trace_->tma_data_port(rounds);
     }
     trace_->shmem_grant(cycle_, ShmemService::a_read, ShmemClient::tma);
@@ -1787,22 +1790,25 @@ Machine::ReadBeat Machine::tma_read_round(const TmaPortRequest& request, bool st
     beat.client = store ? ReadClient::tma_store : ReadClient::tma_frontend;
     beat.slot = store ? store_register : 0;
     beat.round = request.next_round;
-    beat.addresses = tma_round_addresses(request, request.next_round);
+    beat.addresses = tma_round_addresses(request, tma_round_plan(request).at(request.next_round));
+    // (S) the words a swizzle64 store reads, against their writer's row spacing
+    if (store) sanitizer_.check_tma_store_source(cycle_, command, beat.addresses);
     return beat;
 }
 
-// The distinct words one TMA round touches (at most one per bank).
-std::vector<uint32_t> Machine::tma_round_addresses(const TmaPortRequest& request, std::size_t round) const {
+// The distinct words one TMA round touches: at most one per bank (checked).
+std::vector<uint32_t> Machine::tma_round_addresses(
+    const TmaPortRequest& request, const std::vector<TmaPortRequest::Piece>& pieces) const {
     std::vector<uint32_t> addresses;
-    for (const auto& piece : request.rounds.at(round)) {
-        const auto& fragment = request.fragments.at(piece.fragment);
-        const uint32_t address = fragment.shmem_address + piece.offset;
-        if (static_cast<uint64_t>(address) + piece.size > shmem_.size()) {
+    for (const auto& piece : pieces) {
+        const uint32_t address = tma_piece_address(request.run, piece);
+        if (static_cast<uint64_t>(address) + request.run.element_bytes > shmem_.size()) {
             throw SimError("tma port service is outside shmem");
         }
         const uint32_t word = address / 4 * 4;
         if (std::find(addresses.begin(), addresses.end(), word) == addresses.end()) addresses.push_back(word);
     }
+    if (addresses.size() > config_.shmem_banks) throw SimError("internal: a tma round reads more words than banks");
     return addresses;
 }
 
@@ -1818,13 +1824,13 @@ void Machine::advance_tma_read(Wires& w) {
     const bool returned = shmem.delivered.has_value() && shmem.delivered->client == ReadClient::tma_frontend;
     if (!granted && !returned) return;
     auto transaction = shmem.a_read.tma_start
-        ? TmaReadTransaction{*w.tma.a_read, 0, shmem.tma_store_reserved.value_or(0)}
+        ? TmaReadTransaction{*w.tma.a_read, 0, shmem.tma_store_reserved.value_or(0), {}}
         : *tma_read_txn_.cur();
     auto& request = transaction.request;
     shmem.tma_read_changed = true;
     if (granted) ++request.next_round;
     if (request.kind == TmaPortKind::store_read) {
-        if (request.next_round == request.rounds.size()) {
+        if (request.next_round == request.rounds) {
             shmem.tma_read_after.reset(); // A-read is released at the last round's grant
         } else {
             shmem.tma_read_after = std::move(transaction);
@@ -1832,20 +1838,20 @@ void Machine::advance_tma_read(Wires& w) {
         return;
     }
     if (returned) {
+        // The descriptor's words into the frontend latch: element k is bytes
+        // 4k .. 4k + 3.
         const auto& beat = *shmem.delivered;
-        for (const auto& piece : request.rounds.at(beat.round)) {
-            auto& fragment = request.fragments.at(piece.fragment);
-            const uint32_t address = fragment.shmem_address + piece.offset;
+        const auto plan = tma_round_plan(request);
+        for (const auto& piece : plan.at(beat.round)) {
+            const uint32_t address = tma_piece_address(request.run, piece);
             const auto at = std::find(beat.addresses.begin(), beat.addresses.end(), address / 4 * 4);
             const auto word = beat.words.at(static_cast<std::size_t>(at - beat.addresses.begin()));
-            for (uint32_t byte = 0; byte < piece.size; ++byte) {
-                fragment.data.at(piece.offset + byte) = static_cast<uint8_t>(word >> (8 * (address % 4 + byte)));
-            }
+            std::memcpy(transaction.latch.data() + 4 * piece.element, &word, 4);
         }
         ++transaction.returned;
     }
-    if (transaction.returned == request.rounds.size()) {
-        shmem.tma_read_done = std::move(request);
+    if (transaction.returned == request.rounds) {
+        shmem.tma_read_done = std::move(transaction);
         shmem.tma_read_after.reset();
         return;
     }
@@ -1860,19 +1866,27 @@ void Machine::fill_tma_store_register(const ReadBeat& beat, Wires& w) {
     if (!reg.has_value() || reg->complete()) throw SimError("internal: a TMA store round returned to a free register");
     TmaStoreFill fill;
     fill.store_register = beat.slot;
-    fill.command = reg->command;
-    for (const auto& piece : reg->source.rounds.at(beat.round)) {
-        const auto& fragment = reg->source.fragments.at(piece.fragment);
-        const uint32_t address = fragment.shmem_address + piece.offset;
+    fill.command = reg->run.command;
+    // The store-source read's request as its rounds were planned: the
+    // register's run (a store read: whole words, no rotation rule).
+    TmaPortRequest source;
+    source.kind = TmaPortKind::store_read;
+    source.run = reg->run;
+    const uint32_t bytes = reg->run.element_bytes;
+    const uint32_t first = run_sector_offset(reg->run);
+    const auto plan = tma_round_plan(source);
+    for (const auto& piece : plan.at(beat.round)) {
+        const uint32_t address = tma_piece_address(reg->run, piece);
         const auto at = std::find(beat.addresses.begin(), beat.addresses.end(), address / 4 * 4);
         const auto word = beat.words.at(static_cast<std::size_t>(at - beat.addresses.begin()));
-        const auto offset = static_cast<uint32_t>(fragment.gmem_address - reg->sector_address);
-        for (uint32_t byte = 0; byte < piece.size; ++byte) {
-            fill.bytes.emplace_back(offset + piece.offset + byte, static_cast<uint8_t>(word >> (8 * (address % 4 + byte))));
+        const uint32_t offset = first + uint32_t{piece.element} * bytes;
+        for (uint32_t byte = 0; byte < bytes; ++byte) {
+            fill.bytes.emplace_back(offset + byte, static_cast<uint8_t>(word >> (8 * (address % 4 + byte))));
         }
     }
-    fill.last = reg->returned + 1 == reg->source.rounds.size();
-    probe(LsuEdge::tma_store_round, reg->command, beat.round, static_cast<uint32_t>(4 * beat.addresses.size()));
+    if (fill.bytes.size() > config_.gmem_sector_bytes) throw SimError("internal: a tma store round fills more than a sector");
+    fill.last = reg->returned + 1 == reg->rounds;
+    probe(LsuEdge::tma_store_round, reg->run.command, beat.round, static_cast<uint32_t>(4 * beat.addresses.size()));
     w.shmem.tma_store_fill = std::move(fill);
 }
 
@@ -2080,11 +2094,11 @@ void Machine::serve_b_write(Wires& w) {
     shmem.b_write_beat = placement_round(request, start);
     ++request.next_round;
     shmem.tma_write_changed = true;
-    if (request.next_round != request.rounds.size()) {
+    if (request.next_round != request.rounds) {
         shmem.tma_write_after = std::move(request);
         return;
     }
-    shmem.tma_sector_released = request.from_sector_register;
+    shmem.tma_sector_released = !request.run.zero_fill;
     shmem.tma_write_after.reset();
 }
 
@@ -2092,45 +2106,52 @@ void Machine::serve_b_write(Wires& w) {
 // earlier cycles), or zeros for an OOB fill. The last round carries the
 // placement to the RAM, where its load write ends.
 Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool start) {
-    const auto rounds = static_cast<uint32_t>(request.rounds.size());
-    if (request.rounds.empty() || request.next_round >= rounds) {
+    const auto rounds = request.rounds;
+    const auto& run = request.run;
+    if (rounds == 0 || request.next_round >= rounds) {
         throw SimError("internal zero-round tma placement");
     }
     if (start) {
         trace_->shmem_begin(ShmemService::b_write, cycle_, tma_port_label(static_cast<int>(request.kind)),
-            "command=" + std::to_string(request.command) + ", rounds=" + std::to_string(rounds),
-            TraceCategory::tma, request.command);
+            "command=" + std::to_string(run.command) + ", rounds=" + std::to_string(rounds),
+            TraceCategory::tma, run.command);
         trace_->tma_data_port(rounds);
     }
     const auto& sector = tma_sector_.cur();
-    if (request.from_sector_register && !sector.complete) {
-        throw SimError("internal: TMA placement started before its sector register was complete");
+    if (!run.zero_fill && (!sector.complete || sector.sector_address != run_sector_address(run))) {
+        throw SimError("internal: TMA placement started before its sector register held its sector");
     }
+    // Each piece: its element's bytes from the sector register (the run's
+    // offset in the sector plus element x size), or zeros.
     WriteBeat beat;
     uint32_t bytes = 0;
-    for (const auto& piece : request.rounds[request.next_round]) {
-        const auto& fragment = request.fragments.at(piece.fragment);
-        const uint32_t address = fragment.shmem_address + piece.offset;
-        if (static_cast<uint64_t>(address) + piece.size > shmem_.size()) {
+    const uint32_t size = run.element_bytes;
+    const uint32_t first = run.zero_fill ? 0 : run_sector_offset(run);
+    const auto plan = tma_round_plan(request);
+    for (const auto& piece : plan.at(request.next_round)) {
+        const uint32_t address = tma_piece_address(run, piece);
+        if (static_cast<uint64_t>(address) + size > shmem_.size()) {
             throw SimError("tma port service is outside shmem");
         }
-        const uint8_t* source = fragment.data.data() + piece.offset; // OOB zero fill
-        if (request.from_sector_register) {
-            source = sector.data.data() + (fragment.gmem_address - sector.sector_address) + piece.offset;
+        std::vector<uint8_t> data(size, 0);
+        if (!run.zero_fill) {
+            const uint8_t* source = sector.data.data() + first + uint32_t{piece.element} * size;
+            std::copy(source, source + size, data.begin());
         }
-        beat.writes.push_back({address, std::vector<uint8_t>(source, source + piece.size)});
-        bytes += piece.size;
+        beat.writes.push_back({address, std::move(data)});
+        bytes += size;
     }
+    if (bytes > 4 * config_.shmem_banks) throw SimError("internal: a tma placement round writes more than its banks");
     // C10 (sanitizer): a placement round must not write a live mbar.
     std::vector<std::pair<uint32_t, uint32_t>> written;
     for (const auto& write : beat.writes) {
         written.emplace_back(write.address, write.address + static_cast<uint32_t>(write.bytes.size()));
     }
-    sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(request.command) + " placement", written);
+    sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(run.command) + " placement", written);
     probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);
     trace_->shmem_grant(cycle_, ShmemService::b_write, ShmemClient::tma);
     if (request.next_round + 1 == rounds) {
-        beat.placed = PlacementEnd{request.command, request.fragments};
+        beat.placed = PlacementEnd{run.command};
         trace_->shmem_end(ShmemService::b_write, cycle_ + 1);
     }
     return beat;
@@ -2849,12 +2870,14 @@ void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
 //   3. Port-B write: the front ticket's placement, when no placement is
 //      under way.
 //   4. The frontend command: its descriptor read (A-read), or the walker's
-//      next sector -- a load sector wants the request channel, a store sector
-//      the A-read of its source (and a free TMA store register for its
-//      words). One TMA read in service at a time: none while a descriptor
+//      step (plan_tma_walker) -- a load sector wants the request channel, a
+//      store sector the A-read of its source (and a free TMA store register
+//      for its words); a zero fill or a skipped store stretch wants no shared
+//      resource. One TMA read in service at a time: none while a descriptor
 //      read's words are still coming back, or while a store-source read has
 //      rounds left to be granted. There is no mbar read at the start (rfc12
-//      section 8): the walk begins once the descriptor is decoded.
+//      section 8): the walk begins once the descriptor is decoded and the
+//      walker's start has left its pipeline (nothing is wanted meanwhile).
 Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     TmaRequests want;
     const auto& tma = tma_.cur();
@@ -2878,14 +2901,7 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
 
     if (!tma_write_txn_.cur().has_value() && !tma.returns.empty()) {
         const auto& ticket = tma.returns.front();
-        TmaPortRequest request;
-        request.kind = TmaPortKind::load_write;
-        request.command = ticket.command;
-        request.sector_request = ticket.sector_request;
-        request.from_sector_register = ticket.from_sector_register;
-        request.fragments = ticket.fragments;
-        request.rounds = tma_port_rounds(request.fragments, ticket.from_sector_register);
-        want.placement = std::move(request);
+        want.placement = tma_port_request(TmaPortKind::load_write, ticket.run, ticket.sector_request);
     }
 
     want.frontend = tma.frontend.has_value() ? tma.frontend : next_tma_frontend_command(tma);
@@ -2894,19 +2910,17 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     const bool read_free = !tma_read_txn_.cur().has_value();
     if (command.state == TmaCommandState::descriptor) {
         if (!read_free) return want;
-        TmaPortRequest request;
-        request.kind = TmaPortKind::descriptor;
-        request.command = command.id;
-        for (uint32_t offset = 0; offset < tma_descriptor_bytes; offset += 4) {
-            GmemSectorRequest::TmaFragment fragment;
-            fragment.shmem_address = command.descriptor_address + offset;
-            fragment.size = 4;
-            request.fragments.push_back(fragment);
-        }
-        request.rounds = tma_port_rounds(request.fragments);
-        want.a_read = std::move(request);
+        // The descriptor read: the run of its sixteen words (dense).
+        TmaRun run;
+        run.command = command.id;
+        run.shared_address = command.descriptor_address;
+        run.elements = static_cast<uint8_t>(tma_descriptor_bytes / 4);
+        run.element_bytes = 4;
+        want.a_read = tma_port_request(TmaPortKind::descriptor, run);
         return want;
     }
+    // The walker's start is in its pipeline: the frontend waits for it.
+    if (command.state == TmaCommandState::starting) return want;
     if (command.state != TmaCommandState::walking) {
         want.frontend_reset = true;
         return want;
@@ -2915,14 +2929,9 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     // the head one drained into the egress FIFO this cycle (d)) and no TMA
     // read in service.
     const auto store_register = read_free ? tma_store_register_free(egress) : std::nullopt;
-    want.walker = plan_tma_walker(command, tma.credits_used, store_register.has_value());
+    want.walker = plan_tma_walker(command, tma.walker, tma.credits_used, store_register.has_value());
     if (want.walker->sector == TmaWalkerPlan::Sector::store) {
-        TmaPortRequest request;
-        request.kind = TmaPortKind::store_read;
-        request.command = command.id;
-        request.fragments = want.walker->fragments;
-        request.rounds = tma_port_rounds(request.fragments);
-        want.a_read = std::move(request);
+        want.a_read = tma_port_request(TmaPortKind::store_read, want.walker->run);
         want.store_register = store_register;
     }
     return want;
@@ -2938,71 +2947,86 @@ std::optional<uint32_t> Machine::tma_store_register_free(const EgressWrite& egre
     return (stores.head + held) % size; // full and draining: the head itself
 }
 
-// The walker's next sector, planned from Q. A sector is a run of elements in
-// one gmem sector (contiguous) or, for a load's out-of-bounds elements, a
-// zero fill of at most one sector of shmem. Store OOB elements are skipped
-// (no transaction at all), even in a cycle where the sector is then blocked.
-// Blocked: no credit; a store with the TMA store register busy. A load
-// sector also needs the request channel, which select_request_channel decides.
-Machine::TmaWalkerPlan Machine::plan_tma_walker(
-    const TmaCommand& start, uint32_t credits_used, bool store_register_free) const {
+// The walker's step this cycle, planned from Q (TmaWalker, sim.hpp): ONE
+// run, one zero fill or one skipped stretch, found in closed form from the
+// walker's position and its bounds -- never a loop over elements. From (x, y):
+//   in range   a run to the first of the sector's end ((sector bytes -
+//              address mod sector bytes) / element bytes elements on) and
+//              x_high (the tensor's edge, or the row's end): a load or store
+//              sector;
+//   a load's   a zero fill to the first of x_low (the in-range part) or the
+//   stretch    row's end, and a sector's bytes;
+//   a store's  a skip to x_low or the row's end: no sector, no credit, one
+//   stretch    cycle.
+// A run never leaves its row: a tile whose rows are contiguous in gmem and
+// shorter than a sector takes a sector request per row.
+// Blocked (Sector::none; nothing changes): no credit; a store sector without
+// a free store register (and A-read). A load sector also needs the request
+// channel, which select_request_channel decides.
+Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const TmaWalker& walker,
+    uint32_t credits_used, bool store_register_free) const {
+    using Sector = TmaWalkerPlan::Sector;
     TmaWalkerPlan plan;
-    plan.command_after = start;
-    auto& command = plan.command_after;
     if (command.walker_done) return plan;
     const bool load = command.direction == TmaDirection::load;
-
-    while (!load && !command.walker_done && !tma_coordinate_in_bounds(command)) {
-        (void)tma_advance_coordinate(command);
+    const uint32_t bytes = walker.element_bytes;
+    const uint32_t sector_bytes = config_.gmem_sector_bytes;
+    const uint32_t x = walker.x;
+    const bool row_in_range = walker.y >= walker.y_low && walker.y < walker.y_high;
+    const bool in_range = row_in_range && x >= walker.x_low && x < walker.x_high;
+    const uint64_t global = walker.row_global + uint64_t{x} * bytes; // x x bytes: a shift
+    uint32_t end = 0;
+    if (in_range) {
+        const uint32_t to_sector_end = (sector_bytes - static_cast<uint32_t>(global % sector_bytes)) / bytes;
+        end = std::min<uint32_t>(walker.x_high, x + to_sector_end);
+        plan.sector = load ? Sector::load : Sector::store;
+    } else {
+        end = row_in_range && x < walker.x_low ? walker.x_low : walker.tile_length;
+        if (load) end = std::min<uint32_t>(end, x + sector_bytes / bytes);
+        plan.sector = load ? Sector::zero_fill : Sector::skip;
     }
-    if (command.walker_done) return plan;
-    if (credits_used == config_.tma_sector_credits) return plan;
-    if (!load && !store_register_free) return plan;
-
-    const bool synthetic_zero = load && !tma_coordinate_in_bounds(command);
-    uint64_t sector_address = 0;
-    uint64_t expected_next_gmem = 0;
-    uint32_t bytes = 0;
-    while (!command.walker_done) {
-        const bool in_bounds = tma_coordinate_in_bounds(command);
-        if (load && synthetic_zero != !in_bounds) break;
-        if (!load && !in_bounds) break;
-
-        const auto shmem_address = tma_shmem_address(command);
-        uint64_t gmem_address = 0;
-        if (in_bounds) {
-            gmem_address = tma_gmem_address(command);
-            const auto element_sector =
-                (gmem_address / config_.gmem_sector_bytes) * config_.gmem_sector_bytes;
-            if (!plan.fragments.empty() &&
-                (element_sector != sector_address || gmem_address != expected_next_gmem)) {
-                break;
+    if (end <= x || end > walker.tile_length) throw SimError("internal: the tma walker made no progress");
+    if (plan.sector != Sector::skip) {
+        if (credits_used >= config_.tma_sector_credits ||
+            (plan.sector == Sector::store && !store_register_free)) {
+            plan.sector = Sector::none;
+            return plan;
+        }
+        auto& run = plan.run;
+        run.command = command.id;
+        run.elements = static_cast<uint8_t>(end - x);
+        run.element_bytes = static_cast<uint8_t>(bytes);
+        run.zero_fill = !in_range;
+        run.layout = walker.layout;
+        run.transposed = walker.transposed;
+        run.spacing = walker.spacing;
+        // Element x's unshuffled shared address: x x bytes, or (transposed) x x
+        // the stored row's bytes -- a shift either way.
+        run.shared_address = walker.row_shared + x * (walker.transposed ? walker.spacing : bytes);
+        const uint64_t step = walker.transposed ? walker.spacing : bytes;
+        if (uint64_t{run.shared_address} + (run.elements - 1) * step + bytes > shmem_.size()) {
+            throw SimError("internal: a tma run is outside shmem (the tile was checked at its decode)");
+        }
+        if (in_range) {
+            run.global_address = global;
+            const uint64_t run_bytes = uint64_t{run.elements} * bytes;
+            if (global > gmem_.size() || run_bytes > gmem_.size() - global) {
+                throw SimError("tma global access is outside gmem");
             }
-            sector_address = element_sector;
-            expected_next_gmem = gmem_address + command.descriptor.element_bytes;
-        } else if (bytes + command.descriptor.element_bytes > config_.gmem_sector_bytes) {
-            break;
+            plan.sector_address = run_sector_address(run);
         }
-
-        GmemSectorRequest::TmaFragment fragment;
-        fragment.gmem_address = gmem_address;
-        fragment.shmem_address = shmem_address;
-        fragment.size = command.descriptor.element_bytes;
-        plan.fragments.push_back(fragment);
-        bytes += fragment.size;
-        if (in_bounds) command.useful_bytes += fragment.size;
-        (void)tma_advance_coordinate(command);
     }
-    if (plan.fragments.empty()) throw SimError("tma walker failed to emit an element");
-    plan.sector_address = sector_address;
-    plan.sector = synthetic_zero ? TmaWalkerPlan::Sector::zero_fill
-        : load ? TmaWalkerPlan::Sector::load : TmaWalkerPlan::Sector::store;
-    if (!load) {
-        for (const auto& fragment : plan.fragments) {
-            const auto offset = fragment.gmem_address - sector_address;
-            for (uint32_t byte = 0; byte < fragment.size; ++byte)
-                plan.store_byte_enable |= 1ull << (offset + byte);
-        }
+    // The walker after the step: along the row, or to the next row (one add
+    // of each row step).
+    auto& next = plan.walker_after;
+    next = walker;
+    next.x = static_cast<uint16_t>(end);
+    if (end == walker.tile_length) {
+        next.x = 0;
+        next.y = static_cast<uint16_t>(walker.y + 1);
+        next.row_global += walker.row_step_global;
+        next.row_shared += walker.row_step_shared;
+        plan.done_after = next.y == walker.tile_rows;
     }
     return plan;
 }
@@ -3026,7 +3050,19 @@ void Machine::step_tma(Wires& w) {
         trace_tma_depths(tma, cycle_ + 1);
     }
     apply_tma_requests(tma, w);
-    if (w.shmem.tma_read_done.has_value()) complete_tma_frontend_read(tma, *w.shmem.tma_read_done);
+    // The walker's start at the start pipeline's last stage loads the walker:
+    // the command walks from the next cycle.
+    const auto& start_pipe = tma_walker_start_pipe_.cur();
+    if (!start_pipe.empty() && start_pipe.back().has_value()) {
+        const auto& start = *start_pipe.back();
+        auto& command = tma.commands.at(start.command);
+        if (command.state != TmaCommandState::starting || tma.frontend != start.command) {
+            throw SimError("internal: a tma walker start left its pipeline for a command not starting");
+        }
+        tma.walker = start.walker;
+        command.state = TmaCommandState::walking;
+    }
+    if (w.shmem.tma_read_done.has_value()) complete_tma_frontend_read(tma, *w.shmem.tma_read_done, w);
     if (w.shmem.tma_store_fill.has_value() && w.shmem.tma_store_fill->last) {
         complete_tma_store_capture(tma, w.shmem.tma_store_fill->command);
     }
@@ -3062,20 +3098,24 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
     const auto& plan = *w.tma.walker;
     auto& command = tma.commands.at(*tma.frontend);
     // A store sector goes when A-read grants its source read; the others
-    // when the request channel lets them through.
+    // when the request channel lets them through; a skip always goes.
     const bool store_read_granted = w.shmem.a_read.user == AReadUser::tma && w.shmem.a_read.tma_start;
     const bool emits = plan.sector == Sector::store ? store_read_granted
-                                                    : plan.sector != Sector::none && w.channel.walker_proceeds;
-    if (plan.sector == Sector::none || emits) command = plan.command_after;
+        : (plan.sector == Sector::load || plan.sector == Sector::zero_fill) && w.channel.walker_proceeds;
+    if (plan.sector == Sector::skip || emits) {
+        tma.walker = plan.walker_after;
+        if (plan.done_after) command.walker_done = true;
+    }
     if (emits) {
         ++tma.credits_used;
+        if (tma.credits_used > config_.tma_sector_credits) throw SimError("internal: tma sector credits overrun");
         trace_tma_depths(tma, cycle_);
+        if (!plan.run.zero_fill) command.useful_bytes += uint64_t{plan.run.elements} * plan.run.element_bytes;
         switch (plan.sector) {
         case Sector::zero_fill: {
             TmaReturn returned;
-            returned.command = command.id;
+            returned.run = plan.run;
             returned.sector_request = w.channel.walker_id;
-            returned.fragments = plan.fragments;
             ++command.pending_load_writes;
             tma.returns.push_back(std::move(returned));
             trace_tma_depths(tma, cycle_);
@@ -3090,6 +3130,7 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
             ++command.pending_store_captures;
             break;
         case Sector::none:
+        case Sector::skip:
             break;
         }
     }
@@ -3102,10 +3143,13 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
 }
 
 // A descriptor read's last round is back: its data is in `request` (the
-// frontend latch). The command walks next (I3: no mbar phase read and no
-// "enough transaction bytes" check -- the tx count is signed, rfc12 section 8).
-void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& request) {
-    auto command_it = tma.commands.find(request.command);
+// frontend latch). The walker's start enters its pipeline (or, with no
+// stages, loads the walker now); the command walks after it (I3: no mbar
+// phase read and no "enough transaction bytes" check -- the tx count is
+// signed, rfc12 section 8).
+void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w) {
+    const auto& request = read.request;
+    auto command_it = tma.commands.find(request.run.command);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
     auto& command = command_it->second;
 
@@ -3114,22 +3158,21 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& re
         if (command.state != TmaCommandState::descriptor) {
             throw SimError("tma descriptor read completed in the wrong command state");
         }
-        std::array<uint8_t, tma_descriptor_bytes> bytes{};
-        for (const auto& fragment : request.fragments) {
-            const uint32_t offset = fragment.shmem_address - command.descriptor_address;
-            if (offset + fragment.size > bytes.size()) {
-                throw SimError("tma descriptor fragment is outside the descriptor");
-            }
-            std::memcpy(bytes.data() + offset, fragment.data.data(), fragment.size);
-        }
-        command.descriptor = decode_tma_descriptor(bytes.data(), bytes.size());
-        command.logical_bytes = tma_logical_bytes(command.descriptor);
-        validate_tma_runtime_descriptor(command);
-        tma_command_start(command);
+        if (tma.frontend != command.id) throw SimError("internal: a descriptor returned for a command not walked next");
+        const auto descriptor = decode_tma_descriptor(read.latch.data(), read.latch.size());
+        command.logical_bytes = tma_logical_bytes(descriptor);
+        validate_tma_runtime_descriptor(command, descriptor);
+        auto walker = tma_walker_start(command, descriptor);
         // releases the descriptor read-ownership; verifies the accept-time peek
-        sanitizer_.record_tma_descriptor_read(command.id, command.descriptor, command.shmem_address,
+        sanitizer_.record_tma_descriptor_read(command.id, descriptor, command.shmem_address,
             command.direction == TmaDirection::load);
-        command.state = TmaCommandState::walking;
+        if (config_.tma_walker_start_cycles == 0) {
+            tma.walker = std::move(walker);
+            command.state = TmaCommandState::walking;
+        } else {
+            w.tma_walker_starting = TmaWalkerStart{command.id, std::move(walker)};
+            command.state = TmaCommandState::starting;
+        }
         return;
     }
     case TmaPortKind::load_write:
@@ -3150,11 +3193,6 @@ void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed)
     auto& command = command_it->second;
     if (command.direction != TmaDirection::load || command.pending_load_writes == 0) {
         throw SimError("unexpected tma load return");
-    }
-    for (const auto& fragment : placed.fragments) {
-        if (static_cast<uint64_t>(fragment.shmem_address) + fragment.size > shmem_.size()) {
-            throw SimError("tma load return is outside shmem");
-        }
     }
     --command.pending_load_writes;
     release_tma_credit(tma);
@@ -3180,7 +3218,7 @@ void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
 
 std::optional<uint64_t> Machine::next_tma_frontend_command(const TmaQueue& tma) const {
     for (const auto& [id, command] : tma.commands) {
-        if (command.state == TmaCommandState::descriptor ||
+        if (command.state == TmaCommandState::descriptor || command.state == TmaCommandState::starting ||
             (command.state == TmaCommandState::walking && !command.walker_done)) {
             return id;
         }
@@ -3195,153 +3233,139 @@ std::optional<uint64_t> Machine::next_data_complete_tma_command(const TmaQueue& 
     return std::nullopt;
 }
 
-// The bank rounds of one TMA shmem transaction: each round, every bank serves
-// one word.
+// The bank rounds of one TMA shmem transaction, from its run: each round,
+// every bank serves one word. A piece is one element: its bytes lie in one
+// shared word and (a sector run) one sector word, because both addresses are
+// multiples of the element size (the descriptor's base is; the strides count
+// elements; the buffer is 64-byte aligned) and the shuffle moves whole words.
 //
-// A load's placement from the sector register (from_sector_register) has one
-// more rule (HUMAN 2026-11-18): in a round a bank takes its bytes from ONE
-// 4-byte word of the sector register, rotated by one byte amount, and writes
-// them with byte enables. That is all the wiring the path has per bank: a
-// word select, a four-way byte rotate, four byte enables. A shared word whose
-// bytes come from two sector words (a row that starts off a 4-byte boundary)
-// is therefore two partial writes in two rounds; a word that straddles two
+// A load's placement from the sector register has one more rule (HUMAN
+// 2026-11-18): in a round a bank takes its bytes from ONE 4-byte word of the
+// sector register, rotated by one byte amount, and writes them with byte
+// enables. That is all the wiring the path has per bank: a word select, a
+// four-way byte rotate, four byte enables. A shared word whose bytes come
+// from two sector words (a row that starts off a 4-byte boundary) is
+// therefore two partial writes in two rounds; a word that straddles two
 // sectors gets its halves from the two sectors' placements. Crooked data is
 // slower, never refused. Reads (the descriptor, a store's source) and zero
-// fills take whole words and have no such rule.
-std::vector<std::vector<Machine::TmaPortRequest::Piece>> Machine::tma_port_rounds(
-    const std::vector<GmemSectorRequest::TmaFragment>& fragments, bool from_sector_register) const {
+// fills take whole words and have no such rule. In each bank the sources
+// take rounds in (shared word, sector word, rotation) order.
+//
+// Worst case per sector (tma_max_rounds, tma_max_pieces; checked here):
+//   pieces  one per element: at most sector bytes / element bytes (32 at the
+//           canonical profile, a run of 1-byte elements; the descriptor
+//           read: 16);
+//   rounds  with 16 or more banks, a power of two (the canonical 16): a
+//           row's run covers at most sector bytes / 4 + 1 consecutive
+//           unshuffled words (9), shuffled by one row number, so at most
+//           ceil(9 / 16) = 1 per bank, each with at most two sources: 2
+//           rounds; a transposed run's elements sit in consecutive stored
+//           rows, any 16 of which put the same word on 16 banks: 1 round;
+//           the descriptor's 16 aligned words: 1 round. So 2 x ceil((sector
+//           bytes / 4 + 1) / 16) = 2 rounds at the canonical profile. Any
+//           other bank count: at most one round per piece.
+uint32_t Machine::tma_max_pieces() const {
+    return std::max<uint32_t>(config_.gmem_sector_bytes, tma_descriptor_bytes / 4);
+}
+
+uint32_t Machine::tma_max_rounds() const {
+    const uint32_t banks = config_.shmem_banks;
+    if (banks >= 16 && (banks & (banks - 1)) == 0) return 2 * ((config_.gmem_sector_bytes / 4 + 1 + 15) / 16);
+    return tma_max_pieces();
+}
+
+// Where a piece (element) starts in shared memory: the run's unshuffled
+// address plus the element's step (a shift), through the layout's shuffle.
+uint32_t Machine::tma_piece_address(const TmaRun& run, const TmaPortRequest::Piece& piece) const {
+    const uint32_t step = run.transposed ? run.spacing : run.element_bytes;
+    const uint32_t natural = run.shared_address + uint32_t{piece.element} * step;
+    return run.layout == TileLayout::swizzle64 ? swizzle64_shuffle(natural, run.spacing) : natural;
+}
+
+Machine::TmaRoundPlan Machine::tma_round_plan(const TmaPortRequest& request) const {
     using Piece = TmaPortRequest::Piece;
-    // Per bank: (shared word, sector word, byte rotation) -> its bytes.
+    const auto& run = request.run;
+    const bool from_sector_register = request.kind == TmaPortKind::load_write && !run.zero_fill;
+    const uint32_t bytes = run.element_bytes;
+    if (run.elements == 0 || run.elements > tma_max_pieces() || (bytes != 1 && bytes != 2 && bytes != 4)) {
+        throw SimError("internal: a tma run of " + std::to_string(run.elements) + " elements of " +
+            std::to_string(bytes) + " bytes");
+    }
+    // Per bank: (shared word, sector word, byte rotation) -> its pieces.
     using Source = std::tuple<uint32_t, uint64_t, uint8_t>;
-    std::vector<std::map<Source, std::vector<Piece>>> words(config_.shmem_banks);
-    std::set<std::pair<uint32_t, uint8_t>> occupied;
-    for (uint32_t index = 0; index < fragments.size(); ++index) {
-        const auto& fragment = fragments[index];
-        if (fragment.size == 0 || fragment.size > fragment.data.size()) {
-            throw SimError("invalid tma shmem fragment size");
+    std::vector<std::map<Source, std::vector<Piece>>> banks(config_.shmem_banks);
+    for (uint32_t element = 0; element < run.elements; ++element) {
+        const Piece piece{static_cast<uint8_t>(element)};
+        const uint32_t address = tma_piece_address(run, piece);
+        if (address % bytes != 0) throw SimError("internal: a tma element is not aligned in shmem");
+        Source source{address / 4, 0, 0};
+        if (from_sector_register) {
+            const uint64_t from = run.global_address + uint64_t{element} * bytes;
+            if (from % bytes != 0) throw SimError("internal: a tma element is not aligned in gmem");
+            source = {address / 4, from / 4, static_cast<uint8_t>((address % 4 + 4 - from % 4) % 4)};
         }
-        uint8_t offset = 0;
-        while (offset < fragment.size) {
-            const uint32_t address = fragment.shmem_address + offset;
-            const uint32_t word = address / 4;
-            const uint8_t within = static_cast<uint8_t>(address % 4);
-            uint32_t run = std::min<uint32_t>(fragment.size - offset, 4 - within);
-            Source source{word, 0, 0};
-            if (from_sector_register) {
-                const uint64_t from = fragment.gmem_address + offset;
-                const uint8_t from_within = static_cast<uint8_t>(from % 4);
-                run = std::min<uint32_t>(run, 4 - from_within);
-                source = {word, from / 4, static_cast<uint8_t>((within + 4 - from_within) % 4)};
-            }
-            const uint8_t size = static_cast<uint8_t>(run);
-            for (uint8_t byte = 0; byte < size; ++byte) {
-                if (!occupied.emplace(word, uint8_t(within + byte)).second) {
-                    throw SimError("overlapping tma fragments target the same shmem byte");
-                }
-            }
-            words[word % config_.shmem_banks][source].push_back(Piece{index, offset, size});
-            offset = static_cast<uint8_t>(offset + size);
-        }
+        banks[(address / 4) % config_.shmem_banks][source].push_back(piece);
     }
     std::size_t rounds = 0;
-    for (const auto& bank : words) rounds = std::max(rounds, bank.size());
-    if (rounds == 0 || rounds > std::numeric_limits<uint32_t>::max()) {
-        throw SimError("invalid tma shmem request round count");
+    for (const auto& bank : banks) rounds = std::max(rounds, bank.size());
+    if (rounds == 0 || rounds > tma_max_rounds()) {
+        throw SimError("internal: a tma transaction of " + std::to_string(rounds) + " bank rounds (the bound is " +
+            std::to_string(tma_max_rounds()) + ")");
     }
-    std::vector<std::vector<Piece>> result(rounds);
-    for (const auto& bank : words) {
+    TmaRoundPlan plan(rounds);
+    for (const auto& bank : banks) {
         std::size_t round = 0;
         for (const auto& [source, pieces] : bank) {
             (void)source;
-            result[round].insert(result[round].end(), pieces.begin(), pieces.end());
+            plan[round].insert(plan[round].end(), pieces.begin(), pieces.end());
             ++round;
         }
     }
-    return result;
+    return plan;
 }
 
-// The walker's next element: along the row (dimension 0), then the next row.
-bool Machine::tma_advance_coordinate(TmaCommand& command) {
-    if (++command.x < command.descriptor.tile_length) return true;
-    command.x = 0;
-    if (++command.y < command.descriptor.tile_rows) return true;
-    command.y = 0;
-    command.walker_done = true;
-    return false;
+Machine::TmaPortRequest Machine::tma_port_request(TmaPortKind kind, const TmaRun& run, uint64_t sector_request) const {
+    TmaPortRequest request;
+    request.kind = kind;
+    request.sector_request = sector_request;
+    request.run = run;
+    request.rounds = static_cast<uint32_t>(tma_round_plan(request).size());
+    return request;
 }
 
-// The walker's element is inside the tensor in every dimension: dimension 0
-// at c0 + x, the row dimension at its coordinate + y, the other two at their
-// coordinates (fixed_in_bounds, decided once per command).
-bool Machine::tma_coordinate_in_bounds(const TmaCommand& command) const {
-    const auto& descriptor = command.descriptor;
-    const auto inside = [&](uint32_t dimension, int64_t coordinate) {
-        return coordinate >= 0 && static_cast<uint64_t>(coordinate) < descriptor.dimensions[dimension];
-    };
-    const auto row = descriptor.row_dimension;
-    return command.fixed_in_bounds && inside(0, int64_t{command.coordinates[0]} + command.x) &&
-        inside(row, int64_t{command.coordinates[row]} + command.y);
+// The run's sector, its first byte's offset in it, and the byte enables of
+// its bytes (a store's AXI strobes): a decoder of (offset, length).
+uint64_t Machine::run_sector_address(const TmaRun& run) const {
+    return run.global_address - run.global_address % config_.gmem_sector_bytes;
 }
 
-// An in-bounds element's global byte address:
-//     base + (c0 + x + (c_row + y) s_row + fixed_offset) x element_bytes
-// (src/tma.hpp; in bounds, every coordinate is at or above zero). Arithmetic
-// that leaves 64 bits is a SimError, not machine behaviour.
-uint64_t Machine::tma_gmem_address(const TmaCommand& command) const {
-    const auto& descriptor = command.descriptor;
-    const auto row = descriptor.row_dimension;
-    const auto overflow = [] { throw SimError("tma global address arithmetic overflow"); };
-    uint64_t element = static_cast<uint64_t>(int64_t{command.coordinates[0]} + command.x);
-    const auto row_index = static_cast<uint64_t>(int64_t{command.coordinates[row]} + command.y);
-    const auto stride = tma_stride(descriptor, row);
-    if (row_index != 0 && stride > UINT64_MAX / row_index) overflow();
-    if (element > UINT64_MAX - row_index * stride) overflow();
-    element += row_index * stride;
-    if (element > UINT64_MAX - command.fixed_offset) overflow();
-    element += command.fixed_offset;
-    if (element > UINT64_MAX / descriptor.element_bytes) overflow();
-    const auto byte_offset = element * descriptor.element_bytes;
-    if (descriptor.base > UINT64_MAX - byte_offset) overflow();
-    const auto address = descriptor.base + byte_offset;
-    if (address > gmem_.size() || descriptor.element_bytes > gmem_.size() - address) {
-        throw SimError("tma global access is outside gmem");
-    }
-    return address;
+uint32_t Machine::run_sector_offset(const TmaRun& run) const {
+    return static_cast<uint32_t>(run.global_address % config_.gmem_sector_bytes);
 }
 
-// Where the walker's element lands in (load) or comes from (store) shared
-// memory, in its descriptor's layout (src/tma.hpp tma_tile_address, through
-// src/layout.hpp: a swizzle64 tile is shuffled by the address itself).
-uint32_t Machine::tma_shmem_address(const TmaCommand& command) const {
-    const auto address = tma_tile_address(command.descriptor, command.shmem_address, command.x, command.y);
-    if (address > shmem_.size() || command.descriptor.element_bytes > shmem_.size() - address) {
-        throw SimError("tma shmem access is outside shmem");
-    }
-    return static_cast<uint32_t>(address);
+uint64_t Machine::run_byte_enable(const TmaRun& run) const {
+    const uint32_t length = uint32_t{run.elements} * run.element_bytes;
+    const uint64_t mask = length >= 64 ? ~0ull : (1ull << length) - 1;
+    return mask << run_sector_offset(run);
 }
 
-// Once per command, at the descriptor's decode: the two dimensions the tile
-// does not walk (neither 0 nor the row dimension) -- are their coordinates
-// inside the tensor, and their element offset.
-void Machine::tma_command_start(TmaCommand& command) const {
-    const auto& descriptor = command.descriptor;
-    command.fixed_in_bounds = true;
-    command.fixed_offset = 0;
-    for (uint32_t dimension = 1; dimension < tma_max_coordinates; ++dimension) {
-        if (dimension == descriptor.row_dimension) continue;
-        const int64_t coordinate = command.coordinates[dimension];
-        if (coordinate < 0 || static_cast<uint64_t>(coordinate) >= descriptor.dimensions[dimension]) {
-            command.fixed_in_bounds = false;
-            command.fixed_offset = 0;
-            return;
-        }
-        const auto term = static_cast<uint64_t>(coordinate) * tma_stride(descriptor, dimension);
-        if (command.fixed_offset > UINT64_MAX - term) throw SimError("tma global address arithmetic overflow");
-        command.fixed_offset += term;
-    }
-}
-
-void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
+// The walker's registers for the command whose descriptor has just come
+// back (TmaWalker, sim.hpp), computed in that cycle from the decoded
+// descriptor and the command's coordinates; they travel through the walker
+// start pipeline's tma.walker_start_cycles stages (TmaWalkerStart, canonical
+// 2) before the walker is loaded, so the walk starts that many cycles after
+// the next one (0 stages: in the next one, the timing before the stages).
+// Three products, side by side, each a 32-bit coordinate x a 32-bit stride:
+// the row dimension's (c_row x s_row) and the two other dimensions' (c_k x
+// s_k; their in-range test is two compares each); the stages are theirs and
+// the add chain's (trash/walker-followups-2026-11-20.md).
+// Everything else is subtracts, compares and shifts:
+//   x_low  = clamp(-c0, 0, length)        x_high = clamp(d0 - c0, 0, length)
+//   y_low  = clamp(-c_row, 0, rows)       y_high = clamp(d_row - c_row, 0, rows)
+//            (both 0 when another dimension's coordinate is outside)
+//   row_global (row 0) = base + (c0 + c_row s_row + c_a s_a + c_b s_b) x element bytes,
+//            modulo 2^64: exact wherever a row is in range.
+void Machine::validate_tma_runtime_descriptor(const TmaCommand& command, const TmaDescriptor& descriptor) const {
     if (command.logical_bytes == 0 ||
         command.logical_bytes > std::numeric_limits<uint32_t>::max()) {
         throw SimError("tma logical byte count is outside the mbar encoding");
@@ -3352,9 +3376,71 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command) const {
         command.logical_bytes > shmem_.size() - command.shmem_address) {
         throw SimError("tma tile does not fit in shmem");
     }
-    if (command.descriptor.base > gmem_.size()) {
+    if (descriptor.base > gmem_.size()) {
         throw SimError("tma global base is outside gmem");
     }
+}
+
+Machine::TmaWalker Machine::tma_walker_start(const TmaCommand& command, const TmaDescriptor& descriptor) const {
+    TmaWalker walker;
+    const uint32_t bytes = descriptor.element_bytes;
+    const uint32_t row = descriptor.row_dimension;
+    const int64_t length = descriptor.tile_length;
+    const int64_t rows = descriptor.tile_rows;
+    const int64_t c0 = command.coordinates[0];
+    const int64_t c_row = command.coordinates[row];
+    const auto clamp = [](int64_t value, int64_t high) {
+        return static_cast<uint16_t>(std::clamp<int64_t>(value, 0, high));
+    };
+    walker.tile_length = descriptor.tile_length;
+    walker.tile_rows = descriptor.tile_rows;
+    walker.element_bytes = static_cast<uint8_t>(bytes);
+    walker.layout = descriptor.layout;
+    walker.transposed = descriptor.transposed;
+    walker.spacing = descriptor.layout == TileLayout::swizzle64 ? tma_swizzle64_row_bytes(descriptor) : 0;
+    walker.x_low = clamp(-c0, length);
+    walker.x_high = clamp(int64_t{descriptor.dimensions[0]} - c0, length);
+    // The two dimensions the tile does not walk: inside, and their offset.
+    bool others_in_range = true;
+    uint64_t others = 0; // < 2 x 2^31 x 2^32: fits
+    for (uint32_t dimension = 1; dimension < tma_max_coordinates; ++dimension) {
+        if (dimension == row) continue;
+        const int64_t coordinate = command.coordinates[dimension];
+        if (coordinate < 0 || static_cast<uint64_t>(coordinate) >= descriptor.dimensions[dimension]) {
+            others_in_range = false;
+            continue;
+        }
+        others += static_cast<uint64_t>(coordinate) * tma_stride(descriptor, dimension);
+    }
+    if (others_in_range) {
+        walker.y_low = clamp(-c_row, rows);
+        walker.y_high = clamp(int64_t{descriptor.dimensions[row]} - c_row, rows);
+    }
+    const uint64_t s_row = tma_stride(descriptor, row);
+    // Element (0, 0)'s index and address, modulo 2^64 (unsigned wrap): |c_row x
+    // s_row| < 2^63.
+    const uint64_t element0 = static_cast<uint64_t>(c0) + static_cast<uint64_t>(c_row * static_cast<int64_t>(s_row)) +
+        others;
+    walker.row_global = descriptor.base + element0 * bytes;
+    walker.row_step_global = s_row * bytes;
+    walker.row_shared = command.shmem_address;
+    walker.row_step_shared = descriptor.transposed ? bytes : uint32_t{descriptor.tile_length} * bytes;
+    // Simulator check, not machine behaviour: the highest in-range element's
+    // address must not leave 64 bits (each in-range address is then exact).
+    if (walker.x_low < walker.x_high && walker.y_low < walker.y_high) {
+        const auto overflow = [] { throw SimError("tma global address arithmetic overflow"); };
+        const uint64_t last_x = static_cast<uint64_t>(c0 + walker.x_high - 1);
+        const uint64_t last_row = static_cast<uint64_t>(c_row + walker.y_high - 1);
+        if (last_row != 0 && s_row > UINT64_MAX / last_row) overflow();
+        uint64_t element = last_row * s_row;
+        if (element > UINT64_MAX - last_x) overflow();
+        element += last_x;
+        if (element > UINT64_MAX - others) overflow();
+        element += others;
+        if (element >= UINT64_MAX / bytes) overflow();
+        if (descriptor.base > UINT64_MAX - (element + 1) * bytes) overflow();
+    }
+    return walker;
 }
 
 void Machine::release_tma_credit(TmaQueue& tma) {
@@ -4904,7 +4990,7 @@ void Machine::land_urf_write(const Wires& w) {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 37> canonical = {
+    static constexpr std::array<Driver, 38> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -4925,6 +5011,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_acc_transfers,
         &Machine::drive_acc_ld_pipe,
         &Machine::drive_tma_queue,
+        &Machine::drive_tma_walker_start,
         &Machine::drive_tma_transactions,
         &Machine::drive_tma_sector,
         &Machine::drive_tma_store_registers,
@@ -5262,7 +5349,36 @@ void Machine::drive_issue_read_banks(const Wires& w) {
 void Machine::drive_tma_queue(const Wires& w) {
     auto next = w.tma_next;
     if (w.tma_pushed.has_value()) next.commands.emplace(w.tma_pushed->id, *w.tma_pushed);
+    // The hardware sizes (TmaQueue, sim.hpp): issue's admission and the
+    // credits keep them; exceeding one is a machine bug.
+    if (next.commands.size() > config_.tma_queue_commands) {
+        throw SimError("internal: the TMA queue holds more than tma.queue_commands commands");
+    }
+    if (next.credits_used > config_.tma_sector_credits || next.returns.size() > next.credits_used) {
+        throw SimError("internal: TMA placement tickets exceed the sector credits");
+    }
     tma_.set_next(std::move(next), "drive_tma_queue");
+}
+
+// The walker start pipeline moves one stage: a start whose descriptor came
+// back now enters stage 0; the one in the last stage loaded the walker now
+// (step_tma) and leaves. Only the frontend command starts, so at most one
+// stage is occupied (checked).
+void Machine::drive_tma_walker_start(const Wires& w) {
+    const auto& cur = tma_walker_start_pipe_.cur();
+    if (cur.empty()) {
+        if (w.tma_walker_starting.has_value()) throw SimError("internal: a tma walker start with no start stages");
+        return;
+    }
+    const auto occupied = [](const TmaWalkerStartPipeline& pipe) {
+        return std::count_if(pipe.begin(), pipe.end(), [](const auto& stage) { return stage.has_value(); });
+    };
+    if (!w.tma_walker_starting.has_value() && occupied(cur) == 0) return;
+    TmaWalkerStartPipeline next(cur.size());
+    next.front() = w.tma_walker_starting;
+    for (std::size_t stage = 1; stage < cur.size(); ++stage) next[stage] = cur[stage - 1];
+    if (occupied(next) > 1) throw SimError("internal: two tma walker starts in the start pipeline");
+    tma_walker_start_pipe_.set_next(std::move(next), "drive_tma_walker_start");
 }
 
 // The URF's round counter moves to its next round (it empties after the
@@ -5342,13 +5458,10 @@ void Machine::drive_tma_store_registers(const Wires& w) {
     if (reserved.has_value()) {
         auto& reg = next.ring.at(*reserved);
         if (reg.has_value()) throw SimError("internal: a TMA store register reserved twice");
-        const auto& plan = *w.tma.walker;
         TmaStoreRegister fresh;
-        fresh.command = *w.tma.frontend;
-        fresh.sector_address = plan.sector_address;
+        fresh.run = w.tma.walker->run;
+        fresh.rounds = w.tma.a_read->rounds;
         fresh.data.assign(config_.gmem_sector_bytes, 0);
-        fresh.byte_enable = plan.store_byte_enable;
-        fresh.source = *w.tma.a_read;
         reg = std::move(fresh);
     }
     if (fill.has_value()) {
@@ -5396,6 +5509,9 @@ void Machine::drive_lsu_commands(const Wires& w) {
     });
     if (w.dispatch.lsu.has_value()) next.push_back(w.dispatch.lsu->command);
     if (w.lsu_rf_read.command.has_value()) ++command(*w.lsu_rf_read.command).chunks_done;
+    if (next.size() > config_.lsu_active_commands) {
+        throw SimError("internal: the LSU holds more than lsu.active_commands commands");
+    }
     lsu_commands_.set_next(std::move(next), "drive_lsu_commands");
 }
 
@@ -5486,6 +5602,13 @@ void Machine::drive_ingress(const Wires& w) {
         next.bytes += static_cast<uint32_t>(beat.bytes.size());
         next.beats.push_back(beat);
     }
+    // The BRAM's size (IngressFifo): bytes, and the beats of that many sectors.
+    const uint32_t beats_per_sector =
+        (config_.gmem_sector_bytes + config_.gmem_bus_bytes_per_dram_tick - 1) / config_.gmem_bus_bytes_per_dram_tick;
+    if (next.bytes > config_.lsu_ingress_sectors * config_.gmem_sector_bytes ||
+        next.beats.size() > std::size_t{config_.lsu_ingress_sectors} * beats_per_sector) {
+        throw SimError("internal: the ingress FIFO holds more than lsu.ingress_sectors sectors");
+    }
     ingress_.set_next(std::move(next), "drive_ingress");
 }
 
@@ -5512,6 +5635,9 @@ void Machine::drive_egress(const Wires& w) {
         open.words_written += static_cast<uint32_t>(w.egress.words.size());
         if (w.egress.slot_complete) open.complete_cycle = cycle_;
     }
+    if (next.size() > config_.lsu_egress_sectors) {
+        throw SimError("internal: the egress FIFO holds more than lsu.egress_sectors slots");
+    }
     egress_fifo_.set_next(std::move(next), "drive_egress");
 }
 
@@ -5524,6 +5650,21 @@ void Machine::drive_read_records(const Wires& w) {
     for (const auto& [id, record] : w.ingress.records) {
         if (record.has_value()) next[id] = *record;
         else next.erase(id);
+    }
+    // The table's size (ReadRecord): per kind of reader.
+    std::size_t tma = 0;
+    std::size_t vector = 0;
+    std::size_t free_ids = 0;
+    for (const auto& [id, record] : next) {
+        (void)id;
+        if (record.kind == ReadKind::tma) ++tma;
+        else if (record.kind == ReadKind::vector) ++vector;
+        else ++free_ids;
+    }
+    const std::size_t vector_sectors = std::size_t{8} * config_.lanes * 4 / config_.gmem_sector_bytes;
+    if (tma > config_.tma_sector_credits || vector > config_.lsu_active_commands * vector_sectors ||
+        free_ids > config_.lsu_sectors_in_flight) {
+        throw SimError("internal: the read ID table holds more reads than its readers can have in flight");
     }
     read_records_.set_next(std::move(next), "drive_read_records");
 }
@@ -5595,6 +5736,9 @@ void Machine::drive_lsu_read_pipe(const Wires& w) {
     auto next = cur;
     if (arrived) next.pop_front();
     if (w.lsu_rf_read.command.has_value()) next.push_back(w.lsu_rf_read);
+    if (next.size() > config_.rf_read_latency_cycles) {
+        throw SimError("internal: the LSU store-data read pipeline holds more than its Lr stages");
+    }
     lsu_read_pipe_.set_next(std::move(next), "drive_lsu_read_pipe");
 }
 

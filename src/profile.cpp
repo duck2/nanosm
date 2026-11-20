@@ -78,6 +78,7 @@ json profile_json(const DeviceProfile& p) {
             {"queue_commands", p.tma_queue_commands},
             {"sector_credits", p.tma_sector_credits},
             {"store_sector_registers", p.tma_store_sector_registers},
+            {"walker_start_cycles", p.tma_walker_start_cycles},
         }},
         {"core", {
             {"clock_hz", p.core_clock_hz},
@@ -191,6 +192,11 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     if (p.tma_store_sector_registers == 0 || p.tma_store_sector_registers > 64) {
         throw ProfileError("device profile: tma store_sector_registers must be in 1..64");
+    }
+    // The walker's start stages (0: none, the products in the descriptor's
+    // return cycle).
+    if (p.tma_walker_start_cycles > 8) {
+        throw ProfileError("device profile: tma walker_start_cycles must be in 0..8 register stages");
     }
     if (p.sfu_lanes == 0 || p.sfu_lanes > p.lanes) {
         throw ProfileError("device profile: sfu lanes must be in 1..lanes");
@@ -470,6 +476,13 @@ DeviceProfile parse_device_profile(std::string_view source) {
             throw ProfileError("device profile: tma store_sector_registers must be an integer in 1..64");
         }
         p.tma_store_sector_registers = value.get<uint32_t>();
+    }
+    if (tma.contains("walker_start_cycles")) { // optional (absent: 2); present: an integer in 0..8
+        const auto& value = tma.at("walker_start_cycles");
+        if (!value.is_number_unsigned() || value > 8) {
+            throw ProfileError("device profile: tma walker_start_cycles must be an integer in 0..8");
+        }
+        p.tma_walker_start_cycles = value.get<uint32_t>();
     }
     const auto& core = document.at("core");
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");

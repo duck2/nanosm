@@ -619,19 +619,20 @@ void Sanitizer::record_tma_accept(
     if (data_owner.has_value()) shmem_owners_.push_back(*data_owner);
     // Row spacing (record_mma_row_spacing). A swizzle64 tile is its span's
     // words, each row's bytes shuffled inside the row: a load writes all of
-    // them with the stored row's bytes, a store reads all of them. A dense
-    // load states no spacing.
+    // them with the stored row's bytes (its out-of-range elements are zero
+    // fills, written too). A store reads only its in-range elements' words:
+    // its spacing is recorded here and its source rounds are checked as they
+    // are granted (check_tma_store_source). A dense load states no spacing.
     if (data_owner.has_value()) {
         const auto [begin, end] = tma_shmem_span(*descriptor, shmem_address);
         if (descriptor->layout == TileLayout::swizzle64) {
-            std::vector<uint32_t> words;
-            for (uint64_t byte = begin; byte < end; byte += 4) words.push_back(static_cast<uint32_t>(byte / 4));
             const auto spacing = tma_swizzle64_row_bytes(*descriptor);
             if (load) {
+                std::vector<uint32_t> words;
+                for (uint64_t byte = begin; byte < end; byte += 4) words.push_back(static_cast<uint32_t>(byte / 4));
                 record_row_spacing(false, words, spacing, SpacingWriter::tma_load);
             } else {
-                check_row_spacing(site, "tma store #" + std::to_string(command) + " (swizzle64 source)", false,
-                    words, spacing);
+                tma_store_spacings_.push_back({command, spacing, site.warp, site.pc, site.inst, site.mma_shapes});
             }
         } else if (load) {
             forget_row_spacing(begin, end);
@@ -671,6 +672,19 @@ void Sanitizer::record_tma_data_complete(uint64_t command) {
         return owner.command == command &&
             (owner.kind == ShmemOwnerKind::tma_load || owner.kind == ShmemOwnerKind::tma_store);
     });
+    std::erase_if(tma_store_spacings_, [&](const TmaStoreSpacing& store) { return store.command == command; });
+}
+
+void Sanitizer::check_tma_store_source(
+    uint64_t cycle, uint64_t command, const std::vector<uint32_t>& word_addresses) const {
+    const auto store = std::find_if(tma_store_spacings_.begin(), tma_store_spacings_.end(),
+        [&](const TmaStoreSpacing& candidate) { return candidate.command == command; });
+    if (store == tma_store_spacings_.end()) return; // a dense source, or an invalid descriptor (the machine PANICs)
+    std::vector<uint32_t> words;
+    words.reserve(word_addresses.size());
+    for (const auto address : word_addresses) words.push_back(address / 4);
+    check_row_spacing(IssueSite{cycle, store->warp, store->pc, store->inst, store->mma_shapes},
+        "tma store #" + std::to_string(command) + " (swizzle64 source)", false, words, store->spacing);
 }
 
 void Sanitizer::record_mma_accept(

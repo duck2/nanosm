@@ -56,7 +56,8 @@ namespace nanosm {
 // not care.)
 //
 // The TMA places and reads tiles with these functions (src/tma.hpp
-// tma_tile_address; the layout is its descriptor's) and the tensor core reads
+// tma_tile_address, which a run's elements step through: src/sim.hpp TmaRun;
+// the layout is its descriptor's) and the tensor core reads
 // its operands with them (src/sim.cpp mma_a_address / mma_b_address; the
 // layout is the profile's mma.layout, the spacing the instruction's). Neither
 // unit knows the other: a kernel couples them by choosing a descriptor layout

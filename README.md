@@ -261,7 +261,9 @@ so a tma reads its N + 2 registers two per round: urS and urM in its issue's rea
 coordinates, one round per cycle (two rounds for N = 1, 2, three for N = 3, 4); while rounds remain,
 issue refuses every instruction that reads a uniform register. The command reaches the TMA queue
 when its last words arrive (canonically three cycles after issue for N <= 2, four for N > 2) and its
-descriptor is fetched from shmem after that. Completion subtracts the tile's byte count from the
+descriptor is fetched from shmem after that; its walk starts `tma.walker_start_cycles` (2) register
+stages after the descriptor's words are back (the start's coordinate x stride products; 0 is
+legal). Completion subtracts the tile's byte count from the
 barrier after load writes commit or store source bytes are captured. A swizzle64 tile's stored rows
 are packed, each the stored row's bytes apart (the spacing a tensor-core instruction names to read
 it): a power of two bytes, 16 or more, any number of rows (1 included), elements of 2 or 4 bytes.

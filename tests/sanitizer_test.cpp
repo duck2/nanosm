@@ -628,7 +628,95 @@ void test_sanitizer_row_spacing_tmem() {
         require(machine.read_reg(0, lane, 24) == lane, "acc.ld with the acc.st's spacing did not read it back");
 }
 
+// A swizzle64 TMA store checks the row spacing of the words it READS, at its
+// source rounds' grants -- not its whole tile (Astra's false alarm,
+// trash/chan.txt 2026-11-20; trash/tma_clipped_spacing_astra.launch.py). A
+// 2-row fp32 tile of 64-byte stored rows at shmem 1024 is stored to a
+// tensor one row tall; a swizzle64 load with 32-byte rows wrote `load_at`
+// (64 bytes) before it. Store coordinate y = 0 reads row 0 (1024..1087)
+// only; y = 1 reads nothing.
+nanosm::Launch tma_store_spacing_launch() {
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.shmem_image, 1152);
+    auto& gmem = image_bytes(launch.gmem_image, 384);
+    std::fill(shmem.begin() + 1024, shmem.end(), 0x61);
+    std::fill(gmem.begin(), gmem.begin() + 64, 0x34);
+    std::fill(gmem.begin() + 256, gmem.end(), 0xcc);
+    nanosm::TmaDescriptor spaced; // 2 rows of 8 fp32: 32-byte stored rows
+    spaced.dimensions = {8, 2, 1, 1};
+    spaced.strides = {8, 0, 0};
+    spaced.tile_length = 8;
+    spaced.tile_rows = 2;
+    spaced.layout = nanosm::TileLayout::swizzle64;
+    write_tma_descriptor(shmem, 0, spaced);
+    nanosm::TmaDescriptor clipped; // a 2-row tile of 16 fp32 (64-byte rows) of a 1-row tensor
+    clipped.base = 256;
+    clipped.dimensions = {16, 1, 1, 1};
+    clipped.strides = {16, 0, 0};
+    clipped.tile_length = 16;
+    clipped.tile_rows = 2;
+    clipped.layout = nanosm::TileLayout::swizzle64;
+    write_tma_descriptor(shmem, 64, clipped);
+    write_tx_mbar(shmem, 128, 64);
+    write_tx_mbar(shmem, 136, 128);
+    return launch;
+}
+
+std::string tma_store_spacing_program(uint32_t load_at, int32_t store_y) {
+    return tma_operands_asm(1, load_at, 3, 128, 8, {0, 0}) + R"(
+        tma.load.2d [ur1], [0, ur8], [ur3]
+    LOADED:
+        mbar.try_wait p0, [ur3], 0
+        @!p0 bra.uni LOADED
+    )" + tma_operands_asm(2, 1024, 4, 136, 10, {0, store_y}) + R"(
+        tma.store.2d [64, ur10], [ur2], [ur4]
+    STORED:
+        mbar.try_wait p0, [ur4], 0
+        @!p0 bra.uni STORED
+        halt
+    )";
+}
+
+// The rows a store does not read are not checked: the clipped store (row 1,
+// 1088..1151, has the load's 32-byte spacing) and a wholly out-of-range one
+// run clean and write what they should.
+void test_sanitizer_tma_store_spacing_unread_rows() {
+    const auto& profile = canonical_profile();
+    for (const int32_t y : {0, 1}) {
+        nanosm::Machine machine(profile, compile(tma_store_spacing_program(1088, y)), tma_store_spacing_launch());
+        machine.run(20000);
+        require(machine.done(), "a store over rows it does not read did not finish (y = " + std::to_string(y) + ")");
+        for (uint32_t byte = 256; byte < 384; ++byte) {
+            const uint8_t expected = y == 0 && byte < 320 ? 0x61 : 0xcc;
+            require(machine.gmem()[byte] == expected, "clipped store (y = " + std::to_string(y) + "): gmem byte " +
+                std::to_string(byte));
+        }
+    }
+}
+
+// A mismatch in the row the store reads still PANICs: the 32-byte-row load
+// lands at 1024, row 0 of the store.
+void test_sanitizer_tma_store_spacing_read_row_panics() {
+    const auto message = run_expecting_panic(canonical_profile(), compile(tma_store_spacing_program(1024, 0)),
+        tma_store_spacing_launch(), "a swizzle64 store reading a row written with another spacing");
+    require_mentions(message, {"row spacing mismatch: tma store #", "(swizzle64 source) reads shmem byte 10",
+        "with rows 64 bytes apart, but a TMA load into a swizzle64 tile wrote it with rows 32 bytes apart",
+        "tma.store.2d"}, "tma store row spacing mismatch");
+}
+
 } // namespace
+
+// a swizzle64 TMA store is not checked on rows it does not read (clipped, or wholly out of range)
+TEST(Sanitizer, sanitizer_tma_store_spacing_unread_rows) {
+    test_sanitizer_tma_store_spacing_unread_rows();
+}
+
+// a swizzle64 TMA store reading a word written with another row spacing PANICs
+TEST(Sanitizer, sanitizer_tma_store_spacing_read_row_panics) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_sanitizer_tma_store_spacing_read_row_panics();
+}
 
 TEST(Sanitizer, sanitizer_row_spacing_shmem) {
     NANOSM_EXPECTS_SANITIZER_PANIC();

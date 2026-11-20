@@ -139,6 +139,13 @@ struct DeviceProfile {
     // gone into the egress FIFO. One register turns over every D + Lb +
     // ceil(sector words / pluck) cycles. >= 1 (canonical 1, HUMAN).
     uint32_t tma_store_sector_registers = 1;
+    // The register stages of the walker's start: between the cycle a TMA
+    // command's descriptor words are back and the cycle its walker registers
+    // are loaded (the three coordinate x stride products and the add chain
+    // into row 0's address; src/sim.hpp TmaWalkerStart). 0..8; canonical 2
+    // (HUMAN 2026-11-20: "some configurable delay to those multipliers"). 0 is
+    // the timing before the stages existed: products in the return cycle.
+    uint32_t tma_walker_start_cycles = 2;
     uint64_t gmem_bytes = 0;
 
     Timing timing;

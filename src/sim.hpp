@@ -733,29 +733,65 @@ private:
             tma_store,
         };
 
-        uint64_t id = 0;
+        uint64_t id = 0;            // simulator request number (trace, probe); the wire is stream + tag
         uint64_t command = 0;       // tma command id or lsu command id
         uint32_t stream = 0;        // read ID; writes: free-ID tag stream for scatters
         uint64_t sector_address = 0;
         uint64_t ready_dram_tick = 0;
         bool load = false;
         Owner owner = Owner::lsu;
-        struct TmaFragment {
-            uint64_t gmem_address = 0;
-            uint32_t shmem_address = 0;
-            uint8_t size = 0;
-            std::array<uint8_t, 4> data{}; // descriptor reads and OOB zero fills only
-        };
-        std::vector<uint8_t> data;  // reads: the sector as DRAM holds it when its burst starts
+        // Reads: the sector as DRAM holds it when its burst starts (filled
+        // by the placeholder controller at that moment; gmem.sector_bytes,
+        // checked there). The SM never holds it: its beats go on the bus.
+        std::vector<uint8_t> data;
         uint64_t byte_enable = 0;   // writes: bit b enables sector byte b (AXI strobes)
         uint64_t egress_slot = 0;   // writes: the egress FIFO slot holding the data
         uint32_t beats = 0;
         uint32_t next_beat = 0;
     };
 
+    // One sector's work for the TMA: a RUN of elements along ONE tile row,
+    // contiguous in global memory and inside one gmem sector -- or, for a
+    // load's out-of-range elements, a zero fill of at most a sector's bytes of
+    // that row. The walker makes it; it is all that travels with the sector
+    // (walker plan -> read record -> placement ticket -> placement; or walker
+    // plan -> store register). Element i (0 <= i < elements) is at
+    //     global   global_address + i x element_bytes
+    //     shared   layout(shared_address + i x step): step = element_bytes,
+    //              or the stored-row spacing for a transposed tile; layout()
+    //              is the identity for a dense tile and swizzle64_shuffle(.,
+    //              spacing) for a swizzle64 one (src/layout.hpp)
+    // so the run holds its first element's tile coordinate in the form each
+    // memory needs (its global and its unshuffled shared address) rather than
+    // (x, y): from (x, y) a dense tile's placement would need a y x tile-length
+    // multiply. Every byte's place, the placement rounds, the store's byte
+    // enables and the useful bytes follow from these fields.
+    // Width at the canonical profile (4 commands, 64 KiB shmem, 32 B
+    // sectors): command slot 2 + global address 64 + shared address 16 +
+    // elements 6 (1..32) + element size 2 + zero fill 1 + layout 1 +
+    // transposed 1 + spacing 5 (its log2) = 98 bits.
+    struct TmaRun {
+        uint64_t command = 0;         // hardware: the command's queue slot (2 bits at 4 commands)
+        uint64_t global_address = 0;  // element 0's global byte address (a zero fill: 0, unused)
+        uint32_t shared_address = 0;  // element 0's unshuffled shared byte address
+        uint8_t elements = 0;         // 1 .. sector bytes / element bytes
+        uint8_t element_bytes = 0;    // 1, 2 or 4
+        bool zero_fill = false;       // a load's out-of-range elements: zeros, no gmem request
+        TileLayout layout = TileLayout::dense;
+        bool transposed = false;      // swizzle64: element i is in stored row i (step = spacing)
+        uint32_t spacing = 0;         // swizzle64: the stored row's bytes, a power of two (16 ..)
+    };
+
     // What the SM remembers about an accepted read until its sector has been
     // consumed: where each returning byte goes. This is request metadata (an
-    // ID-indexed table), not payload storage.
+    // ID-indexed table), not payload storage. Hardware size: one entry per
+    // read in flight -- the TMA's (at most tma.sector_credits), the vector
+    // loads' (lsu.active_commands x the 8 x lanes x 4 / gmem.sector_bytes
+    // sectors of a block) and the free IDs (lsu.sectors_in_flight): 16 + 2 x
+    // 16 + 16 = 64 entries at the canonical profile; checked in
+    // drive_read_records. Here a map keyed by the 64-bit request number; in
+    // hardware a table indexed by stream and tag (the TMA's stream is in
+    // order, so its part is a FIFO of runs).
     enum class ReadKind : uint8_t { tma, vector, gather, uniform };
     struct ReadRecord {
         ReadKind kind = ReadKind::tma;
@@ -767,21 +803,22 @@ private:
         uint32_t word_offset = 0;   // gather/uniform: the word's byte offset in the sector
         uint32_t tag = 0;           // gather/uniform: free-ID tag
         uint32_t received = 0;      // bytes plucked at the SM
-        std::vector<GmemSectorRequest::TmaFragment> fragments; // tma placement (shmem addresses)
+        TmaRun run;                 // tma: the sector's run (where its bytes go)
     };
 
     // One bus beat in the SM's ingress FIFO (a BRAM, simple dual port).
-    // Capacity lsu.ingress_sectors x sector bytes. Written by the bus (one
-    // beat per DRAM tick); readable from visible_cycle = write cycle +
+    // Capacity lsu.ingress_sectors x sector bytes (256 B, 32 beats of 8 B at
+    // the canonical profile; checked in drive_ingress). Written by the bus
+    // (one beat per DRAM tick); readable from visible_cycle = write cycle +
     // lsu.ingress_latency_cycles; read lsu.pluck_words_per_cycle words per
     // cycle. Never fall-through. (Room freed by a read is a separate
     // contract: reusable from the next cycle, see tick_gmem_controller.)
     struct IngressBeat {
-        uint64_t request = 0;
+        uint64_t request = 0;       // hardware: the read ID (stream / tag) beside the beat
         uint32_t offset = 0;        // byte offset of this beat in its sector
-        std::vector<uint8_t> bytes;
-        uint32_t consumed = 0;      // bytes already plucked
-        uint64_t visible_cycle = 0;
+        std::vector<uint8_t> bytes; // gmem.bus_bytes_per_dram_tick at most (8)
+        uint32_t consumed = 0;      // bytes already plucked (the FIFO's read pointer, within the head beat)
+        uint64_t visible_cycle = 0; // (the BRAM's write-to-read latency, modelled as a time stamp)
     };
 
     // The TMA stream's 32 B sector register (flops). Filled from the ingress
@@ -791,7 +828,7 @@ private:
     struct TmaSectorRegister {
         std::optional<uint64_t> request;
         uint64_t sector_address = 0;
-        std::vector<uint8_t> data;
+        std::vector<uint8_t> data;  // gmem.sector_bytes, sized at construction (32 B)
         uint32_t filled = 0;        // bytes plucked in
         bool complete = false;      // all bytes in; its ticket is in the TMA queue's returns
     };
@@ -807,8 +844,8 @@ private:
     // into the egress FIFO at the pluck rate.
     struct AssemblyRegister {
         std::optional<uint64_t> owner;
-        std::vector<uint32_t> words;     // one per lane
-        std::vector<uint8_t> valid;      // lane enables
+        std::vector<uint32_t> words;     // one per lane (lanes, sized at construction: 64 B)
+        std::vector<uint8_t> valid;      // lane enables (lanes bits)
         uint32_t valid_count = 0;
     };
 
@@ -835,7 +872,10 @@ private:
         uint8_t depbar = 0;
         uint32_t assembly = 0;      // index into staging_
         uint64_t base = 0;          // vector: 64 B-aligned block address
-        std::vector<LsuSector> sectors; // scalar / uniform
+        // scalar: one per lane (lanes entries); uniform: one; vector: none.
+        // Hardware: the lanes' addresses latched at admission (16 x 64 bits
+        // as held here; a sector address and a word offset each).
+        std::vector<LsuSector> sectors;
         uint32_t stream = 0;        // vector load: its ordered read stream (1..read_streams-1)
         uint32_t requests_total = 0;
         uint32_t requests_emitted = 0;
@@ -857,7 +897,8 @@ private:
         uint64_t egress_wait = 0;
     };
 
-    // One 32 B slot of the egress FIFO (a BRAM, lsu.egress_sectors slots).
+    // One 32 B slot of the egress FIFO (a BRAM, lsu.egress_sectors slots: 8 at
+    // the canonical profile; checked in drive_egress).
     // Every store client writes here through one shared write port of
     // lsu.pluck_words_per_cycle words, one client per cycle, granted per
     // slot (a started slot is never preempted; TMA wins each new grant).
@@ -871,7 +912,7 @@ private:
         uint64_t command = 0;
         uint32_t index = 0;         // LSU: the command's request index this slot carries
         uint64_t sector_address = 0;
-        std::vector<uint8_t> data;
+        std::vector<uint8_t> data;  // gmem.sector_bytes (32 B of the BRAM)
         uint64_t byte_enable = 0;
         uint32_t words_total = 0;   // words the client writes into this slot
         uint32_t words_written = 0;
@@ -890,11 +931,16 @@ private:
     // I3 (rfc12 section 8): no mbar phase read between descriptor and walking.
     enum class TmaCommandState : uint8_t {
         descriptor,
+        starting, // its walker's start is in the start pipeline (TmaWalkerStart)
         walking,
         data_complete,
         event_presented,
     };
 
+    // One TMA command, from its push into the queue to its completion
+    // event's claim (tma.queue_commands of them: 4 at the canonical profile).
+    // The decoded descriptor is not kept here: it goes into the walker's
+    // registers when the descriptor read returns (TmaWalker).
     struct TmaCommand {
         uint64_t id = 0;
         uint32_t warp = 0;
@@ -910,22 +956,76 @@ private:
         uint32_t shmem_address = 0;
         uint32_t mbar_address = 0;
         TmaCommandState state = TmaCommandState::descriptor;
-        TmaDescriptor descriptor;
-        uint64_t logical_bytes = 0;
-        uint64_t useful_bytes = 0;
-        // Computed once, when the descriptor is decoded: whether the
-        // coordinates of the two dimensions the tile does not walk are inside
-        // the tensor (if not, every element is out of bounds), and then their
-        // element offset (c_k x s_k summed over those two).
-        bool fixed_in_bounds = true;
-        uint64_t fixed_offset = 0;
-        // The walker: x along the row (dimension 0), y the row.
-        uint32_t x = 0;
-        uint32_t y = 0;
-        uint32_t pending_load_writes = 0;
-        uint32_t pending_store_captures = 0;
+        uint64_t logical_bytes = 0;     // the tile's bytes: what its completion subtracts (32 bits)
+        uint64_t useful_bytes = 0;      // (T) in-range bytes moved, for the trace
+        uint32_t pending_load_writes = 0;    // sectors walked whose placement has not reached the RAM
+        uint32_t pending_store_captures = 0; // store sectors whose source read has not returned
         bool walker_done = false;
     };
+
+    // The TMA's walker: ONE set of registers, serving the frontend command
+    // from its descriptor's return to its last step (only one command walks at
+    // a time). It is loaded tma.walker_start_cycles after the descriptor's last
+    // words come back (tma_walker_start: three coordinate x stride products,
+    // through TmaWalkerStart below) and steps
+    // once per cycle (plan_tma_walker). A step is one of:
+    //   - an in-range run: from (x, y) to the first of the sector's end, the
+    //     row's end and the tensor's edge along dimension 0 -- a load sector
+    //     (needs a credit and the request channel) or a store sector (a
+    //     credit, a free store register and A-read);
+    //   - a load's out-of-range stretch, at most a sector's bytes of it per
+    //     step: a zero fill (a credit);
+    //   - a store's out-of-range stretch of one row, skipped whole (needs
+    //     nothing; one step, one cycle: an entirely out-of-range store takes
+    //     one cycle per row).
+    // A stretch is out of range when its row is (y outside [y_low, y_high)) or
+    // it lies left of x_low or right of x_high. Every boundary is a compare;
+    // addresses move by adders: x x element_bytes and x x spacing are shifts,
+    // a row is one add of the row steps.
+    // Widths at the canonical profile: row_global 64, row_shared 16, x 16,
+    // y 16, x_low 16, x_high 16, y_low 16, y_high 16, row_step_global 34,
+    // row_step_shared 18, tile_length 16, tile_rows 16, element size 2,
+    // layout 1, transposed 1, spacing 5 (log2) = 269 bits.
+    struct TmaWalker {
+        // Computed at the descriptor's decode, loaded from the start pipeline, fixed for the command.
+        uint64_t row_step_global = 0;   // s_row x element bytes: one row to the next in gmem (a shift)
+        uint32_t row_step_shared = 0;   // unshuffled shmem from one row to the next: the stored row
+                                        // (tile length x element bytes) or, transposed, the element bytes
+        uint16_t x_low = 0;             // the tile positions inside the tensor along dimension 0: [x_low, x_high)
+        uint16_t x_high = 0;
+        uint16_t y_low = 0;             // the tile rows inside the tensor (row dimension, and the other two
+        uint16_t y_high = 0;            // dimensions' coordinates; empty if those are outside): [y_low, y_high)
+        uint16_t tile_length = 0;
+        uint16_t tile_rows = 0;
+        uint8_t element_bytes = 0;
+        TileLayout layout = TileLayout::dense;
+        bool transposed = false;
+        uint32_t spacing = 0;           // swizzle64: the stored row's bytes
+        // Stepped.
+        uint64_t row_global = 0;        // global address of row y's element 0, modulo 2^64: exact wherever
+                                        // the row is in range (it may start "negative")
+        uint32_t row_shared = 0;        // unshuffled shared address of row y's element 0
+        uint16_t x = 0;                 // the next element along the row
+        uint16_t y = 0;                 // the row
+    };
+
+    // The walker's start pipeline: tma.walker_start_cycles register stages
+    // (canonical 2) between the cycle a command's descriptor words are back
+    // and the cycle its walker registers are loaded. The three coordinate x
+    // stride products and the add chain into row 0's address get those
+    // stages. A command enters stage 0 at its descriptor's return (in state
+    // `starting`), moves one stage per cycle, and from the last stage loads
+    // the walker (state `walking`): its first step is walker_start_cycles
+    // cycles later than with no stages. Only the frontend command is in it,
+    // so at most one stage is occupied. Each stage carries the finished
+    // walker registers (the multipliers' partial products are not modelled
+    // bit by bit) and the command's queue slot; 0 stages: no pipeline, the
+    // walker is loaded at the descriptor's return, the timing before.
+    struct TmaWalkerStart {
+        uint64_t command = 0;
+        TmaWalker walker;
+    };
+    using TmaWalkerStartPipeline = std::vector<std::optional<TmaWalkerStart>>;
 
     enum class TmaPortKind : uint8_t {
         descriptor,
@@ -933,34 +1033,33 @@ private:
         store_read,
     };
 
-    // One shmem transaction of the TMA. Load placements (port-B write) read
-    // the TMA sector register (or write zeros for an OOB fill); store reads
-    // (A-read) fill the TMA store sector register. Fragments carry addresses;
-    // only the descriptor read (A-read) holds its returned data here (the TMA
-    // frontend latch). next_round: rounds granted.
+    // One shmem transaction of the TMA: its run and how many bank rounds it
+    // has been granted. Load placements (port-B write) read the TMA sector
+    // register (or write zeros for an OOB fill); store reads (A-read) fill a
+    // TMA store sector register; the descriptor read (A-read) fills the
+    // frontend latch (TmaReadTransaction) -- it is the run of the
+    // descriptor's sixteen words, dense. A round's pieces are a function of
+    // the run and the round number (tma_round_plan), so nothing per piece is
+    // held. At most tma_max_rounds() rounds (2 at the canonical profile).
     struct TmaPortRequest {
+        // One element of the run, served in one round: its bytes lie in one
+        // shared word (and, from the sector register, one sector word).
         struct Piece {
-            uint32_t fragment = 0;
-            uint8_t offset = 0;
-            uint8_t size = 0;
+            uint8_t element = 0;
         };
         TmaPortKind kind = TmaPortKind::descriptor;
-        uint64_t command = 0;
-        uint64_t sector_request = 0;
-        bool from_sector_register = false; // load_write: the data is in tma_sector_
-        uint32_t next_round = 0;
-        std::vector<std::vector<Piece>> rounds;
-        std::vector<GmemSectorRequest::TmaFragment> fragments;
+        uint64_t sector_request = 0; // (T) a placement's sector request (the edge probe)
+        TmaRun run;                  // run.command: the command
+        uint32_t rounds = 0;         // bank rounds (tma_round_plan)
+        uint32_t next_round = 0;     // rounds granted
     };
 
-    // A TMA sector ready for placement (port-B write): either the TMA stream's sector
-    // register (complete; it stays occupied until its last round) or a
-    // synthetic OOB zero fill (no bus data, placement metadata only).
+    // A TMA sector ready for placement (port-B write): either the TMA
+    // stream's sector register (complete; it stays occupied until its last
+    // round) or a synthetic OOB zero fill (no bus data: run.zero_fill).
     struct TmaReturn {
-        uint64_t command = 0;
-        uint64_t sector_request = 0;
-        std::vector<GmemSectorRequest::TmaFragment> fragments;
-        bool from_sector_register = false;
+        TmaRun run;
+        uint64_t sector_request = 0; // (T) the request id (trace, probe)
     };
 
     // A TMA store sector register (32 B flops; tma.store_sector_registers of
@@ -972,7 +1071,7 @@ private:
     //              its index (the return context). A-read is free again after
     //              the read's last round's grant.
     //   g + L      the words reach the port output and are written into the
-    //              register at the edge (its `source` says where each byte goes)
+    //              register at the edge (its run says where each byte goes)
     //   g + L + 1  complete in Q: the oldest complete register (the ring's
     //              head) gets the egress write port (TMA wins a new egress
     //              slot) and drains pluck words per cycle
@@ -980,18 +1079,19 @@ private:
     //              read granted in this same cycle may reserve it (d)
     // One register therefore turns over every L + d cycles; N registers and a
     // free egress port sustain min(N x 32 / (L + d), 32 / d) bytes per cycle.
+    // Its sector address and byte enables are the run's (run_sector_address,
+    // run_byte_enable). Width: data 256 + run 98 + rounds 2 + returned 2 +
+    // words_out 4 bits.
     struct TmaStoreRegister {
-        uint64_t command = 0;
-        uint64_t sector_address = 0;
-        std::vector<uint8_t> data;
-        uint64_t byte_enable = 0;
-        TmaPortRequest source;      // the source read's rounds and fragments: each returned byte's place in `data`
+        TmaRun run;                 // its sector's run: each returned byte's place in `data`, the byte enables
+        uint32_t rounds = 0;        // the source read's rounds
+        std::vector<uint8_t> data;  // gmem.sector_bytes (32 B)
         uint32_t returned = 0;      // source rounds whose words are in `data`
         uint32_t words_out = 0;     // words already written into the egress FIFO
-        [[nodiscard]] bool complete() const { return returned == source.rounds.size(); }
+        [[nodiscard]] bool complete() const { return returned == rounds; }
     };
     struct TmaStoreRegisters {
-        std::vector<std::optional<TmaStoreRegister>> ring;
+        std::vector<std::optional<TmaStoreRegister>> ring; // tma.store_sector_registers, sized at construction
         uint32_t head = 0;          // the oldest held register: the one the egress drains
         [[nodiscard]] uint32_t held() const {
             return static_cast<uint32_t>(std::count_if(ring.begin(), ring.end(),
@@ -1046,7 +1146,6 @@ private:
     // ends (pending count, credit release, data complete).
     struct PlacementEnd {
         uint64_t command = 0;
-        std::vector<GmemSectorRequest::TmaFragment> fragments; // (S) the live-mbar PANIC
     };
 
     // One granted write round in a write pipeline (A-write, port-B write): D
@@ -1089,9 +1188,12 @@ private:
     // is released at its last round's grant; each round carries its store
     // register's index back). The TMA starts no other read while it is held.
     struct TmaReadTransaction {
-        TmaPortRequest request;       // next_round: rounds granted; descriptor fragments latch the words
+        TmaPortRequest request;       // next_round: rounds granted
         uint32_t returned = 0;        // descriptor: rounds whose words are back
         uint32_t store_register = 0;  // store-source: the TMA store register its rounds land in
+        // The frontend latch: the descriptor's 64 bytes as its rounds come
+        // back (512 bits of flops).
+        std::array<uint8_t, tma_descriptor_bytes> latch{};
     };
 
     // The A-read and A-write round-robin pointers (rfc12 section 5). A-read
@@ -1209,17 +1311,27 @@ private:
     };
 
     // The TMA engine's command queue and walker bookkeeping. One group:
-    // credits, tickets and each command's pending counts move together. (Its
-    // event register, shmem transactions and the two sector registers are
-    // separate registers.)
+    // credits, tickets, the walker and each command's pending counts move
+    // together. (Its event register, shmem transactions and the two sector
+    // registers are separate registers.) Sizes, checked in drive_tma_queue:
+    //   commands  tma.queue_commands entries (4), in id order; the oldest
+    //             walking or descriptor-state one is the frontend. (A map here;
+    //             in hardware 4 slots of about 120 bits plus an age order.)
+    //   returns   a FIFO of runs (98 bits each). Every entry holds a sector
+    //             credit (from its walk to its placement's end), so at most
+    //             tma.sector_credits entries (16): a 16 x 98-bit LUTRAM FIFO.
     struct TmaQueue {
         std::map<uint64_t, TmaCommand> commands; // tma.queue_commands; issue inserts
         std::optional<uint64_t> frontend;        // the command the descriptor / walker frontend serves
         std::optional<uint64_t> event_command;   // whose completion event is in the TMA's event register
-        uint32_t credits_used = 0;               // of tma.sector_credits
+        uint32_t credits_used = 0;               // of tma.sector_credits (5 bits)
         std::deque<TmaReturn> returns;           // sectors ready for placement (port-B write)
+        TmaWalker walker;                        // the frontend command's walk
     };
 
+    // The ingress FIFO (IngressBeat): at most lsu.ingress_sectors x sector
+    // bytes (`bytes`), in at most that many sectors' beats; checked in
+    // drive_ingress.
     struct IngressFifo {
         std::deque<IngressBeat> beats;
         uint32_t bytes = 0;
@@ -1300,7 +1412,7 @@ private:
     struct TmaStoreFill {
         uint32_t store_register = 0;
         uint64_t command = 0;
-        std::vector<std::pair<uint32_t, uint8_t>> bytes;  // (byte offset in the sector, byte)
+        std::vector<std::pair<uint32_t, uint8_t>> bytes;  // (byte offset in the sector, byte): at most a sector's
         bool last = false;                                // the source read's last round: the register is complete
     };
 
@@ -1316,14 +1428,17 @@ private:
         bool tma_store_drained = false;                // the head TMA store register's last word leaves
     };
 
-    // The TMA walker's next sector, planned from Q.
+    // The TMA walker's step this cycle, planned from Q. none: nothing to do or
+    // blocked (no credit; a store without a free store register or A-read);
+    // skip: a store's out-of-range stretch passes (no sector). The others
+    // emit `run` when their resource grants it.
     struct TmaWalkerPlan {
-        enum class Sector : uint8_t { none, zero_fill, load, store };
+        enum class Sector : uint8_t { none, skip, zero_fill, load, store };
         Sector sector = Sector::none;
-        TmaCommand command_after;   // the command after this cycle's walk
-        std::vector<GmemSectorRequest::TmaFragment> fragments;
-        uint64_t sector_address = 0;
-        uint64_t store_byte_enable = 0;
+        TmaWalker walker_after;     // the walker after this step
+        bool done_after = false;    // this step ends the tile
+        TmaRun run;
+        uint64_t sector_address = 0; // load / store: the run's sector
     };
 
     // What the TMA wants this cycle, from Q (independent of the LSU's wants).
@@ -1412,7 +1527,7 @@ private:
         bool mma_event_claimed = false;              // ... the MMA's event register
         bool tma_read_changed = false;               // tma_read_after is the TMA read transaction's next value
         std::optional<TmaReadTransaction> tma_read_after;
-        std::optional<TmaPortRequest> tma_read_done; // a descriptor read's last words came back now, with its data
+        std::optional<TmaReadTransaction> tma_read_done; // a descriptor read's last words came back now: its latch
         std::optional<uint32_t> tma_store_reserved;  // a store-source read granted now reserves this TMA store register
         std::optional<TmaStoreFill> tma_store_fill;  // a store-source round's words for its TMA store register
         bool tma_write_changed = false;              // tma_write_after is the placement transaction's next value
@@ -1550,6 +1665,9 @@ private:
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
+        // A walker start entering the start pipeline's stage 0 now (its
+        // descriptor came back this cycle; tma.walker_start_cycles > 0).
+        std::optional<TmaWalkerStart> tma_walker_starting;
         // The TMA operand read's end: the pair at the URF output now goes
         // into the holding register; with the last one the command is pushed
         // into the TMA queue (tma_pushed; drive_tma_queue adds it).
@@ -1656,6 +1774,7 @@ private:
     Reg<AccLdPipeline> acc_ld_pipe_{registers_, "acc.ld pipeline"};
     // TMA.
     Reg<TmaQueue> tma_{registers_, "TMA command queue"};
+    Reg<TmaWalkerStartPipeline> tma_walker_start_pipe_{registers_, "TMA walker start pipeline"};
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
     // tma_requests builds it (bypass (h) in tick()). The placement (port-B
     // write) register holds the rounds after the first; the A-read one holds
@@ -1671,6 +1790,11 @@ private:
     Reg<TmaReadPairs> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
     Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, "TMA operand read: holding register"};
     // LSU.
+    // Sizes: command slots lsu.active_commands (2; checked in
+    // drive_lsu_commands); the assembly pool lsu.staging_vectors (2, fixed);
+    // the ingress FIFO and egress FIFO (IngressFifo, EgressSlot), the read ID
+    // table (ReadRecord) as their comments say; free-ID tags
+    // lsu.sectors_in_flight bits (16, fixed).
     Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
     std::deque<Reg<AssemblyRegister>> staging_;   // the lsu.staging_vectors pool, one register each
     Reg<IngressFifo> ingress_{registers_, "ingress FIFO"};
@@ -1691,7 +1815,9 @@ private:
     // Issue -> units: the issue register and the RF read pipeline
     // (issue_to_dispatch stages), carrying memory / engine instructions.
     Reg<std::deque<DispatchEntry>> dispatch_pipe_{registers_, "dispatch pipeline"};
-    // The LSU's store-data RF reads travelling to the assembly registers (Lr).
+    // The LSU's store-data RF reads travelling to the assembly registers (Lr
+    // stages: at most one read per cycle, so at most Lr entries; checked in
+    // drive_lsu_read_pipe).
     Reg<std::deque<LsuRfRead>> lsu_read_pipe_{registers_, "LSU store-data read pipeline"};
     // The URF write pipeline (UrfWrite): L + Wu stages, the uniform ALU's and
     // r2ur's path from the issue register to the URF RAM.
@@ -1716,7 +1842,14 @@ private:
     // calendar: reads are one round at issue + 1, owned by the issue
     // register -- issue_read_banks_.)
     std::map<uint64_t, std::vector<uint32_t>> write_reservations_;
-    // gmem controller (outside the SM): its queue, bus and B channel.
+    // gmem controller (outside the SM): its queue, bus and B channel. The
+    // queue and the bus entry together hold at most gmem.queue_sectors (64;
+    // checked in step_gmem_controller). The B channel holds an ack per write
+    // whose last beat has left and whose ack is not yet due: at most one per
+    // write in flight -- the TMA's (each holds a credit: tma.sector_credits)
+    // and the LSU's (lsu.active_commands commands of at most max(lanes, 8 x
+    // lanes x 4 / sector bytes) requests): 16 + 2 x 16 = 48 at the canonical
+    // profile; checked in finish_gmem_write.
     std::deque<GmemSectorRequest> gmem_queue_;
     std::optional<GmemSectorRequest> gmem_bus_;
     std::deque<WriteAck> pending_write_acks_;
@@ -1874,6 +2007,7 @@ private:
     void drive_mma(const Wires& w);
     void drive_acc_transfers(const Wires& w);
     void drive_tma_queue(const Wires& w);
+    void drive_tma_walker_start(const Wires& w);
     void drive_tma_transactions(const Wires& w);
     void drive_tma_sector(const Wires& w);
     void drive_tma_store_registers(const Wires& w);
@@ -1970,7 +2104,8 @@ private:
     void count_engine_wait_on_other(const Wires& w);
     [[nodiscard]] MbarEngine engine_to_claim(bool tma_held, bool mma_held) const;
     [[nodiscard]] static std::string rmw_label(const ActiveMbarRmw& active);
-    [[nodiscard]] std::vector<uint32_t> tma_round_addresses(const TmaPortRequest& request, std::size_t round) const;
+    [[nodiscard]] std::vector<uint32_t> tma_round_addresses(const TmaPortRequest& request,
+        const std::vector<TmaPortRequest::Piece>& pieces) const;
     void wake_mbar_waiters(Wires& w, uint32_t byte_address, uint8_t new_phase);
 
     // MMA, acc.
@@ -1999,7 +2134,7 @@ private:
     // TMA.
     void apply_tma_requests(TmaQueue& tma, Wires& w);
     void apply_tma_walker(TmaQueue& tma, Wires& w);
-    void complete_tma_frontend_read(TmaQueue& tma, const TmaPortRequest& request);
+    void complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w);
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
     void complete_tma_store_capture(TmaQueue& tma, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
@@ -2007,16 +2142,21 @@ private:
     void trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle);
     [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command(const TmaQueue& tma) const;
     [[nodiscard]] std::optional<uint64_t> next_data_complete_tma_command(const TmaQueue& tma) const;
-    [[nodiscard]] std::vector<std::vector<TmaPortRequest::Piece>> tma_port_rounds(
-        const std::vector<GmemSectorRequest::TmaFragment>& fragments, bool from_sector_register = false) const;
-    [[nodiscard]] TmaWalkerPlan plan_tma_walker(const TmaCommand& command, uint32_t credits_used,
-        bool store_register_free) const;
-    [[nodiscard]] static bool tma_advance_coordinate(TmaCommand& command);
-    [[nodiscard]] bool tma_coordinate_in_bounds(const TmaCommand& command) const;
-    [[nodiscard]] uint64_t tma_gmem_address(const TmaCommand& command) const;
-    [[nodiscard]] uint32_t tma_shmem_address(const TmaCommand& command) const;
-    void validate_tma_runtime_descriptor(const TmaCommand& command) const;
-    void tma_command_start(TmaCommand& command) const;
+    // A TMA transaction's bank rounds, each a list of pieces (a wire: the
+    // run's combinational decode), and the bounds they are checked against.
+    using TmaRoundPlan = std::vector<std::vector<TmaPortRequest::Piece>>;
+    [[nodiscard]] TmaRoundPlan tma_round_plan(const TmaPortRequest& request) const;
+    [[nodiscard]] uint32_t tma_max_rounds() const;
+    [[nodiscard]] uint32_t tma_max_pieces() const;
+    [[nodiscard]] TmaPortRequest tma_port_request(TmaPortKind kind, const TmaRun& run, uint64_t sector_request = 0) const;
+    [[nodiscard]] uint32_t tma_piece_address(const TmaRun& run, const TmaPortRequest::Piece& piece) const;
+    [[nodiscard]] uint64_t run_sector_address(const TmaRun& run) const;
+    [[nodiscard]] uint32_t run_sector_offset(const TmaRun& run) const;
+    [[nodiscard]] uint64_t run_byte_enable(const TmaRun& run) const;
+    [[nodiscard]] TmaWalkerPlan plan_tma_walker(const TmaCommand& command, const TmaWalker& walker,
+        uint32_t credits_used, bool store_register_free) const;
+    void validate_tma_runtime_descriptor(const TmaCommand& command, const TmaDescriptor& descriptor) const;
+    [[nodiscard]] TmaWalker tma_walker_start(const TmaCommand& command, const TmaDescriptor& descriptor) const;
 
     // Issue.
     // The warp's FIFO head (Q), decoded; "fell off kernel" if its pc is past

@@ -295,6 +295,12 @@ public:
     // written by hand is never accused. Writers record and readers check at
     // accept, in issue order: the order every correct kernel already keeps
     // between a writer and its reader (the race checks above see to it).
+    // A TMA store is the exception: it checks the words it actually reads,
+    // at each of its source rounds' grants (check_tma_store_source), so the
+    // rows and stretches of its tile outside the global tensor, which it
+    // never reads, are not checked. Its accept records its spacing; its box
+    // is read-owned from accept on, so no writer can change those words'
+    // shadow in between without a race PANIC.
     // The TMA, SIMT writes and acc transfers are handled in
     // record_tma_accept, record_simt_shmem_issue and
     // record_acc_transfer_accept; a matmul here. a_words / b_words: the shmem
@@ -304,6 +310,11 @@ public:
     void record_mma_row_spacing(const IssueSite& site, uint64_t command, bool init, const TmemRegion& result,
         const std::vector<uint32_t>& a_words, uint32_t a_spacing, const std::vector<uint32_t>& b_words,
         uint32_t b_spacing);
+    // A swizzle64 TMA store's source round granted now (A-read): the shared
+    // words it reads (byte addresses of whole words) against the spacing
+    // their writer used. A store with no swizzle64 source (or none recorded)
+    // is not checked. PANIC text: the store's instruction, this cycle.
+    void check_tma_store_source(uint64_t cycle, uint64_t command, const std::vector<uint32_t>& word_addresses) const;
     void record_mma_fetch_start(uint64_t command);
     void record_mma_operands_consumed(uint64_t command);
     void record_mma_retired(uint64_t command);
@@ -457,6 +468,17 @@ private:
     void forget_row_spacing(uint64_t begin_byte, uint64_t end_byte); // shmem bytes [begin, end)
     std::vector<uint8_t> shmem_row_spacing_;
     std::vector<uint8_t> tmem_row_spacing_;
+    // An accepted swizzle64 TMA store, until its data completes: the spacing
+    // its source rounds are checked with, and its instruction (PANIC text).
+    struct TmaStoreSpacing {
+        uint64_t command = 0;
+        uint32_t spacing = 0;
+        uint32_t warp = 0;
+        uint32_t pc = 0;
+        Instruction inst;
+        const std::vector<MmaShape>* mma_shapes = nullptr;
+    };
+    std::vector<TmaStoreSpacing> tma_store_spacings_;
     [[nodiscard]] std::string stream_name(uint32_t stream) const;
 
     // Copied from the launch (no reference into Machine, which may move).
@@ -539,6 +561,7 @@ public:
     NANOSM_SANITIZER_NOOP(record_tma_data_complete)
     NANOSM_SANITIZER_NOOP(record_mma_accept)
     NANOSM_SANITIZER_NOOP(record_mma_row_spacing)
+    NANOSM_SANITIZER_NOOP(check_tma_store_source)
     NANOSM_SANITIZER_NOOP(record_mma_fetch_start)
     NANOSM_SANITIZER_NOOP(record_mma_operands_consumed)
     NANOSM_SANITIZER_NOOP(record_mma_retired)

@@ -1224,7 +1224,375 @@ void test_dram_uses_its_own_clock() {
     require(beat_cycles[1] - beat_cycles[0] == 4, "DRAM beats advanced at the core clock");
 }
 
+// ---------------------------------------------------------------------------
+// The walker's runs (trash/tma-walker-cleanup-2026-11-20.md): one run, zero
+// fill or skipped stretch per cycle, never past a row's end.
+
+const std::string tma_wait = "wait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
+
+// The cycle a command's completion flips the mbar at `mbar` (Q, between ticks).
+uint64_t tick_until_phase(nanosm::Machine& machine, uint32_t mbar) {
+    while (!machine.read_mbar_state(mbar).phase) {
+        require(!machine.done() && machine.cycle() < 50000, "the tma command never completed its barrier");
+        machine.tick();
+    }
+    return machine.cycle();
+}
+
+// A store whose tile is entirely outside its tensor (its rows, its columns,
+// or a dimension it does not walk) writes nothing and completes its barrier
+// with the tile's bytes; the walker skips one row per cycle, so a tile of 33
+// rows completes exactly 32 cycles after a tile of 1.
+void test_tma_store_entirely_out_of_range() {
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 1024;
+    struct Case { std::string what; std::vector<int32_t> coordinates; };
+    for (const auto& c : {Case{"rows", {0, 100, 0}}, Case{"columns", {-64, 0, 0}}, Case{"third dimension", {0, 0, 5}}}) {
+        std::vector<uint64_t> completion;
+        for (const uint32_t rows : {1u, 33u}) {
+            nanosm::Launch launch;
+            launch.active_warps = 1;
+            auto& shmem = image_bytes(launch.shmem_image, tile_address + 64 * 33);
+            auto& gmem = image_bytes(launch.gmem_image, 8192);
+            std::fill(gmem.begin(), gmem.end(), 0x5a);
+            for (uint32_t i = 0; i < 16 * rows; ++i) write_u32(shmem, tile_address + 4 * i, 0x1000 + i);
+            nanosm::TmaDescriptor descriptor;
+            descriptor.dimensions = {16, 40, 3, 1};
+            descriptor.strides = {16, 640, 0};
+            descriptor.tile_length = 16;
+            descriptor.tile_rows = static_cast<uint16_t>(rows);
+            write_tma_descriptor(shmem, 0, descriptor);
+            write_tx_mbar(shmem, mbar_address, 64 * rows);
+            nanosm::Machine machine(canonical_profile(),
+                compile(tma_operands_asm(4, tile_address, 3, mbar_address, 8, c.coordinates) +
+                    "tma.store.3d [0, ur8], [ur4], [ur3]\n" + tma_wait),
+                std::move(launch));
+            completion.push_back(tick_until_phase(machine, mbar_address));
+            machine.run(50000);
+            require(std::all_of(machine.gmem().begin(), machine.gmem().begin() + 8192, [](uint8_t b) { return b == 0x5a; }),
+                "an out-of-range store (" + c.what + ") wrote gmem");
+            const auto state = machine.read_mbar_state(mbar_address);
+            require(state.phase && state.tx_bytes == 0, "an out-of-range store (" + c.what + ") left its barrier's bytes");
+            const auto& summary = machine.trace().summary();
+            require(summary.tma_command_completions == 1 && summary.tma_useful_bytes == 0 &&
+                    summary.tma_sector_bytes == 0 && summary.tma_port_requests == 0,
+                "an out-of-range store (" + c.what + ") moved data");
+        }
+        require(completion[1] == completion[0] + 32, "an out-of-range store (" + c.what + ") of 33 rows completed " +
+            std::to_string(completion[1] - completion[0]) + " cycles after one of 1 row, not 32 (one skip per row)");
+    }
+}
+
+// A load and a store of a 16 x 10 fp32 tile at (-4, -2) of an 8 x 6 tensor:
+// four out-of-range columns on each side and two out-of-range rows above and
+// below. The load zero-fills them (one fill per row-side band, at most a
+// sector each: 4 rows x 2 + 6 rows x 2 = 20 fills, 6 sectors); the store
+// leaves every byte outside the tensor alone.
+void test_tma_out_of_range_bands() {
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 1024;
+    constexpr uint32_t length = 16;
+    constexpr uint32_t rows = 10;
+    const auto inside = [](uint32_t x, uint32_t y) { return x >= 4 && x < 12 && y >= 2 && y < 8; };
+    nanosm::TmaDescriptor descriptor;
+    descriptor.dimensions = {8, 6, 1, 1};
+    descriptor.strides = {8, 0, 0};
+    descriptor.tile_length = length;
+    descriptor.tile_rows = rows;
+    const std::string operands = tma_operands_asm(4, tile_address, 3, mbar_address, 8, {-4, -2});
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + 4 * length * rows + 64);
+        auto& gmem = image_bytes(launch.gmem_image, 256);
+        for (uint32_t i = 0; i < 48; ++i) write_u32(gmem, 4 * i, 0x100 + i);
+        std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, 4 * length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.load.2d [ur4], [0, ur8], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
+            const uint32_t expected = inside(x, y) ? 0x100 + 8 * (y - 2) + (x - 4) : 0;
+            require(machine.read_shmem_u32(tile_address + 4 * (length * y + x)) == expected,
+                "out-of-range band load: element (" + std::to_string(x) + ", " + std::to_string(y) + ")");
+        }
+        require(machine.read_shmem_u32(tile_address + 4 * length * rows) == 0xa5a5a5a5u, "the load wrote past its tile");
+        const auto& summary = machine.trace().summary();
+        require(summary.tma_port_requests == 26 && summary.tma_sector_bytes == 192 && summary.tma_useful_bytes == 192,
+            "out-of-range band load: " + std::to_string(summary.tma_port_requests) + " placements, " +
+                std::to_string(summary.tma_sector_bytes) + " sector bytes (expected 20 fills + 6 sectors, 192)");
+    }
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + 4 * length * rows);
+        auto& gmem = image_bytes(launch.gmem_image, 256);
+        std::fill(gmem.begin(), gmem.end(), 0x5a);
+        for (uint32_t i = 0; i < length * rows; ++i) write_u32(shmem, tile_address + 4 * i, 0x2000 + i);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, 4 * length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.store.2d [0, ur8], [ur4], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t i = 0; i < 64; ++i) {
+            const uint32_t expected = i < 48 ? 0x2000 + length * (i / 8 + 2) + (i % 8 + 4) : 0x5a5a5a5au;
+            require(machine.read_gmem_u32(4 * i) == expected, "out-of-range band store: gmem word " + std::to_string(i));
+        }
+        require(machine.read_mbar_state(mbar_address).phase, "out-of-range band store did not complete");
+    }
+}
+
+// A transposed swizzle64 fp16 tile (64 stored rows of 16 positions, 32-byte
+// rows) at (-8, -2) of a 40 x 20 tensor: positions 8..47 along dimension 0
+// and tile rows 2..15 are inside. The load places element (x, y) at
+// position y of stored row x (zero outside); the store writes back exactly
+// the inside.
+void test_tma_transposed_out_of_range() {
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 2048;
+    constexpr uint32_t length = 64;
+    constexpr uint32_t rows = 16;
+    constexpr uint32_t dim_x = 40;
+    constexpr uint32_t dim_y = 20;
+    const auto value = [](uint32_t gx, uint32_t gy) { return static_cast<uint16_t>(0x100 + 7 * gy + gx); };
+    const auto inside = [](uint32_t x, uint32_t y) { return x >= 8 && x < 48 && y >= 2; };
+    nanosm::TmaDescriptor descriptor;
+    descriptor.element_bytes = 2;
+    descriptor.layout = nanosm::TileLayout::swizzle64;
+    descriptor.transposed = true;
+    descriptor.dimensions = {dim_x, dim_y, 1, 1};
+    descriptor.strides = {dim_x, 0, 0};
+    descriptor.tile_length = length;
+    descriptor.tile_rows = rows;
+    const auto placement = [&](uint32_t x, uint32_t y) { return reference_swizzle64(tile_address, 32, x, 2 * y); };
+    const auto read_u16 = [](const std::vector<uint8_t>& memory, uint32_t address) {
+        return static_cast<uint16_t>(memory.at(address) | memory.at(address + 1) << 8);
+    };
+    const std::string operands = tma_operands_asm(4, tile_address, 3, mbar_address, 8, {-8, -2});
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + 2 * length * rows);
+        auto& gmem = image_bytes(launch.gmem_image, 2 * dim_x * dim_y);
+        for (uint32_t y = 0; y < dim_y; ++y) for (uint32_t x = 0; x < dim_x; ++x) write_u16(gmem, 2 * (dim_x * y + x), value(x, y));
+        std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, 2 * length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.load.2d [ur4], [0, ur8], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
+            const uint16_t expected = inside(x, y) ? value(x - 8, y - 2) : 0;
+            require(read_u16(machine.shmem(), placement(x, y)) == expected,
+                "transposed out-of-range load: element (" + std::to_string(x) + ", " + std::to_string(y) + ")");
+        }
+    }
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + 2 * length * rows);
+        auto& gmem = image_bytes(launch.gmem_image, 2 * dim_x * dim_y + 64);
+        std::fill(gmem.begin(), gmem.end(), 0x5a);
+        for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
+            write_u16(shmem, placement(x, y), static_cast<uint16_t>(0x4000 + 64 * y + x));
+        }
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, 2 * length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.store.2d [0, ur8], [ur4], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t gy = 0; gy < dim_y; ++gy) for (uint32_t gx = 0; gx < dim_x; ++gx) {
+            const uint32_t x = gx + 8;
+            const uint32_t y = gy + 2;
+            const uint16_t expected = y < rows ? static_cast<uint16_t>(0x4000 + 64 * y + x) : 0x5a5a;
+            require(read_u16(machine.gmem(), 2 * (dim_x * gy + gx)) == expected,
+                "transposed out-of-range store: tensor element (" + std::to_string(gx) + ", " + std::to_string(gy) + ")");
+        }
+        for (uint32_t byte = 2 * dim_x * dim_y; byte < 2 * dim_x * dim_y + 64; ++byte) {
+            require(machine.gmem()[byte] == 0x5a, "transposed out-of-range store wrote past its tensor");
+        }
+    }
+}
+
+// A dense tile of 1-byte elements: the longest runs (32 elements, a whole
+// sector) and crooked ones. 3 rows of 96 at (5, 1) of a 200-byte-row tensor:
+// rows start at 205, 405, 605, so each row is 4 runs (19 + 32 + 32 + 13,
+// 11 + 32 + 32 + 21, 3 + 32 + 32 + 29) and every placement, its shared and
+// global offsets differing mod 4, takes at most two rounds.
+void test_tma_byte_tile_longest_run() {
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 1024;
+    constexpr uint32_t length = 96;
+    constexpr uint32_t rows = 3;
+    nanosm::TmaDescriptor descriptor;
+    descriptor.element_bytes = 1;
+    descriptor.dimensions = {200, 4, 1, 1};
+    descriptor.strides = {200, 0, 0};
+    descriptor.tile_length = length;
+    descriptor.tile_rows = rows;
+    const auto value = [](uint32_t address) { return static_cast<uint8_t>(address * 7 + 3); };
+    const std::string operands = tma_operands_asm(4, tile_address, 3, mbar_address, 8, {5, 1});
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + length * rows);
+        auto& gmem = image_bytes(launch.gmem_image, 800);
+        for (uint32_t i = 0; i < 800; ++i) gmem[i] = value(i);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.load.2d [ur4], [0, ur8], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
+            require(machine.shmem()[tile_address + length * y + x] == value(200 * (y + 1) + 5 + x),
+                "byte tile load: element (" + std::to_string(x) + ", " + std::to_string(y) + ")");
+        }
+        const auto& summary = machine.trace().summary();
+        require(summary.tma_port_requests == 12 && summary.tma_sector_bytes == 384 &&
+                summary.tma_port_rounds > summary.tma_port_requests && summary.tma_port_rounds <= 2 * summary.tma_port_requests,
+            "byte tile load: " + std::to_string(summary.tma_port_requests) + " placements of " +
+                std::to_string(summary.tma_port_rounds) + " rounds (expected 12 sectors, at most two rounds each)");
+    }
+    {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + length * rows);
+        auto& gmem = image_bytes(launch.gmem_image, 800);
+        std::fill(gmem.begin(), gmem.end(), 0x5a);
+        for (uint32_t i = 0; i < length * rows; ++i) shmem[tile_address + i] = value(i);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, length * rows);
+        nanosm::Machine machine(canonical_profile(), compile(operands + "tma.store.2d [0, ur8], [ur4], [ur3]\n" + tma_wait),
+            std::move(launch));
+        machine.run(50000);
+        for (uint32_t address = 0; address < 800; ++address) {
+            const uint32_t row = address / 200;
+            const uint32_t column = address % 200;
+            const bool tile = row >= 1 && row <= rows && column >= 5 && column < 5 + length;
+            const uint8_t expected = tile ? value(length * (row - 1) + column - 5) : 0x5a;
+            require(machine.gmem()[address] == expected, "byte tile store: gmem byte " + std::to_string(address));
+        }
+        require(machine.trace().summary().tma_sector_bytes == 384, "byte tile store: not 12 sectors");
+    }
+}
+
+// The walker's start stages (tma.walker_start_cycles; trash/walker-followups-
+// 2026-11-20.md): the canonical profile declares 2, absent is 2, 0..8 are
+// legal (0: no stages), anything else is refused, and the value is in the
+// fingerprint. A lone 2 x 16 fp32 load at (-4, 0) (zero fills and sectors)
+// makes its first placement exactly one cycle later per stage, with the same
+// bytes.
+void test_tma_walker_start_stages() {
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    const auto parsed = nanosm::parse_device_profile(document.dump());
+    require(parsed.tma_walker_start_cycles == 2 && document["tma"].contains("walker_start_cycles"),
+        "tma.walker_start_cycles: the canonical profile does not declare 2");
+    auto absent = document;
+    absent["tma"].erase("walker_start_cycles");
+    require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(absent.dump())) ==
+            nanosm::device_profile_fingerprint(parsed), "tma.walker_start_cycles: the default is not 2");
+    for (const auto value : {nlohmann::json(-1), nlohmann::json(1.5), nlohmann::json(9)}) {
+        auto modified = document;
+        modified["tma"]["walker_start_cycles"] = value;
+        try {
+            (void)nanosm::parse_device_profile(modified.dump());
+            throw std::runtime_error("tma.walker_start_cycles = " + value.dump() + " was accepted");
+        } catch (const nanosm::ProfileError&) {}
+    }
+    auto zero = document;
+    zero["tma"]["walker_start_cycles"] = 0;
+    require(nanosm::parse_device_profile(zero.dump()).tma_walker_start_cycles == 0, "tma.walker_start_cycles = 0 refused");
+    auto nine = canonical_profile();
+    nine.tma_walker_start_cycles = 9;
+    try {
+        nanosm::validate_device_profile(nine);
+        throw std::runtime_error("tma.walker_start_cycles = 9 passed validation");
+    } catch (const nanosm::ProfileError&) {}
+    for (const uint32_t stages : {0u, 3u}) {
+        auto other = canonical_profile();
+        other.tma_walker_start_cycles = stages;
+        require(nanosm::device_profile_fingerprint(other) != nanosm::device_profile_fingerprint(canonical_profile()),
+            "tma.walker_start_cycles was omitted from the profile fingerprint");
+    }
+
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 1024;
+    nanosm::TmaDescriptor descriptor;
+    descriptor.dimensions = {12, 2, 1, 1};
+    descriptor.strides = {12, 0, 0};
+    descriptor.tile_length = 16;
+    descriptor.tile_rows = 2;
+    std::vector<uint64_t> completion;
+    std::vector<std::vector<uint8_t>> landed;
+    for (const uint32_t stages : {0u, 1u, 2u, 5u}) {
+        auto profile = canonical_profile();
+        profile.tma_walker_start_cycles = stages;
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.shmem_image, tile_address + 128);
+        auto& gmem = image_bytes(launch.gmem_image, 96);
+        for (uint32_t i = 0; i < 24; ++i) write_u32(gmem, 4 * i, 0x300 + i);
+        std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
+        write_tma_descriptor(shmem, 0, descriptor);
+        write_tx_mbar(shmem, mbar_address, 128);
+        nanosm::Machine machine(profile, compile(tma_operands_asm(4, tile_address, 3, mbar_address, 8, {-4, 0}) +
+            "tma.load.2d [ur4], [0, ur8], [ur3]\n" + tma_wait, profile), std::move(launch));
+        machine.enable_edge_probe();
+        machine.run(50000);
+        // The first placement round: the zero fill of x = 0..3, the walk's
+        // first step (core cycles only; the end-to-end time also moves by
+        // DRAM-tick alignment).
+        const auto& events = machine.edge_events();
+        const auto first = std::find_if(events.begin(), events.end(),
+            [](const auto& event) { return event.edge == LsuEdge::tma_place_round; });
+        require(first != events.end(), "no tma placement round");
+        completion.push_back(first->cycle);
+        landed.emplace_back(machine.shmem().begin() + tile_address, machine.shmem().begin() + tile_address + 128);
+        for (uint32_t i = 0; i < 32; ++i) {
+            const uint32_t x = i % 16;
+            const uint32_t expected = x < 4 ? 0 : 0x300 + 12 * (i / 16) + x - 4;
+            require(machine.read_shmem_u32(tile_address + 4 * i) == expected,
+                std::to_string(stages) + " start stages: tile word " + std::to_string(i));
+        }
+    }
+    const uint64_t added[] = {0, 1, 2, 5};
+    for (std::size_t k = 1; k < completion.size(); ++k) {
+        require(completion[k] == completion[0] + added[k], std::to_string(added[k]) + " start stages: the first " +
+            "placement came " + std::to_string(completion[k] - completion[0]) + " cycles after none's, not " +
+            std::to_string(added[k]));
+        require(landed[k] == landed[0], "the start stages changed the landed bytes");
+    }
+}
+
 } // namespace
+
+// a store entirely out of range: nothing written, one skip per row, barrier completed
+TEST(Tma, tma_store_entirely_out_of_range) {
+    test_tma_store_entirely_out_of_range();
+}
+
+// out-of-range bands on every side: zero-filled by a load, untouched by a store
+TEST(Tma, tma_out_of_range_bands) {
+    test_tma_out_of_range_bands();
+}
+
+// a transposed swizzle64 tile with out-of-range parts, loaded and stored
+TEST(Tma, tma_transposed_out_of_range) {
+    test_tma_transposed_out_of_range();
+}
+
+// 1-byte elements: sector-long runs and crooked ones, loaded and stored
+TEST(Tma, tma_byte_tile_longest_run) {
+    test_tma_byte_tile_longest_run();
+}
+
+// tma.walker_start_cycles: parsed, fingerprinted, one cycle per stage, same bytes
+TEST(Tma, tma_walker_start_stages) {
+    test_tma_walker_start_stages();
+}
 
 // tma direction is the opcode; one descriptor serves both
 TEST(Tma, tma_direction_is_the_opcode) {

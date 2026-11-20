@@ -129,7 +129,7 @@ void Machine::assign_channel_requests(RequestChannel& channel, const TmaRequests
 void Machine::accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan) {
     GmemSectorRequest request;
     request.id = channel.walker_id;
-    request.command = plan.command_after.id;
+    request.command = plan.run.command;
     request.stream = tma_stream;
     request.sector_address = plan.sector_address;
     request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
@@ -139,9 +139,9 @@ void Machine::accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan
     ReadRecord record;
     record.kind = ReadKind::tma;
     record.stream = tma_stream;
-    record.command = plan.command_after.id;
+    record.command = plan.run.command;
     record.sector_address = plan.sector_address;
-    record.fragments = plan.fragments;
+    record.run = plan.run;
     channel.new_read_records.emplace_back(request.id, std::move(record));
     sanitizer_.record_ordered_request(tma_stream, request.id);
     channel.accepted = std::move(request);
@@ -401,6 +401,12 @@ void Machine::finish_gmem_write(GmemSectorRequest request) {
     if (ack.client == GmemClient::lsu && request.stream >= config_.lsu_read_streams)
         ack.tag = request.stream - config_.lsu_read_streams;
     pending_write_acks_.push_back(ack);
+    // The B channel's size (sim.hpp, gmem_queue_): one ack per write in flight.
+    const std::size_t lsu_requests = std::max<std::size_t>(
+        config_.lanes, std::size_t{8} * config_.lanes * 4 / config_.gmem_sector_bytes);
+    if (pending_write_acks_.size() > config_.tma_sector_credits + config_.lsu_active_commands * lsu_requests) {
+        throw SimError("internal: more write acknowledgements pending than writes can be in flight");
+    }
 }
 
 // Acks due now. A TMA ack returns its sector credit; an LSU ack its scatter
@@ -743,10 +749,8 @@ void Machine::pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t tak
     if (reg.filled != config_.gmem_sector_bytes) return;
 
     TmaReturn returned;
-    returned.command = record.command;
+    returned.run = record.run;
     returned.sector_request = beat.request;
-    returned.fragments = record.fragments;
-    returned.from_sector_register = true;
     reg.complete = true;
     pluck.tma_ticket = std::move(returned);
 }
@@ -903,11 +907,11 @@ Machine::EgressWrite Machine::decide_egress_write() {
         EgressSlot slot;
         slot.id = next_egress_slot_id_++;
         slot.data.assign(config_.gmem_sector_bytes, 0);
-        if (tma_ready) {
+        if (tma_ready) { // the register's run gives its sector and byte enables
             slot.client = GmemClient::tma;
-            slot.command = tma_head->command;
-            slot.sector_address = tma_head->sector_address;
-            slot.byte_enable = tma_head->byte_enable;
+            slot.command = tma_head->run.command;
+            slot.sector_address = run_sector_address(tma_head->run);
+            slot.byte_enable = run_byte_enable(tma_head->run);
             slot.words_total = sector_words;
         } else if (lsu->kind == LsuKind::vector_store) {
             slot.client = GmemClient::lsu;
