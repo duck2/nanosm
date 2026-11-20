@@ -1597,6 +1597,17 @@ void test_i5_launch_declared_mbars_format() {
                 "active_warps " + bad.dump());
         }
     }
+    // C2: the image's other integers too (a segment address, register_count).
+    for (const auto& bad : {nlohmann::json(1.5), nlohmann::json(-1)}) {
+        auto document = nlohmann::json::parse(declared);
+        document["kernel"]["register_count"] = bad;
+        rejected([&] { return nanosm::emit_launch_image(nanosm::load_launch_image(document.dump())); },
+            "launch image: kernel.register_count is not an unsigned 32-bit integer", "register_count " + bad.dump());
+        document = nlohmann::json::parse(declared);
+        document["shmem"][0]["address"] = bad;
+        rejected([&] { return nanosm::emit_launch_image(nanosm::load_launch_image(document.dump())); },
+            "launch image: shmem[0].address is not an unsigned integer", "segment address " + bad.dump());
+    }
 }
 
 } // namespace

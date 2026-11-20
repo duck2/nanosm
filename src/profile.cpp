@@ -117,7 +117,16 @@ json profile_json(const DeviceProfile& p) {
 template<typename T>
 T field(const json& object, const char* name) {
     try {
-        return object.at(name).get<T>();
+        const auto& value = object.at(name);
+        // An integer field takes a non-negative integer that fits its type;
+        // anything else is refused by name (never narrowed silently).
+        if constexpr (std::is_integral_v<T>) {
+            if (!value.is_number_unsigned() || value.template get<uint64_t>() > std::numeric_limits<T>::max()) {
+                throw ProfileError(std::string("device profile field '") + name + "' must be an integer in 0.." +
+                    std::to_string(std::numeric_limits<T>::max()) + " (got " + value.dump() + ")");
+            }
+        }
+        return value.template get<T>();
     } catch (const json::exception& error) {
         throw ProfileError(std::string("device profile field '") + name + "': " + error.what());
     }

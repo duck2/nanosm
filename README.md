@@ -116,9 +116,14 @@ entry and switches to it: the mask becomes the entry's and the warp goes to its 
 is `ssy L; @p bra T; <else arm>; sync; T: <then arm>; sync; L: ...`: each arm ends in its own
 `sync` and L is an ordinary instruction. Every per-lane writer (arithmetic, moves, conversions,
 special registers, the SFU, `ur2r`, predicates, `lds` / `sts`, scalar `ldg` / `stg`) writes only
-the active lanes; fixed timing ignores the mask. A uniform operation (and `bra.uni`) under a
-partial mask and a halt inside an arm are the sanitizer's PANICs; stack overflow and a `sync` on
-an empty stack are the machine's. There are no guards: only `bra` and `bra.uni` take a predicate.
+the active lanes; fixed timing ignores the mask. Instructions that act for the whole warp are two
+kinds. A warp-wide memory or engine operation under a partial mask is the sanitizer's PANIC:
+`tma.*`, `mma.*`, `acc.*`, `mbar.*`, `atom.*.uni`, `ldg.uni` / `lds.uni`,
+`ldg.v8` / `stg.v8`, `r2ur` and `bra.uni`. Uniform integer arithmetic (`umov`, `uadd`, ...) is
+not checked: it executes once in every arm that issues it, so a counter bumped in both arms is
+bumped twice (`usetp` writes its predicate on the active lanes only). A halt inside an arm is
+the sanitizer's PANIC too; stack overflow and a `sync` on an empty stack are the machine's.
+There are no guards: only `bra` and `bra.uni` take a predicate.
 `kernels/diverge.launch.py` counts Collatz steps per lane.
 
 Qtx conservatively drains live depbars and fixed-latency writes at every branch and `sync`. Qtx's `wait`

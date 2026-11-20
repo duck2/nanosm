@@ -3940,8 +3940,19 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
     case Opcode::nop:
         break; // its wait mask held it until now; its stall is set below
     case Opcode::halt: {
+        // The sanitizer's view counts the warp's own control instruction
+        // resolving this cycle: an ssy does not hold its warp, so the halt
+        // right behind it issues in the cycle the ssy's push resolves, one
+        // cycle before the registered depth shows it.
         const auto& divergence = divergence_.cur().warps.at(warp.id);
-        sanitizer_.check_halt_converged(site(warp, inst), divergence.depth, divergence.active, full_mask());
+        uint32_t depth = divergence.depth;
+        uint64_t active = divergence.active;
+        if (w.branch.has_value() && w.branch->warp == warp.id) {
+            if (w.branch->push.has_value()) ++depth;
+            if (w.branch->pop) --depth;
+            if (w.branch->mask.has_value()) active = *w.branch->mask;
+        }
+        sanitizer_.check_halt_converged(site(warp, inst), depth, active, full_mask());
         w.issue.halt = true;
         break;
     }

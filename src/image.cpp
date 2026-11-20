@@ -93,6 +93,11 @@ std::vector<ImageSegment> load_segments(const json& value, const std::string& na
         const auto& item = value.at(index);
         ImageSegment segment;
         try {
+            // Checked before it is read: get<uint64_t> is a bare cast (-8 or
+            // 4160.9 would become some address).
+            if (!item.at("address").is_number_unsigned()) {
+                throw SimError("launch image: " + field + ".address is not an unsigned integer");
+            }
             segment.address = item.at("address").get<uint64_t>();
             segment.bytes = decode_bytes(item.at("bytes").get<std::string>(), field + ".bytes");
         } catch (const json::exception& error) {
@@ -216,9 +221,12 @@ LaunchImage load_launch_image(std::string_view source) {
         image.kernel.profile_fingerprint = parse_hex_u64(
             profile.at("fingerprint").get<std::string>(), "profile.fingerprint");
         const auto& kernel = document.at("kernel");
-        const auto register_count = kernel.at("register_count").get<uint32_t>();
-        if (register_count > 256) throw SimError("launch image: register count exceeds 256");
-        image.kernel.register_count = static_cast<uint16_t>(register_count);
+        const auto register_count = unsigned_32(kernel.at("register_count"));
+        if (!register_count.has_value()) {
+            throw SimError("launch image: kernel.register_count is not an unsigned 32-bit integer");
+        }
+        if (*register_count > 256) throw SimError("launch image: register count exceeds 256");
+        image.kernel.register_count = static_cast<uint16_t>(*register_count);
         // An image of a kernel built before 2026-11-19 carried an accumulator
         // table; its mma.async / acc.ld / acc.st words mean something else now.
         if (kernel.contains("accumulators")) {

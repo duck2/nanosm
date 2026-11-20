@@ -472,6 +472,22 @@ void test_sfu_profile_validation() {
             throw std::runtime_error("invalid sfu latency was accepted");
         } catch (const nanosm::ProfileError&) {}
     }
+    // C1: a required integer out of its type's range (or negative, or a
+    // fraction) is refused by name, never narrowed (alu_latency_cycles is 8
+    // bits: 257 would have read as 1).
+    for (const auto& [section, name, value] : std::vector<std::tuple<std::string, std::string, nlohmann::json>>{
+             {"core", "alu_latency_cycles", 257}, {"lsu", "active_commands", 4294967297ull},
+             {"shmem", "banks", -16}, {"mma", "queue_commands", 2.5}}) {
+        auto modified = document;
+        modified[section][name] = value;
+        try {
+            (void)nanosm::parse_device_profile(modified.dump());
+            throw std::runtime_error(name + " = " + value.dump() + " was accepted");
+        } catch (const nanosm::ProfileError& error) {
+            require(std::string(error.what()).find("device profile field '" + name + "' must be an integer in 0..") !=
+                    std::string::npos, error.what());
+        }
+    }
     auto faster = document;
     faster["sfu"]["lanes"] = 16;
     require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(faster.dump())) !=

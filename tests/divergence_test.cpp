@@ -416,6 +416,13 @@ void test_uniform_operation_or_halt_in_an_arm_panics() {
         nanosm::Machine machine(canonical_profile(), compile(masked_region(0x00ff, body) + "halt\n"), std::move(launch));
         expect_sim_panic(machine, needle, body);
     }
+    // A halt directly behind an ssy issues in the cycle the ssy's push
+    // resolves (an ssy does not hold its warp); the check counts that push.
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    nanosm::Machine machine(canonical_profile(), compile("ssy JOIN\nhalt\nJOIN: halt\n"), std::move(launch));
+    expect_sim_panic(machine, "halt inside a divergent region (1 divergence stack entries left, active mask 0xffff)",
+        "halt directly behind an ssy");
 }
 
 // The machine's own PANICs: a push onto a full stack (two entries here) and
