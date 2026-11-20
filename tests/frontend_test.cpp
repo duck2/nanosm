@@ -423,18 +423,19 @@ void test_i6b2_prefetch_through_waits() {
         check(*machine, 8, release, "depbar");
     }
     {   // A refused head: one load slot; the second lds.uni (c3) is refused
-        // until the first's RF write frees the slot (the I1 timeline: at its
-        // grant, 1 + i1_lds_shift cycles after the refusal starts).
+        // until the first's RF write frees the slot (the I1 timeline: the
+        // cycle after its grant, 2 + i1_lds_shift cycles after the refusal
+        // starts).
         auto one = profile;
         one.shmem_load_slots = 1;
         auto machine = i6b2_machine(one, R"(
             lds.uni r20, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
             lds.uni r22, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
         )" + i6b2_independent_movs(3) + "halt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n");
-        const auto release = nanosm::fetch_to_issue + 1 + 1 + i1_lds_shift(one);
+        const auto release = nanosm::fetch_to_issue + 1 + 2 + i1_lds_shift(one);
         check(*machine, 8, release, "refused head");
         require(refusals(*machine, 0, "load slots full") ==
-                std::vector<std::pair<uint64_t, uint64_t>>{{nanosm::fetch_to_issue + 1, 1 + i1_lds_shift(one)}},
+                std::vector<std::pair<uint64_t, uint64_t>>{{nanosm::fetch_to_issue + 1, 2 + i1_lds_shift(one)}},
             "refused head: the second lds.uni was not refused from c3 until the slot freed");
     }
 }

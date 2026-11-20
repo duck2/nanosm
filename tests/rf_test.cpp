@@ -854,8 +854,9 @@ void test_i1_acc_ld_pipeline_freeze() {
 
 // Load slots (rfc12 section 3; shmem.load_slots = 2). Two lds.uni hold both
 // slots, their results complete and waiting for the RF (eight fadds keep RF
-// bank 0 booked over them); a third is refused (structural, counted) until
-// the RF write decision grants slot 0 and issues in that same cycle.
+// bank 0 booked over them); a third is refused (structural, counted) through
+// the cycle the RF write decision grants slot 0 and issues the cycle after
+// (issue counts the slots empty in Q: trash/slot-return-cut-2026-11-20.md).
 // Meanwhile port A serves a store while both slots hold results.
 // I6a re-derivation (was two warps, qtxc): one warp, hand assembly, so the
 // fadd bookings are contiguous (a second warp's issues used to leave holes in
@@ -871,7 +872,7 @@ void test_i1_acc_ld_pipeline_freeze() {
 // results wait. The third lds.uni is ordered behind the sts until that grant
 // (L0 + 6 .. L0 + 8; before I6a the sts was granted the cycle after its
 // issue, so no order wait showed), then refused for load slots from L0 + 9
-// to G0, and issues at G0. Results land Wd after their grants.
+// through G0, and issues at G0 + 1. Results land Wd after their grants.
 void test_i1_load_slots() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
@@ -927,13 +928,13 @@ void test_i1_load_slots() {
         "the sts until its grant (L0 + 9):" + observed + "; ordered" +
             describe(refusals(*machine, 0, "ordered behind own access")));
     const auto refused = refusals(*machine, 0, "load slots full");
-    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{l0 + 9, g0 - l0 - 9}},
-        "the third lds.uni was not refused for load slots from L0 + 9 until slot 0's write (G0):" + observed);
-    require(machine->trace().summary().shmem_load_slot_waits == g0 - l0 - 9, "the refusals were not counted");
-    require(lds(2) == std::vector<uint64_t>{g0} && written.at(3) == std::vector<uint64_t>{g0 + wd},
-        "the third lds.uni did not take slot 0 in the cycle its write was granted:" + observed);
+    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{l0 + 9, g0 + 1 - l0 - 9}},
+        "the third lds.uni was not refused for load slots from L0 + 9 through slot 0's write grant (G0):" + observed);
+    require(machine->trace().summary().shmem_load_slot_waits == g0 + 1 - l0 - 9, "the refusals were not counted");
+    require(lds(2) == std::vector<uint64_t>{g0 + 1} && written.at(3) == std::vector<uint64_t>{g0 + wd},
+        "the third lds.uni did not take slot 0 the cycle after its write was granted:" + observed);
     require(written.at(6) == std::vector<uint64_t>{g0 + 1 + wd} &&
-            written.at(9) == std::vector<uint64_t>{g0 + x + 2 + wd},
+            written.at(9) == std::vector<uint64_t>{g0 + 1 + x + 2 + wd},
         "results:" + observed);
     require(machine->read_reg(0, 7, 9) == 0x102, "the third load's word");
     require(store_cycle == l0 + 11 && store_while_both_waiting,
@@ -943,8 +944,8 @@ void test_i1_load_slots() {
 
 // shmem.load_slots: optional in the profile JSON (default 2), an integer of
 // at least 1, part of the fingerprint. With one slot, back-to-back lds.uni
-// serialize on it: the second takes it in the cycle the first's write is
-// granted.
+// serialize on it: the second takes it the cycle after the first's write is
+// granted (issue counts the slot empty in Q).
 void test_i1_load_slots_profile_field() {
     std::ifstream input("profiles/nanosm-v0.json");
     nlohmann::json document;
@@ -983,11 +984,12 @@ void test_i1_load_slots_profile_field() {
     const auto written = i1_run(*machine, {3, 6});
     // I2: the slot is held while the first load's words come back (D + Lb).
     const auto refused = refusals(*machine, 0, "load slots full");
-    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{i1_launch_shift + 2, 1 + i1_lds_shift(one)}},
+    require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{i1_launch_shift + 2, 2 + i1_lds_shift(one)}},
         "the second lds.uni was not refused until the one slot freed:" + describe(refused));
     require(written.at(3).size() == 1 &&
-            issued_at(*machine, 2 * 8) == std::vector<uint64_t>{written.at(3)[0] - one.rf_write_depth_cycles},
-        "the second lds.uni did not take the slot as it freed (the first's write grant, Wd before it lands)");
+            issued_at(*machine, 2 * 8) == std::vector<uint64_t>{written.at(3)[0] - one.rf_write_depth_cycles + 1},
+        "the second lds.uni did not take the slot the cycle after it freed (the first's write grant, Wd before "
+        "it lands)");
     require(machine->read_reg(0, 0, 6) == 0x101, "the second load's word");
 }
 

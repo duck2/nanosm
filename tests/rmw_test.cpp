@@ -860,8 +860,9 @@ void test_i5_add_wraps_at_the_int32_boundary() {
 // it never takes the store pause with nowhere to put its old value. One load
 // slot: the lds holds it from its grant G until its RF write at G + D + Lb +
 // 1; the atomic (not ordered: the lds is serviced at its grant) is refused
-// "load slots full" G .. G + D + Lb and admitted in the cycle the lds's RF
-// write frees the slot (same-cycle reuse), then runs.
+// "load slots full" G .. G + D + Lb + 1 (through the cycle the lds's RF
+// write is granted) and admitted the cycle after, when issue sees the slot
+// empty in Q (trash/slot-return-cut-2026-11-20.md), then runs.
 // I6a: the lds issues at l (it needs the shli's r1: 2 alu_distance) and is
 // granted at G = l + issue_to_dispatch + 1; the atomic, first tried at l + 2
 // (it needs the second mov's r3), is ordered behind the unserviced lds
@@ -891,12 +892,12 @@ void test_i5_return_slot_admission() {
     require(refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{l + 1, t}},
         "the atomic was not ordered behind the lds until its grant:" +
             describe(refusals(*machine, 0, "ordered behind own access")));
-    require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{g.cycle, back + 1}} &&
-            issued_at(*machine, 40) == std::vector<uint64_t>{g.cycle + back + 1},
+    require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{g.cycle, back + 2}} &&
+            issued_at(*machine, 40) == std::vector<uint64_t>{g.cycle + back + 2},
         "the atomic was not refused for its return slot c" + std::to_string(g.cycle) + " .. c" +
-            std::to_string(g.cycle + back) + " and admitted at c" + std::to_string(g.cycle + back + 1) + ":" +
+            std::to_string(g.cycle + back + 1) + " and admitted at c" + std::to_string(g.cycle + back + 2) + ":" +
             describe(refusals(*machine, 0, "load slots full")));
-    require(machine->trace().summary().shmem_load_slot_waits == back + 1, "the return-slot refusals were not counted");
+    require(machine->trace().summary().shmem_load_slot_waits == back + 2, "the return-slot refusals were not counted");
     const auto atomic = i5_atomic(*machine, "after the refusal");
     i5_require_timeline(atomic, profile, atomic.start, "after the refusal");
     require(machine->read_shmem_u32(1024) == 0x205, "the atomic's word");

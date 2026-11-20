@@ -2064,10 +2064,12 @@ private:
     void complete_mbar_try_wait(Wires& w, uint32_t slot, bool result);
 
     // Service slots and the warp's shmem order, as issue sees them after this
-    // cycle's grants (look-ahead (c), reuse (d)).
+    // cycle's grants (look-ahead (c), reuse (d)) -- except the load slots'
+    // count, which is Q only (a slot whose RF write is granted at t counts
+    // for issue from t + 1).
     [[nodiscard]] std::optional<uint32_t> free_load_slot(const Wires& w) const;
     [[nodiscard]] std::optional<uint32_t> free_store_slot(const Wires& w) const;
-    [[nodiscard]] uint32_t free_load_slot_count(const Wires& w) const;
+    [[nodiscard]] uint32_t free_load_slot_count() const;
     [[nodiscard]] uint32_t free_store_slot_count(const Wires& w) const;
     [[nodiscard]] uint32_t free_wait_slot_count(const Wires& w) const;
     // The warp has an instruction in the dispatch pipeline that will read /

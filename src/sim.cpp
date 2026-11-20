@@ -477,10 +477,17 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          register emptied by an RMW start, assembly registers) and the
 //          warp's shmem accesses as this cycle's grants leave them (rfc12
 //          section 4) -- less the space the dispatch pipeline's
-//          instructions will take (dispatch_claims).
+//          instructions will take (dispatch_claims). Not the load slots
+//          (an lds's or an atomic's return slot): issue counts the slots
+//          empty in Q, so a slot whose RF write is granted at t is free for
+//          a new admission from t + 1 (HUMAN 11-20, trash/slot-return-cut-
+//          2026-11-20.md). The RF write decision's fairness inhibit, the
+//          LSU command slot and assembly register its grant releases, and
+//          the acc.ld engine its grant lets advance are still seen at t.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
 //          t (the assembly register, a load slot whose RF write is granted
-//          at t, the TMA sector / store registers, the MMA event register,
+//          at t -- by dispatch, which issue admitted earlier against the
+//          slots' Q -- the TMA sector / store registers, the MMA event register,
 //          an LSU slot or acc slot reallocated by dispatch). The refill's
 //          data is visible at t+1; nothing passes through.
 //      (e) A dispatched stg.v8 may make its first RF read beat in its
@@ -2199,6 +2206,7 @@ std::string Machine::rmw_label(const ActiveMbarRmw& active) {
 // ---- What issue sees of shmem (look-ahead (c), reuse (d)): the service
 // slots and the warp's own order (rfc12 sections 3, 4 and 6) ----
 
+// Dispatch's slot: an empty one, or one whose RF write is granted now (d).
 std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
     for (uint32_t index = 0; index < load_slots_.size(); ++index) {
         if (!load_slots_[index].cur().has_value()) return index;
@@ -2207,10 +2215,14 @@ std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
     return std::nullopt;
 }
 
-uint32_t Machine::free_load_slot_count(const Wires& w) const {
+// Issue's count: the slots empty in Q only. A slot whose RF write is granted
+// at t counts from t + 1 (the slot register's next value); this cycle's grant
+// does not reach the warp selection (trash/issue-depth-2026-11-20/findings.md:
+// RF winner -> slot space -> winning warp was the longest issue path).
+uint32_t Machine::free_load_slot_count() const {
     uint32_t count = 0;
     for (uint32_t index = 0; index < load_slots_.size(); ++index) {
-        if (!load_slots_[index].cur().has_value() || w.rf_write.granted_to(AsyncWriter::load_slot, index)) ++count;
+        if (!load_slots_[index].cur().has_value()) ++count;
     }
     return count;
 }
@@ -3744,7 +3756,7 @@ ResourceView Machine::resource_view(
     view.unserviced_read = warp_unserviced_read(w, warp.id);
     view.unserviced_write = warp_unserviced_write(w, warp.id);
     if (inst.opcode == Opcode::fence_sh) view.own_shmem_at_ram = own_shmem_at_ram(w, warp.id);
-    view.load_slot_free = free_load_slot_count(w) > claims.load_slots;
+    view.load_slot_free = free_load_slot_count() > claims.load_slots;
     view.store_slot_free = free_store_slot_count(w) > claims.store_slots;
     view.probe_register_free =
         (!mbar_probe_.cur().has_value() || w.shmem.a_read.user == AReadUser::probe) && claims.probes == 0;
