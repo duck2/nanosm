@@ -1,7 +1,9 @@
 // The qtx scheduler (src/qtxc/): turns a parsed qtx program into scheduled
 // assembly by filling in each instruction's control bits: the stall counts
 // its fixed-latency dependencies need (FixedTimeline, distances from
-// src/rf.hpp), depbar set / wait for the asynchronous ones, a full drain at
+// src/rf.hpp), depbar set / wait for the asynchronous ones (with all six
+// live, an instruction that needs a new one waits for the oldest and reuses
+// it), a full drain at
 // every branch, a loop body scheduled as a jump enters it (LoopEntry), and
 // qtx's wait as a nop waiting for every live depbar (no drain).
 // schedule_fixed_stalls is the same stall pass for hand assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
@@ -208,14 +210,44 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     int64_t previous_vtime = 0;
     Instruction* previous = nullptr;
 
-    const auto allocate = [&]() -> uint8_t {
-        for (uint8_t bar = 0; bar < 6; ++bar) {
-            if (!live[bar]) {
-                live[bar] = true;
-                return bar;
-            }
+    // A wait on the depbars in `mask`: once it is satisfied their work is
+    // done, so they are free and nothing pending on them needs a wait again.
+    const auto release = [&](uint8_t mask) {
+        for (auto& pending : pending_register) {
+            if (pending.has_value() && (mask & (1u << *pending)) != 0) pending.reset();
         }
-        throw SimError("qtx scheduler exhausted six live depbars");
+        for (auto& pending_mask : pending_async_read_mask) pending_mask &= static_cast<uint8_t>(~mask);
+        acc_store_mask &= static_cast<uint8_t>(~mask);
+        acc_load_mask &= static_cast<uint8_t>(~mask);
+        for (uint8_t bar = 0; bar < 6; ++bar) {
+            if ((mask & (1u << bar)) != 0) live[bar] = false;
+        }
+        if (store_barrier.has_value() && (mask & (1u << *store_barrier)) != 0) store_barrier.reset();
+        if (mma_barrier.has_value() && (mask & (1u << *mma_barrier)) != 0) mma_barrier.reset();
+    };
+
+    // The depbar `inst` sets: the lowest free one. With all six live, the
+    // oldest live one (the earliest allocated): `inst` also waits for it,
+    // which frees it, and then sets it.
+    std::array<uint64_t, 6> allocated_at{};
+    uint64_t allocations = 0;
+    const auto allocate = [&](Instruction& inst) -> uint8_t {
+        std::optional<uint8_t> chosen;
+        for (uint8_t bar = 0; bar < 6 && !chosen.has_value(); ++bar) {
+            if (!live[bar]) chosen = bar;
+        }
+        if (!chosen.has_value()) {
+            chosen = 0;
+            for (uint8_t bar = 1; bar < 6; ++bar) {
+                if (allocated_at[bar] < allocated_at[*chosen]) chosen = bar;
+            }
+            const auto mask = static_cast<uint8_t>(1u << *chosen);
+            inst.control.wait_mask |= mask;
+            release(mask);
+        }
+        live[*chosen] = true;
+        allocated_at[*chosen] = ++allocations;
+        return *chosen;
     };
 
     // A loop head's fall-through edge, until the loop body's first stretch
@@ -313,22 +345,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
         inst.control.wait_mask = wait_mask;
 
-        if (wait_mask != 0) {
-            for (auto& pending : pending_register) {
-                if (pending.has_value() && (wait_mask & (1u << *pending)) != 0) pending.reset();
-            }
-            for (auto& mask : pending_async_read_mask) mask &= static_cast<uint8_t>(~wait_mask);
-            acc_store_mask &= static_cast<uint8_t>(~wait_mask);
-            acc_load_mask &= static_cast<uint8_t>(~wait_mask);
-            for (uint8_t bar = 0; bar < 6; ++bar) {
-                if ((wait_mask & (1u << bar)) != 0) live[bar] = false;
-            }
-            if (store_barrier.has_value() && (wait_mask & (1u << *store_barrier)) != 0) {
-                store_barrier.reset();
-            }
-            if (mma_barrier.has_value() && (wait_mask & (1u << *mma_barrier)) != 0)
-                mma_barrier.reset();
-        }
+        if (wait_mask != 0) release(wait_mask);
 
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
         check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
@@ -355,32 +372,32 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         timeline.record(inst, profile, vtime);
         if (inst.opcode == Opcode::lds || inst.opcode == Opcode::lds_uni || inst.opcode == Opcode::ldg ||
             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::ldg_uni || is_atomic(inst.opcode)) {
-            const auto bar = allocate();
+            const auto bar = allocate(inst);
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
         } else if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg || inst.opcode == Opcode::stg_v8) {
-            if (!store_barrier.has_value()) store_barrier = allocate();
+            if (!store_barrier.has_value()) store_barrier = allocate(inst);
             inst.control.set_depbar = *store_barrier;
             if (inst.opcode == Opcode::stg_v8) {
                 for (unsigned j = 0; j < 8; ++j)
                     pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
             }
         } else if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8) {
-            const auto bar = allocate();
+            const auto bar = allocate(inst);
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::acc_ld_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
             acc_load_mask |= static_cast<uint8_t>(1u << bar);
         } else if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
-            if (!store_barrier.has_value()) store_barrier = allocate();
+            if (!store_barrier.has_value()) store_barrier = allocate(inst);
             inst.control.set_depbar = *store_barrier;
             acc_store_mask |= static_cast<uint8_t>(1u << *store_barrier);
             const auto width = inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j)
                 pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
         } else if (is_mma_async(inst.opcode)) {
-            if (!mma_barrier.has_value()) mma_barrier = allocate();
+            if (!mma_barrier.has_value()) mma_barrier = allocate(inst);
             inst.control.set_depbar = *mma_barrier;
         }
 

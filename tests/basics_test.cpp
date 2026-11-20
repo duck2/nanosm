@@ -114,6 +114,29 @@ void test_compiler_controls() {
     require(program.instructions[5].control.wait_mask == 0b000001, "halt did not wait for store completion");
 }
 
+// With all six depbars live, the instruction that needs a seventh waits for
+// the oldest live one and reuses it (it used to be an error).
+void test_seventh_depbar_reuses_the_oldest() {
+    const auto program = nanosm::compile_qtx(R"(
+        mov r0, 0
+        lds r1, [r0]
+        lds r2, [r0+4]
+        lds r3, [r0+8]
+        lds r4, [r0+12]
+        lds r5, [r0+16]
+        lds r6, [r0+20]
+        lds r7, [r0+24]
+        halt
+    )", canonical_profile());
+    for (unsigned load = 0; load < 6; ++load) {
+        require(program.instructions[1 + load].control.set_depbar == load, "the first six loads take sb0..sb5");
+        require(program.instructions[1 + load].control.wait_mask == 0, "the first six loads wait for nothing");
+    }
+    require(program.instructions[7].control.wait_mask == 0b000001, "the seventh load did not wait for the oldest depbar");
+    require(program.instructions[7].control.set_depbar == 0, "the seventh load did not reuse the oldest depbar");
+    require(program.instructions[8].control.wait_mask == 0b111111, "halt did not wait for every live depbar");
+}
+
 void test_stalls_track_consumer_distance() {
     // fadd's result is consumed three instructions later, so only what its
     // distance (src/rf.hpp: issue_to_visible - the consumer's issue_to_sample)
@@ -866,6 +889,10 @@ TEST(Basics, launch_image_rejects_bad_segment_hex) {
 }
 
 // mbar warp handoff
+TEST(Basics, seventh_depbar_reuses_the_oldest) {
+    test_seventh_depbar_reuses_the_oldest();
+}
+
 TEST(Basics, warp_handoff_through_mbar) {
     test_warp_handoff_through_mbar();
 }
