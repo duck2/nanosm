@@ -463,7 +463,7 @@ void test_mbar_engine_events_visible_next_cycle() {
     constexpr uint32_t tx_mbar = 4104;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     auto& gmem = image_bytes(launch.gmem_image, 64);
     for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
     write_mbar(shmem, commit_mbar, 1, 0);
@@ -521,7 +521,7 @@ void test_simultaneous_depbar_completion_and_admission() {
     body += "ldg r3, [r0] {pred=PT, stall=0, set=sb0, wait=-}\nhalt {pred=PT, stall=0, set=-, wait=sb0}\n";
     nanosm::Launch launch;
     launch.active_warps = 1;
-    write_u32(image_bytes(launch.shmem_image, 64), 0, 0xabcd);
+    write_u32(image_bytes(launch.test_shmem, 64), 0, 0xabcd);
     write_u32(image_bytes(launch.gmem_image, 64), 0, 0x1234);
     nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch), {.timeline = true});
     std::map<uint64_t, uint32_t> sb0_after; // cycle -> sb0 at the next cycle's start
@@ -555,7 +555,7 @@ void test_simultaneous_depbar_completion_and_admission() {
 void test_simultaneous_full_queue_pop_and_push() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 4096);
+    image_bytes(launch.test_shmem, 4096);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 0
         umov ur1, 1024
@@ -689,7 +689,7 @@ void test_driver_shuffle_unit_kernels() {
     const auto tma_and_mma = [] {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         auto& gmem = image_bytes(launch.gmem_image, 64);
         for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
         write_mbar(shmem, 4096, 1, 0);
@@ -725,7 +725,7 @@ void test_driver_shuffle_unit_kernels() {
     const auto scatter_and_tma_store = [] {
         nanosm::Launch launch;
         launch.active_warps = 2;
-        auto& shmem = image_bytes(launch.shmem_image, 4096);
+        auto& shmem = image_bytes(launch.test_shmem, 4096);
         fill_pattern(shmem, 1024, 64, 0);
         write_rank1_tma(shmem, 0, 2048, 64, 128);
         image_bytes(launch.gmem_image, 8192);

@@ -140,12 +140,17 @@ class Result:
 
 
 def launch_copy_counters(expected: Mapping[str, Mapping[str, int]], copied_bytes: int,
-                         sector_bytes: int = 32, bus_bytes: int = 8) -> dict[str, dict[str, int]]:
+                         sector_bytes: int = 32, bus_bytes: int = 8,
+                         block_address: int | None = None) -> dict[str, dict[str, int]]:
     """`expected` (summary line -> counter -> value: a kernel's own algorithmic
     counts) with the launch copy's part added: one TMA load of `copied_bytes`
-    in whole sectors, each one global read and one shared-memory round. Keys
-    a script does not pin are left alone."""
-    sectors = -(-copied_bytes // sector_bytes)
+    in whole sectors, each one global read and one shared-memory round. The
+    sectors are global memory's, so they count from where the block starts
+    inside its first sector: `block_address` is the launch's (None: the
+    default, which is sector-aligned). Keys a script does not pin are left
+    alone."""
+    offset = 0 if block_address is None else block_address % sector_bytes
+    sectors = -(-(offset + copied_bytes) // sector_bytes) if copied_bytes else 0
     extra = {
         "tma": {"commands": 1 if copied_bytes else 0, "completed": 1 if copied_bytes else 0,
                 "logical_bytes": copied_bytes, "useful_bytes": copied_bytes,
@@ -198,7 +203,10 @@ class Launch:
         self._info = json.loads(kernel_info(self.profile.read_bytes(), self.kernel.read_bytes()))
         self._warps = warps
         self.args = self._named(args)
-        self.shmem = SparseMemory()
+        # A TEST's access: bytes placed in shared memory before the first
+        # cycle, untimed (to poison a region). The run's summary reports it
+        # (`test_preload:`), and it may not touch the launch block.
+        self.test_shmem = SparseMemory()
         self.gmem = SparseMemory()
 
     @property
@@ -215,16 +223,15 @@ class Launch:
     def sections(self) -> list[dict[str, object]]:
         """The kernel's launch block in order: each section's name, kind
         (param, mbar, data), shared-memory address, bytes and launch flag (a
-        depbar number; absent on a profile with no launch copy)."""
+        depbar number), and for an mbar its element count."""
         return list(self._info["sections"])
 
     @property
     def copied_bytes(self) -> int:
         """The bytes the launch copy brings from global memory into shared
-        memory: the launch block's size, or 0 when the kernel has no sections
-        or the profile makes no copy (core.launch_flags 0). The copy is one
-        more TMA command of whole sectors; a script that pins counters adds
-        its part (launch_copy_counters)."""
+        memory: the launch block's size, or 0 when the kernel has no
+        sections. The copy is one more TMA command of whole sectors; a script
+        that pins counters adds its part (launch_copy_counters)."""
         return int(self._info["block"]["bytes"]) if self._info["flags"] else 0
 
     def symbol(self, name: str) -> int:
@@ -266,7 +273,7 @@ class Launch:
     def _state_json(self) -> bytes:
         document: dict[str, object] = {
             "format": "nanosm-launch-state-v0",
-            "shmem": self.shmem._json(),
+            "test_shmem": self.test_shmem._json(),
             "gmem": self.gmem._json(),
         }
         if self._warps is not None:

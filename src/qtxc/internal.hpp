@@ -48,6 +48,7 @@ std::vector<uint8_t> issue_sources(const Instruction& inst);
 // section's address.
 bool is_directive(const std::string& clean, std::string_view name);
 std::string section_name(const std::string& name, uint32_t line, const char* what);
+std::pair<std::string, uint32_t> mbar_name_and_count(const std::string& text, uint32_t line);
 uint32_t parse_warps_directive(const std::string& tail, uint32_t line);
 KernelSection parse_param_directive(const std::string& tail, uint32_t line, bool with_address);
 KernelSection parse_mbar_directive(

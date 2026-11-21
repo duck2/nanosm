@@ -41,7 +41,7 @@ void test_tma_direction_is_the_opcode() {
     }
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& shmem = image_bytes(launch.test_shmem, 4096);
     auto& gmem = image_bytes(launch.gmem_image, 64);
     for (uint32_t i = 0; i < 16; ++i) {
         write_u32(gmem, 4 * i, 0x100 + i);
@@ -109,7 +109,7 @@ void test_tma_swizzle64_transposed_load_store() {
 
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 1088);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 1088);
         auto& gmem = image_bytes(launch.gmem_image, stride * dim_y * 2);
         for (uint32_t y = 0; y < dim_y; ++y)
             for (uint32_t x = 0; x < dim_x; ++x)
@@ -136,7 +136,7 @@ void test_tma_swizzle64_transposed_load_store() {
 
         nanosm::Launch store_launch;
         store_launch.active_warps = 1;
-        auto& store_shmem = image_bytes(store_launch.shmem_image, tile_address + 1088);
+        auto& store_shmem = image_bytes(store_launch.test_shmem, tile_address + 1088);
         auto& store_gmem = image_bytes(store_launch.gmem_image, stride * dim_y * 2);
         std::fill(store_gmem.begin(), store_gmem.end(), 0x5a);
         for (uint32_t y = 0; y < tile_rows; ++y) for (uint32_t x = 0; x < tile_length; ++x)
@@ -179,7 +179,7 @@ void test_tma_swizzle64_feeds_mma_orientations() {
         constexpr uint64_t base_b = 8192;
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 7168);
+        auto& shmem = image_bytes(launch.test_shmem, 7168);
         auto& gmem = image_bytes(launch.gmem_image, 20000);
         for (uint32_t m = 0; m < 64; ++m)
             for (uint32_t k = 0; k < 16; ++k)
@@ -342,7 +342,7 @@ void test_tma_swizzle64_census_against_mma() {
                 descriptor.tile_rows = static_cast<uint16_t>(height);
                 nanosm::Launch launch;
                 launch.active_warps = 1;
-                auto& shmem = image_bytes(launch.shmem_image, shmem_bytes);
+                auto& shmem = image_bytes(launch.test_shmem, shmem_bytes);
                 std::fill(shmem.begin(), shmem.end(), poison);
                 std::fill(shmem.begin(), shmem.begin() + 128, 0);
                 write_tma_descriptor(shmem, 0, descriptor);
@@ -398,7 +398,7 @@ void test_tma_swizzle64_tile_ignores_the_mma_layout() {
     const auto run = [&](const nanosm::DeviceProfile& profile) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         auto& gmem = image_bytes(launch.gmem_image, 2 * stride * 70);
         for (uint32_t y = 0; y < 70; ++y)
             for (uint32_t x = 0; x < stride; ++x)
@@ -490,7 +490,7 @@ void test_tma_swizzle64_validation() {
     big.tile_rows = 64;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 33032);
+    auto& shmem = image_bytes(launch.test_shmem, 33032);
     image_bytes(launch.gmem_image, 65536);
     write_tma_descriptor(shmem, 0, big);
     write_u64(shmem, 33024, nanosm::encode_mbar_state({false, true, 1, 0, 8192}));
@@ -539,7 +539,7 @@ void test_tma_swizzle64_pieces_land_anywhere() {
         const auto run_span = [&](uint32_t commands) {
             nanosm::Launch launch;
             launch.active_warps = 1;
-            auto& shmem = image_bytes(launch.shmem_image, tile_address + 8192);
+            auto& shmem = image_bytes(launch.test_shmem, tile_address + 8192);
             auto& gmem = image_bytes(launch.gmem_image, 2 * stride * dim_y + 64);
             for (uint32_t y = 0; y < dim_y; ++y)
                 for (uint32_t x = 0; x < dim_x; ++x)
@@ -606,7 +606,7 @@ void test_tma_swizzle64_sector_economics() {
     const auto run_summary = [&](uint32_t commands) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 8192);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 8192);
         auto& gmem = image_bytes(launch.gmem_image, 8192);
         for (uint32_t i = 0; i < 4096; ++i)
             write_u16(gmem, 2 * i, static_cast<uint16_t>((i * 2654435761u) >> 16));
@@ -772,7 +772,7 @@ void test_tma_fp32_swizzle64_store_and_load() {
     const auto run_store = [&](nanosm::TileLayout layout) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + tile_bytes);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + tile_bytes);
         auto& gmem = image_bytes(launch.gmem_image, gmem_size);
         std::fill(gmem.begin(), gmem.end(), 0x5a);
         for (uint32_t row = 0; row < 64; ++row)
@@ -819,7 +819,7 @@ void test_tma_fp32_swizzle64_store_and_load() {
     // LOAD: row-major gmem -> shmem; every element checked at the independent address.
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + tile_bytes);
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + tile_bytes);
     auto& gmem = image_bytes(launch.gmem_image, gmem_size);
     std::fill(shmem.begin() + tile_address, shmem.end(), 0x7f);
     for (uint32_t row = 0; row < 64; ++row)
@@ -872,7 +872,7 @@ void test_swizzle64_mma_reads_a_tma_tile() {
     constexpr uint32_t b_tile = 0x180;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, a_tile + 8192);
+    auto& shmem = image_bytes(launch.test_shmem, a_tile + 8192);
     auto& gmem = image_bytes(launch.gmem_image, 16384);
     for (uint32_t row = 0; row < 64; ++row) {
         for (uint32_t k = 0; k < 64; ++k) {
@@ -950,7 +950,7 @@ void test_swizzle64_base_rule_panics() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 4096);
+        auto& shmem = image_bytes(launch.test_shmem, 4096);
         image_bytes(launch.gmem_image, 128);
         nanosm::TmaDescriptor descriptor;
         descriptor.element_bytes = 2;
@@ -969,7 +969,7 @@ void test_swizzle64_base_rule_panics() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        image_bytes(launch.shmem_image, 8192);
+        image_bytes(launch.test_shmem, 8192);
         nanosm::Machine machine(canonical_profile(), compile(
             "umov ur0, 1040\numov ur1, 4096\numov ur2, 0\nmma.async.init.m64n64k8 [ur2], [ur0], [ur1]\nhalt\n"),
             std::move(launch));
@@ -987,7 +987,7 @@ void test_swizzle64_transposed_load() {
     constexpr uint32_t tile_address = 1024;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + 8192);
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + 8192);
     auto& gmem = image_bytes(launch.gmem_image, 8192);
     const auto value = [](uint32_t x, uint32_t y) { return static_cast<uint16_t>(0x100 + 3 * y + 5 * x); };
     for (uint32_t y = 0; y < 64; ++y)
@@ -1031,7 +1031,7 @@ void test_tma_rank1_load_and_oob_zero_fill() {
     constexpr uint32_t tile_address = 256;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + 32);
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + 32);
     auto& gmem = image_bytes(launch.gmem_image, 32);
     for (uint32_t i = 0; i < 4; ++i) write_u32(gmem, i * 4, 0x100u + i);
 
@@ -1078,7 +1078,7 @@ void test_tma_store_preserves_other_sector_bytes() {
     constexpr uint32_t tile_address = 256;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + 16);
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + 16);
     auto& gmem = image_bytes(launch.gmem_image, 64);
     std::fill(gmem.begin(), gmem.end(), 0x5a);
     for (uint32_t i = 0; i < 4; ++i) write_u32(shmem, tile_address + i * 4, 0x200u + i);
@@ -1127,7 +1127,7 @@ void test_tma_rank2_strides_planes_in_software() {
     constexpr uint32_t tile_address = 256;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, tile_address + 128);
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + 128);
     auto& gmem = image_bytes(launch.gmem_image, 64 * 4);
     for (uint32_t i = 0; i < 64; ++i) write_u32(gmem, i * 4, 1000 + i);
 
@@ -1252,7 +1252,7 @@ void test_tma_store_entirely_out_of_range() {
         for (const uint32_t rows : {1u, 33u}) {
             nanosm::Launch launch;
             launch.active_warps = 1;
-            auto& shmem = image_bytes(launch.shmem_image, tile_address + 64 * 33);
+            auto& shmem = image_bytes(launch.test_shmem, tile_address + 64 * 33);
             auto& gmem = image_bytes(launch.gmem_image, 8192);
             std::fill(gmem.begin(), gmem.end(), 0x5a);
             for (uint32_t i = 0; i < 16 * rows; ++i) write_u32(shmem, tile_address + 4 * i, 0x1000 + i);
@@ -1303,7 +1303,7 @@ void test_tma_out_of_range_bands() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 4 * length * rows + 64);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 4 * length * rows + 64);
         auto& gmem = image_bytes(launch.gmem_image, 256);
         for (uint32_t i = 0; i < 48; ++i) write_u32(gmem, 4 * i, 0x100 + i);
         std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
@@ -1326,7 +1326,7 @@ void test_tma_out_of_range_bands() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 4 * length * rows);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 4 * length * rows);
         auto& gmem = image_bytes(launch.gmem_image, 256);
         std::fill(gmem.begin(), gmem.end(), 0x5a);
         for (uint32_t i = 0; i < length * rows; ++i) write_u32(shmem, tile_address + 4 * i, 0x2000 + i);
@@ -1373,7 +1373,7 @@ void test_tma_transposed_out_of_range() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 2 * length * rows);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 2 * length * rows);
         auto& gmem = image_bytes(launch.gmem_image, 2 * dim_x * dim_y);
         for (uint32_t y = 0; y < dim_y; ++y) for (uint32_t x = 0; x < dim_x; ++x) write_u16(gmem, 2 * (dim_x * y + x), value(x, y));
         std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
@@ -1391,7 +1391,7 @@ void test_tma_transposed_out_of_range() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 2 * length * rows);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 2 * length * rows);
         auto& gmem = image_bytes(launch.gmem_image, 2 * dim_x * dim_y + 64);
         std::fill(gmem.begin(), gmem.end(), 0x5a);
         for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
@@ -1436,7 +1436,7 @@ void test_tma_byte_tile_longest_run() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + length * rows);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + length * rows);
         auto& gmem = image_bytes(launch.gmem_image, 800);
         for (uint32_t i = 0; i < 800; ++i) gmem[i] = value(i);
         write_tma_descriptor(shmem, 0, descriptor);
@@ -1457,7 +1457,7 @@ void test_tma_byte_tile_longest_run() {
     {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + length * rows);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + length * rows);
         auto& gmem = image_bytes(launch.gmem_image, 800);
         std::fill(gmem.begin(), gmem.end(), 0x5a);
         for (uint32_t i = 0; i < length * rows; ++i) shmem[tile_address + i] = value(i);
@@ -1532,7 +1532,7 @@ void test_tma_walker_start_stages() {
         profile.tma_walker_start_cycles = stages;
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, tile_address + 128);
+        auto& shmem = image_bytes(launch.test_shmem, tile_address + 128);
         auto& gmem = image_bytes(launch.gmem_image, 96);
         for (uint32_t i = 0; i < 24; ++i) write_u32(gmem, 4 * i, 0x300 + i);
         std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);

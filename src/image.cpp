@@ -195,6 +195,7 @@ void emit_kernel_declarations(json& kernel_json, const Kernel& kernel) {
             case SectionKind::mbar:
                 item["kind"] = "mbar";
                 item["expect"] = section.expected;
+                if (section.count != 1) item["count"] = section.count; // an array: NAME[count]
                 break;
             case SectionKind::data:
                 item["kind"] = "data";
@@ -246,6 +247,13 @@ void load_kernel_declarations(const json& kernel_json, Kernel& kernel) {
                     throw SimError("launch image: " + field + ": expected count must be 1..32767");
                 }
                 section.expected = static_cast<uint16_t>(expected);
+                if (item.contains("count")) {
+                    section.count = declared_u32(item, "count", field);
+                    if (section.count == 0 || section.count > max_mbar_array) {
+                        throw SimError("launch image: " + field + ": an mbar array has 1.." +
+                            std::to_string(max_mbar_array) + " barriers");
+                    }
+                }
             } else if (kind == "data") {
                 section.kind = SectionKind::data;
                 section.bytes = decode_bytes(item.at("bytes").get<std::string>(), field + ".bytes");
@@ -358,8 +366,10 @@ Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& pro
             state.valid = true;
             state.expected = section.expected;
             state.remaining = section.expected;
-            append_le(piece, encode_mbar_state(state), 8);
-            mbars.push_back(section.address);
+            for (uint32_t element = 0; element < section.count; ++element) {
+                append_le(piece, encode_mbar_state(state), 8);
+                mbars.push_back(section.address + 8 * element);
+            }
             break;
         }
         case SectionKind::param: {
@@ -411,15 +421,16 @@ Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& pro
     mbars.insert(mbars.end(), launch.mbars.begin(), launch.mbars.end());
     launch.mbars = std::move(mbars);
 
-    if (profile.core_launch_flags == 0) {
-        // No launch copy on this profile: the block is in shared memory
-        // before the first cycle, ahead of the launch's own writes.
-        std::vector<ImageSegment> shmem;
-        shmem.push_back({block.start, std::move(bytes)});
-        shmem.insert(shmem.end(),
-            std::make_move_iterator(launch.shmem_image.begin()), std::make_move_iterator(launch.shmem_image.end()));
-        launch.shmem_image = std::move(shmem);
-        return launch;
+    // A test's preload (Launch::test_shmem) is untimed; it may not stand in
+    // for the launch block, whose bytes arrive by the copy.
+    for (const auto& segment : launch.test_shmem) {
+        if (segment.address < uint64_t{block.start} + block.bytes &&
+            block.start < segment.address + segment.bytes.size()) {
+            throw SimError("a test's shared-memory preload at " + std::to_string(segment.address) + " (" +
+                std::to_string(segment.bytes.size()) + " bytes) touches the kernel's launch block (" +
+                std::to_string(block.start) + ".." + std::to_string(block.start + block.bytes) +
+                "): those bytes arrive by the launch copy");
+        }
     }
 
     // The host writes the block into global memory and says where in the
@@ -473,6 +484,7 @@ std::string emit_kernel_info(const Kernel& kernel) {
             {"address", section.address},
             {"bytes", section_bytes(section)},
         };
+        if (section.kind == SectionKind::mbar) item["count"] = section.count;
         if (const auto bar = launch_flag_covering(kernel.flags, section.address - start + section_bytes(section));
             bar.has_value()) {
             item["flag"] = *bar;
@@ -497,7 +509,7 @@ std::string emit_kernel_info(const Kernel& kernel) {
 std::string emit_launch_state(const Launch& launch) {
     json document = {
         {"format", "nanosm-launch-state-v0"},
-        {"shmem", emit_segments(launch.shmem_image)},
+        {"test_shmem", emit_segments(launch.test_shmem)},
         {"gmem", emit_segments(launch.gmem_image)},
     };
     emit_active_warps(document, launch.active_warps);
@@ -515,7 +527,7 @@ Launch load_launch_state(std::string_view source) {
         }
         Launch launch;
         launch.active_warps = load_active_warps(document, "launch state");
-        launch.shmem_image = load_segments(document.at("shmem"), "shmem");
+        launch.test_shmem = load_segments(document.at("test_shmem"), "test_shmem");
         launch.gmem_image = load_segments(document.at("gmem"), "gmem");
         launch.mbars = load_mbars(document);
         launch.args = load_args(document);
@@ -546,7 +558,7 @@ std::string emit_launch_image(const LaunchImage& image) {
             {"register_count", image.kernel.register_count},
             {"words", std::move(words)},
         }},
-        {"shmem", emit_segments(image.launch.shmem_image)},
+        {"test_shmem", emit_segments(image.launch.test_shmem)},
         {"gmem", emit_segments(image.launch.gmem_image)},
     };
     emit_kernel_declarations(document["kernel"], image.kernel);
@@ -592,7 +604,7 @@ LaunchImage load_launch_image(std::string_view source) {
         load_kernel_declarations(kernel, image.kernel);
         image.launch.active_warps = load_active_warps(document, "launch image");
         image.launch.args = load_args(document);
-        image.launch.shmem_image = load_segments(document.at("shmem"), "shmem");
+        image.launch.test_shmem = load_segments(document.at("test_shmem"), "test_shmem");
         image.launch.gmem_image = load_segments(document.at("gmem"), "gmem");
         image.launch.mbars = load_mbars(document);
         image.launch.block_address = load_block_address(document);

@@ -26,7 +26,7 @@ DivergentRun run_divergent(const nanosm::Kernel& kernel, const std::function<voi
     nanosm::Launch launch;
     launch.active_warps = 1;
     image_bytes(launch.gmem_image, 4096);
-    image_bytes(launch.shmem_image, 8192);
+    image_bytes(launch.test_shmem, 8192);
     if (setup) setup(launch);
     DivergentRun run;
     run.machine = std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
@@ -380,7 +380,7 @@ void test_memory_writers_under_a_partial_mask() {
         sts [r3 + 512], r5
     )") + "halt\n", [](nanosm::Launch& launch) {
         auto& gmem = launch.gmem_image.at(0).bytes;
-        auto& shmem = launch.shmem_image.at(0).bytes;
+        auto& shmem = launch.test_shmem.at(0).bytes;
         for (uint32_t lane = 0; lane < 16; ++lane) {
             write_u32(gmem, 4 * lane, 100 + lane);
             write_u32(gmem, 256 + 4 * lane, 0xdead);
@@ -413,7 +413,7 @@ void test_uniform_operation_or_halt_in_an_arm_panics() {
              {"halt", "halt inside a divergent region (2 divergence stack entries left, active mask 0xff)"}}) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        image_bytes(launch.shmem_image, 64);
+        image_bytes(launch.test_shmem, 64);
         nanosm::Machine machine(canonical_profile(), compile(masked_region(0x00ff, body) + "halt\n"), std::move(launch));
         expect_sim_panic(machine, needle, body);
     }
@@ -571,7 +571,7 @@ void test_write_masks_are_lane_write_enables() {
         @p1 mov r20, 1
     )" + masked_region(0x00ff, "@p0 mov r21, 1") + "halt\n", [](nanosm::Launch& launch) {
         auto& gmem = launch.gmem_image.at(0).bytes;
-        auto& shmem = launch.shmem_image.at(0).bytes;
+        auto& shmem = launch.test_shmem.at(0).bytes;
         for (uint32_t lane = 0; lane < 16; ++lane) {
             write_u32(gmem, 4 * lane, 100 + lane);
             write_u32(gmem, 256 + 4 * lane, 0xdead);
@@ -627,7 +627,7 @@ void test_timing_ignores_the_write_mask() {
             halt
         )", [](nanosm::Launch& launch) {
             auto& gmem = launch.gmem_image.at(0).bytes;
-            auto& shmem = launch.shmem_image.at(0).bytes;
+            auto& shmem = launch.test_shmem.at(0).bytes;
             for (uint32_t lane = 0; lane < 16; ++lane) {
                 write_u32(gmem, 4 * lane, 100 + lane);
                 write_u32(gmem, 256 + 4 * lane, 0xdead);

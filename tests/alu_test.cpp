@@ -48,7 +48,7 @@ void test_integer_alu_menu() {
         2, 62, 33, 95};   // 62 -> 30, 33 -> 1, 95 -> 31
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& image = image_bytes(launch.shmem_image, 128);
+    auto& image = image_bytes(launch.test_shmem, 128);
     for (uint32_t lane = 0; lane < 16; ++lane) {
         write_u32(image, lane * 4, a[lane]);
         write_u32(image, 64 + lane * 4, b[lane]);
@@ -232,7 +232,7 @@ void test_fa_menu_numeric_vectors() {
 
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 256);
+    auto& shmem = image_bytes(launch.test_shmem, 256);
     for (uint32_t lane = 0; lane < 16; ++lane) {
         write_u32(shmem, lane * 4, a[lane]);
         write_u32(shmem, 64 + lane * 4, b[lane]);
@@ -365,7 +365,7 @@ void test_fma_bank_discipline() {
     }
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 64);
+    auto& shmem = image_bytes(launch.test_shmem, 64);
     for (uint32_t lane = 0; lane < 16; ++lane) write_u32(shmem, lane * 4, nanosm::float_bits(2.0f));
     nanosm::Machine machine(canonical_profile(), compile(R"(
         sread r0, LANE_ID
@@ -388,7 +388,7 @@ void test_mini_softmax_smoke() {
     // values recompute the same spec algorithms in the same association.
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 512);
+    auto& shmem = image_bytes(launch.test_shmem, 512);
     std::array<std::array<float, 4>, 16> scores{};
     for (uint32_t lane = 0; lane < 16; ++lane) {
         for (uint32_t j = 0; j < 4; ++j) {

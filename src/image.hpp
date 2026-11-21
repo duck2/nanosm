@@ -33,7 +33,7 @@ struct LaunchArgument {
 // launch flag is decremented in every warp. Size at the canonical profile:
 // warps 5 + global address 64 + shared address 16 + bytes 17 + four flags x
 // (valid 1 + bytes 17) = 174 bits. bind_launch fills it; a kernel with no
-// sections, or a profile with core.launch_flags 0, has none.
+// sections has none.
 struct LaunchRecord {
     uint64_t global_address = 0;
     uint32_t shared_address = 0;
@@ -44,12 +44,14 @@ struct LaunchRecord {
 // What the host gives a kernel: how many warps (0: as many as the kernel's
 // `.warps` says), one argument per parameter, and global memory. The host
 // needs no address inside shared memory for any of it.
-// shmem_image and mbars are a debugger's access, for tests that poison a
-// region or set up a machine by hand: bytes written into shared memory before
-// the first cycle, and barriers declared live.
+// test_shmem and mbars are a TEST's access, for tests that poison a region or
+// set up a machine by hand: bytes written into shared memory before the first
+// cycle, untimed, and barriers declared live. A launch that uses test_shmem
+// says so in its run summary (`test_preload:`), so a harness can refuse it,
+// and it may not touch the kernel's launch block (bind_launch).
 struct Launch {
     uint32_t active_warps = 0;
-    std::vector<ImageSegment> shmem_image;
+    std::vector<ImageSegment> test_shmem;
     std::vector<ImageSegment> gmem_image;
     // Barriers the shmem image initializes by hand (byte addresses,
     // 8-aligned). Declared, not detected: the sanitizer treats them as LIVE
@@ -72,10 +74,9 @@ struct Launch {
 // kernel's section order: src/isa.hpp launch_block) and written into GLOBAL
 // memory at block_address, with the launch record saying where; the kernel's
 // barriers added to the live list. The machine copies the block into shared
-// memory from the first cycle on (src/sim.cpp, the launch copy). On a
-// profile with core.launch_flags 0 there is no copy: the block is written
-// into shared memory here, before the first cycle. A missing, unknown or
-// wrongly typed argument is refused by name. The result has no args left.
+// memory from the first cycle on (src/sim.cpp, the launch copy); there is no
+// other way for it to get there. A missing, unknown or wrongly typed argument
+// is refused by name. The result has no args left.
 Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& profile);
 
 // What a kernel declares, as JSON, for a host and for a test that looks

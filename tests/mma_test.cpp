@@ -258,7 +258,7 @@ void test_mma_fusion_boundaries() {
         const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile);
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         const std::array<uint16_t, 8> a{0x6c00, 0x3c00, 0, 0, 0xec00, 0, 0, 0};
         const std::array<uint16_t, 8> b{0x6c00, 0x3c00, 0, 0, 0x6c00, 0, 0, 0};
         for (uint32_t row = 0; row < 64; ++row)
@@ -305,7 +305,7 @@ void test_autonomous_mma_gemm_and_commit() {
 
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     auto a_address = [](uint32_t m, uint32_t k) {
         return 4 * (4 * m + ((k >> 1) ^ ((m >> 2) & 3))) + 2 * (k & 1);
     };
@@ -362,7 +362,7 @@ void test_worker_acc_store_mbar_handoff() {
         "worker mbar.arrive was not gated by its accumulator-store completion");
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 2;
@@ -405,7 +405,7 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
     const auto make_launch = [&] {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         write_mbar(shmem, commit_mbar, 1, 0);
         write_mbar(shmem, tx_mbar, 0, 128); // arrived; waits for 2 x 64 bytes
         return launch;
@@ -473,7 +473,7 @@ void test_mbar_engine_events_alternate_tma_first() {
     constexpr uint32_t commit1 = 4112;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     write_mbar(shmem, commit0, 1, 0);
     write_mbar(shmem, commit1, 1, 0);
     write_mbar(shmem, tx_mbar, 0, 128);
@@ -576,7 +576,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
         qtx << "mma.async.m64n64k8 [ur20], [ur0], [ur1]\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         auto& gmem = image_bytes(launch.gmem_image, 64);
         for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
         write_mbar(shmem, commit_mbar, 1, 0);
@@ -690,7 +690,7 @@ void test_mma_dense_profile_recurrence_bubbles() {
     )", profile);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    auto& shmem = image_bytes(launch.test_shmem, 2048);
     for (uint32_t m = 0; m < 32; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, 2 * (m * 8 + k), 0x3c00);
     for (uint32_t k = 0; k < 8; ++k)
@@ -777,7 +777,7 @@ void test_mma_multi_round_fetch_timing() {
     const auto bar = scheduled.instructions[6].control.set_depbar;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    auto& shmem = image_bytes(launch.test_shmem, 2048);
     for (uint32_t m = 0; m < 32; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, 2 * (m * 8 + k), 0x3c00);
     for (uint32_t k = 0; k < 8; ++k)
@@ -842,7 +842,7 @@ void test_mma_varying_round_service() {
     )", profile);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& shmem = image_bytes(launch.test_shmem, 4096);
     for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 2 * i, 0x3c00);
     for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 2048 + 2 * i, 0x3c00);
     nanosm::Machine machine(profile, kernel, std::move(launch), {.timeline = true});
@@ -898,7 +898,7 @@ std::unique_ptr<nanosm::Machine> i7_machine(const std::array<uint16_t, 8>& a,
         << "acc.ld r10, [ur8, 64]\nhalt\n";
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t m = 0; m < 64; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, i7_a_address(m, k), a[k]);
     for (uint32_t k = 0; k < 8; ++k)
@@ -1054,7 +1054,7 @@ float i9_reference(uint32_t m, uint32_t n) {
 
 // A 64-row A object at 0 and a B object at 2048, both from i9_a / i9_b.
 void i9_write_operands(nanosm::Launch& launch) {
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& shmem = image_bytes(launch.test_shmem, 4096);
     for (uint32_t m = 0; m < 64; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, i9_a_address(0, m, k), i9_fp16(i9_a(m, k)));
     for (uint32_t k = 0; k < 8; ++k)
@@ -1623,7 +1623,7 @@ std::unique_ptr<nanosm::Machine> d15_run_shape(const nanosm::DeviceProfile& prof
            << "mma.commit [ur4]\nwait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\nhalt\n";
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, b_base + b_bytes);
+    auto& shmem = image_bytes(launch.test_shmem, b_base + b_bytes);
     for (uint32_t m = 0; m < shape.m; ++m)
         for (uint32_t k = 0; k < shape.k; ++k)
             write_u16(shmem, d15_a_address(0, shape.k, m, k), i9_fp16(i9_a(m, k)));
@@ -1778,7 +1778,7 @@ std::unique_ptr<nanosm::Machine> i8_machine(const nanosm::DeviceProfile& profile
     uint32_t warps, uint16_t a, uint16_t b) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t m = 0; m < 64; ++m)
         for (uint32_t k = 0; k < 8; ++k) write_u16(shmem, i7_a_address(m, k), a);
     for (uint32_t k = 0; k < 8; ++k)
@@ -2207,8 +2207,8 @@ void test_acc_view_over_two_matmul_results() {
     nanosm::Launch launch;
     launch.active_warps = 4;
     i9_write_operands(launch);
-    launch.shmem_image.push_back({8192, std::vector<uint8_t>(8, 0)}); // the commit's barrier, expecting 1
-    write_count_mbar(launch.shmem_image.back().bytes, 0, 1);
+    launch.test_shmem.push_back({8192, std::vector<uint8_t>(8, 0)}); // the commit's barrier, expecting 1
+    write_count_mbar(launch.test_shmem.back().bytes, 0, 1);
     nanosm::Machine machine(profile, compile(R"(
         umov ur4, 8192
         usread ur10, WARP_ID

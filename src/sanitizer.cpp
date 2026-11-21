@@ -503,7 +503,7 @@ std::string Sanitizer::describe_live_mbar(const LiveMbar& mbar) {
         "); until kernel end only mbar operations may touch it";
 }
 
-// The launch's declared mbars (host-initialized in the shmem image): live
+// The launch's declared mbars (a kernel's .mbar sections, or a test's own preload): live
 // from launch. A repeated declaration is one mbar.
 void Sanitizer::record_launch_mbars(const std::vector<uint32_t>& addresses) {
     for (const auto address : addresses) {

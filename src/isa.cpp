@@ -43,7 +43,8 @@ std::string address(uint8_t base, int32_t offset) {
 uint64_t encode(const Instruction& inst) {
     if (inst.control.predicate > 7 || inst.control.stall > encoding::stall_mask ||
         inst.control.set_depbar > 7 || inst.control.wait_mask > encoding::wait_mask_mask ||
-        inst.imm < encoding::immediate_min || inst.imm > encoding::immediate_max) {
+        (inst.opcode != Opcode::umovi &&
+         (inst.imm < encoding::immediate_min || inst.imm > encoding::immediate_max))) {
         throw SimError("instruction field does not fit 64-bit encoding: " + format_instruction(inst));
     }
     if (is_atomic(inst.opcode) &&
@@ -214,6 +215,13 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         break;
     case Opcode::umovi:
+        // dst[6], imm[32]: the whole word.
+        if (inst.dst > encoding::umovi_dst_mask) {
+            throw SimError("umov's uniform register does not fit its 6-bit field: " + format_instruction(inst));
+        }
+        word |= static_cast<uint64_t>(inst.dst) << encoding::umovi_dst_shift;
+        word |= static_cast<uint64_t>(static_cast<uint32_t>(inst.imm));
+        break;
     case Opcode::usread:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= immediate;
@@ -436,6 +444,9 @@ Instruction decode(uint64_t word) {
         inst.src0 = reg1;
         break;
     case Opcode::umovi:
+        inst.dst = static_cast<uint8_t>((word >> encoding::umovi_dst_shift) & encoding::umovi_dst_mask);
+        inst.imm = static_cast<int32_t>(static_cast<uint32_t>(word & 0xffffffffu));
+        break;
     case Opcode::usread:
         inst.dst = reg0;
         inst.imm = static_cast<int32_t>(immediate);
@@ -880,7 +891,15 @@ std::string format_instruction(
         out << ' ' << reg(inst.dst) << ", " << ureg(inst.src0);
         break;
     case Opcode::umovi:
-        out << ' ' << ureg(inst.dst) << ", " << inst.imm;
+        // A small value as a number (addresses, counts); any other word as
+        // its 32 bits in hex (a float constant, a mask).
+        out << ' ' << ureg(inst.dst) << ", ";
+        if (inst.imm >= encoding::immediate_min && inst.imm <= encoding::immediate_max) {
+            out << inst.imm;
+        } else {
+            out << "0x" << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(inst.imm)
+                << std::dec << std::setfill(' ');
+        }
         break;
     case Opcode::usread:
         out << ' ' << ureg(inst.dst) << ", " << special_name(inst.imm);

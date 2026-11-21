@@ -161,7 +161,7 @@ void test_stalls_track_consumer_distance() {
     require(program.instructions[3].control.stall == fadd_distance - 2, "pre-consumer stall wrong");
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 4);
+    image_bytes(launch.test_shmem, 4);
     nanosm::Machine machine(
         canonical_profile(),
         nanosm::assemble_asm(nanosm::emit_asm(program), canonical_profile()),
@@ -297,7 +297,7 @@ void test_wait_on_matmul_operands() {
 
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192 + 8);
+    auto& shmem = image_bytes(launch.test_shmem, 8192 + 8);
     write_count_mbar(shmem, 8192, 1);
     nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
     machine.run(20000);
@@ -386,7 +386,7 @@ void test_nop_in_hand_assembly() {
 void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 128);
+    image_bytes(launch.test_shmem, 128);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 64
         mbar.init [ur0], 1
@@ -428,7 +428,7 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
 void test_mbar_test_wait_broadcasts_predicate() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.phase = true;
@@ -454,7 +454,7 @@ void test_mbar_test_wait_broadcasts_predicate() {
 void test_mbar_try_wait_immediate_success() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.phase = true;
@@ -485,7 +485,7 @@ void test_mbar_try_wait_times_out_false() {
     profile.mbar_try_wait_timeout_cycles = 3;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 1;
@@ -520,7 +520,7 @@ void test_mbar_phase_flip_wins_on_try_wait_deadline() {
         profile.shmem_rmw_compute_cycles + 1;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 1;
@@ -553,7 +553,7 @@ void test_mbar_try_wait_slots_limit_parked_warps() {
     profile.mbar_try_wait_timeout_cycles = 4;
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 1;
@@ -597,7 +597,9 @@ void test_staged_pipeline_kernel() {
     auto loaded = nanosm::load_launch_image(serialized);
     require(loaded.kernel.warps == 2 && loaded.launch.active_warps == 0,
         "launch image lost the kernel's warp count");
-    require(loaded.kernel.sections.size() == 7 && loaded.launch.args.size() == 3 && loaded.kernel.flags.size() == 4,
+    // Three pointers and two pairs of barriers, each pair one array section.
+    require(loaded.kernel.sections.size() == 5 && loaded.kernel.sections[3].count == 2 &&
+            loaded.launch.args.size() == 3 && loaded.kernel.flags.size() == 4,
         "launch image lost the kernel's signature, its barriers, its launch flags or the arguments");
     require(loaded.launch.gmem_image.size() == 1, "launch image lost its gmem segment");
     require(
@@ -748,16 +750,200 @@ void test_launch_arguments_reach_the_kernel() {
         "the flags did not clear with their sectors: three in the first, the last with the fifth");
     require(machine.cycle() > summary.launch_flags[3].cycle, "the kernel ended before its launch block landed");
 
-    // A profile with no launch flags has no copy: the same kernel text finds
-    // its block in shared memory at the first cycle and runs the old way.
+    // There is no untimed way for the block to reach shared memory: a profile
+    // must reserve at least one launch flag.
     auto untimed = profile;
     untimed.core_launch_flags = 0;
-    nanosm::Machine old_way(untimed, nanosm::compile_and_assemble(argument_kernel, untimed), argument_launch());
-    require(old_way.read_shmem_u32(start + 8) == 41, "with no launch flags the block is not in place at the start");
-    old_way.run();
-    check(old_way, "no launch flags");
-    require(old_way.trace().summary().launch_block_bytes == 0 && old_way.cycle() < machine.cycle(),
-        "the untimed launch made a copy or was not faster");
+    try {
+        nanosm::validate_device_profile(untimed);
+        throw std::runtime_error("a profile with no launch flags was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require(std::string(error.what()).find("launch_flags must be in 1..6") != std::string::npos,
+            std::string("no launch flags: wrong refusal: ") + error.what());
+    }
+
+    // The declared order is the delivery order, and it survives scheduled
+    // assembly, the hex text and a saved image (so a replay has the same
+    // timing): sections and flags come back the same.
+    const auto same_block = [&](const nanosm::Kernel& other, const std::string& what) {
+        require(other.sections.size() == kernel.sections.size() && other.flags.size() == kernel.flags.size(),
+            what + " lost sections or flags");
+        for (std::size_t index = 0; index < kernel.sections.size(); ++index) {
+            require(other.sections[index].name == kernel.sections[index].name &&
+                    other.sections[index].address == kernel.sections[index].address,
+                what + " changed the order of the launch block at " + kernel.sections[index].name);
+        }
+        for (std::size_t index = 0; index < kernel.flags.size(); ++index) {
+            require(other.flags[index].bar == kernel.flags[index].bar &&
+                    other.flags[index].bytes == kernel.flags[index].bytes, what + " changed a launch flag");
+        }
+    };
+    same_block(nanosm::assemble_asm(nanosm::emit_asm(nanosm::compile_qtx(argument_kernel, profile)), profile),
+        "scheduled assembly");
+    same_block(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
+    same_block(nanosm::load_launch_image(serialized).kernel, "a saved image");
+}
+
+// `.equ XX, X` is another name for section X: an instruction that names XX
+// waits on X's launch flag like one that names X (Astra, 2026-11-21: it got
+// no wait and, with the sanitizer off, read zeros). A chain of such lines too.
+void test_section_alias_waits_on_its_flag() {
+    const auto run = [](const std::string& name) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        launch.args = {{"X", uint64_t{0x12345678}}};
+        nanosm::Machine machine(canonical_profile(), compile(
+            ".param u32 X\n.equ XX, X\n.equ XXX, XX\n"
+            "umov ur1, " + name + "\nlds.uni r1, [ur1]\nsread r2, LANE_ID\nshli r2, r2, 2\nsts [r2], r1\nhalt\n"),
+            std::move(launch));
+        machine.run();
+        return machine.read_shmem_u32(0);
+    };
+    // Sanitizer on or off, the value is the argument (off, it used to be 0).
+    for (const std::string name : {"X", "XX", "XXX"}) {
+        require(run(name) == 0x12345678u, "umov ur1, " + name + " read its parameter before it landed");
+    }
+    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx(
+        ".param u32 X\n.equ XX, X\n.equ XXX, XX\numov ur1, XXX\nhalt\n", canonical_profile()));
+    require(scheduled.find("wait=sb5") != std::string::npos, "an alias of a section got no launch-flag wait");
+}
+
+// `.mbar NAME[C]` is one section of C barriers, element i at NAME + 8 i and
+// written NAME[i]; naming any of it waits for the whole array, and an index
+// past its end is refused.
+void test_mbar_array() {
+    const auto& profile = canonical_profile();
+    const char* const source = R"(
+.warps 1
+.param u32 A
+.mbar PAIR[2], expect 3
+.mbar ONE, expect 1
+        umov ur1, PAIR
+        umov ur2, PAIR[1]
+        umov ur3, ONE
+        mbar.arrive [ur2]
+        halt
+)";
+    const auto kernel = compile(source);
+    require(kernel.sections.size() == 3 && kernel.sections[1].count == 2 &&
+            nanosm::section_bytes(kernel.sections[1]) == 16 &&
+            kernel.sections[2].address == kernel.sections[1].address + 16,
+        "an mbar array is not one section of 8 bytes per barrier");
+    const auto text = nanosm::emit_hex(kernel);
+    require(text.find(".mbar PAIR[2], ") != std::string::npos &&
+            nanosm::load_hex(text).sections[1].count == 2, "the hex text lost the array");
+    nanosm::LaunchImage image{kernel, {}};
+    image.launch.args = {{"A", uint64_t{1}}};
+    auto loaded = nanosm::load_launch_image(nanosm::emit_launch_image(image));
+    require(loaded.kernel.sections[1].count == 2, "a saved image lost the array");
+    nanosm::Machine machine(profile, std::move(loaded.kernel), std::move(loaded.launch));
+    machine.run();
+    const auto state = [&](uint32_t address) {
+        return nanosm::decode_mbar_state(machine.read_shmem_u32(address) |
+            (static_cast<uint64_t>(machine.read_shmem_u32(address + 4)) << 32));
+    };
+    const auto pair = kernel.sections[1].address;
+    require(state(pair).valid && state(pair).expected == 3 && state(pair).remaining == 3,
+        "element 0 of the array did not start expecting 3");
+    require(state(pair + 8).valid && state(pair + 8).expected == 3 && state(pair + 8).remaining == 2,
+        "element 1 of the array is not where NAME[1] says (the arrive went elsewhere)");
+    for (const char* bad : {"umov ur1, PAIR[2]\nhalt\n", ".equ P, PAIR[7]\nhalt\n", "umov ur1, ONE[1]\nhalt\n"}) {
+        try {
+            compile(std::string(".mbar PAIR[2], expect 1\n.mbar ONE, expect 1\n") + bad);
+            throw std::runtime_error(std::string("accepted an index past an mbar array's end: ") + bad);
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("is past the end of .mbar") != std::string::npos,
+                std::string("an index past an array's end: wrong refusal: ") + error.what());
+        }
+    }
+    try {
+        compile(".mbar PAIR[0], expect 1\nhalt\n");
+        throw std::runtime_error("accepted an empty mbar array");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("an array has 1..") != std::string::npos,
+            std::string("an empty mbar array: wrong refusal: ") + error.what());
+    }
+}
+
+// umov urD, imm takes any 32-bit word (dst[6] imm[32]): a float literal is its
+// IEEE bits, with no memory behind the constant; it survives the encoding,
+// scheduled assembly and the hex text.
+void test_umov_takes_a_32_bit_word() {
+    const auto& profile = canonical_profile();
+    const char* const source =
+        "umov ur1, 0.180336878\numov ur2, -inf\numov ur3, 0xdeadbeef\numov ur4, -1\numov ur5, 4294967295\n"
+        "umov ur31, 1e-3\numov ur6, 70000\numov ur7, 2147483648\nur2r r1, ur1\nhalt\n";
+    const std::vector<std::pair<uint32_t, uint32_t>> expected{
+        {1, nanosm::float_bits(0.180336878f)}, {2, 0xff800000u}, {3, 0xdeadbeefu}, {4, 0xffffffffu},
+        {5, 0xffffffffu}, {31, nanosm::float_bits(1e-3f)}, {6, 70000u}, {7, 0x80000000u}};
+    const auto check = [&](const nanosm::Kernel& kernel, const std::string& what) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        nanosm::Machine machine(profile, kernel, std::move(launch));
+        machine.run();
+        for (const auto& [reg, value] : expected) {
+            require(machine.read_ureg(0, reg) == value, what + ": umov did not write its 32-bit word to ur" +
+                std::to_string(reg));
+        }
+        require(machine.read_reg(0, 9, 1) == nanosm::float_bits(0.180336878f), what + ": ur2r lost the constant");
+    };
+    const auto kernel = compile(source);
+    check(kernel, "qtx");
+    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx(source, profile));
+    check(nanosm::assemble_asm(scheduled, profile), "scheduled assembly");
+    check(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
+    // A word outside the old 22-bit immediate prints as its 32 bits in hex; a
+    // small one as a number.
+    nanosm::Instruction inst;
+    inst.opcode = nanosm::Opcode::umovi;
+    inst.dst = 63;
+    inst.imm = static_cast<int32_t>(0xff800000u);
+    const auto decoded = nanosm::decode(nanosm::encode(inst));
+    require(decoded.dst == 63 && static_cast<uint32_t>(decoded.imm) == 0xff800000u,
+        "umov's dst[6] imm[32] payload does not round-trip");
+    require(nanosm::format_instruction(decoded, false) == "umov ur63, 0xff800000",
+        "a large umov word is not printed as hex: " + nanosm::format_instruction(decoded, false));
+    inst.imm = -4;
+    require(nanosm::format_instruction(nanosm::decode(nanosm::encode(inst)), false) == "umov ur63, -4",
+        "a small umov word is not printed as a number");
+    for (const char* bad : {"umov ur1, 4294967296\nhalt\n", "umov ur1, -2147483649\nhalt\n", "umov ur1, 1.5f\nhalt\n",
+                            "umov ur1, 0x1p3\nhalt\n", "uaddi ur1, ur1, 1.5\nhalt\n", "mov r1, 4194304\nhalt\n"}) {
+        try {
+            compile(bad);
+            throw std::runtime_error(std::string("accepted: ") + bad);
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("immediate") != std::string::npos,
+                std::string("a bad immediate: wrong refusal: ") + error.what());
+        }
+    }
+}
+
+// A test's untimed preload of shared memory (Launch::test_shmem) is reported
+// in the run's summary and may not stand in for the launch block.
+void test_test_preload_is_reported_and_kept_off_the_block() {
+    const auto& profile = canonical_profile();
+    const auto preloaded_bytes = [&](bool preload) {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        if (preload) launch.test_shmem.push_back({64, std::vector<uint8_t>(12, 0xa5)});
+        nanosm::Machine machine(profile, compile("halt\n"), std::move(launch));
+        machine.run();
+        return machine.trace().summary().test_preload_bytes;
+    };
+    require(preloaded_bytes(true) == 12, "a test's preload is not in the run summary");
+    require(preloaded_bytes(false) == 0, "a launch with no preload reports one");
+    const auto kernel = compile(".param u32 A\nhalt\n");
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        launch.args = {{"A", uint64_t{7}}};
+        launch.test_shmem.push_back({kernel.sections[0].address, {7, 0, 0, 0}});
+        nanosm::Machine machine(profile, kernel, std::move(launch));
+        throw std::runtime_error("a test preload over the launch block was accepted");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("touches the kernel's launch block") != std::string::npos,
+            std::string("a preload over the launch block: wrong refusal: ") + error.what());
+    }
 }
 
 // A hand-written kernel that reads its parameter without waiting on the
@@ -870,7 +1056,7 @@ void test_launch_image_rejects_bad_segment_hex() {
     nanosm::LaunchImage input;
     input.kernel = compile("halt");
     input.launch.active_warps = 1;
-    input.launch.shmem_image.push_back({0, {0xab}});
+    input.launch.test_shmem.push_back({0, {0xab}});
     auto serialized = nanosm::emit_launch_image(input);
     const auto field = serialized.find("\"bytes\": \"ab\"");
     const auto byte = serialized.find("ab", field);
@@ -915,7 +1101,7 @@ void test_warp_handoff_through_mbar() {
     // race between warps -- exactly why design.md makes barriers launch-time.
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 512);
+    auto& shmem = image_bytes(launch.test_shmem, 512);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 1;
@@ -968,7 +1154,7 @@ void test_warp_handoff_through_mbar() {
 void test_mbar_arrival_underflow_panics() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 128);
+    image_bytes(launch.test_shmem, 128);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 64
         mbar.init [ur0], 1
@@ -992,7 +1178,7 @@ void test_mbar_arrival_underflow_panics() {
 void test_mbar_complete_wrong_phase_panics() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.phase = true;
@@ -1135,6 +1321,22 @@ TEST(Basics, launch_arguments_reach_the_kernel) {
 
 TEST(Basics, launch_refusals) {
     test_launch_refusals();
+}
+
+TEST(Basics, section_alias_waits_on_its_flag) {
+    test_section_alias_waits_on_its_flag();
+}
+
+TEST(Basics, mbar_array) {
+    test_mbar_array();
+}
+
+TEST(Basics, umov_takes_a_32_bit_word) {
+    test_umov_takes_a_32_bit_word();
+}
+
+TEST(Basics, test_preload_is_reported_and_kept_off_the_block) {
+    test_test_preload_is_reported_and_kept_off_the_block();
 }
 
 TEST(Basics, early_launch_read_panics) {

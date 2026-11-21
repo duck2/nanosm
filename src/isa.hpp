@@ -134,7 +134,7 @@ enum class Opcode : uint8_t {
     // Shifts by a register use its low 5 bits; immediates are the signed
     // 22-bit field.
     umov   = 0x80,   // umov urD, urA
-    umovi  = 0x81,   // umov urD, imm
+    umovi  = 0x81,   // umov urD, imm: any 32-bit word (encoding below)
     uadd   = 0x82,
     uaddi  = 0x83,
     usub   = 0x84,
@@ -261,17 +261,24 @@ inline const char* param_type_name(ParamType type) {
 //   .param TYPE NAME           an argument of the launch (the signature)
 //   .mbar  NAME, expect N      a barrier's initial state: phase 0, N arrivals
 //                              expected, none seen (8 bytes)
+//   .mbar  NAME[C], expect N   C such barriers side by side, ONE section:
+//                              element i is at NAME + 8 i, and the whole
+//                              array arrives (and is waited for) together
 //   .data  NAME, f32|u32 ...   initialized words
 // Together, in that order, they are the LAUNCH BLOCK (launch_block below):
 // the bytes the launch copies from global memory into shared memory, the
 // first declared arriving first.
 enum class SectionKind : uint8_t { param, mbar, data };
 
+// The most barriers one `.mbar NAME[C]` array may hold.
+inline constexpr uint32_t max_mbar_array = 1024;
+
 struct KernelSection {
     std::string name;
     SectionKind kind = SectionKind::param;
     ParamType type = ParamType::ptr;  // param: its type
     uint16_t expected = 0;            // mbar: arrivals expected
+    uint32_t count = 1;               // mbar: how many barriers (NAME[C]); 1 otherwise
     std::vector<uint8_t> bytes;       // data: its words, little-endian
     uint32_t address = 0;             // where it sits in shared memory (launch_block)
 };
@@ -279,7 +286,7 @@ struct KernelSection {
 inline uint32_t section_bytes(const KernelSection& section) {
     switch (section.kind) {
         case SectionKind::param: return param_bytes(section.type);
-        case SectionKind::mbar: return 8;
+        case SectionKind::mbar: return 8 * section.count;
         case SectionKind::data: return static_cast<uint32_t>(section.bytes.size());
     }
     return 0;
@@ -393,6 +400,10 @@ namespace encoding {
 // RRI payload: dst[8], src0[8], simm[22]
 // store payload: base[8], value[8], simm[22]
 // RI payload: dst[8], reserved[8], simm[22]
+// umov urD, imm (umovi) payload: dst[6], imm[32] -- a uniform register number
+// needs at most 6 bits, which leaves a whole 32-bit word: any constant, a
+// float's bits included, in one instruction and no memory. Instruction::imm
+// holds the 32 bits as written (its sign is not meaning).
 // atomic payload: dst[8], base[8], operand[8], simm[14] (the offset is 14 bits:
 // the third register takes the immediate's high bits)
 // setp and usetp use dst as p0..p6; immediate and register RHS forms have
@@ -438,6 +449,9 @@ inline constexpr uint64_t tma_descriptor_field_mask = 0x3fff;
 inline constexpr uint32_t tma_descriptor_field_unit = 64;
 inline constexpr int32_t atomic_immediate_min = -(1 << 13);
 inline constexpr int32_t atomic_immediate_max = (1 << 13) - 1;
+
+inline constexpr unsigned umovi_dst_shift = 32;
+inline constexpr uint64_t umovi_dst_mask = 0x3f;
 
 inline constexpr unsigned reg0_shift = 30;
 inline constexpr unsigned reg1_shift = 22;

@@ -84,7 +84,7 @@ int main() {
         const std::string state = R"({
             "format": "nanosm-launch-state-v0",
             "active_warps": 1,
-            "shmem": [],
+            "test_shmem": [],
             "gmem": []
         })";
         auto handle = nanosm_session_create_qtx(
@@ -145,7 +145,7 @@ int main() {
         const std::string with_argument = R"({
             "format": "nanosm-launch-state-v0",
             "args": {"OUT": 4096},
-            "shmem": [],
+            "test_shmem": [],
             "gmem": []
         })";
         handle = nanosm_session_create_qtx(

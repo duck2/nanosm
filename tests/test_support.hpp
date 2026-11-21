@@ -537,7 +537,7 @@ inline std::unique_ptr<nanosm::Machine> i2_machine(const nanosm::DeviceProfile& 
     uint32_t warps = 1, bool hand_assembly = true) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     nanosm::MbarState mbar;
     mbar.valid = true;
@@ -580,7 +580,7 @@ inline std::unique_ptr<nanosm::Machine> i21_machine(const nanosm::DeviceProfile&
     const std::vector<std::pair<uint32_t, nanosm::MbarState>>& mbars, uint32_t warps = 1) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     for (const auto& [address, state] : mbars) write_u64(shmem, address, nanosm::encode_mbar_state(state));
     return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program), profile),
@@ -719,7 +719,7 @@ inline std::unique_ptr<nanosm::Machine> i6a_machine(
     const nanosm::DeviceProfile& profile, const nanosm::Kernel& kernel, uint32_t warps = 1) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     return std::make_unique<nanosm::Machine>(profile, kernel, std::move(launch),
         nanosm::TraceOptions{.timeline = true, .debug = true});

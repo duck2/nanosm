@@ -187,7 +187,7 @@ void test_r2ur_under_a_partial_mask_panics() {
 void test_consumers_take_uniform_registers() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 1024);
+    auto& shmem = image_bytes(launch.test_shmem, 1024);
     write_u32(shmem, 256, 40);
     write_u32(shmem, 324, 0x1234);
     auto& gmem = image_bytes(launch.gmem_image, 128);

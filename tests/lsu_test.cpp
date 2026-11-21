@@ -64,9 +64,9 @@ void test_vadd() {
 void test_sparse_launch_images() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    launch.shmem_image.push_back({64, std::vector<uint8_t>(4, 0)});
+    launch.test_shmem.push_back({64, std::vector<uint8_t>(4, 0)});
     launch.gmem_image.push_back({128, std::vector<uint8_t>(4, 0)});
-    write_u32(launch.shmem_image.back().bytes, 0, 0x11223344u);
+    write_u32(launch.test_shmem.back().bytes, 0, 0x11223344u);
     write_u32(launch.gmem_image.back().bytes, 0, 0x55667788u);
     nanosm::Machine machine(canonical_profile(), compile("halt"), std::move(launch));
     machine.run();
@@ -544,7 +544,7 @@ void test_lsu_backpressure_chain() {
 void test_lsu_tma_and_vector_streams_interleave() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& shmem = image_bytes(launch.test_shmem, 4096);
     write_rank1_load(shmem, 0, 0, 128, 128);
     auto& gmem = image_bytes(launch.gmem_image, 1024);
     fill_pattern(gmem, 0, 256, 0);
@@ -793,7 +793,7 @@ void test_lsu_edge_widths() {
         const auto config = fast_bus_profile(1);
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 4096);
+        auto& shmem = image_bytes(launch.test_shmem, 4096);
         write_rank1_tma(shmem, 0, 0, 512, 128);
         auto& gmem = image_bytes(launch.gmem_image, 4096);
         if (store) fill_pattern(shmem, 1024, 512, 0); else fill_pattern(gmem, 0, 512, 0);
@@ -822,7 +822,7 @@ void test_tma_store_egress_is_pluck_bound() {
         config.lsu_egress_sectors = 2;
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 16384 + 256);
+        auto& shmem = image_bytes(launch.test_shmem, 16384 + 256);
         fill_pattern(shmem, 0, 4096, 0);
         write_rank1_tma(shmem, 16384, 0, 4096, 16384 + 128);
         image_bytes(launch.gmem_image, 16384);
@@ -882,7 +882,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
         launch.active_warps = 1;
         auto& gmem = image_bytes(launch.gmem_image, 8192);
         fill_pattern(gmem, 0, 2048, 0);
-        if (tma) write_rank1_tma(image_bytes(launch.shmem_image, 2048), 0, 0, 8, 128);
+        if (tma) write_rank1_tma(image_bytes(launch.test_shmem, 2048), 0, 0, 8, 128);
         auto machine = std::make_unique<nanosm::Machine>(config, compile(text, config), std::move(launch));
         machine->enable_edge_probe();
         machine->run();
@@ -1081,7 +1081,7 @@ void test_lsu_one_write_contract() {
     { // TMA store, 128 fp32
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 2048);
+        auto& shmem = image_bytes(launch.test_shmem, 2048);
         write_rank1_tma(shmem, 0, 1024, 128, 128);
         fill_pattern(shmem, 1024, 128, 0);
         image_bytes(launch.gmem_image, 2048);

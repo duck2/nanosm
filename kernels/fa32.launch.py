@@ -58,7 +58,7 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
     # launching). Block b's P: 64 rows of 128 bytes from PBUF0 + P_BLOCK_STEP b.
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
     for block in range(2):
-        launch.shmem.write(launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP") * block,
+        launch.test_shmem.write(launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP") * block,
                            struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
@@ -110,10 +110,10 @@ EXPECTED_COUNTERS = {
             "useful_bytes": 57344, "sector_bytes": 57344,
             "port_requests": 1792, "port_rounds": 1792},
     "gmem": {"commands": 0, "sectors": 1792, "beats": 7168, "bytes": 57344},
-    # 1792 TMA sectors + 8 descriptor reads + 12 constant loads (three
-    # lds.uni per worker) + 24 statistics stores + 256 P stores + 256 staging
-    # stores, all one round each.
-    "shmem": {"requests": 2348, "rounds": 2348},
+    # 1792 TMA sectors + 8 descriptor reads + 24 statistics stores + 256 P
+    # stores + 256 staging stores, all one round each. (The two float
+    # constants are umov immediates: no shared-memory load.)
+    "shmem": {"requests": 2336, "rounds": 2336},
     # 64 m32n64k8 commands (2 query tiles x 2 key blocks x (8 for S + 8 for
     # O)) of 128 steps on the 4x4x8 core: the 64-row kernel's 8192 steps.
     # Each command reads its 8 A blocks once, with the first B block (two
@@ -179,9 +179,10 @@ def run_case(case: str, trace: Path | None) -> None:
             check_tile(result, V_SHARED[b], 128, WIDTH, BLOCK, "e",
                        lambda channel, key: v[BLOCK * b + key][channel], f"V block {b}")
         # The kernel's own counts, and the launch copy's part: its launch
-        # block (four descriptors, fifteen barrier states, two constants: 384
+        # block (four descriptors, fifteen barrier states: 384
         # bytes) comes from global memory as one more TMA load, 12 sectors.
-        check_counters(result.summary, launch_copy_counters(EXPECTED_COUNTERS, launch.copied_bytes))
+        check_counters(result.summary, launch_copy_counters(
+            EXPECTED_COUNTERS, launch.copied_bytes, block_address=launch.block_address))
         print(f"FA32 {case}: PASS, 4096 outputs, cycles={result.cycle}, "
               f"online_error={model_error:.3g}, attention_error={attention_error:.3g}, "
               f"second_alpha=[{min(second_alpha):.5g},{max(second_alpha):.5g}]")

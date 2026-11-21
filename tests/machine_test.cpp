@@ -52,7 +52,7 @@ void test_lds_is_nonblocking_and_depbar_waits() {
     )", canonical_profile());
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     write_u32(shmem, 0, nanosm::float_bits(2.0f));
     write_u32(shmem, 64, nanosm::float_bits(3.0f));
     nanosm::Machine machine(
@@ -89,7 +89,7 @@ void test_missing_wait_panics_instead_of_scoreboarding() {
     const auto kernel = nanosm::assemble_asm(assembly, profile);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 64);
+    image_bytes(launch.test_shmem, 64);
     nanosm::Machine machine(canonical_profile(), kernel, std::move(launch));
     try {
         machine.run();
@@ -108,7 +108,7 @@ void test_missing_wait_panics_instead_of_scoreboarding() {
 void test_plain_lds_of_one_word_is_sixteen_rounds() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 4);
+    auto& shmem = image_bytes(launch.test_shmem, 4);
     write_u32(shmem, 0, 0x12345678u);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         mov  r0, 0
@@ -126,7 +126,7 @@ void test_plain_lds_of_one_word_is_sixteen_rounds() {
 void test_bank_conflict_serializes() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 16 * 64);
+    auto& shmem = image_bytes(launch.test_shmem, 16 * 64);
     for (uint32_t lane = 0; lane < 16; ++lane) write_u32(shmem, lane * 64, lane + 10);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         sread r0, LANE_ID

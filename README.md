@@ -62,15 +62,17 @@ truth.
 
 **Launch.** A qtx file is self-contained: it declares everything a launch needs to know beside its
 code, and the host knows only the kernel's signature. (v0.1, a first working version: the copy and
-the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
+the flags below are expected to change; trash/launch-timed-2026-11-21.md and
+trash/launch-fixes-umov-2026-11-21.md.)
 
 ```
 .warps  6                          ; how many warps the kernel is written for (optional)
 .param  ptr   OUT                  ; the signature, in order:
 .param  u32   COUNT                ;   ptr  8 bytes, a 64-bit global byte address
 .param  desc  QDESC                ;   u32, f32  4 bytes;  desc  64 bytes, a TMA descriptor
-.mbar   S_READY, expect 1          ; a barrier's initial state: phase 0, 1 arrival expected (8 bytes)
-.data   CONSTANTS, f32 0.180336878, -inf     ; initialized words (f32 or u32)
+.mbar   O_STORED, expect 1         ; a barrier's initial state: phase 0, 1 arrival expected (8 bytes)
+.mbar   S_READY[2], expect 1       ; an array: two such barriers side by side, ONE section
+.data   TABLE, f32 0.5, 0.25, -inf ; initialized words (f32 or u32)
 ```
 
 - **The `.param` lines are the signature.** The launch passes one argument per parameter, by name
@@ -83,10 +85,21 @@ the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
   to its own size (`ptr` 8, `u32` / `f32` 4, `desc` 64, an mbar 8, data 4); the block starts at the
   top of shared memory (`shmem.bytes`) minus its bytes, rounded down to a multiple of 64. A section's
   name is its address, an immediate: `umov ur1, OUT` then `lds.uni r4, [ur1]`, or the name as the
-  descriptor operand of `tma.load` / `tma.store`. Two barriers declared one after the other are 8
-  bytes apart. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
+  descriptor operand of `tma.load` / `tma.store`. An `.equ` whose value is a section's name is
+  another name for that section. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
   register, so a kernel reads the low word and the launch refuses a pointer that does not fit 32
   bits (a second address register is planned).
+- **Barrier arrays.** `.mbar NAME[C], expect N` is C barriers side by side in ONE section: element
+  i is at `NAME + 8 i` and is written `NAME[i]` (`umov ur11, S_READY[1]`; `NAME` alone is element
+  0, and code may reach element t as `NAME + 8 t` in a register). An index past the array's end is
+  refused. Because an array is one section it arrives, and is waited for, whole: that is how a
+  kernel says "these belong together", so the ORDER of the declarations is free to mean only
+  arrival order. Two separate `.mbar` lines promise nothing about each other's address.
+- **The signature's order and the block's order.** The signature is the `.param` lines in the order
+  written among themselves; the block is all the section lines in the order written. So a kernel
+  can keep its public parameter order and still put a barrier it needs first between two
+  parameters (`kernels/fa32.qtx`: `QDESC`, then `Q_LANDED[2]` and the other barriers, then `KDESC`,
+  `VDESC`, `ODESC`).
 - **Nothing of it is in shared memory at the first cycle.** The host writes the block's bytes (the
   arguments, the barrier states, the data) into global memory, by default at its top
   (`Launch(..., block_address=...)` chooses), and writes the launch record: host-written registers
@@ -100,7 +113,7 @@ the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
   cross the bus at its rate (8 cycles per 32-byte sector) and share the bus, the TMA's queue (one
   of its four commands) and the port-B write with the kernel's own work. The kernel ends only after
   the copy has. A profile with no TMA cannot run a kernel that has sections.
-- **Launch flags** (`core.launch_flags`, 4; 0..6). A launch flag is one of a warp's six depbars, taken
+- **Launch flags** (`core.launch_flags`, 4; 1..6). A launch flag is one of a warp's six depbars, taken
   from sb5 downward. It starts counted once in every warp, and is decremented in every warp when the
   copy has landed the first N bytes of the block, N being that flag's cut. An instruction waits on a
   flag through its ordinary wait mask, so nothing is new at issue and no warp signals another.
@@ -109,15 +122,19 @@ the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
   all the rest; assembly and hex carry them as `.flag sbN, BYTES`) and makes every instruction
   whose text names a section wait on that section's flag, unless the straight-line code before it
   already has; code that names no section runs meanwhile. A branch, a `halt` or qtx's `wait` do not
-  wait for launch flags. A wait is on the NAMING instruction, not on the access: a kernel that
-  reaches a section through arithmetic on another one's address (a barrier pair, `S_READY0 + 8 t`)
-  is covered only if both are behind the same flag, and the sanitizer PANICs on any read or write
-  of block bytes that have not landed (an `lds`, an `sts`, an mbar operation, a TMA's descriptor or
-  buffer). The summary's `launch:` line says when each flag cleared (`sb5:64@118`: depbar, block
+  wait for launch flags. A wait is on the NAMING instruction, not on the access: naming a section
+  (by its own name, an element `NAME[i]`, or an `.equ` name for either) covers the whole section, an
+  array included; a kernel that computes its way from one section into ANOTHER is not covered by
+  qtxc, and the sanitizer PANICs on any read or write of block bytes that have not landed (an
+  `lds`, an `sts`, an mbar operation, a TMA's descriptor or buffer). The summary's `launch:` line says when each flag cleared (`sb5:64@118`: depbar, block
   bytes, cycle).
-- **`core.launch_flags` 0** means no copy: the block is in shared memory before the first cycle,
-  untimed, and nothing waits. It is the comparison case, not the machine: a kernel there gets its
-  launch bytes for free.
+- **There is no untimed way in.** The launch block reaches shared memory only by the copy
+  (`core.launch_flags` 0 is refused: a kernel with sections needs a flag to wait on). The kernel's
+  code is the one thing still in place before the first cycle without being timed (the instruction
+  memory is loaded by the launch; HUMAN 2026-11-21: "can be skipped for now").
+- **Float constants need no memory.** `umov urD, imm` takes any 32-bit word, so a constant is one
+  instruction (`umov ur2, 0.180336878`, then `ur2r r9, ur2` if every lane needs it). `.data` is for
+  tables.
 - **A barrier is initialized by its `.mbar` line** and not by `mbar.init` at run time: the warps
   start together and nothing would hold the others until one had initialized it.
 - **`.warps N`** is optional; a kernel that works at any count leaves it out and the launch says
@@ -125,12 +142,17 @@ the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
 - **Looking inside is separate from launching.** `nanosm_qtx_kernel_info` (C API) returns the
   kernel's signature, its sections with their addresses and flags, and its symbols (`.equ` names,
   section addresses) as JSON; Python has `launch.signature`, `launch.sections` and
-  `launch.symbol("PBUF0")`. A test that checks or poisons a tile inside shared memory uses those
-  names with `result.shmem(...)` / `launch.shmem.write(...)` (bytes written before the first cycle:
-  a debugger's access, not part of a launch). Assembly carries the same directives; hex carries
+  `launch.symbol("PBUF0")`. A test that checks a tile inside shared memory uses those names with
+  `result.shmem(...)`. A test that poisons a region first uses `launch.test_shmem.write(...)` (C++:
+  `Launch::test_shmem`): bytes placed before the first cycle, untimed, which is a TEST's access and
+  not part of a launch. It may not touch the launch block, and a run that used it says so in its
+  summary (`test_preload: shmem_bytes=N`, absent otherwise), so a harness that scores kernels can
+  refuse it. Assembly carries the same directives; hex carries
   them with each section's address (kernel load checks it against the rule); neither hex nor a
-  saved image carries symbols. The launch copy counts in the `tma:` and `gmem:` summary lines like
-  any load; `nanosm.launch_copy_counters` adds its part to a script's own expected counts.
+  saved image carries symbols; all three keep the sections in their declared order, so a replay
+  has the same timing. The launch copy counts in the `tma:` and `gmem:` summary lines like any
+  load; `nanosm.launch_copy_counters` adds its part to a script's own expected counts (in global
+  sectors, so it takes the block's global address when the launch chose one).
 
 The public boundary is [src/capi.h](src/capi.h): fixed-width C values, integer session handles,
 pointer-plus-length inputs, and caller-owned output buffers. It performs no file I/O and exposes no
@@ -151,7 +173,11 @@ registers named.
 
 Each warp also has a uniform register file (the profile's `urf` section; trash/rfc16.md and
 trash/urf-slice-2026-11-08.md): `urf.registers` 32-bit registers (32 in the canonical profile,
-`ur0`..`ur31`), two read ports, one write port. Only uniform arithmetic (`umov`, `uadd`, `uaddi`,
+`ur0`..`ur31`), two read ports, one write port. `umov urD, imm` holds a whole 32-bit word (its
+payload is the register in 6 bits and the word in 32; every other immediate is 22 bits signed): an
+integer from -2^31 to 2^32 - 1, or a float literal (`1.5`, `1e-3`, `-inf`, `nan`), taken as its
+IEEE bits; a word outside the 22-bit range prints as hex (`umov ur2, 0x3e38aa3b`). Only uniform
+arithmetic (`umov`, `uadd`, `uaddi`,
 `usub`, `ushl`/`ushr`/`ushli`/`ushri`, `uand`/`uor`/`uxor` and their immediates, `usread urD, WARP_ID
 | N_WARPS`) and `r2ur urD, rS` (lane 0 of a vector register) write it, each presenting its result at
 the URF write port the same fixed `urf.issue_to_port_cycles` after issue, so one issue per cycle is
@@ -343,9 +369,10 @@ their fingerprinted artifacts; serial scalar-FMA MMA arithmetic is no longer sup
 A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,
 what the kernel declares (`warps`, its `sections` in order, its launch `flags`), the launch's
 arguments (`args`), its warp count and its launch block's global address (`block_address`) when it
-gives them, and ordered sparse shmem/gmem byte segments (shmem segments are a test's own writes,
-in place before the first cycle; the launch block is not among them: the machine's loader writes
-it into global memory from the sections and the arguments). Bytes and 64-bit words are written
+gives them, and ordered sparse `gmem` and `test_shmem` byte segments (`test_shmem` segments are a
+test's own untimed writes, in place before the first cycle and reported in the run's summary; the
+launch block is not among them and they may not touch it: the machine's loader writes the block
+into global memory from the sections and the arguments). Bytes and 64-bit words are written
 as hexadecimal strings, while addresses are JSON integers. Segments are applied in array order and
 later overlapping bytes win. The simulator runner does not know which workload authored the image.
 

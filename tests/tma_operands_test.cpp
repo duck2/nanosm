@@ -56,7 +56,7 @@ nanosm::Launch tensor_launch(uint32_t warps, uint16_t tile_rows, uint32_t barrie
     launch.active_warps = warps;
     auto& gmem = image_bytes(launch.gmem_image, tensor_elements * 4);
     for (uint32_t i = 0; i < tensor_elements; ++i) write_u32(gmem, 4 * i, 1000u + i);
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t address = 0; address < descriptor_4d; address += 4) write_u32(shmem, address, 0xdeadbeefu);
     write_tma_descriptor(shmem, descriptor_4d, sequence_tiles(tile_rows));
     write_tma_descriptor(shmem, descriptor_2d, rows_of_8(tile_rows));

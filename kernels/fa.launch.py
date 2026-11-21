@@ -8,7 +8,7 @@ the FP32 output leaves through TMA: workers stage normalized O in shmem as
 fp32 swizzle64 tiles over the dead Q/K0 stages. Each worker pair publishes
 32 output rows for its own TMA store.
 The host supplies only the four descriptors (the kernel's signature); the
-kernel's qtx declares its warps, barriers and constants. The checks that look
+kernel's qtx declares its warps and barriers. The checks that look
 inside shared memory (statistics, P, the staged output) take their addresses
 from the kernel's symbols.
 Workers compute P's and O's swizzled addresses and do all softmax, P
@@ -84,7 +84,7 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
     # Poison outputs / P so unwritten entries cannot pass as launch-zero values
     # (P's address is the kernel's; a test's look inside, not part of launching).
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
-    launch.shmem.write(launch.symbol("PBUF0"), struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
+    launch.test_shmem.write(launch.symbol("PBUF0"), struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
 
@@ -262,9 +262,10 @@ def run_case(case: str, trace: Path | None) -> None:
             # All DRAM traffic is now TMA: no SIMT gmem commands remain. Total
             # traffic unchanged: 1792 sectors = 57344 bytes = useful (1.00x).
             "gmem": {"commands": 0, "sectors": 1792, "beats": 7168, "bytes": 57344},
-            # 1792 TMA sector transfers + 8 descriptor reads + 16 constant
-            # loads + 24 statistics stores + 256 P stores + 256 O stores.
-            "shmem": {"requests": 2352, "rounds": 2352},
+            # 1792 TMA sector transfers + 8 descriptor reads + 24 statistics
+            # stores + 256 P stores + 256 O stores. (The two float constants
+            # are umov immediates: no shared-memory load.)
+            "shmem": {"requests": 2336, "rounds": 2336},
             # Each 32x64x8 command walks 8 A blocks x 16 B blocks. Loading
             # A once per row group gives 8 x 17 shared-memory rounds.
             "mma": {"commands": 64, "input_steps": 8192, "result_steps": 8192,
@@ -273,9 +274,10 @@ def run_case(case: str, trace: Path | None) -> None:
             "sfu": {"ops": 524, "busy_cycles": 2096},
         }
         # And the launch copy's part: the kernel's launch block (four
-        # descriptors, ten barrier states, two constants: 344 bytes) comes
-        # from global memory as one more TMA load, 11 sectors.
-        expected_counters = launch_copy_counters(expected_counters, launch.copied_bytes)
+        # descriptors, ten barrier states: 384 bytes with the alignment) comes
+        # from global memory as one more TMA load, 12 sectors.
+        expected_counters = launch_copy_counters(
+            expected_counters, launch.copied_bytes, block_address=launch.block_address)
         for engine, expected in expected_counters.items():
             line = next(line for line in result.summary.splitlines() if line.startswith(engine + ":"))
             actual = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}

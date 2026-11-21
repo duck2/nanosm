@@ -31,7 +31,7 @@ void test_rf_one_round_fadd_and_halt() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& image = image_bytes(launch.shmem_image, 8);
+    auto& image = image_bytes(launch.test_shmem, 8);
     write_u32(image, 0, nanosm::float_bits(1.25f));
     write_u32(image, 4, nanosm::float_bits(2.5f));
     nanosm::Machine machine(profile, compile(R"(
@@ -98,7 +98,7 @@ void test_rf_one_round_war_and_branch() {
     require(async_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall an async writer cannot need");
     nanosm::Launch launch;
     launch.active_warps = 1;
-    write_u32(image_bytes(launch.shmem_image, 64), 0, 7);
+    write_u32(image_bytes(launch.test_shmem, 64), 0, 7);
     nanosm::Machine war(profile, compile(source, profile), std::move(launch));
     war.run();
     require(war.read_reg(0, 0, 2) == 0 && war.read_reg(0, 0, 1) == 7,
@@ -212,7 +212,7 @@ std::unique_ptr<nanosm::Machine> i1_machine(
     const nanosm::DeviceProfile& profile, const std::string& body, uint32_t warps = 1) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 4096);
+    auto& shmem = image_bytes(launch.test_shmem, 4096);
     for (uint32_t word = 0; word < 1024; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, body), profile),
         std::move(launch), nanosm::TraceOptions{.timeline = true});
@@ -261,7 +261,7 @@ void test_i1_lds_issue_ignores_its_rounds() {
     const auto run = [&](uint32_t mask) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 256);
+        auto& shmem = image_bytes(launch.test_shmem, 256);
         write_u32(shmem, 0, mask);
         for (uint32_t word = 1; word < 64; ++word) write_u32(shmem, 4 * word, 0x100 + word);
         nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch),
@@ -1778,7 +1778,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
     // assembler and kernel load accept it, and it computes.
     nanosm::Launch launch;
     launch.active_warps = 1;
-    image_bytes(launch.shmem_image, 256);
+    image_bytes(launch.test_shmem, 256);
     nanosm::Machine machine(canonical, compile(R"(
         sread r3, LANE_ID
         shli r3, r3, 2
@@ -2057,7 +2057,7 @@ void test_i6b1_unrelated_banks_proceed() {
     barrier.valid = true;
     barrier.expected = 3;
     barrier.remaining = 3;
-    write_u64(image_bytes(launch.shmem_image, 8192), 4096, nanosm::encode_mbar_state(barrier));
+    write_u64(image_bytes(launch.test_shmem, 8192), 4096, nanosm::encode_mbar_state(barrier));
     nanosm::Machine machine(profile, compile(R"(
         usread ur1, WARP_ID
         ur2r r50, ur1
@@ -2144,7 +2144,7 @@ void test_i6b1_sixteen_warps() {
     }
     nanosm::Launch launch;
     launch.active_warps = 16;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     nanosm::MbarState initial;
     initial.valid = true;
     initial.expected = 16;

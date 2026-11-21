@@ -133,7 +133,7 @@ void test_i3_reads_during_an_rmw() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 512; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     write_u64(shmem, i2_event_mbar, nanosm::encode_mbar_state(i21_mbar(1, 0, 64)));
     write_rank1_load(shmem, 5120, 0, 16, 4104);
@@ -457,7 +457,7 @@ void test_i3_tma_start_reads_no_mbar() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     write_rank1_load(shmem, 5120, 0, 16, 4104);
     write_u64(shmem, 4104, nanosm::encode_mbar_state(i21_mbar(1, 1)));
     fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
@@ -542,7 +542,7 @@ void test_i3_sanitizer_wrong_phase_complete_tx() {
     const auto machine_for = [&](const std::string& program) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         write_rank1_load(shmem, 5120, 0, 16, 4104);
         write_u64(shmem, 4104, nanosm::encode_mbar_state(i21_mbar(1, 1)));
         fill_pattern(image_bytes(launch.gmem_image, 64), 0, 16, 0);
@@ -635,12 +635,12 @@ uint32_t i5_expected(nanosm::Opcode opcode, uint32_t old_word, uint32_t operand)
 
 // An I2-style machine (shmem words 0..2047 hold 0x100 + word; gmem words
 // 0..1023 hold 5 * word + 2); `setup` may change the launch (its image's
-// shmem bytes are launch.shmem_image[0].bytes; its declared mbars).
+// shmem bytes are launch.test_shmem[0].bytes; its declared mbars).
 std::unique_ptr<nanosm::Machine> i5_machine(const nanosm::DeviceProfile& profile, const std::string& program,
     uint32_t warps = 1, const std::function<void(nanosm::Launch&)>& setup = {}, bool hand_assembly = true) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     auto& gmem = image_bytes(launch.gmem_image, 4096);
     for (uint32_t word = 0; word < 1024; ++word) write_u32(gmem, 4 * word, 5 * word + 2);
@@ -835,7 +835,7 @@ void test_i5_add_wraps_at_the_int32_boundary() {
         atom.add.uni r24, [ur1 + 2092], ur7 {pred=PT, stall=0, set=sb2, wait=-}
         halt {pred=PT, stall=0, set=-, wait=sb0|sb2}
     )", 1, [&](nanosm::Launch& launch) {
-        auto& shmem = launch.shmem_image.at(0).bytes;
+        auto& shmem = launch.test_shmem.at(0).bytes;
         for (uint32_t k = 0; k < 5; ++k) {
             write_u32(shmem, 2048 + 4 * k, cases[k].first);
             write_u32(shmem, 7232 + 4 * k, cases[k].second);
@@ -1145,7 +1145,7 @@ void test_d12_uniform_ops_under_a_partial_mask() {
     )") + R"(
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )";
-    const auto mbar = [](nanosm::Launch& launch) { write_count_mbar(launch.shmem_image.at(0).bytes, 4160, 1); };
+    const auto mbar = [](nanosm::Launch& launch) { write_count_mbar(launch.test_shmem.at(0).bytes, 4160, 1); };
     for (const uint64_t mask : {uint64_t{0xfffe}}) {
         const auto what = "mask " + std::to_string(mask);
         auto machine = i5_machine(profile, program, 1, mbar);
@@ -1182,7 +1182,7 @@ void test_d12_sts_two_lanes_on_one_word() {
     for (const uint64_t mask : {uint64_t{0xffff}, uint64_t{0x00f6}}) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        image_bytes(launch.shmem_image, 4);
+        image_bytes(launch.test_shmem, 4);
         nanosm::Machine machine(canonical_profile(), compile(R"(
             sread r1, LANE_ID
             addi r2, r1, 1
@@ -1236,7 +1236,7 @@ void test_d12_stg_two_lanes_on_one_word() {
 void test_d12_sts_over_an_mbar_with_a_live_waiter() {
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     write_count_mbar(shmem, 64, 1);
     launch.mbars = {64};
     nanosm::Machine machine(canonical_profile(), compile(R"(
@@ -1278,7 +1278,7 @@ void test_d12_sts_over_an_mbar_with_a_live_waiter() {
 void test_d12_1_every_uniform_op_under_a_partial_mask() {
     const auto& profile = canonical_profile();
     const auto setup = [](nanosm::Launch& launch) {
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         write_count_mbar(shmem, 4096, 1);
         write_tma_descriptor(shmem, 5120, linear_tma(64));
         write_tx_mbar(shmem, 4104, 64);
@@ -1355,7 +1355,7 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
 void test_d12_1_mbar_init_over_a_live_waiter() {
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 128);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
     write_count_mbar(shmem, 64, 1);
     launch.mbars = {64};
     nanosm::Machine machine(canonical_profile(), compile(R"(
@@ -1402,7 +1402,7 @@ void test_d12_1_mbar_init_over_a_live_waiter() {
 void test_d12_1_tma_load_over_a_live_waiter() {
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     write_count_mbar(shmem, 1032, 1);
     write_tma_descriptor(shmem, 5120, linear_tma(64));
     write_tx_mbar(shmem, 4104, 64);
@@ -1475,7 +1475,7 @@ void test_i5_atomic_sanitizer() {
         "until kernel end only mbar operations may touch it"}, "an atomic on a SIMT-initialized mbar");
 
     const auto declared = [](nanosm::Launch& launch) {
-        write_count_mbar(launch.shmem_image.at(0).bytes, 4160, 1);
+        write_count_mbar(launch.test_shmem.at(0).bytes, 4160, 1);
         launch.mbars = {4160};
     };
     message = i4_panic(*i5_machine(profile, "umov ur4, 4164\numov ur11, 9\natom.exch.uni r7, [ur4], ur11\nhalt\n", 1,
@@ -1497,7 +1497,7 @@ void test_i5_atomic_sanitizer() {
     require(legal->read_mbar_state(4160).phase, "an arrive on a launch-declared mbar did not complete its phase");
 
     const auto tma = [](nanosm::Launch& launch) {
-        auto& shmem = launch.shmem_image.at(0).bytes;
+        auto& shmem = launch.test_shmem.at(0).bytes;
         write_tma_descriptor(shmem, 5120, linear_tma(64));
         write_tx_mbar(shmem, 4104, 64);
     };
@@ -1543,7 +1543,7 @@ void test_i5_launch_declared_mbars_format() {
     nanosm::LaunchImage input;
     input.kernel = compile("halt");
     input.launch.active_warps = 1;
-    input.launch.shmem_image.push_back({4160, std::vector<uint8_t>(8, 0)});
+    input.launch.test_shmem.push_back({4160, std::vector<uint8_t>(8, 0)});
     const auto plain = nanosm::emit_launch_image(input);
     require(plain.find("mbars") == std::string::npos, "a launch with no declared mbar emitted an mbars field");
     input.launch.mbars = {4160, 4168};
@@ -1604,9 +1604,9 @@ void test_i5_launch_declared_mbars_format() {
         rejected([&] { return nanosm::emit_launch_image(nanosm::load_launch_image(document.dump())); },
             "launch image: kernel.register_count is not an unsigned 32-bit integer", "register_count " + bad.dump());
         document = nlohmann::json::parse(declared);
-        document["shmem"][0]["address"] = bad;
+        document["test_shmem"][0]["address"] = bad;
         rejected([&] { return nanosm::emit_launch_image(nanosm::load_launch_image(document.dump())); },
-            "launch image: shmem[0].address is not an unsigned integer", "segment address " + bad.dump());
+            "launch image: test_shmem[0].address is not an unsigned integer", "segment address " + bad.dump());
     }
 }
 

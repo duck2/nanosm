@@ -51,26 +51,27 @@
 .equ STATS,      50176
 
 ; What the launch gives: one TMA descriptor per tensor (Q and O move 32 rows
-; at a time, K and V a 64-key block; V transposed). Everything below it is the
-; kernel's own: five warps, its barriers and its two constants.
+; at a time, K and V a 64-key block; V transposed): the four .param lines, in
+; that order, are the kernel's signature. Everything else below is the
+; kernel's own: five warps and its barriers (its two float constants are umov immediates).
+; Together, in the order written, these lines are the launch block, the first
+; declared arriving first (README "Launch"): the issuer's first act is an
+; arrive on INPUT_DONE and a load through QDESC, so those come first. A pair
+; of barriers is an array (`.mbar NAME[2]`: NAME[1] is 8 bytes after NAME[0],
+; and the workers reach it as NAME + 8 t); an array arrives whole.
+; SCORE and OUTPUT count the issuer's MMA commits; WORK and STAGED the two
+; workers that own each query tile.
 .warps  5
 .param  desc QDESC
+.mbar INPUT_DONE,  expect 1
+.mbar SCORE[2],    expect 1
+.mbar WORK[2],     expect 2
+.mbar OUTPUT[2],   expect 1
+.mbar STAGED[2],   expect 2
+.mbar OSTORE_DONE, expect 1
 .param  desc KDESC
 .param  desc VDESC
 .param  desc ODESC
-; SCORE and OUTPUT count the issuer's MMA commits; WORK and STAGED the two
-; workers that own each query tile.
-.mbar SCORE0,      expect 1
-.mbar SCORE1,      expect 1
-.mbar WORK0,       expect 2
-.mbar WORK1,       expect 2
-.mbar OUTPUT0,     expect 1
-.mbar OUTPUT1,     expect 1
-.mbar STAGED0,     expect 2
-.mbar STAGED1,     expect 2
-.mbar INPUT_DONE,  expect 1
-.mbar OSTORE_DONE, expect 1
-.data CONSTANTS, f32 0.180336878, -inf      ; log2(e) / sqrt(64), -infinity
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0
@@ -87,15 +88,16 @@
         add   r1, r0, r1           ; global row for P, statistics and staged O
         shli  r3, r1, 2
         addi  r3, r3, STATS
-        umov  ur2, CONSTANTS
-        lds.uni r9, [ur2]
-        lds.uni r10, [ur2+4]       ; -infinity
+        umov  ur2, 0.180336878     ; log2(e) / sqrt(64): a constant is a umov, no memory
+        umov  ur9, -inf
+        ur2r  r9, ur2
+        ur2r  r10, ur9             ; -infinity
         mov   r11, 0              ; denominator = 0.0
         umov  ur6, 0
-        uaddi ur3, ur8, SCORE0
-        uaddi ur4, ur8, WORK0
-        uaddi ur5, ur8, OUTPUT0
-        uaddi ur7, ur8, STAGED0
+        uaddi ur3, ur8, SCORE
+        uaddi ur4, ur8, WORK
+        uaddi ur5, ur8, OUTPUT
+        uaddi ur7, ur8, STAGED
         uaddi ur10, ur0, 64        ; the end of the score rows' columns
         uaddi ur11, ur0, O_TMEM    ; the same rows of O
         uaddi ur12, ur11, 64
@@ -113,7 +115,7 @@ S_READY:
 @!p1    bra.uni S_READY
 
 ; Pass 1: row max. Keep only eight scores resident, not a whole row.
-        lds.uni r12, [ur2+4]
+        ur2r  r12, ur9             ; -infinity
         umov  ur1, ur0
 ROW_MAX:
         acc.ld.v8 r16, [ur1, 64]
@@ -300,12 +302,12 @@ ISSUER:
         tma.load.2d [ur11], [KDESC, ur8], [ur2]
         tma.load.2d [ur12], [VDESC, ur8], [ur2]
 
-        umov  ur3, SCORE0
-        umov  ur4, SCORE1
-        umov  ur5, WORK0
-        umov  ur6, WORK1
-        umov  ur7, OUTPUT0
-        umov  ur15, OUTPUT1
+        umov  ur3, SCORE
+        umov  ur4, SCORE[1]
+        umov  ur5, WORK
+        umov  ur6, WORK[1]
+        umov  ur7, OUTPUT
+        umov  ur15, OUTPUT[1]
         umov  ur16, 0              ; key block, also the workers' barrier parity
         umov  ur13, KBUF1
         umov  ur14, VBUF1
@@ -459,8 +461,8 @@ IN1:
 ; Each pair stages 32 fp32 rows. Start draining the first tile while the
 ; second pair can still be normalizing. Both stores credit the same 16 KiB.
 WRITE_OUTPUT:
-        umov  ur3, STAGED0
-        umov  ur4, STAGED1
+        umov  ur3, STAGED
+        umov  ur4, STAGED[1]
         umov  ur5, OSTORE_DONE
         umov  ur10, OSTAGE0
         umov  ur11, OSTAGE1

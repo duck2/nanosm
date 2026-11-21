@@ -76,37 +76,38 @@
 .equ STATS,      50176           ; per row: max, denominator, alpha, per block
 
 ; What the launch gives: one TMA descriptor per tensor (Q a 32-row tile, K a
-; 64-key block, V the same transposed, O 32 fp32 rows). Everything below it
-; is the kernel's own: six warps, its barriers and its two constants.
-.warps  6
-.param  desc QDESC
-.param  desc KDESC
-.param  desc VDESC
-.param  desc ODESC
+; 64-key block, V the same transposed, O 32 fp32 rows): the four .param lines,
+; in that order, are the kernel's signature. Everything else below is the
+; kernel's own: six warps and its barriers (its two float constants are umov immediates).
+;
+; All of these lines together, in the order written, are the launch block:
+; copied from global memory when the kernel starts, the first declared
+; arriving first (README "Launch"). So they are written in the order the
+; kernel first needs them: the producer's first act is an arrive on Q_LANDED
+; and a load through QDESC; the other descriptors are needed only after 4 KiB
+; of Q has crossed the bus. Descriptors are 64-byte aligned, so the three
+; later ones sit together at the end (no padding between them).
+;
+; A pair of barriers is an array, `.mbar NAME[2]`: element 1 is 8 bytes after
+; element 0 (tile 1's, or block 1's, after tile 0's), written NAME[1], and the
+; workers reach it as NAME + 8 t. An array is one section: it arrives, and is
+; waited for, whole.
 ; S_READY and O_DONE count one mma.commit each; P_READY and O_STAGED the two
 ; workers of a query tile; each LANDED barrier one TMA load (the producer's
 ; arrive.expect_tx); O_STORED both output stores.
-; Barriers come in pairs, tile 1's (or block 1's) 8 bytes after tile 0's:
-; a pair is two .mbar lines one after the other (the code reaches the second
-; as the first plus 8). All of these, with the descriptors above and the
-; constants below, are the launch block: copied from global memory when the
-; kernel starts, the first declared arriving first (README "Launch").
-.mbar S_READY0,  expect 1    ; commit after S(t,b), phase b
-.mbar S_READY1,  expect 1
-.mbar P_READY0,  expect 2    ; tile t's two workers wrote P(t,b) and corrected O(t), phase b
-.mbar P_READY1,  expect 2
-.mbar O_DONE0,   expect 1    ; commit after O(t,b), phase b
-.mbar O_DONE1,   expect 1
-.mbar O_STAGED0, expect 2    ; tile t's two workers staged its output
-.mbar O_STAGED1, expect 2
-.mbar Q_LANDED0, expect 1    ; one TMA load each, phase 0 only
-.mbar Q_LANDED1, expect 1
-.mbar K_LANDED0, expect 1
-.mbar K_LANDED1, expect 1
-.mbar V_LANDED0, expect 1
-.mbar V_LANDED1, expect 1
-.mbar O_STORED,  expect 1    ; both output stores count down one phase
-.data CONSTANTS, f32 0.180336878, -inf      ; log2(e) / sqrt(64), -infinity
+.warps  6
+.param  desc QDESC
+.mbar Q_LANDED[2], expect 1  ; one TMA load each, phase 0 only
+.mbar S_READY[2],  expect 1  ; commit after S(t,b), phase b
+.mbar P_READY[2],  expect 2  ; tile t's two workers wrote P(t,b) and corrected O(t), phase b
+.mbar O_DONE[2],   expect 1  ; commit after O(t,b), phase b
+.mbar O_STAGED[2], expect 2  ; tile t's two workers staged its output
+.mbar K_LANDED[2], expect 1
+.mbar V_LANDED[2], expect 1
+.mbar O_STORED,    expect 1  ; both output stores count down one phase
+.param  desc KDESC
+.param  desc VDESC
+.param  desc ODESC
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0
@@ -133,9 +134,10 @@
 ; Uniform registers: ur0 this warp's 16 score rows in tmem (S_TMEM + 64 x its
 ; first query row), ur11 the same rows of O, ur10 / ur12 their ends (+ 64);
 ; ur1 the tmem pointer the column loops walk, eight columns a step (their
-; counter), ur2 constants, ur3 S_READY(t), ur4 P_READY(t), ur5 O_DONE(t), ur6
-; key block (the block loop's counter and the parity of the three per-block
-; barriers), ur7 O_STAGED(t), ur8 8 t, ur9 the previous block's parity.
+; counter), ur2 / ur13 the two constants, ur3 S_READY(t), ur4 P_READY(t), ur5
+; O_DONE(t), ur6 key block (the block loop's counter and the parity of the
+; three per-block barriers), ur7 O_STAGED(t), ur8 8 t, ur9 the previous
+; block's parity.
 ; The tile is the pointer: both tiles' warps run the same code.
 ;
 ; P and the staged output are swizzle64 tiles (src/layout.hpp): row r whole
@@ -154,16 +156,17 @@
         ushli ur0, ur1, 6          ; its score rows: S_TMEM (0) + 64 x 16 w
         shli  r3, r1, 2
         addi  r3, r3, STATS
-        umov  ur2, CONSTANTS
-        lds.uni r9, [ur2]
-        lds.uni r10, [ur2+4]       ; -infinity: the running max
-        lds.uni r39, [ur2+4]       ; -infinity, kept
+        umov  ur2, 0.180336878     ; log2(e) / sqrt(64): a constant is a umov, no memory
+        umov  ur13, -inf
+        ur2r  r9, ur2
+        ur2r  r10, ur13            ; -infinity: the running max
+        ur2r  r39, ur13            ; -infinity, kept
         mov   r11, 0               ; denominator = 0.0
         umov  ur6, 0
-        uaddi ur3, ur8, S_READY0
-        uaddi ur4, ur8, P_READY0
-        uaddi ur5, ur8, O_DONE0
-        uaddi ur7, ur8, O_STAGED0
+        uaddi ur3, ur8, S_READY
+        uaddi ur4, ur8, P_READY
+        uaddi ur5, ur8, O_DONE
+        uaddi ur7, ur8, O_STAGED
         uaddi ur10, ur0, 64        ; the end of the score rows' columns
         uaddi ur11, ur0, O_TMEM    ; the same rows of O
         uaddi ur12, ur11, 64
@@ -390,17 +393,17 @@ ISSUER:
         umov  ur19, S1_TMEM
         umov  ur20, O_TMEM
         umov  ur21, O1_TMEM
-        umov  ur7, Q_LANDED0
-        umov  ur8, Q_LANDED1
-        umov  ur10, S_READY0
-        umov  ur11, S_READY1
-        umov  ur12, P_READY0
-        umov  ur13, P_READY1
-        umov  ur14, O_DONE0
-        umov  ur15, O_DONE1
+        umov  ur7, Q_LANDED
+        umov  ur8, Q_LANDED[1]
+        umov  ur10, S_READY
+        umov  ur11, S_READY[1]
+        umov  ur12, P_READY
+        umov  ur13, P_READY[1]
+        umov  ur14, O_DONE
+        umov  ur15, O_DONE[1]
         umov  ur2, 0
         umov  ur3, KBUF0
-        umov  ur5, K_LANDED0
+        umov  ur5, K_LANDED
 SCORE_BLOCK:
         uxori ur9, ur2, 1
 ; S(0,b) = Q0 K(b)^T: eight K = 8 commands across the 64 channels.
@@ -481,7 +484,7 @@ S1_FREE_WAIT:
 
         umov  ur2, 0
         umov  ur4, VBUF0
-        umov  ur6, V_LANDED0
+        umov  ur6, V_LANDED
         umov  ur16, PBUF0
         umov  ur17, PBUF1
 OUTPUT_BLOCK:
@@ -577,32 +580,32 @@ PRODUCER:
         umov  ur8, 0
         umov  ur9, 0
         umov  ur0, QBUF0
-        umov  ur1, Q_LANDED0
+        umov  ur1, Q_LANDED
         mbar.arrive.expect_tx [ur1], 4096
         tma.load.2d [ur0], [QDESC, ur8], [ur1]
         umov  ur0, KBUF0
-        umov  ur1, K_LANDED0
+        umov  ur1, K_LANDED
         mbar.arrive.expect_tx [ur1], 8192
         tma.load.2d [ur0], [KDESC, ur8], [ur1]
         umov  ur9, 32
         umov  ur0, QBUF1
-        umov  ur1, Q_LANDED1
+        umov  ur1, Q_LANDED[1]
         mbar.arrive.expect_tx [ur1], 4096
         tma.load.2d [ur0], [QDESC, ur8], [ur1]
         umov  ur9, 64
         umov  ur0, KBUF1
-        umov  ur1, K_LANDED1
+        umov  ur1, K_LANDED[1]
         mbar.arrive.expect_tx [ur1], 8192
         tma.load.2d [ur0], [KDESC, ur8], [ur1]
 ; The TMA queue holds four commands; these two wait for Q0 and K0 to finish.
         umov  ur9, 0
         umov  ur0, VBUF0
-        umov  ur1, V_LANDED0
+        umov  ur1, V_LANDED
         mbar.arrive.expect_tx [ur1], 8192
         tma.load.2d [ur0], [VDESC, ur8], [ur1]
         umov  ur9, 64
         umov  ur0, VBUF1
-        umov  ur1, V_LANDED1
+        umov  ur1, V_LANDED[1]
         mbar.arrive.expect_tx [ur1], 8192
         tma.load.2d [ur0], [VDESC, ur8], [ur1]
 
@@ -612,7 +615,7 @@ PRODUCER:
         umov  ur9, 0
         umov  ur0, OSTAGE
         umov  ur1, O_STORED
-        umov  ur2, O_STAGED0
+        umov  ur2, O_STAGED
         umov  ur3, 0
         mbar.arrive.expect_tx [ur1], 16384
 STORE_TILE:

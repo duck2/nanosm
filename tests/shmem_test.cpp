@@ -37,7 +37,7 @@ uint32_t b3_word(uint32_t address) {
 nanosm::Launch b3_launch(const std::vector<uint32_t>& lane_addresses = {}) {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, b3_table + 64);
+    auto& shmem = image_bytes(launch.test_shmem, b3_table + 64);
     for (uint32_t address = 0; address < b3_table; address += 4) write_u32(shmem, address, b3_word(address));
     for (uint32_t lane = 0; lane < lane_addresses.size(); ++lane) {
         write_u32(shmem, b3_table + 4 * lane, lane_addresses[lane]);
@@ -302,7 +302,7 @@ nanosm::Launch uniformity_launch() {
     nanosm::Launch launch;
     launch.active_warps = 1;
     fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-    auto& shmem = image_bytes(launch.shmem_image, 256);
+    auto& shmem = image_bytes(launch.test_shmem, 256);
     for (uint32_t address = 0; address < 256; address += 4) write_u32(shmem, address, 0x5000 + address);
     return launch;
 }
@@ -801,7 +801,7 @@ void test_i2_round_robin_tma_reads_and_loads() {
     const auto run = [&](bool primed) {
         nanosm::Launch launch;
         launch.active_warps = 2;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         nanosm::MbarState mbar;
         mbar.valid = true;
         mbar.expected = 1;
@@ -864,7 +864,7 @@ void test_i2_round_robin_tma_reads_and_loads() {
 void test_i2_tma_placement_on_port_b() {
     nanosm::Launch launch;
     launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t i = 0; i < 1024; ++i) write_u16(shmem, 2 * i, 0x3c00); // A and B: 1.0
     write_rank1_load(shmem, 5120, 0, 256, 4104);
     fill_pattern(image_bytes(launch.gmem_image, 1024), 0, 256, 0);
@@ -1145,7 +1145,7 @@ void test_i2_read_first_across_services() {
             << "umov ur8, 0\nacc.ld r10, [ur8, 64]\nhalt\n";
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 2048);
+        auto& shmem = image_bytes(launch.test_shmem, 2048);
         for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
         for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
         nanosm::MbarState event;
@@ -1618,7 +1618,7 @@ std::pair<std::vector<uint64_t>, uint64_t> i21_tma_store_returns(const nanosm::D
     const uint32_t bytes = 32 * sectors;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, bytes + 256);
+    auto& shmem = image_bytes(launch.test_shmem, bytes + 256);
     fill_pattern(shmem, 0, bytes / 4, 0);
     write_rank1_tma(shmem, bytes, 0, bytes / 4, bytes + 128);
     image_bytes(launch.gmem_image, bytes);
@@ -1741,7 +1741,7 @@ void test_i21_acc_ld_read_ownership() {
     const auto machine_for = [&](uint32_t gap) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 4096);
+        auto& shmem = image_bytes(launch.test_shmem, 4096);
         for (uint32_t i = 0; i < 1024; ++i) write_u16(shmem, 2 * i, 0x3c00); // A and B: 1.0
         return std::make_unique<nanosm::Machine>(profile, hand_assemble(i1_asm(profile, program(gap)), profile),
             std::move(launch), nanosm::TraceOptions{.timeline = true});
@@ -1803,7 +1803,7 @@ std::unique_ptr<nanosm::Machine> i4_machine(const nanosm::DeviceProfile& profile
     const std::function<void(std::vector<uint8_t>&)>& setup = {}, uint32_t warps = 1, bool hand_assembly = true) {
     nanosm::Launch launch;
     launch.active_warps = warps;
-    auto& shmem = image_bytes(launch.shmem_image, 8192);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t word = 0; word < 2048; ++word) write_u32(shmem, 4 * word, 0x100 + word);
     if (setup) setup(shmem);
     auto& gmem = image_bytes(launch.gmem_image, 4096);
@@ -2056,7 +2056,7 @@ void test_i4_missing_fence_panics() {
     const auto mma_machine = [&](bool fence) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 2048);
+        auto& shmem = image_bytes(launch.test_shmem, 2048);
         for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
         for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
         write_count_mbar(shmem, 896, 1);
@@ -2210,7 +2210,7 @@ void test_i4_read_read_overlap_is_clean() {
     const auto dense = dense_one_bank_profile(4);
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 2048);
+    auto& shmem = image_bytes(launch.test_shmem, 2048);
     for (uint32_t i = 0; i < 256; ++i) write_u16(shmem, 2 * i, 0x3c00);        // A: 1.0
     for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00); // B: 1.0
     write_count_mbar(shmem, 896, 1);

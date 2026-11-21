@@ -472,6 +472,10 @@ void TraceRecorder::launch_copy_begin(
     tma_depths(cycle, 1, last_tma_credit_depth_.value_or(0), last_tma_return_depth_.value_or(0));
 }
 
+void TraceRecorder::test_preload(uint64_t bytes) {
+    summary_.test_preload_bytes = bytes;
+}
+
 void TraceRecorder::launch_flag(uint64_t cycle, uint8_t bar, uint32_t bytes) {
     summary_.launch_flags.push_back({bar, bytes, cycle});
 }
@@ -644,6 +648,11 @@ std::string TraceRecorder::summary_text() const {
         << " rf_write_wait=" << summary_.lsu_rf_write_wait_cycles
         << " rf_read_wait=" << summary_.lsu_rf_read_wait_cycles
         << " egress_wait=" << summary_.lsu_egress_wait_cycles << '\n';
+    if (summary_.test_preload_bytes != 0) {
+        // A test put bytes into shared memory before the first cycle, for
+        // free. Printed only then, so a harness can refuse a run that has it.
+        out << "test_preload: shmem_bytes=" << summary_.test_preload_bytes << " (untimed, a test's access)" << '\n';
+    }
     if (summary_.launch_block_bytes != 0) {
         // The launch copy's own part of the tma and gmem numbers below: one
         // command, its bytes. Each flag: its depbar, the block bytes it

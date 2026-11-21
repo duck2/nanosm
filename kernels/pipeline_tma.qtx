@@ -13,10 +13,8 @@
 .equ SB0,    64
 .equ SA1,    128
 .equ SB1,    192
-.mbar FULL0,  expect 1
-.mbar FULL1,  expect 1
-.mbar EMPTY0, expect 1
-.mbar EMPTY1, expect 1
+.mbar FULL[2],  expect 1    ; a pair is an array: FULL[1] is 8 bytes after FULL[0]
+.mbar EMPTY[2], expect 1
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0
@@ -32,10 +30,10 @@
         umov  ur8, C
         lds.uni r14, [ur8]      ; C's low word (an stg address is one 32-bit register)
         add   r1, r0, r14
-        umov  ur1, FULL0
-        umov  ur2, FULL1
-        umov  ur3, EMPTY0
-        umov  ur4, EMPTY1
+        umov  ur1, FULL[0]
+        umov  ur2, FULL[1]
+        umov  ur3, EMPTY[0]
+        umov  ur4, EMPTY[1]
         umov  ur5, 0
         umov  ur6, 0
         umov  ur12, 4
@@ -65,10 +63,10 @@ CDONE:  halt
 
 ; ---- producer: warp 0 ----
 PRODUCER:
-        umov  ur1, FULL0
-        umov  ur2, FULL1
-        umov  ur3, EMPTY0
-        umov  ur4, EMPTY1
+        umov  ur1, FULL[0]
+        umov  ur2, FULL[1]
+        umov  ur3, EMPTY[0]
+        umov  ur4, EMPTY[1]
         umov  ur5, 0
         umov  ur6, 0
 ; The stage buffers (ur7..ur10) and the tile's coordinate (ur11, c0 in

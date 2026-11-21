@@ -459,11 +459,14 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     trace_.emplace(
         launch.active_warps, config_.core_clock_hz, config_.dram_clock_hz, trace_options);
     trace_->set_mma_shapes(config_.mma_shapes);
-    apply_image(shmem_, launch.shmem_image, "shmem");
+    apply_image(shmem_, launch.test_shmem, "shmem");
+    uint64_t test_preload_bytes = 0;
+    for (const auto& segment : launch.test_shmem) test_preload_bytes += segment.bytes.size();
+    trace_->test_preload(test_preload_bytes);
     apply_image(gmem_, launch.gmem_image, "gmem");
     // The mbars the launch declares (the kernel's `.mbar` sections, and a
     // test's own, initialized by hand in the shmem
-    // image, e.g. FA's): live from launch for the sanitizer's C10 opacity,
+    // preload): live from launch for the sanitizer's C10 opacity,
     // like a SIMT mbar.init's (rfc12 section 11). A declaration is metadata;
     // the machine only checks that it names an mbar slot.
     for (const auto address : launch.mbars) {

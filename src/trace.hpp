@@ -156,6 +156,9 @@ struct TraceSummary {
     uint64_t lsu_egress_wait_cycles = 0;
     // The launch copy (0 bytes: none): where the block came from and went,
     // and when each launch flag cleared (depbar, block bytes, cycle).
+    // Bytes a TEST placed in shared memory before the first cycle, untimed
+    // (Launch::test_shmem). 0 for a launch that used no such access.
+    uint64_t test_preload_bytes = 0;
     uint64_t launch_block_bytes = 0;
     uint64_t launch_global_address = 0;
     uint32_t launch_shared_address = 0;
@@ -293,6 +296,7 @@ public:
     void launch_copy_begin(
         uint64_t cycle, uint64_t command, uint64_t global_address, uint32_t shared_address, uint32_t bytes);
     void launch_flag(uint64_t cycle, uint8_t bar, uint32_t bytes);
+    void test_preload(uint64_t bytes);
     void tma_sector(uint32_t sector_bytes);
     void tma_data_port(uint32_t rounds);
     void tma_depths(

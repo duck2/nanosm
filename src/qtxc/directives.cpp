@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <regex>
 #include <sstream>
+#include <tuple>
 
 namespace nanosm {
 namespace qtxc_internal {
@@ -75,6 +76,20 @@ std::string section_name(const std::string& name, uint32_t line, const char* wha
     return name;
 }
 
+// An mbar's name with its optional element count: "NAME" (1) or "NAME[C]".
+std::pair<std::string, uint32_t> mbar_name_and_count(const std::string& text, uint32_t line) {
+    static const std::regex array(R"(^([^\[\]\s]+)\s*\[\s*([0-9]+)\s*\]$)");
+    std::smatch match;
+    if (!std::regex_match(text, match, array)) return {section_name(text, line, "mbar"), 1};
+    const auto name = section_name(match[1].str(), line, "mbar");
+    const auto count = match[2].str().size() > 6 ? 0ul : std::stoul(match[2].str());
+    if (count == 0 || count > max_mbar_array) {
+        throw SimError(at(line) + ".mbar " + name + "[" + match[2].str() + "]: an array has 1.." +
+            std::to_string(max_mbar_array) + " barriers");
+    }
+    return {name, static_cast<uint32_t>(count)};
+}
+
 bool is_directive(const std::string& clean, std::string_view name) {
     return clean.starts_with(name) &&
         (clean.size() == name.size() || std::isspace(static_cast<unsigned char>(clean[name.size()])) != 0);
@@ -113,8 +128,9 @@ KernelSection parse_param_directive(const std::string& tail, uint32_t line, bool
 }
 
 // `.mbar NAME, expect N`: a barrier in phase 0 that expects N arrivals; NAME
-// becomes its address in the launch block. The hex text: `.mbar NAME,
-// ADDRESS, expect N`.
+// becomes its address in the launch block. `.mbar NAME[C], expect N`: C such
+// barriers side by side, one section, element i at NAME + 8 i. The hex text:
+// `.mbar NAME, ADDRESS, expect N` (NAME[C] for an array).
 KernelSection parse_mbar_directive(
     const std::string& tail, const std::unordered_map<std::string, int32_t>& constants, uint32_t line,
     bool with_address) {
@@ -124,11 +140,12 @@ KernelSection parse_mbar_directive(
     if (args.size() != count || last.first != "expect" || last.second.empty()) {
         throw SimError(at(line) + (with_address
             ? "expected .mbar NAME, ADDRESS, expect N"
-            : "expected .mbar NAME, expect N (the name is the barrier's address, given by the launch block)"));
+            : "expected .mbar NAME, expect N or .mbar NAME[COUNT], expect N (the name is the first "
+              "barrier's address, given by the launch block)"));
     }
     KernelSection mbar;
     mbar.kind = SectionKind::mbar;
-    mbar.name = section_name(args[0], line, "mbar");
+    std::tie(mbar.name, mbar.count) = mbar_name_and_count(args[0], line);
     if (with_address) mbar.address = static_cast<uint32_t>(unsigned_value(args[1], {}, 0xffffffffu, line, "address"));
     const auto expected = unsigned_value(last.second, constants, mbar_encoding::max_count, line, "expected count");
     if (expected == 0) throw SimError(at(line) + "an mbar's expected count must be 1..32767");
@@ -198,7 +215,8 @@ std::string format_section_directive(const KernelSection& section, bool with_add
     case SectionKind::param:
         return std::string(".param ") + param_type_name(section.type) + ' ' + section.name + address;
     case SectionKind::mbar:
-        return ".mbar " + section.name + address + ", expect " + std::to_string(section.expected);
+        return ".mbar " + section.name + (section.count == 1 ? "" : "[" + std::to_string(section.count) + "]") +
+            address + ", expect " + std::to_string(section.expected);
     case SectionKind::data: {
         // Always as u32 words in hex: the bits, whatever type the source wrote.
         std::ostringstream out;
@@ -248,6 +266,12 @@ void check_kernel_image(const Kernel& kernel, const DeviceProfile& profile) {
             (section.expected == 0 || section.expected > mbar_encoding::max_count)) {
             throw SimError(".mbar " + section.name + " must expect 1..32767 arrivals");
         }
+        if (section.count == 0 || section.count > max_mbar_array ||
+            (section.kind != SectionKind::mbar && section.count != 1)) {
+            throw SimError("kernel section '" + section.name + "' has a bad element count (" +
+                std::to_string(section.count) + "); only an .mbar is an array, of 1.." +
+                std::to_string(max_mbar_array));
+        }
     }
     const auto block = launch_block(kernel.sections, profile.shmem_bytes);
     if (!block.has_value()) {
@@ -265,10 +289,9 @@ void check_kernel_image(const Kernel& kernel, const DeviceProfile& profile) {
         throw SimError("kernel has " + std::to_string(kernel.flags.size()) + " launch flags; this profile reserves " +
             std::to_string(profile.core_launch_flags) + " (core.launch_flags; rebuild the kernel)");
     }
-    if (profile.core_launch_flags == 0) return; // no copy: the block is in place before the first cycle
     if (profile.tma_queue_commands == 0) {
         throw SimError("this profile has no TMA to copy the kernel's launch block (.param, .mbar, .data) "
-            "into shared memory; core.launch_flags 0 puts it in place before the first cycle instead");
+            "into shared memory; it runs only kernels that declare none");
     }
     bool covered = false;
     for (std::size_t index = 0; index < kernel.flags.size(); ++index) {

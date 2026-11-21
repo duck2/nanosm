@@ -80,7 +80,8 @@ def main() -> None:
         }
         # And the launch copy's part: the three pointers (24 bytes) come from
         # global memory as one TMA load, one sector.
-        expected_counters = launch_copy_counters(expected_counters, launch.copied_bytes)
+        expected_counters = launch_copy_counters(
+            expected_counters, launch.copied_bytes, block_address=launch.block_address)
         for engine, wanted in expected_counters.items():
             line = next(line for line in result.summary.splitlines() if line.startswith(engine + ":"))
             values = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}

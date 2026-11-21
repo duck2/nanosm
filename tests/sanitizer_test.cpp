@@ -15,7 +15,7 @@ void test_sanitizer_sts_into_tma_store_source() {
     const auto launch_with_store = [] {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         image_bytes(launch.gmem_image, 2048);
         for (uint32_t i = 0; i < 256; ++i) write_u32(shmem, 4 * i, 3 * i + 1);
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
@@ -59,7 +59,7 @@ void test_sanitizer_sts_into_mma_operand_stage() {
     for (const bool queued : {true, false}) {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192 + 8);
+        auto& shmem = image_bytes(launch.test_shmem, 8192 + 8);
         write_count_mbar(shmem, 8192, 1);
         const auto kernel = compile(std::string(R"(
             umov ur0, 0
@@ -98,7 +98,7 @@ void test_sanitizer_lds_from_tma_load_destination() {
     const auto launch_with_load = [] {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         for (uint32_t i = 0; i < 256; ++i) write_u32(gmem, 4 * i, 5 * i + 2);
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
@@ -136,7 +136,7 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         // A SIMT arrive whose mbar sits inside a pending TMA load destination.
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         image_bytes(launch.gmem_image, 1024);
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
@@ -156,7 +156,7 @@ void test_sanitizer_mbar_rmw_into_owned_range() {
         // operand stage two queued MMAs still read.
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         image_bytes(launch.gmem_image, 1024);
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 512, 1024);
@@ -183,7 +183,7 @@ void test_sanitizer_tma_and_mma_accept_conflicts() {
     const auto launch_with_descriptor = [] {
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192);
+        auto& shmem = image_bytes(launch.test_shmem, 8192);
         image_bytes(launch.gmem_image, 1024);
         write_tma_descriptor(shmem, 4096, linear_tma(1024));
         write_tx_mbar(shmem, 4160, 1024);
@@ -335,7 +335,7 @@ void test_sanitizer_tmem_race_by_words() {
     const auto launch = [] {
         nanosm::Launch result;
         result.active_warps = 1;
-        image_bytes(result.shmem_image, 4096);
+        image_bytes(result.test_shmem, 4096);
         return result;
     };
     const std::string header = R"(
@@ -379,7 +379,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         // the stage mbar. Disjoint ranges: no panic, exact result.
         nanosm::Launch launch;
         launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.shmem_image, 8192 + 24);
+        auto& shmem = image_bytes(launch.test_shmem, 8192 + 24);
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         for (uint32_t i = 0; i < 512; ++i) write_u16(gmem, 2 * i, 0x3c00);
         // One descriptor (512 fp16 at gmem 0); each stage's command names its
@@ -462,7 +462,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
         // commit mbar -> worker overwrites P -> mbar -> MMA reads it again.
         nanosm::Launch launch;
         launch.active_warps = 2;
-        auto& shmem = image_bytes(launch.shmem_image, 8192 + 16);
+        auto& shmem = image_bytes(launch.test_shmem, 8192 + 16);
         for (uint32_t i = 0; i < 512; ++i) write_u16(shmem, 1024 + 2 * i, 0x3c00);
         write_count_mbar(shmem, 8192, 1);
         write_count_mbar(shmem, 8200, 1);
@@ -543,7 +543,7 @@ void test_sanitizer_row_spacing_shmem() {
     const auto launch = [] {
         nanosm::Launch result;
         result.active_warps = 1;
-        auto& shmem = image_bytes(result.shmem_image, 9344);
+        auto& shmem = image_bytes(result.test_shmem, 9344);
         auto& gmem = image_bytes(result.gmem_image, 8192);
         for (uint32_t i = 0; i < 4096; ++i) write_u16(gmem, 2 * i, 0x3c00);
         nanosm::TmaDescriptor descriptor;
@@ -638,7 +638,7 @@ void test_sanitizer_row_spacing_tmem() {
 nanosm::Launch tma_store_spacing_launch() {
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.shmem_image, 1152);
+    auto& shmem = image_bytes(launch.test_shmem, 1152);
     auto& gmem = image_bytes(launch.gmem_image, 384);
     std::fill(shmem.begin() + 1024, shmem.end(), 0x61);
     std::fill(gmem.begin(), gmem.begin() + 64, 0x34);
