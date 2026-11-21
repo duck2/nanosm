@@ -428,7 +428,9 @@ private:
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;                             // (S) PANIC text: the instruction's own pc
-        uint64_t active_mask = 0;                    // the issue cycle's: its result's lane enables (16 bits)
+        // Its result's lane enables (16 bits): the issue cycle's active mask,
+        // ANDed with the instruction's write mask at the sample.
+        uint64_t active_mask = 0;
         Instruction instruction;
         std::vector<uint8_t> reads;                  // the round's registers
         std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
@@ -444,7 +446,9 @@ private:
     // the unit's space when it accepted the instruction: every later
     // admission counts the entries here against that space (a credit counter
     // per resource in hardware; dispatch_claims). The pc and the active mask
-    // are the issue cycle's.
+    // are the issue cycle's; a masked lds / sts / ldg / stg's write mask is
+    // ANDed into the active mask at its sample, so from issue + 2 the field
+    // holds its lane enables.
     struct DispatchEntry {
         uint64_t issue_cycle = 0;
         uint32_t warp = 0;
@@ -1747,6 +1751,9 @@ private:
             std::vector<std::vector<uint32_t>> operands;
             std::size_t uniform_first = 0;
             std::vector<uint32_t> uniform_operands;
+            // A masked entry's write mask as lanes, sampled from the
+            // predicate file now: ANDed into its active mask.
+            std::optional<uint64_t> write_mask_lanes;
         };
         std::vector<DispatchSample> dispatch_samples;
         // The URF write pipeline: the write at the RAM now (it lands at this
@@ -2010,6 +2017,7 @@ private:
     // ---- dispatch: the RF read pipeline's end, the unit takes it ----
     void dispatch_issued(Wires& w);
     void hand_over(const DispatchEntry& op, Wires& w);
+    void complete_without_lanes(const DispatchEntry& op, Wires& w);
     void dispatch_mma(const DispatchEntry& op, Wires& w);
     void dispatch_acc_transfer(const DispatchEntry& op, Wires& w);
     void dispatch_shared_load(const DispatchEntry& op, Wires& w);
@@ -2242,6 +2250,9 @@ private:
     // A conditional branch's predicate, every lane, read from the predicate
     // file in the issue register's cycle (resolve_branch).
     [[nodiscard]] std::vector<uint32_t> capture_predicate(const Warp& warp, uint8_t predicate) const;
+    // A masked instruction's write mask as lanes (bit l = lane l writes), read
+    // from the predicate file in its operand round (step_rf_reads).
+    [[nodiscard]] uint64_t write_mask_lanes(const Warp& warp, const Instruction& inst) const;
     // A declared-uniform operand: lane 0's value (the sanitizer checks the rest).
     [[nodiscard]] uint32_t uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const;
     // A uniform-register operand, as the round latched it at its sample:

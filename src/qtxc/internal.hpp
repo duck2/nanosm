@@ -46,6 +46,7 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
 void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
+void check_write_mask(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 
 } // namespace qtxc_internal
 

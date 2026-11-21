@@ -173,10 +173,10 @@ void test_lsu_v8_store_source_lifetime() {
 void test_gmem_v8_predication_is_rejected() {
     try {
         (void)compile("@p0 stg.v8 [r0], r8\nhalt\n");
-        throw std::runtime_error("predicated stg.v8 was accepted (there are no guards on instructions)");
+        throw std::runtime_error("predicated stg.v8 was accepted (a warp-wide store cannot be masked)");
     } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("only bra and bra.uni may be predicated") != std::string::npos,
-            "predicated stg.v8 produced the wrong rejection");
+        require(std::string(error.what()).find("stg.v8 cannot be masked (@p)") != std::string::npos,
+            "predicated stg.v8 produced the wrong rejection: " + std::string(error.what()));
     }
 }
 

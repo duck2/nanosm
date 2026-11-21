@@ -597,10 +597,18 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = parse_ureg(args[1], line_number, profile);
         } else if (op == "mov") {
+            // mov rD, IMM is the mov instruction. mov rD, rS is written for
+            // the reader: it is addi rD, rS, 0, and disassembles as that.
             expect_count(args, 2, line_number);
-            inst.opcode = Opcode::mov;
             inst.dst = parse_reg(args[0], line_number);
-            inst.imm = parse_value(args[1], constants, line_number);
+            if (is_register(args[1])) {
+                inst.opcode = Opcode::addi;
+                inst.src0 = parse_reg(args[1], line_number);
+                inst.imm = 0;
+            } else {
+                inst.opcode = Opcode::mov;
+                inst.imm = parse_value(args[1], constants, line_number);
+            }
         } else if (op == "add" || op == "fadd") {
             expect_count(args, 3, line_number);
             inst.opcode = op == "add" ? Opcode::add : Opcode::fadd;

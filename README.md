@@ -123,8 +123,31 @@ kinds. A warp-wide memory or engine operation under a partial mask is the saniti
 not checked: it executes once in every arm that issues it, so a counter bumped in both arms is
 bumped twice (`usetp` writes its predicate on the active lanes only). A halt inside an arm is
 the sanitizer's PANIC too; stack overflow and a `sync` on an empty stack are the machine's.
-There are no guards: only `bra` and `bra.uni` take a predicate.
 `kernels/diverge.launch.py` counts Collatz steps per lane.
+
+Masked instructions: `@p` / `@!p` on a per-lane instruction. The operation runs as usual and
+its result is written with a mask (the note that built this, trash/guards-2026-11-21.md, uses
+an older word for it). The per-lane instructions are exactly the writers above: every fixed
+arithmetic instruction (ALU, FPU, the SFU, `cvt.pack`, `mov`, `sread`, `ur2r`, `setp`) and
+`lds`, `sts`, `ldg`, `stg`. The instruction's write mask is its predicate's lanes (inverted for
+`@!p`); the lanes it writes are the active mask AND its write mask. The write mask is
+read from the predicate file in the instruction's operand round, the cycle a branch reads
+its predicate (issue + 1), so qtxc keeps the predicate's writer the distance it keeps a
+`bra.uni`'s, and the sanitizer checks it the same way. There is no exception: a masked
+`setp` leaves the predicate bit alone in the lanes its write mask turns off; a masked load
+leaves those lanes of its register unchanged; a masked store sends nothing for them (and does
+not check their addresses). Issue does not look at the write mask (it is not known yet) and
+timing ignores it: the write booking, the SFU's cycles, the depbar and the memory slot are
+taken as if every lane were on. A masked `lds` / `sts` / `ldg` / `stg` whose write mask turns
+every lane off makes no request and completes at its dispatch: its depbar is decremented then,
+so a waiting instruction can issue 4 cycles after it at canonical depths. Every other
+instruction refuses to be masked at qtxc, the assembler and kernel load (`uadd cannot be
+masked (@p)`): uniform arithmetic, `usetp`, `r2ur`, the warp-wide memory and engine operations
+listed above, `mbar.*`, `atom.*`, `fence.sh`, `nop`, `halt`, `ssy` and `sync`. `bra` and
+`bra.uni` keep their own meaning of the predicate. In qtx `mov rD, rS` is `addi rD, rS, 0` (and
+disassembles as that), so a register move can be masked: `@p0 mov r1, r2`.
+`kernels/diverge_masked.launch.py` is the Collatz count with each step's odd / even choice
+made by two masked arms instead of an if / else on the stack.
 
 Qtx conservatively drains live depbars and fixed-latency writes at every branch and `sync`. Qtx's `wait`
 waits for every live depbar as a branch or `halt` does, but transfers no control and drains no

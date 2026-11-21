@@ -1113,4 +1113,25 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     throw SimError("latency requested for unknown opcode");
 }
 
+// The fixed arithmetic pipeline's instructions (a nonzero fixed latency;
+// mbar.test_wait's one cycle is a probe, not arithmetic) and the four
+// per-lane memory instructions (src/isa.hpp).
+bool can_be_masked(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::lds:
+    case Opcode::sts:
+    case Opcode::ldg:
+    case Opcode::stg:
+        return true;
+    case Opcode::mbar_test_wait_i:
+    case Opcode::mbar_test_wait_r:
+        return false;
+    default:
+        break;
+    }
+    Instruction probe;
+    probe.opcode = opcode;
+    return fixed_latency(probe, Timing{1, 1, 1}) != 0;
+}
+
 } // namespace nanosm

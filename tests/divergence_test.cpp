@@ -5,7 +5,8 @@
 // ordinary instruction. Smoke tests: per-lane if / else, a nested if, an arm
 // no lane takes, the loop that sheds one lane at a time (Astra's layout, two
 // entries), every writer class under a partial mask, the timing facts the
-// design rests on, and the refusals and PANICs.
+// design rests on, and the refusals and PANICs. At the end, masked
+// instructions (@p / @!p on the per-lane instructions).
 #include "test_support.hpp"
 
 namespace {
@@ -505,8 +506,8 @@ void test_depth_zero_profile_refuses_divergence() {
 }
 
 // The toolchain: the three forms parse, encode and print; an ssy's label
-// may name any instruction; bssy is not a mnemonic; guards on other
-// instructions stay refused.
+// may name any instruction; bssy is not a mnemonic. (Masked instructions:
+// the tests at the end of this file.)
 void test_toolchain_forms() {
     const auto kernel = compile("ssy J\n@!p3 bra J\nJ: sync\nhalt\n");
     const auto ssy = nanosm::decode(kernel.words.at(0));
@@ -523,8 +524,7 @@ void test_toolchain_forms() {
     const auto any = compile("ssy J\nJ: mov r1, 1\nhalt\n");
     require(nanosm::decode(any.words.at(0)).opcode == nanosm::Opcode::ssy, "ssy naming a mov");
     for (const auto& [program, needle] : std::vector<std::pair<std::string, std::string>>{
-             {"bssy J\nJ: halt\n", "unknown opcode 'bssy'"},
-             {"setp.eq.u32 p0, r0, r0\n@p0 add r1, r0, r0\nhalt\n", "only bra and bra.uni may be predicated"}}) {
+             {"bssy J\nJ: halt\n", "unknown opcode 'bssy'"}}) {
         try {
             (void)compile(program);
             throw std::runtime_error("accepted: " + program);
@@ -532,6 +532,249 @@ void test_toolchain_forms() {
             require_mentions(error.what(), {needle}, program);
         }
     }
+}
+
+// Masked instructions: the operation runs and its result is written with a
+// mask, the predicate's lanes. p0 holds the odd lanes. Masked arithmetic,
+// sread, the special-function unit, setp (its predicate bit kept where the
+// write mask is off), ldg / stg and lds / sts write (or send) only the lanes
+// their write mask names; inside a divergent region the lanes are the active
+// mask AND the write mask.
+void test_write_masks_are_lane_write_enables() {
+    const auto run = run_divergent(R"(
+        sread r0, LANE_ID
+        andi r1, r0, 1
+        shli r3, r0, 2
+        setp.ne.u32 p0, r1, 0
+        setp.eq.u32 p1, r0, r0
+        mov r10, 0x77
+        mov r11, 0x77
+        mov r12, 0x77
+        mov r13, 0x77
+        mov r14, 0x77
+        mov r15, 0
+        mov r5, 0x55
+        mov r20, 0
+        mov r21, 0
+        mov r22, 0
+        @p0 addi r10, r0, 1000
+        @!p0 sread r11, LANE_ID
+        @p0 ex2 r12, r15
+        @p0 setp.ne.u32 p1, r0, r0
+        setp.eq.u32 p2, r1, 0
+        @!p2 setp.eq.u32 p2, r0, r0
+        @p2 mov r22, 1
+        @p0 ldg r13, [r3 + 0]
+        @p0 stg [r3 + 256], r5
+        @!p0 lds r14, [r3 + 0]
+        @!p0 sts [r3 + 512], r5
+        @p1 mov r20, 1
+    )" + masked_region(0x00ff, "@p0 mov r21, 1") + "halt\n", [](nanosm::Launch& launch) {
+        auto& gmem = launch.gmem_image.at(0).bytes;
+        auto& shmem = launch.shmem_image.at(0).bytes;
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            write_u32(gmem, 4 * lane, 100 + lane);
+            write_u32(gmem, 256 + 4 * lane, 0xdead);
+            write_u32(shmem, 4 * lane, 200 + lane);
+            write_u32(shmem, 512 + 4 * lane, 0xbeef);
+        }
+    });
+    const auto& machine = *run.machine;
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        const bool odd = (lane & 1) != 0;
+        const auto what = "lane " + std::to_string(lane) + (odd ? " (odd)" : " (even)");
+        require(machine.read_reg(0, lane, 10) == (odd ? 1000 + lane : 0x77), what + ": @p0 addi");
+        require(machine.read_reg(0, lane, 11) == (odd ? 0x77 : lane), what + ": @!p0 sread");
+        require(machine.read_reg(0, lane, 12) == (odd ? 0x3f800000u : 0x77u), what + ": @p0 ex2");
+        require(machine.read_reg(0, lane, 20) == (odd ? 0u : 1u), what + ": @p0 setp (even lanes keep p1 true)");
+        require(machine.read_reg(0, lane, 22) == 1u, what + ": @!p2 setp p2 (an inverted write mask writing its own predicate)");
+        require(machine.read_reg(0, lane, 13) == (odd ? 100 + lane : 0x77), what + ": @p0 ldg");
+        require(machine.read_gmem_u32(256 + 4 * lane) == (odd ? 0x55u : 0xdeadu), what + ": @p0 stg");
+        require(machine.read_reg(0, lane, 14) == (odd ? 0x77 : 200 + lane), what + ": @!p0 lds");
+        require(machine.read_shmem_u32(512 + 4 * lane) == (odd ? 0xbeefu : 0x55u), what + ": @!p0 sts");
+        require(machine.read_reg(0, lane, 21) == (odd && lane < 8 ? 1u : 0u), what + ": mask 0xff AND @p0");
+    }
+    const auto& summary = machine.trace().summary();
+    require(summary.lsu_sectors == 16, "gmem requests: " + std::to_string(summary.lsu_sectors) + " (want 8 + 8)");
+}
+
+// Timing never depends on the write mask. The same program with p0 set in every
+// lane and in none: every instruction issues at the same cycle (the
+// special-function unit takes its full cycles, depbars are set and waited
+// for alike). With no lane on, the ldg / lds / stg / sts make no request and
+// leave memory and registers alone; each completes at its dispatch, so the
+// consumer waiting for the ldg's depbar issues 4 cycles after it (issue +
+// issue_to_dispatch + 1 at canonical depths).
+void test_timing_ignores_the_write_mask() {
+    std::vector<std::vector<uint64_t>> issues;
+    for (const bool on : {true, false}) {
+        const auto run = run_divergent(std::string(R"(
+            sread r0, LANE_ID
+            shli r3, r0, 2
+            mov r4, 0x77
+            mov r5, 0x77
+            mov r15, 0
+        )") + (on ? "setp.eq.u32 p0, r0, r0\n" : "setp.ne.u32 p0, r0, r0\n") + R"(
+            @p0 ex2 r13, r15
+            @p0 ex2 r14, r15
+            @p0 addi r10, r13, 1
+            @p0 ldg r4, [r3 + 0]
+            addi r7, r4, 1
+            @p0 lds r5, [r3 + 0]
+            @p0 sts [r3 + 512], r5
+            @p0 stg [r3 + 256], r7
+            addi r8, r5, 1
+            halt
+        )", [](nanosm::Launch& launch) {
+            auto& gmem = launch.gmem_image.at(0).bytes;
+            auto& shmem = launch.shmem_image.at(0).bytes;
+            for (uint32_t lane = 0; lane < 16; ++lane) {
+                write_u32(gmem, 4 * lane, 100 + lane);
+                write_u32(gmem, 256 + 4 * lane, 0xdead);
+                write_u32(shmem, 4 * lane, 200 + lane);
+                write_u32(shmem, 512 + 4 * lane, 0xbeef);
+            }
+        });
+        const auto& machine = *run.machine;
+        std::vector<uint64_t> fixed;
+        for (const auto* name : {"ex2", "addi"}) {
+            for (const auto cycle : issues_named(machine, name)) fixed.push_back(cycle);
+        }
+        issues.push_back(fixed);
+        if (on) continue;
+        const auto& summary = machine.trace().summary();
+        require(summary.lsu_sectors == 0 && summary.shmem_requests == 0,
+            "a write mask with no lane on made requests: " + std::to_string(summary.lsu_sectors) + " gmem, " +
+            std::to_string(summary.shmem_requests) + " shmem");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine.read_reg(0, lane, 4) == 0x77 && machine.read_reg(0, lane, 5) == 0x77 &&
+                    machine.read_reg(0, lane, 7) == 0x78 && machine.read_gmem_u32(256 + 4 * lane) == 0xdead &&
+                    machine.read_shmem_u32(512 + 4 * lane) == 0xbeef,
+                "lane " + std::to_string(lane) + ": a write mask with no lane on changed something");
+        }
+        const auto ldg = issues_named(machine, "ldg");
+        const auto addi = issues_named(machine, "addi");
+        require(ldg.size() == 1 && addi.size() == 3 && addi[1] == ldg[0] + 4,
+            "the ldg's consumer issued " + std::to_string(addi.at(1) - ldg.at(0)) + " cycles after it (want 4)");
+    }
+    // The fixed instructions (ex2, ex2, addi, then the two consumers, which
+    // wait for depbars) at the same cycles both ways: only the first three.
+    require(std::equal(issues[0].begin(), issues[0].begin() + 3, issues[1].begin()),
+        "fixed issue cycles depend on the write mask");
+
+    // Astra's case (trash/chan.txt): a real store still in flight and an
+    // empty one on the same depbar (qtxc gives every store one), then a wait.
+    // The empty store owes exactly one decrement (an extra one would
+    // underflow, a missing one would never let the wait go) and the real
+    // write still lands.
+    const auto shared = run_divergent(R"(
+        sread r0, LANE_ID
+        shli r3, r0, 2
+        mov r5, 0x55
+        setp.ne.u32 p0, r0, r0
+        stg [r3 + 256], r5
+        @p0 stg [r3 + 512], r5
+        wait
+        ldg r7, [r3 + 256]
+        halt
+    )", [](nanosm::Launch& launch) {
+        auto& gmem = launch.gmem_image.at(0).bytes;
+        for (uint32_t lane = 0; lane < 16; ++lane) write_u32(gmem, 512 + 4 * lane, 0xdead);
+    });
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(shared.machine->read_gmem_u32(256 + 4 * lane) == 0x55 &&
+                shared.machine->read_reg(0, lane, 7) == 0x55 &&
+                shared.machine->read_gmem_u32(512 + 4 * lane) == 0xdead,
+            "lane " + std::to_string(lane) + ": a real and an empty store on one depbar");
+    }
+}
+
+// What refuses to be masked: qtxc, the assembler and kernel load, by name.
+// And mov rD, rS: the register form is addi rD, rS, 0, so it can be masked.
+void test_write_mask_refusals() {
+    for (const auto& [line, name] : std::vector<std::pair<std::string, std::string>>{
+             {"@p0 uadd ur1, ur1, ur1", "uadd"}, {"@p0 usetp.eq.u32 p1, ur1, 0", "usetp.eq.u32"},
+             {"@p0 r2ur ur1, r1", "r2ur"}, {"@!p0 lds.uni r1, [ur1]", "lds.uni"},
+             {"@p0 ldg.v8 r8, [r0]", "ldg.v8"}, {"@p0 mbar.arrive [ur1]", "mbar.arrive"},
+             {"@p0 halt", "halt"}, {"@p0 sync", "sync"}, {"@p0 ssy L", "ssy"}, {"@p0 fence.sh", "fence.sh"}}) {
+        try {
+            (void)compile(line + "\nL: halt\n");
+            throw std::runtime_error("qtxc accepted '" + line + "'");
+        } catch (const nanosm::SimError& error) {
+            require_mentions(error.what(), {name + " cannot be masked (@p)"}, line);
+        }
+    }
+    const auto& profile = canonical_profile();
+    try {
+        (void)nanosm::assemble_asm(i1_asm(profile, "uadd ur1, ur1, ur1 {pred=!p2, stall=0, set=-, wait=-}\nhalt\n"),
+            profile);
+        throw std::runtime_error("the assembler accepted a masked uadd");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"uadd cannot be masked (@p)"}, "assembler");
+    }
+    auto kernel = compile("uadd ur1, ur1, ur1\nhalt\n");
+    auto word = nanosm::decode(kernel.words.at(0));
+    word.control.predicate = 2;
+    kernel.words.at(0) = nanosm::encode(word);
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        nanosm::Machine machine(profile, kernel, std::move(launch));
+        throw std::runtime_error("kernel load accepted a masked uadd");
+    } catch (const nanosm::SimError& error) {
+        require_mentions(error.what(), {"kernel pc 0: uadd cannot be masked (@p)"}, "kernel load");
+    }
+    // mov rD, rS is addi rD, rS, 0 (and prints as that); mov rD, IMM stays mov.
+    const auto moves = compile("mov r1, r2\nmov r1, 2\nhalt\n");
+    const auto move = nanosm::decode(moves.words.at(0));
+    require(move.opcode == nanosm::Opcode::addi && move.dst == 1 && move.src0 == 2 && move.imm == 0 &&
+            nanosm::format_instruction(move, false) == "addi r1, r2, 0",
+        "mov r1, r2: " + nanosm::format_instruction(move));
+    require(nanosm::decode(moves.words.at(1)).opcode == nanosm::Opcode::mov, "mov r1, 2 is no longer mov");
+    // A masked instruction needs no divergence stack: a profile without one
+    // runs it (here the register form of mov, masked).
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    document["core"]["divergence_stack_entries"] = 0;
+    const auto zero = nanosm::parse_device_profile(document.dump());
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    nanosm::Machine machine(zero, compile(R"(
+        sread r0, LANE_ID
+        andi r1, r0, 1
+        mov r2, 7
+        mov r3, 9
+        setp.ne.u32 p0, r1, 0
+        @p0 mov r2, r3
+        halt
+    )", zero), std::move(launch));
+    machine.run();
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine.read_reg(0, lane, 2) == ((lane & 1) != 0 ? 9u : 7u),
+            "lane " + std::to_string(lane) + ": a masked mov on a profile with no divergence stack");
+    }
+}
+
+// A write mask read before its predicate is in the file is the sanitizer's
+// PANIC, as for a branch (setp's predicate is in the file 5 cycles after its
+// issue; the write mask is sampled 1 cycle after the masked instruction's).
+void test_early_write_mask_panics() {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    const auto& profile = canonical_profile();
+    const auto machine = [&](uint32_t stall) {
+        const auto program = "setp.eq.u32 p0, r0, r0 {pred=PT, stall=" + std::to_string(stall) +
+            ", set=-, wait=-}\nmov r1, 5 {pred=p0, stall=0, set=-, wait=-}\nhalt\n";
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        return std::make_unique<nanosm::Machine>(
+            profile, nanosm::assemble_asm(i1_asm(profile, program), profile), std::move(launch));
+    };
+    const auto at = machine(4);
+    at->run(20000);
+    require(at->read_reg(0, 3, 1) == 5, "at 4 cycles the write mask did not see the compare's predicate");
+    const auto early = machine(3);
+    expect_sim_panic(*early, "predicate RAW hazard: missing stall for p0", "a masked instruction three cycles after its setp");
 }
 
 } // namespace
@@ -591,7 +834,27 @@ TEST(Divergence, depth_zero_profile_refuses_divergence) {
     test_depth_zero_profile_refuses_divergence();
 }
 
-// parse, encode, print; ssy names any instruction; no bssy; no guards
+// parse, encode, print; ssy names any instruction; no bssy
 TEST(Divergence, toolchain_forms) {
     test_toolchain_forms();
+}
+
+// @p / @!p on arithmetic, sread, SFU, setp, ldg / stg / lds / sts; AND the stack's active mask
+TEST(Divergence, write_masks_are_lane_write_enables) {
+    test_write_masks_are_lane_write_enables();
+}
+
+// the same issue cycles with every lane on or none; a write mask with no lane makes no request
+TEST(Divergence, timing_ignores_the_write_mask) {
+    test_timing_ignores_the_write_mask();
+}
+
+// qtxc / assembler / kernel load refuse a write mask where it does not belong; mov rD, rS
+TEST(Divergence, write_mask_refusals) {
+    test_write_mask_refusals();
+}
+
+// a write mask sampled before its setp's predicate is in the file: sanitizer panic
+TEST(Divergence, early_write_mask_panics) {
+    test_early_write_mask_panics();
 }

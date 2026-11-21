@@ -39,6 +39,7 @@ LAUNCHES = [
     ("vadd_warps2", "kernels/vadd.launch.py", ["--warps", "2"]),
     ("vadd_warps16", "kernels/vadd.launch.py", ["--warps", "16"]),
     ("diverge", "kernels/diverge.launch.py", []),
+    ("diverge_masked", "kernels/diverge_masked.launch.py", []),
 ]
 
 

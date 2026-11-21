@@ -26,8 +26,9 @@ namespace {
 //     results are covered by depbars instead);
 //   read_until: the exclusive end of the fixed reads' samples;
 //   predicate_ready: the vtime from which a predicate is in the file (a
-//     conditional branch samples it issue_to_predicate_sample after its issue;
-//     a predicate writer may issue from it). A setp's comes from the
+//     conditional branch, and a masked instruction for its write mask, samples it
+//     issue_to_predicate_sample after its issue; a predicate writer may issue
+//     from it). A setp's comes from the
 //     arithmetic pipeline, a usetp's from the URF write pipeline
 //     (issue_to_uniform_predicate_visible);
 //   ureg_visible: the vtime from which a URF sample sees a uniform register
@@ -59,7 +60,12 @@ struct FixedTimeline {
                 at = std::max(at, read_until[*dst + j] - earliest);      // WAR: land at or after older samples
             }
         }
-        if ((inst.opcode == Opcode::bra_uni || inst.opcode == Opcode::bra) && inst.control.predicate != 7) {
+        // A branch's predicate and any other instruction's write mask are
+        // sampled at the same point, the operand round. A masked
+        // instruction's write is booked as a full write (record):
+        // instructions issue in the order written, so the lanes it leaves
+        // alone are the older write's, which WAW above has landed first.
+        if (inst.control.predicate != 7) {
             at = std::max(at, predicate_ready[inst.control.predicate] - int64_t{issue_to_predicate_sample});
         }
         if (const auto dst = predicate_destination(inst); dst.has_value()) at = std::max(at, predicate_ready[*dst]);

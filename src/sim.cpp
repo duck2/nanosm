@@ -350,6 +350,9 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // Distinct sources beyond a bank's read ports are a property of the
     // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
+    // A write mask only on an instruction that can be masked (src/isa.hpp
+    // can_be_masked).
+    check_write_masks(kernel_, config_);
     // An mma.async's shape is one the profile lists; an acc.ld / acc.st's
     // words per row are legal (src/layout.hpp).
     check_mma_shapes(kernel_, config_);
@@ -3696,9 +3699,10 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
     return {true, WarpState::issued, {}};
 }
 
-// Panics on the instruction word alone: register encodings that wrap, and
-// predication outside bra and bra.uni (there are no guards on other
-// instructions; a predicated bra is the divergent branch).
+// Panics on the instruction word alone: register encodings that wrap and
+// special registers read by the wrong instruction. (A write mask on an
+// instruction that cannot be masked was refused at kernel load:
+// check_write_masks.)
 void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) const {
     if ((inst.opcode == Opcode::ldg_v8 && static_cast<unsigned>(inst.dst) + 8 > 256) ||
         (inst.opcode == Opcode::stg_v8 && static_cast<unsigned>(inst.src1) + 8 > 256))
@@ -3709,10 +3713,6 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
         const auto base = is_acc_load(inst.opcode) ? inst.dst : inst.src1;
         const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
         if (static_cast<unsigned>(base) + width > 256) panic(warp, inst, "accumulator register encoding wraps");
-    }
-    if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-        inst.opcode != Opcode::bra_uni && inst.opcode != Opcode::bra) {
-        panic(warp, inst, "only bra and bra.uni may be predicated");
     }
     if (inst.opcode == Opcode::sread && inst.imm != static_cast<int32_t>(SpecialReg::lane_id) &&
         inst.imm != static_cast<int32_t>(SpecialReg::thread_id)) {
@@ -3762,7 +3762,9 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
         if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
         sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
     }
-    if ((inst.opcode == Opcode::bra_uni || inst.opcode == Opcode::bra) && inst.control.predicate != 7) {
+    // A branch's predicate and any other instruction's write mask are sampled in
+    // the operand round (issue_to_predicate_sample = issue_to_sample).
+    if (inst.control.predicate != 7) {
         sanitizer_.check_pred_raw(site(warp, inst), inst.control.predicate, cycle_ + issue_to_predicate_sample);
     }
     check_register_hazards(warp, inst);
@@ -4152,6 +4154,10 @@ void Machine::dispatch_issued(Wires& w) {
 }
 
 void Machine::hand_over(const DispatchEntry& op, Wires& w) {
+    if (op.active_mask == 0) {
+        complete_without_lanes(op, w);
+        return;
+    }
     if (is_mma_async(op.instruction.opcode)) {
         dispatch_mma(op, w);
         return;
@@ -4201,6 +4207,28 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
         break;
     default:
         panic(op, "unknown opcode");
+    }
+}
+
+// A masked lds / sts / ldg / stg whose write mask turned every active lane
+// off. Issue could not know: it took its slot (the
+// admission's claim), set its depbar and booked its read round like any.
+// Here it completes with zero accesses: no load or store slot, no LSU
+// command, no assembly register, no request; its depbar is decremented now,
+// so a waiting instruction sees it zero from the next cycle (issue +
+// issue_to_dispatch + 1, canonical issue + 4). A load's destination keeps
+// every lane's old value and is no longer in flight from then on. Only a
+// write mask can leave no lane: the divergence stack's active mask is never
+// empty, and every other dispatched instruction refuses to be masked.
+void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
+    const auto& inst = op.instruction;
+    if (!can_be_masked(inst.opcode)) {
+        throw SimError("internal: " + opcode_name(inst.opcode) + " reached dispatch with no active lane");
+    }
+    record_depbar_completion(w, op.warp, inst.control.set_depbar,
+        "depbar underflow on sb" + std::to_string(inst.control.set_depbar));
+    if (const auto dst = destination_register(inst); dst.has_value()) {
+        sanitizer_.record_reg_ready(op.warp, *dst, cycle_ + 1);
     }
 }
 
@@ -4864,9 +4892,9 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     default: fail("non-arithmetic instruction in RF read pipeline");
     }
     // The execution pipeline's E cycles, then the write port it booked. Every
-    // lane computes; the issue cycle's active mask is the write's lane
-    // enables (the port, its cycle and the booking are the same whatever the
-    // mask).
+    // lane computes; the issue cycle's active mask AND the instruction's write
+    // mask (sampled with the operands) is the write's lane enables (the port, its cycle and the
+    // booking are the same whatever the lanes, none included).
     const auto port_cycle = pending.issue_cycle + issue_to_port(inst, config_);
     auto writeback = is_setp(inst.opcode)
         ? predicate_writeback(warp, inst.dst, port_cycle, std::move(result))
@@ -4908,6 +4936,9 @@ void Machine::step_rf_reads(Wires& w) {
         if (it->issue_cycle + issue_to_sample == cycle_) {
             for (std::size_t i = 0; i < it->reads.size(); ++i) it->operands[i] = sample(it->warp, it->reads[i]);
             it->uniform_operands = sample_uniform(it->warp, it->uniform_reads);
+            // The write mask joins the round: its lanes AND the issue cycle's
+            // active mask are the result's lane enables.
+            if (has_write_mask(it->instruction)) it->active_mask &= write_mask_lanes(warps_[it->warp], it->instruction);
         }
         if (it->issue_cycle + issue_to_operands(config_) == cycle_) {
             execute_arithmetic(*it, w);
@@ -4919,12 +4950,17 @@ void Machine::step_rf_reads(Wires& w) {
     const auto& pipe = dispatch_pipe_.cur();
     for (std::size_t index = 0; index < pipe.size(); ++index) {
         const auto& op = pipe[index];
-        if (op.issue_cycle + issue_to_sample != cycle_ || (op.reads.empty() && op.uniform_reads.empty())) continue;
+        const bool masked = has_write_mask(op.instruction);
+        if (op.issue_cycle + issue_to_sample != cycle_ ||
+            (op.reads.empty() && op.uniform_reads.empty() && !masked)) {
+            continue;
+        }
         auto operands = op.operands;
         for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
         const auto rounds = uniform_read_rounds(op.instruction);
         w.dispatch_samples.push_back({index, false, std::move(operands), 0,
-            sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front())});
+            sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front()),
+            masked ? std::optional<uint64_t>{write_mask_lanes(warps_[op.warp], op.instruction)} : std::nullopt});
     }
     // The URF write pipeline's stage 0: uniform arithmetic samples its
     // uniform sources (in operand order; a register named twice is one read),
@@ -4969,7 +5005,7 @@ void Machine::step_rf_reads(Wires& w) {
             for (const auto reg : registers) values.push_back(warps_[rounds->header.warp].urf.at(reg));
             uniform_reads += static_cast<uint32_t>(registers.size());
             w.dispatch_samples.push_back({static_cast<std::size_t>(entry - pipe.begin()), true, {}, first,
-                std::move(values)});
+                std::move(values), std::nullopt});
         }
     }
     if (uniform_reads > urf_read_ports) {
@@ -5874,6 +5910,7 @@ void Machine::drive_dispatch_pipe(const Wires& w) {
     for (const auto& sample : w.dispatch_samples) {
         auto& entry = next.at(sample.index);
         if (!sample.later_round) entry.operands = sample.operands;
+        if (sample.write_mask_lanes.has_value()) entry.active_mask &= *sample.write_mask_lanes;
         for (std::size_t i = 0; i < sample.uniform_operands.size(); ++i) {
             entry.uniform_operands.at(sample.uniform_first + i) = sample.uniform_operands[i];
         }
@@ -6060,6 +6097,19 @@ std::vector<uint32_t> Machine::capture(const DispatchEntry& op, uint8_t reg) con
 std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predicate) const {
     const auto& bits = warp.predicates.at(predicate);
     return std::vector<uint32_t>(bits.begin(), bits.end());
+}
+
+// A masked instruction's write mask as lanes, read from the predicate
+// file in the instruction's operand round, as a branch reads its predicate:
+// the lanes whose predicate bit differs from the invert bit (PT is set in
+// every lane, so @!PT is no lane). Sixteen XORs, beside the round's reads.
+uint64_t Machine::write_mask_lanes(const Warp& warp, const Instruction& inst) const {
+    uint64_t lanes = 0;
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        const bool bit = inst.control.predicate == 7 || warp.predicates.at(inst.control.predicate).at(lane) != 0;
+        if (bit != inst.control.predicate_invert) lanes |= uint64_t{1} << lane;
+    }
+    return lanes;
 }
 
 // A declared-uniform operand still taken from a VECTOR register (rfc09 pin

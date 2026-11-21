@@ -40,17 +40,27 @@ void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, c
     }
 }
 
-// Predication and the divergence stack (trash/divergence-2026-11-21.md):
-// only bra (the divergent branch) and bra.uni take a predicate -- there are
-// no guards on other instructions -- and ssy, sync and a predicated bra
-// need a stack, which a profile with core.divergence_stack_entries = 0 does
-// not have. Kernel load refuses the latter too (src/sim.cpp).
-void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
-    if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
-        inst.opcode != Opcode::bra && inst.opcode != Opcode::bra_uni) {
-        throw SimError(where + ": only bra and bra.uni may be predicated (there are no guards on other "
-            "instructions)");
+// A write mask (@p / @!p) on an instruction that cannot be masked
+// (src/isa.hpp can_be_masked): only the per-lane instructions can; bra and
+// bra.uni have their own predicate. Applied by qtxc and the assembler per
+// line and at kernel load per pc (check_write_masks).
+void check_write_mask(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if (!has_write_mask(inst) || inst.opcode == Opcode::bra || inst.opcode == Opcode::bra_uni ||
+        can_be_masked(inst.opcode)) {
+        return;
     }
+    throw SimError(where + ": " + opcode_name(inst.opcode, &profile.mma_shapes) +
+        " cannot be masked (@p): only per-lane instructions can (arithmetic, mov, sread, ur2r, the "
+        "special functions, cvt, setp, lds, sts, ldg, stg)");
+}
+
+// Predication and the divergence stack (trash/divergence-2026-11-21.md):
+// a write mask only on an instruction that can be masked (check_write_mask), and ssy, sync
+// and a predicated bra need a stack, which a profile with
+// core.divergence_stack_entries = 0 does not have. Kernel load refuses both
+// too (src/sim.cpp).
+void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    check_write_mask(inst, profile, where);
     if (profile.core_divergence_stack_entries == 0 && uses_divergence_stack(inst)) {
         throw SimError(where + ": " + (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
             " needs the divergence stack, which this device profile does not have "
@@ -132,6 +142,12 @@ void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile)
                 std::to_string(reg) + ", outside this profile's " + std::to_string(profile.urf_registers) +
                 " (urf.registers)");
         }
+    }
+}
+
+void check_write_masks(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        check_write_mask(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
     }
 }
 

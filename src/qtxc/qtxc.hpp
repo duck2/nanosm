@@ -60,6 +60,11 @@ void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
 // row spacings), and every acc.ld / acc.st a legal words per row (qtxc and
 // the assembler apply the same rules per source line).
 void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: a write mask (@p / @!p) only on an instruction that can be
+// masked (src/isa.hpp can_be_masked; bra and bra.uni have their own
+// predicate), else a SimError naming the pc (qtxc and the assembler refuse it
+// per source line).
+void check_write_masks(const Kernel& kernel, const DeviceProfile& profile);
 // Kernel load: every uniform register an instruction names (src/isa.hpp
 // uniform_sources -- a tma's last coordinate register included -- and
 // uniform_destination) is below the profile's urf.registers, else a SimError

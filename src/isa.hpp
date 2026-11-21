@@ -390,6 +390,29 @@ inline bool is_divergent_branch(const Instruction& instruction) {
         (instruction.control.predicate != 7 || instruction.control.predicate_invert);
 }
 
+// The instruction word's predicate field names something (anything but plain
+// PT). On bra it makes the divergent branch, on bra.uni it is the branch's
+// condition; on every other instruction it is the instruction's write mask,
+// which makes it a masked instruction. (The note that built this is
+// trash/guards-2026-11-21.md; it uses an older word for the same thing.)
+inline bool has_write_mask(const Instruction& instruction) {
+    return instruction.control.predicate != 7 || instruction.control.predicate_invert;
+}
+
+// The instructions that can be masked (@p / @!p): the per-lane ones, which
+// already write only the divergence stack's active lanes -- every instruction
+// of the fixed arithmetic pipeline (ALU, FPU, SFU, cvt.pack, mov, sread, ur2r,
+// setp) and the per-lane memory instructions lds, sts, ldg, stg. The
+// operation runs as usual and its result is written with a mask: the lanes
+// the instruction writes (or, for sts / stg, sends) are the active mask AND
+// its write mask, the predicate's lanes (inverted for @!p), sampled with the
+// operands at issue + 1. @!PT turns every lane off. Fixed timing ignores the
+// write mask. Everything else (uniform arithmetic, usetp, r2ur, the
+// warp-wide memory and engine operations, mbar, atomics, fence, nop, halt,
+// ssy, sync) refuses to be masked at qtxc, the assembler and kernel load; bra
+// and bra.uni keep their own meaning of the predicate.
+bool can_be_masked(Opcode opcode);
+
 // The instructions that use the divergence stack: refused by qtxc, the
 // assembler and kernel load when the profile has none
 // (core.divergence_stack_entries = 0).
