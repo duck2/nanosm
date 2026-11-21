@@ -58,7 +58,8 @@
     "fadd_latency_cycles": 4,
     "warps": 16,
     "instruction_buffer_packets": 2,
-    "divergence_stack_entries": 8
+    "divergence_stack_entries": 8,
+    "launch_flags": 4
   },
   "sfu": {
     "lanes": 4,

@@ -154,6 +154,17 @@ struct TraceSummary {
     uint64_t lsu_rf_write_wait_cycles = 0;
     uint64_t lsu_rf_read_wait_cycles = 0;
     uint64_t lsu_egress_wait_cycles = 0;
+    // The launch copy (0 bytes: none): where the block came from and went,
+    // and when each launch flag cleared (depbar, block bytes, cycle).
+    uint64_t launch_block_bytes = 0;
+    uint64_t launch_global_address = 0;
+    uint32_t launch_shared_address = 0;
+    struct LaunchFlagCleared {
+        uint8_t bar = 0;
+        uint32_t bytes = 0;
+        uint64_t cycle = 0;
+    };
+    std::vector<LaunchFlagCleared> launch_flags;
     uint64_t tma_commands = 0;
     uint64_t tma_command_completions = 0;
     uint64_t tma_logical_bytes = 0;
@@ -276,6 +287,12 @@ public:
         std::size_t command_depth);
     void tma_command_end(
         uint64_t end_cycle, uint64_t command, uint64_t logical_bytes, uint64_t useful_bytes);
+    // The launch copy: the TMA command the launch record starts (it counts in
+    // the tma and gmem numbers like any load), and each launch flag's
+    // decrement (the cycle from which a waiting instruction can issue).
+    void launch_copy_begin(
+        uint64_t cycle, uint64_t command, uint64_t global_address, uint32_t shared_address, uint32_t bytes);
+    void launch_flag(uint64_t cycle, uint8_t bar, uint32_t bytes);
     void tma_sector(uint32_t sector_bytes);
     void tma_data_port(uint32_t rounds);
     void tma_depths(

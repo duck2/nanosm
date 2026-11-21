@@ -4,8 +4,8 @@
 ; rows, each with its own score and output accumulators (S0/O0 for query rows
 ; 0..31, S1/O1 for rows 32..63), so that one tile's softmax runs while the
 ; tensor core works on the other tile. Unmasked full tiles, fp16 Q/K/V/P,
-; fp32 S/O/statistics. fa32.launch.py has the descriptors, constants,
-; reference and checks; trash/fa32-2026-11-19.md the measurements.
+; fp32 S/O/statistics. fa32.launch.py passes the four descriptor arguments
+; and has the reference and checks; trash/fa32-2026-11-19.md the measurements.
 ;
 ; Warps:
 ;   0     loads: six TMA loads, in the order the matmuls need them, then the
@@ -73,28 +73,40 @@
 ; sanitizer checks this argument at run time.
 .equ OSTAGE,     0
 .equ OSTAGE_STEP, 8192
-; Barriers come in pairs, tile 1's (or block 1's) 8 bytes after tile 0's.
-.equ S_READY0,   49152           ; commit after S(t,b), phase b
-.equ S_READY1,   49160
-.equ P_READY0,   49168           ; tile t's two workers wrote P(t,b) and corrected O(t), phase b
-.equ P_READY1,   49176
-.equ O_DONE0,    49184           ; commit after O(t,b), phase b
-.equ O_DONE1,    49192
-.equ O_STAGED0,  49200           ; tile t's two workers staged its output
-.equ O_STAGED1,  49208
-.equ Q_LANDED0,  49216           ; one TMA load each, phase 0 only
-.equ Q_LANDED1,  49224
-.equ K_LANDED0,  49232
-.equ K_LANDED1,  49240
-.equ V_LANDED0,  49248
-.equ V_LANDED1,  49256
-.equ O_STORED,   49264           ; both output stores count down one phase
-.equ CONSTANTS,  49280           ; log2(e)/8, -infinity
-.equ QDESC,      49664           ; one descriptor per tensor
-.equ KDESC,      49728
-.equ VDESC,      49792
-.equ ODESC,      49856
 .equ STATS,      50176           ; per row: max, denominator, alpha, per block
+
+; What the launch gives: one TMA descriptor per tensor (Q a 32-row tile, K a
+; 64-key block, V the same transposed, O 32 fp32 rows). Everything below it
+; is the kernel's own: six warps, its barriers and its two constants.
+.warps  6
+.param  desc QDESC
+.param  desc KDESC
+.param  desc VDESC
+.param  desc ODESC
+; S_READY and O_DONE count one mma.commit each; P_READY and O_STAGED the two
+; workers of a query tile; each LANDED barrier one TMA load (the producer's
+; arrive.expect_tx); O_STORED both output stores.
+; Barriers come in pairs, tile 1's (or block 1's) 8 bytes after tile 0's:
+; a pair is two .mbar lines one after the other (the code reaches the second
+; as the first plus 8). All of these, with the descriptors above and the
+; constants below, are the launch block: copied from global memory when the
+; kernel starts, the first declared arriving first (README "Launch").
+.mbar S_READY0,  expect 1    ; commit after S(t,b), phase b
+.mbar S_READY1,  expect 1
+.mbar P_READY0,  expect 2    ; tile t's two workers wrote P(t,b) and corrected O(t), phase b
+.mbar P_READY1,  expect 2
+.mbar O_DONE0,   expect 1    ; commit after O(t,b), phase b
+.mbar O_DONE1,   expect 1
+.mbar O_STAGED0, expect 2    ; tile t's two workers staged its output
+.mbar O_STAGED1, expect 2
+.mbar Q_LANDED0, expect 1    ; one TMA load each, phase 0 only
+.mbar Q_LANDED1, expect 1
+.mbar K_LANDED0, expect 1
+.mbar K_LANDED1, expect 1
+.mbar V_LANDED0, expect 1
+.mbar V_LANDED1, expect 1
+.mbar O_STORED,  expect 1    ; both output stores count down one phase
+.data CONSTANTS, f32 0.180336878, -inf      ; log2(e) / sqrt(64), -infinity
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0

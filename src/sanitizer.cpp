@@ -298,6 +298,9 @@ std::string Sanitizer::describe_shmem_owner(const ShmemOwner& owner) const {
             (owner.kind == ShmemOwnerKind::mma_a ? "A" : "B") + " operand " +
             half_open(owner.begin, owner.end) + " until its final operand read";
         break;
+    case ShmemOwnerKind::launch_copy:
+        return "the launch copy (write-owner of the launch block's bytes " + half_open(owner.begin, owner.end) +
+            " until they land from global memory)";
     }
     return text + " (warp " + std::to_string(owner.warp) + " pc " + std::to_string(owner.pc) +
         ", accepted cycle " + std::to_string(owner.issue_cycle) + "; " + role + ")";
@@ -321,6 +324,9 @@ std::string Sanitizer::shmem_race(
     case ShmemOwnerKind::mma_b:
         fix = "wait the operand-consumed depbar sb" + std::to_string(owner.depbar) +
             " of warp " + std::to_string(owner.warp) + " / commit mbar first";
+        break;
+    case ShmemOwnerKind::launch_copy:
+        fix = "wait on the section's launch flag first (qtxc does when an instruction names the section)";
         break;
     }
     return "shmem race: " + access + " bytes " + half_open(overlap_begin, overlap_end) +
@@ -356,6 +362,13 @@ void Sanitizer::check_simt_mbar_rmw(const IssueSite& site, uint32_t address) con
     if (const auto* owner = shmem_owner_overlapping(address, address + 8ull, false)) {
         throw_issue_panic(site, shmem_race(
             opcode_name(site.inst.opcode) + " writes mbar", address, address + 8ull, *owner));
+    }
+}
+
+void Sanitizer::check_simt_mbar_probe(const IssueSite& site, uint32_t address) const {
+    if (const auto* owner = shmem_owner_overlapping(address, address + 8ull, true)) {
+        throw_issue_panic(site, shmem_race(
+            opcode_name(site.inst.opcode) + " reads mbar", address, address + 8ull, *owner));
     }
 }
 
@@ -678,6 +691,24 @@ void Sanitizer::record_tma_descriptor_read(
             " decoded a descriptor different from the one peeked at accept (a write in flight "
             "at accept escaped the missing-fence / race check; the owner record cannot be trusted)");
     }
+}
+
+void Sanitizer::record_launch_copy(uint32_t begin, uint32_t end) {
+    ShmemOwner owner;
+    owner.kind = ShmemOwnerKind::launch_copy;
+    owner.write = true;
+    owner.begin = begin;
+    owner.end = end;
+    shmem_owners_.push_back(owner);
+}
+
+void Sanitizer::record_launch_landed(uint32_t landed_end) {
+    for (auto& owner : shmem_owners_) {
+        if (owner.kind == ShmemOwnerKind::launch_copy) owner.begin = std::max(owner.begin, landed_end);
+    }
+    std::erase_if(shmem_owners_, [](const ShmemOwner& owner) {
+        return owner.kind == ShmemOwnerKind::launch_copy && owner.begin >= owner.end;
+    });
 }
 
 void Sanitizer::record_tma_data_complete(uint64_t command) {

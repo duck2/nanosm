@@ -206,6 +206,10 @@ public:
     void check_simt_shmem_access(
         const IssueSite& site, const std::vector<uint32_t>& word_addresses, bool load) const;
     void check_simt_mbar_rmw(const IssueSite& site, uint32_t address) const;
+    // A probe (mbar.test_wait / try_wait) reads the mbar's two words: it
+    // conflicts with a write-owner (a barrier of the launch block that has
+    // not landed yet).
+    void check_simt_mbar_probe(const IssueSite& site, uint32_t address) const;
     void check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool complete_tx) const;
 
     // ---- missing fence.sh / race (trash/rfc12.md sections 10 and 11) ----
@@ -279,6 +283,15 @@ public:
     void record_tma_descriptor_read(
         uint64_t command, const TmaDescriptor& decoded, uint32_t shmem_address, bool load);
     void record_tma_data_complete(uint64_t command);
+    // ---- the launch copy (README "Launch") ----
+    // The launch block's bytes [begin, end) in shared memory are on their way
+    // from global memory: until they land they are write-owned by the launch
+    // copy, so an lds, an sts, an mbar operation or a TMA or tensor-core
+    // command touching them PANICs like any shmem race (the fix: name the
+    // section, so that qtxc waits on its launch flag). record_launch_landed:
+    // everything below landed_end has landed.
+    void record_launch_copy(uint32_t begin, uint32_t end);
+    void record_launch_landed(uint32_t landed_end);
     // Panics on a conflict (first the missing-fence / race check of both
     // operand spans, port-B reads; then its result words against every
     // transfer that owns one), else records the A/B operand owners and the
@@ -368,6 +381,7 @@ private:
         tma_descriptor, // read-owner of the 64-byte descriptor until the engine reads it
         mma_a,          // read-owner of the A operand until the final operand read
         mma_b,          // read-owner of the B operand until the final operand read
+        launch_copy,    // write-owner of the launch block's bytes that have not landed yet
     };
 
     struct ShmemOwner {
@@ -555,6 +569,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_store_word_collision)
     NANOSM_SANITIZER_NOOP(check_simt_shmem_access)
     NANOSM_SANITIZER_NOOP(check_simt_mbar_rmw)
+    NANOSM_SANITIZER_NOOP(check_simt_mbar_probe)
     NANOSM_SANITIZER_NOOP(check_engine_mbar_rmw)
     NANOSM_SANITIZER_NOOP(record_simt_shmem_issue)
     NANOSM_SANITIZER_NOOP(record_simt_shmem_grant)
@@ -567,6 +582,8 @@ public:
     NANOSM_SANITIZER_NOOP(check_kernel_end)
     NANOSM_SANITIZER_NOOP(record_tma_descriptor_read)
     NANOSM_SANITIZER_NOOP(record_tma_data_complete)
+    NANOSM_SANITIZER_NOOP(record_launch_copy)
+    NANOSM_SANITIZER_NOOP(record_launch_landed)
     NANOSM_SANITIZER_NOOP(record_mma_accept)
     NANOSM_SANITIZER_NOOP(record_mma_row_spacing)
     NANOSM_SANITIZER_NOOP(check_tma_store_source)

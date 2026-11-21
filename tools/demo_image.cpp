@@ -1,7 +1,6 @@
 #include "compiler.hpp"
 #include "image.hpp"
 #include "log.hpp"
-#include "mbar.hpp"
 #include "profile.hpp"
 
 #include <bit>
@@ -30,14 +29,16 @@ nanosm::ImageSegment f32_sequence(
 }
 
 nanosm::Launch make_vadd(const nanosm::DeviceProfile& profile) {
-    // kernels/vadd.qtx: A at 0, B at 32 KiB, C at 64 KiB, 8192 fp32 each,
-    // four warps streaming 512 B blocks with ldg.v8 / stg.v8.
+    // kernels/vadd.qtx: 8192 fp32 per vector, four warps streaming 512 B
+    // blocks with ldg.v8 / stg.v8. Its signature is ptr A, ptr B, ptr C: A at
+    // 0, B at 32 KiB, C at 64 KiB.
     constexpr uint32_t elements = 8192;
     if (profile.lanes != 16) {
         throw nanosm::SimError("vadd demo requires the canonical 16-lane profile");
     }
     nanosm::Launch launch;
     launch.active_warps = 4;
+    launch.args = {{"A", uint64_t{0}}, {"B", uint64_t{32768}}, {"C", uint64_t{65536}}};
     launch.gmem_image.push_back(f32_sequence(0, elements, [](uint32_t i) { return i; }));
     launch.gmem_image.push_back(f32_sequence(32768, elements, [](uint32_t i) { return 2 * i; }));
     return launch;
@@ -49,20 +50,10 @@ nanosm::Launch make_pipeline(const nanosm::DeviceProfile& profile) {
     if (profile.lanes != 16) {
         throw nanosm::SimError("pipeline demo requires the canonical 16-lane profile");
     }
+    // kernels/pipeline.qtx declares its two warps and its four barriers; the
+    // launch gives the three arrays' addresses (ptr A, ptr B, ptr C).
     nanosm::Launch launch;
-    launch.active_warps = 2;
-    nanosm::MbarState barrier;
-    barrier.valid = true;
-    barrier.expected = 1;
-    barrier.remaining = 1;
-    const auto encoded = nanosm::encode_mbar_state(barrier);
-    for (const uint64_t address : {1024ull, 1032ull, 1040ull, 1048ull}) {
-        nanosm::ImageSegment segment;
-        segment.address = address;
-        segment.bytes.resize(8);
-        std::memcpy(segment.bytes.data(), &encoded, sizeof(encoded));
-        launch.shmem_image.push_back(std::move(segment));
-    }
+    launch.args = {{"A", uint64_t{0}}, {"B", uint64_t{4096}}, {"C", uint64_t{8192}}};
     launch.gmem_image.push_back(f32_sequence(0, elements, [](uint32_t i) { return i; }));
     launch.gmem_image.push_back(f32_sequence(4096, elements, [](uint32_t i) { return 2 * i; }));
     return launch;

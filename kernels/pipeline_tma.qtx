@@ -1,21 +1,22 @@
 ; Double-buffered vector add with a TMA producer and a SIMT consumer.
-; Two launch-authored descriptors (A, B: dense one-dimensional tensors, a
+; Two descriptor arguments (A, B: dense one-dimensional tensors, a
 ; 16-element tile); each stage's buffer and full barrier are tma.load.1d
 ; operands (src/tma.hpp). The coordinate advances by one tile. Barriers,
 ; parities, buffers and the coordinate are uniform registers (ur1..ur11), and
 ; so is each role's loop counter (ur12, tested with usetp).
 
-.equ C,      8192
+.warps  2
+.param  desc ADESC      ; A and B: dense one-dimensional tensors, one tile per load
+.param  desc BDESC
+.param  ptr  C          ; the output's global address
 .equ SA0,    0
 .equ SB0,    64
 .equ SA1,    128
 .equ SB1,    192
-.equ FULL0,  1024
-.equ FULL1,  1032
-.equ EMPTY0, 1040
-.equ EMPTY1, 1048
-.equ ADESC,  1152
-.equ BDESC,  1216
+.mbar FULL0,  expect 1
+.mbar FULL1,  expect 1
+.mbar EMPTY0, expect 1
+.mbar EMPTY1, expect 1
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0
@@ -28,7 +29,9 @@
         addi  r11, r0, SB0
         addi  r12, r0, SA1
         addi  r13, r0, SB1
-        addi  r1, r0, C
+        umov  ur8, C
+        lds.uni r14, [ur8]      ; C's low word (an stg address is one 32-bit register)
+        add   r1, r0, r14
         umov  ur1, FULL0
         umov  ur2, FULL1
         umov  ur3, EMPTY0

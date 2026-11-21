@@ -6,21 +6,39 @@
 ; The block base is warp-uniform and 64 B aligned, as v8 requires; ldg.v8 /
 ; stg.v8 still take it from lane 0 of a vector register, so the warp id goes
 ; through the uniform side (usread) and back with ur2r.
+;
+; The launch gives the three vectors' global addresses (64 B aligned) and the
+; warp count. Any number of warps that divides the 64 blocks works: a warp's
+; step from one of its blocks to the next is 512 B x N_WARPS, read at run
+; time, and it stops when its A pointer passes the end of A.
 ; Launch: kernels/vadd.launch.py.
 
-.equ A, 0
-.equ B, 32768
-.equ C, 65536
-.equ BLOCKS_PER_WARP, 16
-.equ WARP_STRIDE, 2048        ; four warps x 512 B
+.param ptr A
+.param ptr B
+.param ptr C
+.equ BYTES, 32768             ; per vector: 8192 fp32
 
         usread ur0, WARP_ID
-        ushli  ur0, ur0, 9            ; 512 * warp
-        mov    r21, BLOCKS_PER_WARP
-        ur2r   r20, ur0               ; r20 = 512 * warp
+        ushli  ur0, ur0, 9            ; 512 * warp: this warp's first block
+        usread ur1, N_WARPS
+        ushli  ur1, ur1, 9            ; 512 * warps: to this warp's next block
+        umov   ur2, A
+        umov   ur3, B
+        umov   ur4, C
+        lds.uni r20, [ur2]            ; the pointers' low words (an ldg.v8 /
+        lds.uni r23, [ur3]            ; stg.v8 address is one 32-bit register)
+        lds.uni r26, [ur4]
+        ur2r   r16, ur0
+        ur2r   r18, ur1
+        ; r20 / r23 / r26 (bank 2) walk A, B and C; the step r18 (bank 0) and
+        ; the end of A r19 (bank 1) sit in the other two banks.
+        addi   r19, r20, BYTES
+        add    r20, r20, r16
+        add    r23, r23, r16
+        add    r26, r26, r16
 loop:
-        ldg.v8 r0, [r20 + A]
-        ldg.v8 r8, [r20 + B]
+        ldg.v8 r0, [r20]
+        ldg.v8 r8, [r23]
         ; rj and r(8+j) are always in different RF banks (j vs j+2 mod 3)
         fadd   r0, r0, r8
         fadd   r1, r1, r9
@@ -30,9 +48,10 @@ loop:
         fadd   r5, r5, r13
         fadd   r6, r6, r14
         fadd   r7, r7, r15
-        stg.v8 [r20 + C], r0
-        addi   r20, r20, WARP_STRIDE
-        addi   r21, r21, -1
-        setp.ne.u32 p0, r21, 0
+        stg.v8 [r26], r0
+        add    r20, r20, r18
+        add    r23, r23, r18
+        add    r26, r26, r18
+        setp.lt.u32 p0, r20, r19
         @p0 bra.uni loop
         halt

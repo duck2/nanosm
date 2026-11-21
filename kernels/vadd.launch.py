@@ -3,7 +3,10 @@
 Run from emu2: python -B -m nanosm kernels/vadd.launch.py
 Options: --profile PATH (e.g. a scratch profile with lsu.staging_vectors = 1),
          --trace PATH (Perfetto output),
-         --warps N (default 4; rewrites the kernel's BLOCKS_PER_WARP / WARP_STRIDE).
+         --warps N (default 4; the kernel reads N_WARPS and strides by it).
+
+The launch passes the three vectors' global addresses (the kernel's
+signature: ptr A, ptr B, ptr C) and writes the inputs; nothing else.
 
 Checks every output bit-exactly against a Python fp32 reference, checks the
 guard bytes after C, pins the algorithmic traffic counters (3 x 32 KiB, zero
@@ -19,9 +22,8 @@ import json
 from pathlib import Path
 import re
 import struct
-import tempfile
 
-from nanosm import Launch
+from nanosm import Launch, launch_copy_counters
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,20 +48,11 @@ def main() -> None:
     parser.add_argument("--profile", type=Path, default=ROOT / "profiles" / "nanosm-v0.json")
     parser.add_argument("--trace", type=Path)
     parser.add_argument("--warps", type=int, default=WARPS, choices=(1, 2, 4, 8, 16),
-                        help="active warps; the kernel's two stride constants are rewritten")
+                        help="active warps: warp w streams blocks w, w + warps, ...")
     args = parser.parse_args()
 
     kernel = Path(__file__).with_suffix("").with_suffix(".qtx")
-    scratch = tempfile.TemporaryDirectory()
-    if args.warps != WARPS:
-        # Same kernel, same blocks: warp w streams blocks w, w+warps, ...
-        source = kernel.read_text(encoding="utf-8")
-        source = re.sub(r"\.equ BLOCKS_PER_WARP, \d+", f".equ BLOCKS_PER_WARP, {N // 128 // args.warps}", source)
-        source = re.sub(r"\.equ WARP_STRIDE, \d+", f".equ WARP_STRIDE, {512 * args.warps}", source)
-        kernel = Path(scratch.name) / "vadd.qtx"
-        kernel.write_text(source, encoding="utf-8")
-
-    launch = Launch(kernel=kernel, profile=args.profile, warps=args.warps)
+    launch = Launch(kernel=kernel, profile=args.profile, warps=args.warps, args={"A": A, "B": B, "C": C})
     launch.gmem.f32(A, INPUT_A)
     launch.gmem.f32(B, INPUT_B)
     launch.gmem.write(C + 4 * N, bytes([0xA5]) * GUARD)
@@ -85,6 +78,9 @@ def main() -> None:
             "gmem": {"commands": 192, "sectors": sectors, "beats": 4 * sectors, "bytes": traffic},
             "tma": {"commands": 0},
         }
+        # And the launch copy's part: the three pointers (24 bytes) come from
+        # global memory as one TMA load, one sector.
+        expected_counters = launch_copy_counters(expected_counters, launch.copied_bytes)
         for engine, wanted in expected_counters.items():
             line = next(line for line in result.summary.splitlines() if line.startswith(engine + ":"))
             values = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}

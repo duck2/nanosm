@@ -34,6 +34,7 @@ void test_vadd() {
     auto config = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 4;
+    launch.args = {{"A", uint64_t{0}}, {"B", uint64_t{b}}, {"C", uint64_t{c}}};
     auto& gmem = image_bytes(launch.gmem_image, c + n * 4 + 64);
     for (uint32_t i = 0; i < n; ++i) {
         write_u32(gmem, i * 4, nanosm::float_bits(static_cast<float>(i % 97)));
@@ -54,8 +55,10 @@ void test_vadd() {
     const auto& summary = machine.trace().summary();
     require(summary.lsu_vector_loads == 128 && summary.lsu_vector_stores == 64 &&
             summary.lsu_sectors == 3 * n * 4 / 32 && summary.lsu_bytes == 3 * n * 4 &&
-            summary.lsu_useful_bytes == summary.lsu_bytes && summary.gmem_bytes == 3 * n * 4,
-        "vadd traffic is not exactly 3 x 32 KiB of whole sectors");
+            summary.lsu_useful_bytes == summary.lsu_bytes &&
+            // and one more sector on the bus: the launch copy of the three pointers
+            summary.gmem_bytes == 3 * n * 4 + 32 && summary.launch_block_bytes == 24,
+        "vadd traffic is not exactly 3 x 32 KiB of whole sectors and the launch copy's one");
 }
 
 void test_sparse_launch_images() {

@@ -80,6 +80,15 @@ lib.nanosm_session_create_qtx.argtypes = [
     ctypes.c_uint64,
 ]
 lib.nanosm_session_create_qtx.restype = ctypes.c_uint32
+lib.nanosm_qtx_kernel_info.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+]
+lib.nanosm_qtx_kernel_info.restype = ctypes.c_uint64
 lib.nanosm_session_create_image.argtypes = [
     ctypes.c_char_p,
     ctypes.c_uint64,
@@ -162,6 +171,18 @@ def encode_tma_descriptor(
         )
     )
     return bytes(output)
+
+
+def kernel_info(profile_json: bytes, qtx_source: bytes) -> str:
+    """What a qtx kernel declares, as JSON text (src/image.hpp emit_kernel_info)."""
+    arguments = (profile_json, len(profile_json), qtx_source, len(qtx_source))
+    size = int(lib.nanosm_qtx_kernel_info(*arguments, None, 0))
+    if size == SIZE_ERROR:
+        raise RuntimeError(last_error())
+    buffer = ctypes.create_string_buffer(size + 1)
+    if int(lib.nanosm_qtx_kernel_info(*arguments, buffer, len(buffer))) != size:
+        raise RuntimeError(last_error() or "nanosm kernel info changed between size query and copy")
+    return buffer.value.decode("utf-8")
 
 
 def _string(function, handle: int) -> str:

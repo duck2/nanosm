@@ -25,6 +25,7 @@ set(NANOSM_SOURCES
     src/profile.cpp
     src/trace.cpp
     src/qtxc/parse.cpp
+    src/qtxc/directives.cpp
     src/qtxc/metadata.cpp
     src/qtxc/checks.cpp
     src/qtxc/schedule.cpp

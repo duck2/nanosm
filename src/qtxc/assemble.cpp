@@ -16,10 +16,16 @@ std::string emit_asm(const AssemblyProgram& program) {
     out << "; {pred, stall, set, wait}; six warp-local depbar counters sb0..sb5\n\n";
     out << ".profile " << program.profile_name << ", 0x"
         << format_profile_fingerprint(program.profile_fingerprint) << "\n\n";
+    // What the source declares beside the code (directives.cpp): the
+    // sections of the launch block in their order, the launch flags the
+    // scheduler chose over them, then the constants.
+    if (program.warps != 0) out << ".warps " << program.warps << '\n';
+    for (const auto& section : program.sections) out << format_section_directive(section, false) << '\n';
+    for (const auto& flag : program.flags) out << format_flag_directive(flag) << '\n';
     for (const auto& [name, value] : program.constants) {
         out << ".equ " << name << ", " << value << '\n';
     }
-    if (!program.constants.empty()) out << '\n';
+    if (program.warps != 0 || !program.sections.empty() || !program.constants.empty()) out << '\n';
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         for (const auto& label : program.labels) {
             if (label.instruction_index == index) out << label.name << ":\n";
@@ -45,6 +51,16 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     kernel.register_count = register_count(program);
     kernel.profile_name = program.profile_name;
     kernel.profile_fingerprint = program.profile_fingerprint;
+    kernel.warps = program.warps;
+    kernel.sections = program.sections;
+    kernel.flags = program.flags;
+    // The names a debugger or a test may ask for: the .equ constants and each
+    // section's address.
+    kernel.symbols = program.constants;
+    for (const auto& section : program.sections) {
+        kernel.symbols.emplace_back(section.name, static_cast<int32_t>(section.address));
+    }
+    check_kernel_image(kernel, profile);
     kernel.words.reserve(program.instructions.size());
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         const auto& inst = program.instructions[index];

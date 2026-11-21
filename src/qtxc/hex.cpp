@@ -1,6 +1,8 @@
 // The hex kernel text (src/qtxc/): emit_hex writes a Kernel as a .profile /
-// .registers header and one 64-bit word per line; load_hex reads it
-// back and runs validate_kernel (checks.cpp). The encoding of a word is
+// .registers header, what the kernel declares beside its code (.warps, its
+// sections .param / .mbar / .data each with its address, its launch flags
+// .flag: directives.cpp) and one 64-bit word per line; load_hex reads it back and runs validate_kernel
+// (checks.cpp). The qtx's symbols are not in it. The encoding of a word is
 // src/isa.cpp's; this is only the text around the words.
 
 #include "qtxc/internal.hpp"
@@ -15,6 +17,9 @@ std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shap
     out << ".profile " << kernel.profile_name << ", 0x"
         << format_profile_fingerprint(kernel.profile_fingerprint) << '\n';
     out << ".registers " << kernel.register_count << '\n';
+    if (kernel.warps != 0) out << ".warps " << kernel.warps << '\n';
+    for (const auto& section : kernel.sections) out << format_section_directive(section, true) << '\n';
+    for (const auto& flag : kernel.flags) out << format_flag_directive(flag) << '\n';
     for (const auto word : kernel.words) {
         out << std::hex << std::setw(16) << std::setfill('0') << word
             << " ; " << format_instruction(decode(word), true, mma_shapes) << '\n';
@@ -65,6 +70,27 @@ Kernel load_hex(std::string_view source) {
             } catch (const std::exception&) {
                 throw SimError("line " + std::to_string(line) + ": bad register count");
             }
+            continue;
+        }
+        if (is_directive(clean, ".warps")) {
+            if (kernel.warps != 0) throw SimError("line " + std::to_string(line) + ": duplicate .warps");
+            kernel.warps = parse_warps_directive(trim(clean.substr(6)), line);
+            continue;
+        }
+        if (is_directive(clean, ".param")) {
+            kernel.sections.push_back(parse_param_directive(trim(clean.substr(6)), line, true));
+            continue;
+        }
+        if (is_directive(clean, ".mbar")) {
+            kernel.sections.push_back(parse_mbar_directive(trim(clean.substr(5)), {}, line, true));
+            continue;
+        }
+        if (is_directive(clean, ".data")) {
+            kernel.sections.push_back(parse_data_directive(trim(clean.substr(5)), {}, line, true));
+            continue;
+        }
+        if (is_directive(clean, ".flag")) {
+            kernel.flags.push_back(parse_flag_directive(trim(clean.substr(5)), line));
             continue;
         }
         if (clean.starts_with(".acc")) {

@@ -10,7 +10,7 @@ build and build_nosan at once).
 import argparse
 from pathlib import Path
 
-from nanosm import Launch
+from nanosm import Launch, tma_desc
 
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -21,33 +21,24 @@ ROOT = Path(__file__).resolve().parents[1]
 A = 0
 B = 4096
 C = 8192
-FULL0 = 1024
-FULL1 = 1032
-EMPTY0 = 1040
-EMPTY1 = 1048
-ADESC = 1152
-BDESC = 1216
 ELEMENTS = 8 * 64
 
+
+def tensor(base: int) -> bytes:
+    # One descriptor per input tensor (a dense one-dimensional tile of 64
+    # elements); the stage's buffer and full barrier are the instruction's.
+    return tma_desc(base=base, dimensions=(ELEMENTS,), tile=(64,), layout="dense")
+
+
+# The kernel's signature is desc ADESC, desc BDESC, ptr C; its two warps and
+# its four barriers are declared in the qtx.
 launch = Launch(
     kernel=Path(__file__).with_suffix("").with_suffix(".qtx"),
     profile=ROOT / "profiles" / "nanosm-v0.json",
-    warps=2,
+    args={"ADESC": tensor(A), "BDESC": tensor(B), "C": C},
 )
 launch.gmem.f32(A, (float(i) for i in range(ELEMENTS)))
 launch.gmem.f32(B, (float(2 * i) for i in range(ELEMENTS)))
-for address in [FULL0, FULL1, EMPTY0, EMPTY1]:
-    launch.shmem.mbar(address, expected=1)
-# One descriptor per tensor (a dense one-dimensional tile of 64 elements);
-# the stage's buffer and full barrier are the instruction's operands.
-for address, base in [(ADESC, A), (BDESC, B)]:
-    launch.shmem.tma_desc(
-        address,
-        base=base,
-        dimensions=(ELEMENTS,),
-        tile=(64,),
-        layout="dense",
-    )
 
 with launch.run(trace=args.trace) as result:
     expected = [float(3 * i) for i in range(ELEMENTS)]

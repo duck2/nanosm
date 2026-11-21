@@ -453,6 +453,29 @@ void TraceRecorder::tma_command_begin(
         last_tma_return_depth_.value_or(0));
 }
 
+void TraceRecorder::launch_copy_begin(
+    uint64_t cycle, uint64_t command, uint64_t global_address, uint32_t shared_address, uint32_t bytes) {
+    summary_.launch_block_bytes = bytes;
+    summary_.launch_global_address = global_address;
+    summary_.launch_shared_address = shared_address;
+    ++summary_.tma_commands;
+    tma_commands_.emplace(command, OpenSlice{
+        cycle,
+        tma_command_track,
+        TraceCategory::tma,
+        "launch copy",
+        "global=" + std::to_string(global_address) + ", shared=" + std::to_string(shared_address) +
+            ", bytes=" + std::to_string(bytes),
+        command,
+        true,
+    });
+    tma_depths(cycle, 1, last_tma_credit_depth_.value_or(0), last_tma_return_depth_.value_or(0));
+}
+
+void TraceRecorder::launch_flag(uint64_t cycle, uint8_t bar, uint32_t bytes) {
+    summary_.launch_flags.push_back({bar, bytes, cycle});
+}
+
 void TraceRecorder::tma_command_end(
     uint64_t end_cycle, uint64_t command, uint64_t logical_bytes, uint64_t useful_bytes) {
     const auto found = tma_commands_.find(command);
@@ -621,6 +644,21 @@ std::string TraceRecorder::summary_text() const {
         << " rf_write_wait=" << summary_.lsu_rf_write_wait_cycles
         << " rf_read_wait=" << summary_.lsu_rf_read_wait_cycles
         << " egress_wait=" << summary_.lsu_egress_wait_cycles << '\n';
+    if (summary_.launch_block_bytes != 0) {
+        // The launch copy's own part of the tma and gmem numbers below: one
+        // command, its bytes. Each flag: its depbar, the block bytes it
+        // covers, the cycle from which an instruction waiting on it can issue.
+        out << "launch: block_bytes=" << summary_.launch_block_bytes
+            << " global=" << summary_.launch_global_address
+            << " shared=" << summary_.launch_shared_address << " flags=";
+        for (std::size_t index = 0; index < summary_.launch_flags.size(); ++index) {
+            const auto& flag = summary_.launch_flags[index];
+            out << (index == 0 ? "" : ",") << "sb" << static_cast<unsigned>(flag.bar) << ':' << flag.bytes << '@'
+                << flag.cycle;
+        }
+        if (summary_.launch_flags.empty()) out << "none";
+        out << '\n';
+    }
     out << "tma: commands=" << summary_.tma_commands
         << " completed=" << summary_.tma_command_completions
         << " logical_bytes=" << summary_.tma_logical_bytes

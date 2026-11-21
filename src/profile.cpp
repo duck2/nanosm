@@ -87,6 +87,7 @@ json profile_json(const DeviceProfile& p) {
             {"warps", p.core_warps},
             {"instruction_buffer_packets", p.core_instruction_buffer_packets},
             {"divergence_stack_entries", p.core_divergence_stack_entries},
+            {"launch_flags", p.core_launch_flags},
         }},
         {"sfu", {
             {"lanes", p.sfu_lanes},
@@ -189,6 +190,9 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     if (p.core_instruction_buffer_packets == 0 || p.core_instruction_buffer_packets > 16) {
         throw ProfileError("device profile: core instruction_buffer_packets must be in 1..16");
+    }
+    if (p.core_launch_flags > 6) {
+        throw ProfileError("device profile: core launch_flags must be in 0..6 (a warp has six depbars)");
     }
     if (p.core_divergence_stack_entries > 64) {
         throw ProfileError("device profile: core divergence_stack_entries must be in 0..64");
@@ -515,6 +519,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_core("warps", 1, 64, p.core_warps);
     optional_core("instruction_buffer_packets", 1, 16, p.core_instruction_buffer_packets);
     optional_core("divergence_stack_entries", 0, 64, p.core_divergence_stack_entries); // absent: 8
+    optional_core("launch_flags", 0, 6, p.core_launch_flags); // absent: 4
     const auto& sfu = document.at("sfu");
     const auto checked_sfu = [&](const char* name, uint32_t low, uint32_t high) {
         const auto& value = sfu.at(name);

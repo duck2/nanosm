@@ -41,7 +41,7 @@ def main() -> None:
     args = parser.parse_args()
 
     kernel = Path(__file__).with_suffix("").with_suffix(".qtx")
-    launch = Launch(kernel=kernel, profile=args.profile, warps=WARPS)
+    launch = Launch(kernel=kernel, profile=args.profile, warps=WARPS, args={"IN": IN, "OUT": OUT})
     launch.gmem.u32(IN, INPUTS)
     launch.gmem.write(OUT, bytes(4 * N))
 

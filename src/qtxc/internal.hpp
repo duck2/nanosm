@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace nanosm {
@@ -40,6 +41,24 @@ std::optional<uint8_t> predicate_destination(const Instruction& inst);
 std::optional<uint8_t> destination(const Instruction& inst);
 uint16_t register_count(const AssemblyProgram& program);
 std::vector<uint8_t> issue_sources(const Instruction& inst);
+
+// The directives beside the code (directives.cpp): `.warps`, the sections
+// `.param`, `.mbar`, `.data`, and `.flag`. `tail` is the line after the
+// directive's name; with_address: the hex text's form, which carries each
+// section's address.
+bool is_directive(const std::string& clean, std::string_view name);
+std::string section_name(const std::string& name, uint32_t line, const char* what);
+uint32_t parse_warps_directive(const std::string& tail, uint32_t line);
+KernelSection parse_param_directive(const std::string& tail, uint32_t line, bool with_address);
+KernelSection parse_mbar_directive(
+    const std::string& tail, const std::unordered_map<std::string, int32_t>& constants, uint32_t line,
+    bool with_address);
+KernelSection parse_data_directive(
+    const std::string& tail, const std::unordered_map<std::string, int32_t>& constants, uint32_t line,
+    bool with_address);
+LaunchFlag parse_flag_directive(const std::string& tail, uint32_t line);
+std::string format_section_directive(const KernelSection& section, bool with_address);
+std::string format_flag_directive(const LaunchFlag& flag);
 
 // The per-instruction rules (checks.cpp).
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);

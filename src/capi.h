@@ -83,6 +83,20 @@ NANOSM_CAPI uint32_t nanosm_session_create_qtx(
     uint32_t trace_flags,
     uint64_t max_trace_events);
 
+// What a qtx kernel declares, as JSON (src/image.hpp emit_kernel_info): how
+// many warps it is written for, its signature (the `.param` lines: name,
+// type, shared-memory address, size) and its symbols (.equ constants and
+// parameter addresses). A host needs only the signature to launch; the
+// symbols are for a debugger or a test that looks inside shared memory.
+// Follows the string getters' size convention below.
+NANOSM_CAPI uint64_t nanosm_qtx_kernel_info(
+    const char* profile_json,
+    uint64_t profile_size,
+    const char* qtx_source,
+    uint64_t qtx_size,
+    char* output,
+    uint64_t capacity);
+
 // Test seam: if the environment variable NANOSM_DRIVER_SHUFFLE_SEED is set
 // when a session is created, the machine runs its register drivers in a
 // random order every cycle (seeded). Results must be byte-identical; the

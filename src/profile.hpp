@@ -40,6 +40,16 @@ struct DeviceProfile {
     // legal and means no stack: a kernel with ssy, sync or a predicated bra
     // is refused by qtxc, the assembler and kernel load. 0..64.
     uint32_t core_divergence_stack_entries = 8;
+    // Launch flags (core.launch_flags; README "Launch",
+    // trash/launch-timed-2026-11-21.md): how many of each warp's six depbars,
+    // from sb5 downward, the launch may count once in every warp before the
+    // first instruction; each is decremented in every warp when the launch
+    // copy has delivered its part of the kernel's launch block (.param,
+    // .mbar, .data) from global memory into shared memory. Canonical 4. 0 is
+    // legal and means no copy: the block is in shared memory before the
+    // first cycle, untimed (the comparison case; a kernel can then use
+    // launch bytes for free). 0..6.
+    uint32_t core_launch_flags = 4;
     // One row of one bank holds one lane-wide register (lanes x 4 B). A
     // launch fits when active warps x the kernel's rows in every bank fit
     // (and the warps fit core.warps). Canonical 352: 3 x 352 x 64 B = 66 KiB,

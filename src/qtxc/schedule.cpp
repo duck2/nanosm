@@ -3,7 +3,8 @@
 // its fixed-latency dependencies need (FixedTimeline, distances from
 // src/rf.hpp), depbar set / wait for the asynchronous ones (with all six
 // live, an instruction that needs a new one waits for the oldest and reuses
-// it), a full drain at
+// it), a wait on a launch flag for an instruction that names a section of
+// the launch block (flag_pending below), a full drain at
 // every branch and sync, a loop body scheduled as a jump enters it (LoopEntry), and
 // qtx's wait as a nop waiting for every live depbar (no drain).
 // schedule_fixed_stalls is the same stall pass for hand assembly. It does not parse (parse.cpp), write the text (assemble.cpp) or
@@ -196,6 +197,25 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     program.profile_name = profile.name;
     program.profile_fingerprint = device_profile_fingerprint(profile);
     std::array<bool, 6> live{};
+    // Launch flags (README "Launch"): a depbar the launch counted once in
+    // every warp before the first instruction, decremented when the launch
+    // copy has delivered its part of the launch block. flag_pending[b]: on
+    // the path to this instruction nothing has waited on flag b yet, so its
+    // count may still be there. An instruction that names a section waits on
+    // the section's flag while it is pending; that wait proves it gone for
+    // the straight-line code after. Any label may be entered from a path
+    // that has not waited, and so may the instruction after a branch or a
+    // sync: there every flag is pending again (a wait on a counter at zero
+    // costs nothing). Flags are not the warp's own work: a branch, a halt or
+    // qtx's wait do not wait for them, and the code that names no section
+    // never does.
+    std::array<bool, 6> launch_flag{};
+    for (const auto& flag : program.flags) launch_flag[flag.bar] = true;
+    std::array<bool, 6> flag_pending = launch_flag;
+    std::vector<bool> labelled(program.instructions.size(), false);
+    for (const auto& label : program.labels) {
+        if (label.instruction_index < labelled.size()) labelled[label.instruction_index] = true;
+    }
     std::array<std::optional<uint8_t>, 256> pending_register{};
     std::array<uint8_t, 256> pending_async_read_mask{};
     // tmem order between one warp's transfers (trash/rfc11.md section 0: the
@@ -231,19 +251,28 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         acc_store_mask &= static_cast<uint8_t>(~mask);
         acc_load_mask &= static_cast<uint8_t>(~mask);
         for (uint8_t bar = 0; bar < 6; ++bar) {
-            if ((mask & (1u << bar)) != 0) live[bar] = false;
+            if ((mask & (1u << bar)) != 0) {
+                live[bar] = false;
+                flag_pending[bar] = false;
+            }
         }
         if (store_barrier.has_value() && (mask & (1u << *store_barrier)) != 0) store_barrier.reset();
         if (mma_barrier.has_value() && (mask & (1u << *mma_barrier)) != 0) mma_barrier.reset();
     };
 
-    // The depbar `inst` sets: the lowest free one. With all six live, the
-    // oldest live one (the earliest allocated): `inst` also waits for it,
-    // which frees it, and then sets it.
+    // The depbar `inst` sets: the lowest free one that is not a pending
+    // launch flag; else the lowest free one that is (the counter then holds
+    // the launch's count beside this instruction's: whoever waits on it
+    // waits for both, which is only slower); with all six live, the oldest
+    // live one (the earliest allocated): `inst` also waits for it, which
+    // frees it, and then sets it.
     std::array<uint64_t, 6> allocated_at{};
     uint64_t allocations = 0;
     const auto allocate = [&](Instruction& inst) -> uint8_t {
         std::optional<uint8_t> chosen;
+        for (uint8_t bar = 0; bar < 6 && !chosen.has_value(); ++bar) {
+            if (!live[bar] && !flag_pending[bar]) chosen = bar;
+        }
         for (uint8_t bar = 0; bar < 6 && !chosen.has_value(); ++bar) {
             if (!live[bar]) chosen = bar;
         }
@@ -297,6 +326,8 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             previous_vtime = 0;
             vtime = 0;
         }
+        // A label: some path may arrive here without having waited on a flag.
+        if (labelled[index]) flag_pending = launch_flag;
         if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
             throw SimError(
                 "line " + std::to_string(inst.line) +
@@ -344,6 +375,13 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         if (inst.opcode == Opcode::halt || inst.opcode == Opcode::nop || transfers_control(inst.opcode)) {
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if (live[bar]) wait_mask |= static_cast<uint8_t>(1u << bar);
+            }
+        }
+        // The sections this instruction names: their launch flags, where
+        // still pending on this path.
+        for (uint8_t bar = 0; bar < 6; ++bar) {
+            if ((program.named_flags[index] & (1u << bar)) != 0 && flag_pending[bar]) {
+                wait_mask |= static_cast<uint8_t>(1u << bar);
             }
         }
         inst.control.wait_mask = wait_mask;
@@ -426,6 +464,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             // fall-through, whatever pc a sync pops --
             // therefore begins with clean timing state.
             live.fill(false);
+            flag_pending = launch_flag;
             pending_register.fill(std::nullopt);
             pending_async_read_mask.fill(0);
             acc_store_mask = 0;

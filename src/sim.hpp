@@ -981,6 +981,7 @@ private:
         walking,
         data_complete,
         event_presented,
+        launch_done, // the launch copy: its last sector has landed; it leaves the queue next cycle
     };
 
     // One TMA command, from its push into the queue to its completion
@@ -1007,6 +1008,11 @@ private:
         uint32_t pending_load_writes = 0;    // sectors walked whose placement has not reached the RAM
         uint32_t pending_store_captures = 0; // store sectors whose source read has not returned
         bool walker_done = false;
+        // The launch copy (start_launch_copy): no instruction, no descriptor,
+        // no barrier. launch_landed: the bytes of the launch block whose
+        // placement has reached the RAM (17 bits), in order from its start.
+        bool launch = false;
+        uint32_t launch_landed = 0;
     };
 
     // The TMA's walker: ONE set of registers, serving the frontend command
@@ -1192,6 +1198,7 @@ private:
     // ends (pending count, credit release, data complete).
     struct PlacementEnd {
         uint64_t command = 0;
+        uint32_t shared_end = 0; // the end of the run's bytes in shared memory (the launch copy's mark)
     };
 
     // One granted write round in a write pipeline (A-write, port-B write): D
@@ -1934,6 +1941,9 @@ private:
     uint64_t next_lsu_command_id_ = 0;
     uint64_t next_gmem_request_id_ = 0;
     uint64_t next_tma_command_id_ = 0;
+    // The launch record (src/image.hpp): host-written before the first
+    // cycle, read-only after. None: nothing to copy.
+    std::optional<LaunchRecord> launch_record_;
     uint64_t next_mma_command_id_ = 1;
     // (T) trace-only per-command LSU phases.
     std::map<uint64_t, LsuCommandPhases> lsu_phases_;
@@ -2214,6 +2224,11 @@ private:
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
     void complete_tma_store_capture(TmaQueue& tma, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
+    // The launch copy (README "Launch"): the TMA's first command and walker
+    // and the warps' launch flags, from the launch record; each landed
+    // sector's bytes and the flags they clear.
+    void start_launch_copy(const LaunchRecord& record);
+    void land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires& w);
     void release_tma_credit(TmaQueue& tma);
     void trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle);
     [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command(const TmaQueue& tma) const;

@@ -7,7 +7,10 @@ Plain row-major FP16 inputs enter through TMA, not prepacked shared memory, and
 the FP32 output leaves through TMA: workers stage normalized O in shmem as
 fp32 swizzle64 tiles over the dead Q/K0 stages. Each worker pair publishes
 32 output rows for its own TMA store.
-The host supplies only descriptors, synchronization state and constants.
+The host supplies only the four descriptors (the kernel's signature); the
+kernel's qtx declares its warps, barriers and constants. The checks that look
+inside shared memory (statistics, P, the staged output) take their addresses
+from the kernel's symbols.
 Workers compute P's and O's swizzled addresses and do all softmax, P
 conversion/stores, O correction, normalization and O staging stores.
 """
@@ -20,18 +23,13 @@ from pathlib import Path
 import re
 import struct
 
-from nanosm import Launch
+from nanosm import Launch, launch_copy_counters, tma_desc
 
 
 ROOT = Path(__file__).resolve().parents[1]
 Q_GLOBAL, K_GLOBAL, V_GLOBAL, O_GLOBAL = 0, 8192, 24576, 65536
-P_SHARED = 40960
-SCORE, WORK, OUTPUT, STAGED = 49152, 49168, 49184, 49200  # two adjacent mbars each
-INPUT_DONE, OSTORE_DONE = 49216, 49224
-CONSTANTS, QDESC, KDESC, VDESC, STATS = 49280, 49664, 49728, 49792, 50176
-ODESC = 49984
 # O staging reuses the Q + K stage-0 region: 64 fp32 swizzle64 rows of 256 bytes, 16 KiB.
-O_SHARED, O_STAGE_BYTES = 0, 16384
+O_STAGE_BYTES = 16384
 ROWS, KEYS, WIDTH, BLOCK = 64, 128, 64, 64
 QUERY_TILE = 32
 
@@ -58,38 +56,35 @@ def inputs(case: str) -> tuple[list[list[float]], list[list[float]], list[list[f
     return q, k, v
 
 
+def descriptors(query_tile: int) -> dict[str, bytes]:
+    """The four arguments of an FA kernel: one descriptor per tensor.
+
+    Q and O move `query_tile` rows at a time. Both query tiles share the full
+    K / V blocks at 0 and 64. V is transposed so a stored row holds one output
+    channel across 64 keys.
+    """
+    def fp16(base: int, rows: int, tile_rows: int, transposed: bool = False) -> bytes:
+        return tma_desc(base=base, dimensions=(WIDTH, rows), tile=(WIDTH, tile_rows),
+                        element_bytes=2, layout="swizzle64", transposed=transposed)
+    return {
+        "QDESC": fp16(Q_GLOBAL, ROWS, query_tile),
+        "KDESC": fp16(K_GLOBAL, KEYS, BLOCK),
+        "VDESC": fp16(V_GLOBAL, KEYS, BLOCK, transposed=True),
+        "ODESC": tma_desc(base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, query_tile),
+                          element_bytes=4, layout="swizzle64"),
+    }
+
+
 def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]) -> Launch:
-    launch = Launch(kernel=ROOT / "kernels/fa.qtx", profile=ROOT / "profiles/nanosm-v0.json", warps=5)
+    launch = Launch(kernel=ROOT / "kernels/fa.qtx", profile=ROOT / "profiles/nanosm-v0.json",
+                    args=descriptors(QUERY_TILE))
     for base, matrix in [(Q_GLOBAL, q), (K_GLOBAL, k), (V_GLOBAL, v)]:
         values = [value for row in matrix for value in row]
         launch.gmem.write(base, struct.pack(f"<{len(values)}e", *values))
-    # Poison outputs / P so unwritten entries cannot pass as launch-zero values.
+    # Poison outputs / P so unwritten entries cannot pass as launch-zero values
+    # (P's address is the kernel's; a test's look inside, not part of launching).
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
-    launch.shmem.write(P_SHARED, struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
-    launch.shmem.f32(CONSTANTS, [SCALE, -math.inf])
-    # SCORE and OUTPUT count the issuer's MMA commits. WORK and STAGED count
-    # the two workers that own each query tile.
-    for base, count in [(SCORE, 1), (OUTPUT, 1), (WORK, 2), (STAGED, 2)]:
-        for address in (base, base + 8):
-            launch.shmem.mbar(address, expected=count)
-    for address in (INPUT_DONE, OSTORE_DONE):
-        launch.shmem.mbar(address, expected=1)
-    # Q and O move 32 rows at coordinates 0 and 32. Both query tiles share
-    # the full K/V blocks at 0 and 64. V is transposed so a stored row holds
-    # one output channel across 64 keys.
-    for desc, gbase, rows, tile_rows, transposed in [
-        (QDESC, Q_GLOBAL, ROWS, QUERY_TILE, False),
-        (KDESC, K_GLOBAL, KEYS, BLOCK, False),
-        (VDESC, V_GLOBAL, KEYS, BLOCK, True),
-    ]:
-        launch.shmem.tma_desc(
-            desc, base=gbase, dimensions=(WIDTH, rows), tile=(WIDTH, tile_rows),
-            element_bytes=2, layout="swizzle64", transposed=transposed,
-        )
-    launch.shmem.tma_desc(
-        ODESC, base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, QUERY_TILE),
-        element_bytes=4, layout="swizzle64",
-    )
+    launch.shmem.write(launch.symbol("PBUF0"), struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
 
@@ -222,6 +217,7 @@ def run_case(case: str, trace: Path | None) -> None:
     else:
         assert all(alpha == 1 for alpha in second_alpha), "stable-max control is not stable"
     launch = make_launch(q, k, v)
+    STATS, P_SHARED, O_SHARED = launch.symbol("STATS"), launch.symbol("PBUF0"), launch.symbol("OSTAGE0")
     with launch.run(trace=trace, max_trace_events=1_000_000, cycle_limit=1_000_000) as result:
         output = result.gmem_f32(O_GLOBAL, ROWS * WIDTH)
         model_error = check_close(output, ref["model"], 2e-6, "quantized online reference")
@@ -276,6 +272,10 @@ def run_case(case: str, trace: Path | None) -> None:
             "tmem": {"load_beats": 1536, "store_beats": 256},
             "sfu": {"ops": 524, "busy_cycles": 2096},
         }
+        # And the launch copy's part: the kernel's launch block (four
+        # descriptors, ten barrier states, two constants: 344 bytes) comes
+        # from global memory as one more TMA load, 11 sectors.
+        expected_counters = launch_copy_counters(expected_counters, launch.copied_bytes)
         for engine, expected in expected_counters.items():
             line = next(line for line in result.summary.splitlines() if line.startswith(engine + ":"))
             actual = {key: int(value) for key, value in re.findall(r"(\w+)=(\d+)", line)}

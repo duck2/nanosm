@@ -37,6 +37,17 @@ struct AssemblyProgram {
     std::vector<std::pair<std::string, int32_t>> constants;
     std::vector<AssemblyLabel> labels;
     std::vector<Instruction> instructions;
+    // What the source declares beside the code (src/isa.hpp Kernel): `.warps`,
+    // the sections of the launch block in declaration order (`.param`,
+    // `.mbar`, `.data`, each with its shared-memory address) and the launch
+    // flags over them. Assembly text carries the same directives and `.flag`.
+    uint32_t warps = 0;
+    std::vector<KernelSection> sections;
+    std::vector<LaunchFlag> flags;
+    // qtx only, one per instruction: the launch flags (a depbar mask) of the
+    // sections the instruction's text names. The scheduler turns them into
+    // waits (schedule.cpp); assembly's waits are the author's.
+    std::vector<uint8_t> named_flags;
 };
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile);
@@ -71,6 +82,13 @@ void check_write_masks(const Kernel& kernel, const DeviceProfile& profile);
 // naming the pc and the instruction (qtxc and the assembler refuse it per
 // source line).
 void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile);
+
+// Kernel load and assembly: what the kernel declares beside its code
+// (`.warps`, its sections `.param` / `.mbar` / `.data`, its launch flags)
+// fits this profile: the launch block is inside shared memory, every section
+// sits where the block rule puts it (src/isa.hpp launch_block) and the flags
+// are the profile's and cover the block.
+void check_kernel_image(const Kernel& kernel, const DeviceProfile& profile);
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile);
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile);

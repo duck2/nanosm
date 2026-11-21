@@ -119,6 +119,52 @@ int main() {
         require(nanosm_session_run(handle, 100) == NANOSM_OK, "replayed C API run failed");
         require(nanosm_session_destroy(handle) == NANOSM_OK, "replayed C API destroy failed");
 
+        // A kernel with a signature: the host learns it (and the symbols a
+        // test may want) from the kernel, passes arguments by name, and a
+        // missing one is refused by name.
+        const std::string signed_qtx = ".warps 1\n.param ptr OUT\n.equ SPOT, 256\nhalt\n";
+        const auto info_size = nanosm_qtx_kernel_info(
+            profile.data(), profile.size(), signed_qtx.data(), signed_qtx.size(), nullptr, 0);
+        require(info_size != NANOSM_SIZE_ERROR, "C API could not describe a kernel");
+        std::vector<char> info(info_size + 1);
+        require(
+            nanosm_qtx_kernel_info(
+                profile.data(), profile.size(), signed_qtx.data(), signed_qtx.size(), info.data(), info.size()) ==
+                info_size,
+            "C API kernel info copy failed");
+        const std::string info_text = info.data();
+        require(
+            info_text.find("\"name\": \"OUT\"") != std::string::npos &&
+                info_text.find("\"type\": \"ptr\"") != std::string::npos &&
+                info_text.find("\"SPOT\": 256") != std::string::npos &&
+                info_text.find("\"warps\": 1") != std::string::npos &&
+                info_text.find("\"kind\": \"param\"") != std::string::npos &&
+                info_text.find("\"flag\": 5") != std::string::npos &&
+                info_text.find("\"bar\": 5") != std::string::npos,
+            "C API kernel info lacks the signature, a symbol, the warp count, the sections or the launch flags");
+        const std::string with_argument = R"({
+            "format": "nanosm-launch-state-v0",
+            "args": {"OUT": 4096},
+            "shmem": [],
+            "gmem": []
+        })";
+        handle = nanosm_session_create_qtx(
+            profile.data(), profile.size(), signed_qtx.data(), signed_qtx.size(),
+            with_argument.data(), with_argument.size(), 0, 0);
+        require(handle != NANOSM_INVALID_HANDLE, "C API refused a launch that gives its argument");
+        // The kernel halts at once, but the machine is done only when the
+        // launch copy has brought the argument into shared memory: global
+        // memory's latency (100 cycles) and one sector.
+        require(nanosm_session_run(handle, 100) != NANOSM_OK, "the launch copy took no time");
+        require(nanosm_session_run(handle, 1000) == NANOSM_OK, "C API run with an argument failed");
+        require(nanosm_session_destroy(handle) == NANOSM_OK, "C API destroy failed");
+        handle = nanosm_session_create_qtx(
+            profile.data(), profile.size(), signed_qtx.data(), signed_qtx.size(),
+            state.data(), state.size(), 0, 0);
+        require(
+            handle == NANOSM_INVALID_HANDLE && last_error().find("'OUT' (ptr) is missing") != std::string::npos,
+            "C API did not refuse a missing argument by name");
+
         const std::string bad_qtx = "not_an_opcode\n";
         handle = nanosm_session_create_qtx(
             profile.data(), profile.size(), bad_qtx.data(), bad_qtx.size(),

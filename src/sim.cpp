@@ -358,6 +358,12 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     check_mma_shapes(kernel_, config_);
     // Every uniform register named is one the profile's URF has.
     check_uniform_registers(kernel_, config_);
+    // The host's part (src/image.hpp bind_launch): the warp count settled
+    // against the kernel's `.warps`; the kernel's launch block (its `.data`,
+    // its `.mbar` states, the launch's arguments) written into global memory
+    // with the launch record saying where. The launch copy below brings it
+    // into shared memory from the first cycle on.
+    launch = bind_launch(kernel_, std::move(launch), config_);
     if (launch.active_warps == 0) throw SimError("active warp count is zero");
     // The SM's warp slots (core.warps): the scheduler's and the front end's
     // per-warp state exists for that many warps, whatever the RF could hold.
@@ -455,7 +461,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     trace_->set_mma_shapes(config_.mma_shapes);
     apply_image(shmem_, launch.shmem_image, "shmem");
     apply_image(gmem_, launch.gmem_image, "gmem");
-    // The mbars the launch declares (initialized by the host in the shmem
+    // The mbars the launch declares (the kernel's `.mbar` sections, and a
+    // test's own, initialized by hand in the shmem
     // image, e.g. FA's): live from launch for the sanitizer's C10 opacity,
     // like a SIMT mbar.init's (rfc12 section 11). A declaration is metadata;
     // the machine only checks that it names an mbar slot.
@@ -466,6 +473,93 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         }
     }
     sanitizer_.record_launch_mbars(launch.mbars);
+    if (launch.record.has_value()) start_launch_copy(*launch.record);
+}
+
+// The launch copy (README "Launch"; trash/launch-timed-2026-11-21.md). The
+// host wrote the kernel's launch block into global memory and the launch
+// record says where it is, where it goes in shared memory and how long it
+// is. Nothing of it is in shared memory at the first cycle. The copy is the
+// TMA's engine doing one dense load with no instruction behind it: at reset
+// the TMA's queue holds one command and the walker registers are loaded from
+// the launch record (one row of 4-byte elements from the block's global
+// address to its shared address), so there is no descriptor fetch and no
+// barrier; its sectors go through the request channel, the bus, the ingress
+// FIFO, the TMA sector register and the port-B write like any load's, and
+// share them with the kernel's own work. The warps start at the first cycle
+// too. Each launch flag starts counted once in every warp (the depbar's
+// reset value) and is decremented in every warp when the copy has landed its
+// bytes (land_launch_bytes). When the last sector has landed the command
+// leaves the queue; a kernel's own TMA commands queue behind it meanwhile.
+// Hardware beyond the TMA's: the launch record (src/image.hpp), a 17-bit
+// landed counter, one comparator per flag, and one more decrement source on
+// each flag's counter in every warp.
+void Machine::start_launch_copy(const LaunchRecord& record) {
+    if (config_.tma_queue_commands == 0) {
+        throw SimError("internal: a launch record on a profile with no TMA (check_kernel_image refuses it)");
+    }
+    if (record.bytes == 0 || record.bytes % 4 != 0 || record.global_address % 4 != 0 ||
+        record.shared_address % 4 != 0 || record.bytes / 4 > 0xffff ||
+        uint64_t{record.shared_address} + record.bytes > shmem_.size() ||
+        record.global_address > gmem_.size() || record.bytes > gmem_.size() - record.global_address) {
+        throw SimError("launch record: the launch block is not whole 4-byte words inside global and shared memory");
+    }
+    launch_record_ = record;
+    auto tma = tma_.cur();
+    TmaCommand command;
+    command.id = next_tma_command_id_++;
+    command.launch = true;
+    command.direction = TmaDirection::load;
+    command.shmem_address = record.shared_address;
+    command.state = TmaCommandState::walking;
+    command.logical_bytes = record.bytes;
+    TmaWalker walker;
+    walker.element_bytes = 4;
+    walker.tile_length = static_cast<uint16_t>(record.bytes / 4);
+    walker.tile_rows = 1;
+    walker.x_high = walker.tile_length;
+    walker.y_high = 1;
+    walker.row_global = record.global_address;
+    walker.row_shared = record.shared_address;
+    tma.walker = walker;
+    tma.frontend = command.id;
+    trace_->launch_copy_begin(0, command.id, record.global_address, record.shared_address, record.bytes);
+    tma.commands.emplace(command.id, std::move(command));
+    tma_.poke(std::move(tma));
+    auto depbar = depbar_.cur();
+    for (const auto& flag : record.flags) {
+        for (uint32_t warp = 0; warp < depbar.size(); ++warp) {
+            depbar.at(warp).at(flag.bar) = 1;
+            trace_->depbar(0, warp, flag.bar, 1);
+        }
+    }
+    depbar_.poke(std::move(depbar));
+    sanitizer_.record_launch_copy(record.shared_address, record.shared_address + record.bytes);
+}
+
+// A sector of the launch copy has reached the RAM (placements are in order:
+// one sector register, one write transaction): the block's landed bytes
+// grow, and every launch flag whose cut they now reach is decremented in
+// every warp. Issue reads the counters' Q, so a waiting instruction can
+// issue from the next cycle, when the bytes are in the RAM.
+void Machine::land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires& w) {
+    const auto found = tma.commands.find(placed.command);
+    if (found == tma.commands.end() || !found->second.launch) return;
+    auto& command = found->second;
+    const auto& record = *launch_record_;
+    const uint32_t landed = placed.shared_end - record.shared_address;
+    if (placed.shared_end <= record.shared_address + command.launch_landed || landed > record.bytes) {
+        throw SimError("internal: the launch copy's sectors did not land in order");
+    }
+    for (const auto& flag : record.flags) {
+        if (flag.bytes <= command.launch_landed || flag.bytes > landed) continue;
+        for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
+            record_depbar_completion(w, warp, flag.bar, "internal: a launch flag's counter was already zero");
+        }
+        trace_->launch_flag(cycle_ + 1, flag.bar, flag.bytes);
+    }
+    command.launch_landed = landed;
+    sanitizer_.record_launch_landed(record.shared_address + landed);
 }
 
 void Machine::set_driver_shuffle_seed(uint64_t seed) {
@@ -2257,11 +2351,17 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
     for (const auto& write : beat.writes) {
         written.emplace_back(write.address, write.address + static_cast<uint32_t>(write.bytes.size()));
     }
-    sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(run.command) + " placement", written);
+    // (The launch copy writes the kernel's `.mbar` states: that is how they
+    // get there.)
+    const auto placing = tma_.cur().commands.find(run.command);
+    if (placing == tma_.cur().commands.end() || !placing->second.launch) {
+        sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(run.command) + " placement", written);
+    }
     probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);
     trace_->shmem_grant(cycle_, ShmemService::b_write, ShmemClient::tma);
     if (request.next_round + 1 == rounds) {
-        beat.placed = PlacementEnd{run.command};
+        beat.placed = PlacementEnd{run.command,
+            run.shared_address + uint32_t{run.elements} * run.element_bytes};
         trace_->shmem_end(ShmemService::b_write, cycle_ + 1);
     }
     return beat;
@@ -3153,6 +3253,17 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
 // commits it with issue's new command.
 void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
+    // The launch copy, done last cycle, leaves the queue: it has no
+    // completion event.
+    for (auto it = tma.commands.begin(); it != tma.commands.end();) {
+        if (it->second.state != TmaCommandState::launch_done) {
+            ++it;
+            continue;
+        }
+        trace_->tma_command_end(cycle_, it->second.id, it->second.logical_bytes, it->second.useful_bytes);
+        it = tma.commands.erase(it);
+        trace_tma_depths(tma, cycle_);
+    }
     // The command whose event the register holds ends in the cycle the RMW
     // engine claims that event (the event's RMW starts: serve_rmw_start).
     // (Today the TMA never presents in that cycle:
@@ -3181,7 +3292,10 @@ void Machine::step_tma(Wires& w) {
     if (w.shmem.tma_store_fill.has_value() && w.shmem.tma_store_fill->last) {
         complete_tma_store_capture(tma, w.shmem.tma_store_fill->command);
     }
-    if (w.shmem.tma_placed.has_value()) complete_tma_load_write(tma, *w.shmem.tma_placed);
+    if (w.shmem.tma_placed.has_value()) {
+        land_launch_bytes(tma, *w.shmem.tma_placed, w);
+        complete_tma_load_write(tma, *w.shmem.tma_placed);
+    }
     if (w.ingress.tma_ticket.has_value()) {
         tma.returns.push_back(*w.ingress.tma_ticket);
         trace_tma_depths(tma, cycle_);
@@ -3571,6 +3685,12 @@ void Machine::trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle) {
 // Hardware: the command's data movement is done. Sanitizer: its box
 // ownership ends here.
 void Machine::mark_tma_data_complete(TmaCommand& command) {
+    if (command.launch) {
+        // The launch copy completes into the launch flags (land_launch_bytes),
+        // not into a barrier: no event to present.
+        command.state = TmaCommandState::launch_done;
+        return;
+    }
     command.state = TmaCommandState::data_complete;
     sanitizer_.record_tma_data_complete(command.id);
 }
@@ -4686,6 +4806,7 @@ void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
         w.dispatch.wait_slot = std::make_pair(*slot_index, slot);
         request.wait_slot = *slot_index;
     }
+    sanitizer_.check_simt_mbar_probe(site(op), request.byte_address);
     sanitizer_.record_simt_shmem_issue(site(op), SimtShmemHolder::probe, op.warp,
         std::vector<std::vector<uint32_t>>{{request.byte_address}}, 8, false);
     w.dispatch.mbar_probe = std::move(request);

@@ -45,9 +45,9 @@ build/nanosm_tests --gtest_filter=Rf.*      # one suite (or Suite.name for one t
 
 `scripts/build_nosan.ps1` takes the same `-Fast` switch for the sanitizer-OFF build.
 
-Launch demos are ordinary Python files next to their kernels. They build sparse initial memory,
-invoke qtx compilation and simulation in-process through `libnanosm_capi`, inspect the result, and
-can optionally write a Perfetto trace:
+Launch demos are ordinary Python files next to their kernels. They build the inputs in global
+memory, pass the kernel's arguments, invoke qtx compilation and simulation in-process through
+`libnanosm_capi`, check the result, and can optionally write a Perfetto trace:
 
 ```sh
 python -m nanosm kernels/pipeline.launch.py
@@ -59,6 +59,78 @@ library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `bui
 also call `write_image(path)` to produce a self-contained `.launch.json` replay artifact for
 `nanosm_run`. The Python file is the authoring interface; JSON is transport, not another source of
 truth.
+
+**Launch.** A qtx file is self-contained: it declares everything a launch needs to know beside its
+code, and the host knows only the kernel's signature. (v0.1, a first working version: the copy and
+the flags below are expected to change; trash/launch-timed-2026-11-21.md.)
+
+```
+.warps  6                          ; how many warps the kernel is written for (optional)
+.param  ptr   OUT                  ; the signature, in order:
+.param  u32   COUNT                ;   ptr  8 bytes, a 64-bit global byte address
+.param  desc  QDESC                ;   u32, f32  4 bytes;  desc  64 bytes, a TMA descriptor
+.mbar   S_READY, expect 1          ; a barrier's initial state: phase 0, 1 arrival expected (8 bytes)
+.data   CONSTANTS, f32 0.180336878, -inf     ; initialized words (f32 or u32)
+```
+
+- **The `.param` lines are the signature.** The launch passes one argument per parameter, by name
+  (`Launch(kernel=..., profile=..., args={"OUT": 65536, "QDESC": tma_desc(...)})`) or in the
+  signature's order; a missing, unknown or wrongly typed argument is refused by name. Arguments and
+  global memory are all the host gives: it needs no address inside shared memory.
+- **The launch block.** Every `.param`, `.mbar` and `.data` line is a named section, and together,
+  in the order they are declared, they are the launch block. Its place in shared memory is one
+  fixed rule from the sections and the profile: the sections sit in declaration order, each aligned
+  to its own size (`ptr` 8, `u32` / `f32` 4, `desc` 64, an mbar 8, data 4); the block starts at the
+  top of shared memory (`shmem.bytes`) minus its bytes, rounded down to a multiple of 64. A section's
+  name is its address, an immediate: `umov ur1, OUT` then `lds.uni r4, [ur1]`, or the name as the
+  descriptor operand of `tma.load` / `tma.store`. Two barriers declared one after the other are 8
+  bytes apart. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
+  register, so a kernel reads the low word and the launch refuses a pointer that does not fit 32
+  bits (a second address register is planned).
+- **Nothing of it is in shared memory at the first cycle.** The host writes the block's bytes (the
+  arguments, the barrier states, the data) into global memory, by default at its top
+  (`Launch(..., block_address=...)` chooses), and writes the launch record: host-written registers
+  that are in place before the first cycle, like the warp count. The record holds the block's global
+  address, its shared address, its size and the launch flags' cuts (174 bits at the canonical
+  profile: src/image.hpp).
+- **The launch copy.** From the first cycle the SM copies the block from global memory into shared
+  memory, and the warps start at the first cycle too. The copy is the TMA's engine doing one dense
+  load with no instruction behind it: its walker is loaded from the launch record, so it fetches no
+  descriptor and completes into no barrier; its sectors pay global memory's latency (100 cycles),
+  cross the bus at its rate (8 cycles per 32-byte sector) and share the bus, the TMA's queue (one
+  of its four commands) and the port-B write with the kernel's own work. The kernel ends only after
+  the copy has. A profile with no TMA cannot run a kernel that has sections.
+- **Launch flags** (`core.launch_flags`, 4; 0..6). A launch flag is one of a warp's six depbars, taken
+  from sb5 downward. It starts counted once in every warp, and is decremented in every warp when the
+  copy has landed the first N bytes of the block, N being that flag's cut. An instruction waits on a
+  flag through its ordinary wait mask, so nothing is new at issue and no warp signals another.
+  **Declared first arrives first:** the sections land in declaration order. qtxc chooses the cuts
+  (the first policy: one flag for each of the first `launch_flags` - 1 sections, the last flag for
+  all the rest; assembly and hex carry them as `.flag sbN, BYTES`) and makes every instruction
+  whose text names a section wait on that section's flag, unless the straight-line code before it
+  already has; code that names no section runs meanwhile. A branch, a `halt` or qtx's `wait` do not
+  wait for launch flags. A wait is on the NAMING instruction, not on the access: a kernel that
+  reaches a section through arithmetic on another one's address (a barrier pair, `S_READY0 + 8 t`)
+  is covered only if both are behind the same flag, and the sanitizer PANICs on any read or write
+  of block bytes that have not landed (an `lds`, an `sts`, an mbar operation, a TMA's descriptor or
+  buffer). The summary's `launch:` line says when each flag cleared (`sb5:64@118`: depbar, block
+  bytes, cycle).
+- **`core.launch_flags` 0** means no copy: the block is in shared memory before the first cycle,
+  untimed, and nothing waits. It is the comparison case, not the machine: a kernel there gets its
+  launch bytes for free.
+- **A barrier is initialized by its `.mbar` line** and not by `mbar.init` at run time: the warps
+  start together and nothing would hold the others until one had initialized it.
+- **`.warps N`** is optional; a kernel that works at any count leaves it out and the launch says
+  (`warps=`). If both say, they must agree.
+- **Looking inside is separate from launching.** `nanosm_qtx_kernel_info` (C API) returns the
+  kernel's signature, its sections with their addresses and flags, and its symbols (`.equ` names,
+  section addresses) as JSON; Python has `launch.signature`, `launch.sections` and
+  `launch.symbol("PBUF0")`. A test that checks or poisons a tile inside shared memory uses those
+  names with `result.shmem(...)` / `launch.shmem.write(...)` (bytes written before the first cycle:
+  a debugger's access, not part of a launch). Assembly carries the same directives; hex carries
+  them with each section's address (kernel load checks it against the rule); neither hex nor a
+  saved image carries symbols. The launch copy counts in the `tma:` and `gmem:` summary lines like
+  any load; `nanosm.launch_copy_counters` adds its part to a script's own expected counts.
 
 The public boundary is [src/capi.h](src/capi.h): fixed-width C values, integer session handles,
 pointer-plus-length inputs, and caller-owned output buffers. It performs no file I/O and exposes no
@@ -269,7 +341,11 @@ double-precision attention. Older profiles must name the new model and regenerat
 their fingerprinted artifacts; serial scalar-FMA MMA arithmetic is no longer supported.
 
 A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,
-active warp count, and ordered sparse shmem/gmem byte segments. Bytes and 64-bit words are written
+what the kernel declares (`warps`, its `sections` in order, its launch `flags`), the launch's
+arguments (`args`), its warp count and its launch block's global address (`block_address`) when it
+gives them, and ordered sparse shmem/gmem byte segments (shmem segments are a test's own writes,
+in place before the first cycle; the launch block is not among them: the machine's loader writes
+it into global memory from the sections and the arguments). Bytes and 64-bit words are written
 as hexadecimal strings, while addresses are JSON integers. Segments are applied in array order and
 later overlapping bytes win. The simulator runner does not know which workload authored the image.
 
@@ -321,10 +397,10 @@ otherwise) and keeps its 64-byte minimum (its low six bits are not wired): with 
 command can land at any row, with 64-byte rows too, but with 32-byte rows only at every second row
 and with 16-byte rows only at every fourth.
 
-`kernels/pipeline_tma.launch.py` authors one descriptor per tensor with `launch.shmem.tma_desc`
-(its keywords: `base`, `dimensions`, `strides`, `tile=(length, rows)`, `element_bytes`,
-`row_dimension`, `layout="dense" | "swizzle64"`, `transposed`), runs the double-buffered A/B
-pipeline, validates output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
+`kernels/pipeline_tma.launch.py` builds one descriptor per tensor with `tma_desc(...)` (its
+keywords: `base`, `dimensions`, `strides`, `tile=(length, rows)`, `element_bytes`,
+`row_dimension`, `layout="dense" | "swizzle64"`, `transposed`) and passes them as the kernel's two
+`desc` arguments, runs the double-buffered A/B pipeline, validates output, and with `--trace PATH` writes a Perfetto trace (no launch writes a trace unless asked, so
 overlapping runs never share an output file).
 The TMA trace tracks command lifetimes, command/sector-credit/return depth, port-A traffic, shared
 bus ownership, and logical/useful/physical byte totals.

@@ -1,12 +1,18 @@
 #include "image.hpp"
 
 #include "compiler.hpp"
+#include "mbar.hpp"
 #include "profile.hpp"
+#include "tma.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <optional>
@@ -121,11 +127,148 @@ std::optional<uint32_t> unsigned_32(const json& value) {
     return static_cast<uint32_t>(wide);
 }
 
+// Optional: a launch that does not say takes the kernel's `.warps`
+// (bind_launch); 0 is that absence, never written.
 uint32_t load_active_warps(const json& document, const std::string& format) {
+    if (!document.contains("active_warps")) return 0;
     const auto warps = unsigned_32(document.at("active_warps"));
     if (!warps.has_value()) throw SimError(format + ": active warp count is not an unsigned 32-bit integer");
     if (*warps == 0) throw SimError(format + ": active warp count is zero");
     return *warps;
+}
+
+void emit_active_warps(json& document, uint32_t warps) {
+    if (warps != 0) document["active_warps"] = warps;
+}
+
+// "args": {"NAME": value}: an unsigned integer, a number, or the hex text of
+// bytes (a descriptor). Emitted only when there are arguments.
+void emit_args(json& document, const std::vector<LaunchArgument>& args) {
+    if (args.empty()) return;
+    auto object = json::object();
+    for (const auto& arg : args) {
+        if (object.contains(arg.name)) throw SimError("launch: argument '" + arg.name + "' is given twice");
+        if (const auto* integer = std::get_if<uint64_t>(&arg.value)) object[arg.name] = *integer;
+        else if (const auto* number = std::get_if<double>(&arg.value)) {
+            if (!std::isfinite(*number)) {
+                throw SimError("launch: argument '" + arg.name + "' is not a finite number");
+            }
+            object[arg.name] = *number;
+        } else object[arg.name] = encode_bytes(std::get<std::vector<uint8_t>>(arg.value));
+    }
+    document["args"] = std::move(object);
+}
+
+std::vector<LaunchArgument> load_args(const json& document) {
+    if (!document.contains("args")) return {};
+    const auto& value = document.at("args");
+    if (!value.is_object()) throw SimError("launch: args is not an object of name: value");
+    std::vector<LaunchArgument> args;
+    for (const auto& [name, item] : value.items()) {
+        LaunchArgument arg;
+        arg.name = name;
+        if (item.is_number_unsigned()) arg.value = item.get<uint64_t>();
+        else if (item.is_number()) arg.value = item.get<double>();
+        else if (item.is_string()) arg.value = decode_bytes(item.get<std::string>(), "args." + name);
+        else {
+            throw SimError("launch: argument '" + name +
+                "' is not an unsigned integer, a number or the hex text of bytes");
+        }
+        args.push_back(std::move(arg));
+    }
+    return args;
+}
+
+// What the kernel declares beside its words (src/isa.hpp Kernel), in a saved
+// launch image; each key is written only when the kernel has it.
+void emit_kernel_declarations(json& kernel_json, const Kernel& kernel) {
+    if (kernel.warps != 0) kernel_json["warps"] = kernel.warps;
+    if (!kernel.sections.empty()) {
+        auto sections = json::array();
+        for (const auto& section : kernel.sections) {
+            json item = {{"name", section.name}, {"address", section.address}};
+            switch (section.kind) {
+            case SectionKind::param:
+                item["kind"] = "param";
+                item["type"] = param_type_name(section.type);
+                break;
+            case SectionKind::mbar:
+                item["kind"] = "mbar";
+                item["expect"] = section.expected;
+                break;
+            case SectionKind::data:
+                item["kind"] = "data";
+                item["bytes"] = encode_bytes(section.bytes);
+                break;
+            }
+            sections.push_back(std::move(item));
+        }
+        kernel_json["sections"] = std::move(sections);
+    }
+    if (!kernel.flags.empty()) {
+        auto flags = json::array();
+        for (const auto& flag : kernel.flags) flags.push_back({{"bar", flag.bar}, {"bytes", flag.bytes}});
+        kernel_json["flags"] = std::move(flags);
+    }
+}
+
+uint32_t declared_u32(const json& item, const char* key, const std::string& field) {
+    const auto value = unsigned_32(item.at(key));
+    if (!value.has_value()) throw SimError("launch image: " + field + "." + key + " is not an unsigned 32-bit integer");
+    return *value;
+}
+
+void load_kernel_declarations(const json& kernel_json, Kernel& kernel) {
+    if (kernel_json.contains("warps")) kernel.warps = declared_u32(kernel_json, "warps", "kernel");
+    if (kernel_json.contains("params") || kernel_json.contains("data") || kernel_json.contains("mbars")) {
+        throw SimError("launch image: kernel.params / data / mbars are kernel.sections since 2026-11-21 "
+            "(the launch block); rebuild the image");
+    }
+    if (kernel_json.contains("sections")) {
+        for (const auto& item : kernel_json.at("sections")) {
+            KernelSection section;
+            section.name = item.at("name").get<std::string>();
+            const auto field = "kernel.sections." + section.name;
+            section.address = declared_u32(item, "address", field);
+            const auto kind = item.at("kind").get<std::string>();
+            if (kind == "param") {
+                section.kind = SectionKind::param;
+                const auto type = item.at("type").get<std::string>();
+                if (type == "ptr") section.type = ParamType::ptr;
+                else if (type == "u32") section.type = ParamType::u32;
+                else if (type == "f32") section.type = ParamType::f32;
+                else if (type == "desc") section.type = ParamType::desc;
+                else throw SimError("launch image: kernel parameter '" + section.name + "' has unknown type '" + type + "'");
+            } else if (kind == "mbar") {
+                section.kind = SectionKind::mbar;
+                const auto expected = declared_u32(item, "expect", field);
+                if (expected == 0 || expected > mbar_encoding::max_count) {
+                    throw SimError("launch image: " + field + ": expected count must be 1..32767");
+                }
+                section.expected = static_cast<uint16_t>(expected);
+            } else if (kind == "data") {
+                section.kind = SectionKind::data;
+                section.bytes = decode_bytes(item.at("bytes").get<std::string>(), field + ".bytes");
+            } else {
+                throw SimError("launch image: " + field + " has unknown kind '" + kind + "'");
+            }
+            kernel.sections.push_back(std::move(section));
+        }
+    }
+    if (kernel_json.contains("flags")) {
+        for (const auto& item : kernel_json.at("flags")) {
+            LaunchFlag flag;
+            const auto bar = declared_u32(item, "bar", "kernel.flags");
+            if (bar >= 6) throw SimError("launch image: kernel.flags: bar must be 0..5");
+            flag.bar = static_cast<uint8_t>(bar);
+            flag.bytes = declared_u32(item, "bytes", "kernel.flags");
+            kernel.flags.push_back(flag);
+        }
+    }
+}
+
+void append_le(std::vector<uint8_t>& bytes, uint64_t value, unsigned count) {
+    for (unsigned index = 0; index < count; ++index) bytes.push_back(static_cast<uint8_t>(value >> (8 * index)));
 }
 
 // The optional declared-mbar list (Launch::mbars): emitted only when there is
@@ -149,17 +292,218 @@ std::vector<uint32_t> load_mbars(const json& document) {
     return mbars;
 }
 
+// Where the host puts the launch block in global memory (Launch::
+// block_address); written only when the launch chose one.
+void emit_block_address(json& document, const std::optional<uint64_t>& address) {
+    if (address.has_value()) document["block_address"] = *address;
+}
+
+std::optional<uint64_t> load_block_address(const json& document) {
+    if (!document.contains("block_address")) return std::nullopt;
+    const auto& value = document.at("block_address");
+    if (!value.is_number_unsigned()) throw SimError("launch: block_address is not an unsigned integer");
+    return value.get<uint64_t>();
+}
+
 } // namespace
 
+Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& profile) {
+    check_kernel_image(kernel, profile);
+    if (launch.active_warps == 0) {
+        if (kernel.warps == 0) {
+            throw SimError("the launch gives no warp count and the kernel declares none (.warps)");
+        }
+        launch.active_warps = kernel.warps;
+    } else if (kernel.warps != 0 && launch.active_warps != kernel.warps) {
+        throw SimError("the launch asks for " + std::to_string(launch.active_warps) +
+            " warps; the kernel is written for " + std::to_string(kernel.warps) + " (.warps)");
+    }
+
+    std::string signature;
+    for (const auto& section : kernel.sections) {
+        if (section.kind != SectionKind::param) continue;
+        signature += (signature.empty() ? "" : ", ") + std::string(param_type_name(section.type)) + ' ' + section.name;
+    }
+    for (std::size_t index = 0; index < launch.args.size(); ++index) {
+        const auto& name = launch.args[index].name;
+        for (std::size_t other = 0; other < index; ++other) {
+            if (launch.args[other].name == name) throw SimError("launch argument '" + name + "' is given twice");
+        }
+        const bool known = std::any_of(kernel.sections.begin(), kernel.sections.end(),
+            [&](const KernelSection& section) { return section.kind == SectionKind::param && section.name == name; });
+        if (!known) {
+            throw SimError("launch argument '" + name + "' names no parameter of the kernel (" +
+                (signature.empty() ? "it declares none" : "its signature: " + signature) + ")");
+        }
+    }
+    launch.record.reset();
+    if (kernel.sections.empty()) {
+        launch.args.clear();
+        return launch;
+    }
+
+    // The launch block's bytes, section by section (check_kernel_image has
+    // settled that it fits and where each section sits).
+    const auto block = *launch_block(kernel.sections, profile.shmem_bytes);
+    std::vector<uint8_t> bytes(block.bytes, 0);
+    std::vector<uint32_t> mbars;
+    for (const auto& section : kernel.sections) {
+        std::vector<uint8_t> piece;
+        switch (section.kind) {
+        case SectionKind::data:
+            piece = section.bytes;
+            break;
+        case SectionKind::mbar: {
+            MbarState state;
+            state.valid = true;
+            state.expected = section.expected;
+            state.remaining = section.expected;
+            append_le(piece, encode_mbar_state(state), 8);
+            mbars.push_back(section.address);
+            break;
+        }
+        case SectionKind::param: {
+            const auto found = std::find_if(launch.args.begin(), launch.args.end(),
+                [&](const LaunchArgument& arg) { return arg.name == section.name; });
+            const auto what = "launch argument '" + section.name + "' (" + param_type_name(section.type) + ")";
+            if (found == launch.args.end()) throw SimError(what + " is missing");
+            const auto* integer = std::get_if<uint64_t>(&found->value);
+            const auto* number = std::get_if<double>(&found->value);
+            const auto* given = std::get_if<std::vector<uint8_t>>(&found->value);
+            switch (section.type) {
+            case ParamType::ptr:
+                if (integer == nullptr) throw SimError(what + " must be an unsigned integer, a global byte address");
+                // The parameter is 8 bytes; ldg and stg take their whole address
+                // from one 32-bit register until they take a second one.
+                if (*integer > 0xffffffffull) {
+                    throw SimError(what + " = " + std::to_string(*integer) +
+                        " does not fit 32 bits: ldg / stg take their address from one 32-bit register for now");
+                }
+                append_le(piece, *integer, 8);
+                break;
+            case ParamType::u32:
+                if (integer == nullptr || *integer > 0xffffffffull) {
+                    throw SimError(what + " must be an unsigned integer that fits 32 bits");
+                }
+                append_le(piece, *integer, 4);
+                break;
+            case ParamType::f32: {
+                if (given != nullptr) throw SimError(what + " must be a number");
+                const float value = integer != nullptr ? static_cast<float>(*integer) : static_cast<float>(*number);
+                uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                append_le(piece, bits, 4);
+                break;
+            }
+            case ParamType::desc:
+                if (given == nullptr || given->size() != tma_descriptor_bytes) {
+                    throw SimError(what + " must be a TMA descriptor, 64 bytes");
+                }
+                piece = *given;
+                break;
+            }
+            break;
+        }
+        }
+        std::copy(piece.begin(), piece.end(), bytes.begin() + (section.address - block.start));
+    }
+    launch.args.clear();
+    mbars.insert(mbars.end(), launch.mbars.begin(), launch.mbars.end());
+    launch.mbars = std::move(mbars);
+
+    if (profile.core_launch_flags == 0) {
+        // No launch copy on this profile: the block is in shared memory
+        // before the first cycle, ahead of the launch's own writes.
+        std::vector<ImageSegment> shmem;
+        shmem.push_back({block.start, std::move(bytes)});
+        shmem.insert(shmem.end(),
+            std::make_move_iterator(launch.shmem_image.begin()), std::make_move_iterator(launch.shmem_image.end()));
+        launch.shmem_image = std::move(shmem);
+        return launch;
+    }
+
+    // The host writes the block into global memory and says where in the
+    // launch record; the machine copies it from the first cycle on.
+    const uint64_t sector = profile.gmem_sector_bytes;
+    if (profile.gmem_bytes < block.bytes) {
+        throw SimError("the kernel's launch block (" + std::to_string(block.bytes) + " bytes) does not fit global memory");
+    }
+    const uint64_t address = launch.block_address.has_value()
+        ? *launch.block_address : (profile.gmem_bytes - block.bytes) / sector * sector;
+    if (address % 4 != 0 || address > profile.gmem_bytes - block.bytes) {
+        throw SimError("the launch block's global address " + std::to_string(address) + " must be a multiple of 4 with " +
+            std::to_string(block.bytes) + " bytes inside global memory (" + std::to_string(profile.gmem_bytes) + ")");
+    }
+    for (const auto& segment : launch.gmem_image) {
+        if (segment.address < address + block.bytes && address < segment.address + segment.bytes.size()) {
+            throw SimError("the launch block (global " + std::to_string(address) + ".." +
+                std::to_string(address + block.bytes) + ") overlaps the launch's own global memory at " +
+                std::to_string(segment.address) + "; give the launch another block address");
+        }
+    }
+    launch.gmem_image.push_back({address, std::move(bytes)});
+    LaunchRecord record;
+    record.global_address = address;
+    record.shared_address = block.start;
+    record.bytes = block.bytes;
+    record.flags = kernel.flags;
+    launch.record = std::move(record);
+    return launch;
+}
+
+std::string emit_kernel_info(const Kernel& kernel) {
+    auto params = json::array();
+    auto sections = json::array();
+    // The block starts at its first section and ends after its last.
+    const uint32_t start = kernel.sections.empty() ? 0 : kernel.sections.front().address;
+    const uint32_t end = kernel.sections.empty() ? 0
+        : kernel.sections.back().address + section_bytes(kernel.sections.back());
+    for (const auto& section : kernel.sections) {
+        if (section.kind == SectionKind::param) {
+            params.push_back({
+                {"name", section.name},
+                {"type", param_type_name(section.type)},
+                {"address", section.address},
+                {"bytes", param_bytes(section.type)},
+            });
+        }
+        json item = {
+            {"name", section.name},
+            {"kind", section.kind == SectionKind::param ? "param" : section.kind == SectionKind::mbar ? "mbar" : "data"},
+            {"address", section.address},
+            {"bytes", section_bytes(section)},
+        };
+        if (const auto bar = launch_flag_covering(kernel.flags, section.address - start + section_bytes(section));
+            bar.has_value()) {
+            item["flag"] = *bar;
+        }
+        sections.push_back(std::move(item));
+    }
+    auto flags = json::array();
+    for (const auto& flag : kernel.flags) flags.push_back({{"bar", flag.bar}, {"bytes", flag.bytes}});
+    auto symbols = json::object();
+    for (const auto& [name, value] : kernel.symbols) symbols[name] = value;
+    json document = {
+        {"warps", kernel.warps},
+        {"params", std::move(params)},
+        {"sections", std::move(sections)},
+        {"block", {{"address", start}, {"bytes", (end - start + 3) / 4 * 4}}},
+        {"flags", std::move(flags)},
+        {"symbols", std::move(symbols)},
+    };
+    return document.dump(2) + '\n';
+}
+
 std::string emit_launch_state(const Launch& launch) {
-    if (launch.active_warps == 0) throw SimError("launch state: active warp count is zero");
     json document = {
         {"format", "nanosm-launch-state-v0"},
-        {"active_warps", launch.active_warps},
         {"shmem", emit_segments(launch.shmem_image)},
         {"gmem", emit_segments(launch.gmem_image)},
     };
+    emit_active_warps(document, launch.active_warps);
+    emit_args(document, launch.args);
     emit_mbars(document, launch.mbars);
+    emit_block_address(document, launch.block_address);
     return document.dump(2) + '\n';
 }
 
@@ -174,6 +518,8 @@ Launch load_launch_state(std::string_view source) {
         launch.shmem_image = load_segments(document.at("shmem"), "shmem");
         launch.gmem_image = load_segments(document.at("gmem"), "gmem");
         launch.mbars = load_mbars(document);
+        launch.args = load_args(document);
+        launch.block_address = load_block_address(document);
         return launch;
     } catch (const SimError&) {
         throw;
@@ -188,7 +534,6 @@ Launch load_launch_state(std::string_view source) {
 
 std::string emit_launch_image(const LaunchImage& image) {
     validate_kernel(image.kernel);
-    if (image.launch.active_warps == 0) throw SimError("launch image: active warp count is zero");
     auto words = json::array();
     for (const auto word : image.kernel.words) words.push_back(hex_u64(word));
     json document = {
@@ -201,11 +546,14 @@ std::string emit_launch_image(const LaunchImage& image) {
             {"register_count", image.kernel.register_count},
             {"words", std::move(words)},
         }},
-        {"active_warps", image.launch.active_warps},
         {"shmem", emit_segments(image.launch.shmem_image)},
         {"gmem", emit_segments(image.launch.gmem_image)},
     };
+    emit_kernel_declarations(document["kernel"], image.kernel);
+    emit_active_warps(document, image.launch.active_warps);
+    emit_args(document, image.launch.args);
     emit_mbars(document, image.launch.mbars);
+    emit_block_address(document, image.launch.block_address);
     return document.dump(2) + '\n';
 }
 
@@ -241,10 +589,13 @@ LaunchImage load_launch_image(std::string_view source) {
                 words.at(index).get<std::string>(),
                 "kernel.words[" + std::to_string(index) + "]"));
         }
+        load_kernel_declarations(kernel, image.kernel);
         image.launch.active_warps = load_active_warps(document, "launch image");
+        image.launch.args = load_args(document);
         image.launch.shmem_image = load_segments(document.at("shmem"), "shmem");
         image.launch.gmem_image = load_segments(document.at("gmem"), "gmem");
         image.launch.mbars = load_mbars(document);
+        image.launch.block_address = load_block_address(document);
         validate_kernel(image.kernel);
         return image;
     } catch (const SimError&) {

@@ -11,8 +11,8 @@
 ; the even lanes': three entries.
 ; Launch: kernels/diverge.launch.py.
 
-.equ IN, 0
-.equ OUT, 1024
+.param ptr IN                 ; 16 x warps inputs (u32)
+.param ptr OUT                ; as many step counts
 
         usread ur0, WARP_ID
         ushli  ur0, ur0, 6            ; 64 bytes per warp
@@ -20,7 +20,13 @@
         sread  r2, LANE_ID
         shli   r2, r2, 2
         add    r1, r1, r2             ; this lane's byte offset
-        ldg    r3, [r1 + IN]          ; n
+        umov   ur1, IN
+        umov   ur2, OUT
+        lds.uni r8, [ur1]             ; the pointers' low words (an ldg / stg
+        lds.uni r9, [ur2]             ; address is one 32-bit register)
+        add    r10, r1, r8            ; this lane's input address
+        add    r12, r1, r9            ; and its output address
+        ldg    r3, [r10]              ; n
         mov    r5, 0                  ; steps
         ssy    DONE                   ; (every lane, DONE)
         bra    TEST                   ; a lane that starts at 1 never steps
@@ -38,5 +44,5 @@ NEXT:   addi   r5, r5, 1
 TEST:   setp.ne.u32 p0, r3, 1         ; lanes not yet at 1 go round again
         @p0 bra STEP                  ; (staying lanes, STEP); the leavers fall through
         sync                          ; leavers switch to the stayers; the last pops (every lane, DONE)
-DONE:   stg    [r1 + OUT], r5         ; every lane, once
+DONE:   stg    [r12], r5              ; every lane, once
         halt

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <optional>
 #include <stdint.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nanosm {
@@ -225,14 +227,160 @@ struct Instruction {
     std::string text;
 };
 
-// A kernel is its words and the profile they were built for. Nothing rides
-// beside the words: an accumulator is a tmem pointer in a uniform register
-// (src/layout.hpp; the accumulator table of a5d0652 is gone).
+// A kernel's signature (README "Launch"): the `.param` lines of its qtx, in
+// order. The launch passes one argument per parameter; nothing else crosses
+// between the host and the kernel.
+//   ptr   8 bytes: a 64-bit global byte address
+//   u32   4 bytes
+//   f32   4 bytes
+//   desc  64 bytes: a TMA descriptor (src/tma.hpp), built by the host
+enum class ParamType : uint8_t { ptr, u32, f32, desc };
+
+inline uint32_t param_bytes(ParamType type) {
+    switch (type) {
+        case ParamType::ptr: return 8;
+        case ParamType::u32: return 4;
+        case ParamType::f32: return 4;
+        case ParamType::desc: return 64;
+    }
+    return 0;
+}
+
+inline const char* param_type_name(ParamType type) {
+    switch (type) {
+        case ParamType::ptr: return "ptr";
+        case ParamType::u32: return "u32";
+        case ParamType::f32: return "f32";
+        case ParamType::desc: return "desc";
+    }
+    return "?";
+}
+
+// One named piece of what a kernel declares in shared memory beside its code
+// (README "Launch"), in the order the qtx declares it:
+//   .param TYPE NAME           an argument of the launch (the signature)
+//   .mbar  NAME, expect N      a barrier's initial state: phase 0, N arrivals
+//                              expected, none seen (8 bytes)
+//   .data  NAME, f32|u32 ...   initialized words
+// Together, in that order, they are the LAUNCH BLOCK (launch_block below):
+// the bytes the launch copies from global memory into shared memory, the
+// first declared arriving first.
+enum class SectionKind : uint8_t { param, mbar, data };
+
+struct KernelSection {
+    std::string name;
+    SectionKind kind = SectionKind::param;
+    ParamType type = ParamType::ptr;  // param: its type
+    uint16_t expected = 0;            // mbar: arrivals expected
+    std::vector<uint8_t> bytes;       // data: its words, little-endian
+    uint32_t address = 0;             // where it sits in shared memory (launch_block)
+};
+
+inline uint32_t section_bytes(const KernelSection& section) {
+    switch (section.kind) {
+        case SectionKind::param: return param_bytes(section.type);
+        case SectionKind::mbar: return 8;
+        case SectionKind::data: return static_cast<uint32_t>(section.bytes.size());
+    }
+    return 0;
+}
+
+// ptr 8, u32 / f32 4, desc 64, an mbar 8, data 4.
+inline uint32_t section_alignment(const KernelSection& section) {
+    switch (section.kind) {
+        case SectionKind::param: return param_bytes(section.type);
+        case SectionKind::mbar: return 8;
+        case SectionKind::data: return 4;
+    }
+    return 4;
+}
+
+// The launch block's place, one fixed rule from the sections and the size of
+// shared memory: the sections sit in declaration order, each aligned to its
+// own alignment; the block starts at the top of shared memory minus its
+// bytes, rounded down to a multiple of 64. `addresses` has one per section;
+// `bytes` is the block's size (a multiple of 4; 0 with no sections). nullopt
+// when it does not fit.
+struct LaunchBlock {
+    uint32_t start = 0;
+    uint32_t bytes = 0;
+    std::vector<uint32_t> addresses;
+};
+
+inline std::optional<LaunchBlock> launch_block(
+    const std::vector<KernelSection>& sections, uint32_t shmem_bytes) {
+    LaunchBlock block;
+    uint64_t total = 0;
+    for (const auto& section : sections) {
+        const uint64_t alignment = section_alignment(section);
+        total = (total + alignment - 1) / alignment * alignment;
+        block.addresses.push_back(static_cast<uint32_t>(total));
+        total += section_bytes(section);
+    }
+    total = (total + 3) / 4 * 4;
+    if (total > shmem_bytes) return std::nullopt;
+    block.bytes = static_cast<uint32_t>(total);
+    block.start = (shmem_bytes - block.bytes) / 64 * 64;
+    for (auto& address : block.addresses) address += block.start;
+    return block;
+}
+
+// A launch flag (README "Launch"): depbar `bar` starts counted once in every
+// warp and is decremented in every warp when the first `bytes` bytes of the
+// launch block have landed in shared memory. A kernel's flags are written by
+// qtxc (the policy: default_launch_flags) and travel to the launch record;
+// the machine only applies them.
+struct LaunchFlag {
+    uint8_t bar = 0;
+    uint32_t bytes = 0;
+};
+
+// The first policy for the cuts: with `count` flags (the profile's
+// core.launch_flags), one flag for each of the first count - 1 sections and
+// the last flag for all the rest; fewer sections than flags leaves flags
+// unused. Flags take depbars from sb5 downward. `block` is launch_block's.
+inline std::vector<LaunchFlag> default_launch_flags(
+    const std::vector<KernelSection>& sections, const LaunchBlock& block, uint32_t count) {
+    std::vector<LaunchFlag> flags;
+    if (count == 0 || sections.empty()) return flags;
+    const auto used = std::min<std::size_t>(count, sections.size());
+    for (std::size_t index = 0; index < used; ++index) {
+        const bool last = index + 1 == used;
+        const uint32_t cut = last ? block.bytes
+            : block.addresses[index] - block.start + section_bytes(sections[index]);
+        flags.push_back({static_cast<uint8_t>(5 - index), cut});
+    }
+    return flags;
+}
+
+// The flag a byte range of the block ending at offset `end` (from the block's
+// start) waits for: the first one, in cut order, whose cut covers it.
+inline std::optional<uint8_t> launch_flag_covering(const std::vector<LaunchFlag>& flags, uint32_t end) {
+    std::optional<LaunchFlag> best;
+    for (const auto& flag : flags) {
+        if (flag.bytes >= end && (!best.has_value() || flag.bytes < best->bytes)) best = flag;
+    }
+    if (!best.has_value()) return std::nullopt;
+    return best->bar;
+}
+
+// A kernel is its words, the profile they were built for, and what its qtx
+// declares beside the code: how many warps it is written for (0: it does not
+// say), its sections (the signature and its initialized shared memory: the
+// launch block) and the launch flags over them. An accumulator is a tmem
+// pointer in a uniform register (src/layout.hpp), not part of this.
+// `symbols` are the qtx's names (.equ constants and section addresses) for
+// a debugger or a test that looks inside; a hex kernel and a saved launch
+// image do not carry them.
 struct Kernel {
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
     uint16_t register_count = 0;
     std::vector<uint64_t> words;
+    uint32_t warps = 0;
+    std::vector<KernelSection> sections;
+    std::vector<LaunchFlag> flags;
+    std::vector<std::pair<std::string, int32_t>> symbols;
 };
 
 namespace encoding {

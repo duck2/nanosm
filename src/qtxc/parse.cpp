@@ -425,6 +425,68 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     std::string raw;
     uint32_t line_number = 0;
 
+    // The sections first (`.param`, `.mbar`, `.data` lines, README "Launch"):
+    // a section's address depends on the whole list (src/isa.hpp
+    // launch_block), and its name is a constant, the address, from the first
+    // line on. This pass takes each section's name, kind and size; the lines
+    // are read in full below, in order, where their values may use `.equ`
+    // names. A `.data` line's size is its value count.
+    std::unordered_map<std::string, uint8_t> section_flags; // qtx: name -> its launch flag's depbar bit
+    std::size_t next_section = 0;
+    {
+        std::istringstream scan{std::string(source)};
+        uint32_t scan_line = 0;
+        uint32_t last_section_line = 0;
+        while (std::getline(scan, raw)) {
+            ++scan_line;
+            const auto clean = trim(raw.substr(0, raw.find(';')));
+            KernelSection section;
+            if (is_directive(clean, ".param")) {
+                section = parse_param_directive(trim(clean.substr(6)), scan_line, false);
+            } else if (is_directive(clean, ".mbar")) {
+                // "expect N" is read below, where N may be an .equ name.
+                const auto args = operands(trim(clean.substr(5)));
+                section.kind = SectionKind::mbar;
+                section.name = section_name(args.empty() ? std::string() : args[0], scan_line, "mbar");
+            } else if (is_directive(clean, ".data")) {
+                const auto args = operands(trim(clean.substr(5)));
+                section.kind = SectionKind::data;
+                section.name = section_name(args.empty() ? std::string() : args[0], scan_line, "data");
+                section.bytes.assign(args.size() < 2 ? 0 : 4 * (args.size() - 1), 0);
+            } else {
+                continue;
+            }
+            for (const auto& earlier : program.sections) {
+                if (earlier.name == section.name) {
+                    throw SimError("line " + std::to_string(scan_line) + ": duplicate symbol '" + section.name + "'");
+                }
+            }
+            program.sections.push_back(std::move(section));
+            last_section_line = scan_line;
+        }
+        const auto block = launch_block(program.sections, profile.shmem_bytes);
+        if (!block.has_value()) {
+            throw SimError("line " + std::to_string(last_section_line) +
+                ": the launch block (.param, .mbar, .data) does not fit shared memory (" +
+                std::to_string(profile.shmem_bytes) + " bytes)");
+        }
+        for (std::size_t index = 0; index < program.sections.size(); ++index) {
+            program.sections[index].address = block->addresses[index];
+            constants[program.sections[index].name] = static_cast<int32_t>(block->addresses[index]);
+        }
+        // qtx: the launch flags are the compiler's (the policy: src/isa.hpp
+        // default_launch_flags); assembly states its own (`.flag`).
+        if (!allow_control) {
+            program.flags = default_launch_flags(program.sections, *block, profile.core_launch_flags);
+            for (const auto& section : program.sections) {
+                const auto end = section.address - block->start + section_bytes(section);
+                if (const auto bar = launch_flag_covering(program.flags, end); bar.has_value()) {
+                    section_flags[section.name] = static_cast<uint8_t>(1u << *bar);
+                }
+            }
+        }
+    }
+
     while (std::getline(input, raw)) {
         ++line_number;
         const auto comment = raw.find(';');
@@ -473,6 +535,41 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": bad profile fingerprint");
             }
             program.profile_name = args[0];
+            continue;
+        }
+        if (is_directive(clean, ".param")) { // read above, before the first line
+            ++next_section;
+            continue;
+        }
+        if (is_directive(clean, ".flag")) {
+            if (!allow_control) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": qtx has no .flag line (qtxc chooses the launch flags)");
+            }
+            program.flags.push_back(parse_flag_directive(trim(clean.substr(5)), line_number));
+            continue;
+        }
+        if (is_directive(clean, ".warps")) {
+            if (program.warps != 0) throw SimError("line " + std::to_string(line_number) + ": duplicate .warps");
+            program.warps = parse_warps_directive(trim(clean.substr(6)), line_number);
+            if (program.warps > profile.core_warps) {
+                throw SimError("line " + std::to_string(line_number) + ": .warps " + std::to_string(program.warps) +
+                    " exceeds this profile's " + std::to_string(profile.core_warps) + " warp slots (core.warps)");
+            }
+            continue;
+        }
+        if (is_directive(clean, ".mbar") || is_directive(clean, ".data")) {
+            // Its place was settled above; its values are read here. (Its
+            // own name is a constant by now; the directive wants a name.)
+            auto& section = program.sections.at(next_section++);
+            auto read = is_directive(clean, ".mbar")
+                ? parse_mbar_directive(trim(clean.substr(5)), constants, line_number, false)
+                : parse_data_directive(trim(clean.substr(5)), constants, line_number, false);
+            if (read.name != section.name || section_bytes(read) != section_bytes(section)) {
+                throw SimError("internal: line " + std::to_string(line_number) + " is not the section the first pass saw");
+            }
+            section.expected = read.expected;
+            section.bytes = std::move(read.bytes);
             continue;
         }
         if (clean.starts_with(".acc") && (clean.size() == 4 || std::isspace(static_cast<unsigned char>(clean[4])))) {
@@ -894,6 +991,18 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         } else {
             throw SimError("line " + std::to_string(line_number) + ": unknown opcode '" + op + "'");
         }
+        // The sections this instruction's operands name (qtx): their launch
+        // flags, for the scheduler.
+        uint8_t named = 0;
+        if (!section_flags.empty()) {
+            static const std::regex word(R"([A-Za-z_][A-Za-z0-9_]*)");
+            for (std::sregex_iterator it(tail.begin(), tail.end(), word), end; it != end; ++it) {
+                if (const auto found = section_flags.find(it->str()); found != section_flags.end()) {
+                    named |= found->second;
+                }
+            }
+        }
+        program.named_flags.push_back(named);
         program.instructions.push_back(std::move(inst));
     }
     if (program.instructions.empty()) throw SimError("kernel contains no instructions");

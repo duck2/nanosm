@@ -11,11 +11,12 @@ through TMA (Q as two 32-row tiles, K and V as two 64-key blocks); the fp32
 output leaves through two TMA stores of 32 rows each.
 
 The reference and checking functions (inputs, references, check_close and
-the problem constants) are imported from kernels/fa.launch.py, not copied: the
-FA problem is defined once. Those functions are the same in a5d0652 and in
-the working tree on 2026-11-19. This file adds the addresses of the new tile
-arrangement, restated from the README's swizzle64 rule (not the simulator's
-layout code), and its own algorithmic counter census.
+the problem constants) and the four descriptor arguments are imported from
+kernels/fa.launch.py, not copied: the FA problem is defined once. This file
+adds the checks of the new tile arrangement -- the tiles' addresses come from
+the kernel's symbols, the shuffle inside a tile is restated from the README's
+swizzle64 rule (not the simulator's layout code) -- and its own algorithmic
+counter census.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path
 import re
 import struct
 
-from nanosm import Launch
+from nanosm import Launch, launch_copy_counters
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,57 +38,28 @@ _spec.loader.exec_module(fa)
 ROWS, KEYS, WIDTH, BLOCK, SCALE = fa.ROWS, fa.KEYS, fa.WIDTH, fa.BLOCK, fa.SCALE
 
 QUERY_TILE = 32
-Q_GLOBAL, K_GLOBAL, V_GLOBAL, O_GLOBAL = 0, 8192, 24576, 65536
-# Shared memory (kernels/fa32.qtx has the same numbers as .equ).
-Q_SHARED = [0, 4096]                 # query tile t: 32 rows of 128 bytes
-K_SHARED = [8192, 24576]             # key block b: 64 rows of 128 bytes
-V_SHARED = [16384, 32768]            # key block b, transposed: 64 channel rows of 64 keys
-P_SHARED = [[40960, 45056],          # [key block][query tile]: 32 rows of 128 bytes (fp16)
-            [53248, 57344]]
-O_STAGED = [0, 8192]                 # query tile t: 32 rows of 256 bytes (fp32)
-S_READY, P_READY, O_DONE, O_STAGED_BAR = 49152, 49168, 49184, 49200   # pairs: tile 1 at + 8
-Q_LANDED, K_LANDED, V_LANDED, O_STORED = 49216, 49232, 49248, 49264   # pairs: index 1 at + 8
-CONSTANTS, QDESC, KDESC, VDESC, ODESC, STATS = 49280, 49664, 49728, 49792, 49856, 50176
+Q_GLOBAL, K_GLOBAL, V_GLOBAL, O_GLOBAL = fa.Q_GLOBAL, fa.K_GLOBAL, fa.V_GLOBAL, fa.O_GLOBAL
 
 
 def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]) -> Launch:
-    launch = Launch(kernel=ROOT / "kernels/fa32.qtx", profile=ROOT / "profiles/nanosm-v0.json", warps=6)
+    # The kernel's signature is the four descriptors, one per tensor, cut at
+    # the instruction's coordinates (c0 = 0, c1 = the first row). All
+    # swizzle64 (the profile's mma.layout): Q a 32-row tile (one per query
+    # tile), K a 64-row tile (one per key block), V the same tile transposed,
+    # so its stored rows are the 64 channels, 64 keys each (the tensor core
+    # reads B's K along a row); O 32 fp32 rows per store, at row 0 and row 32.
+    launch = Launch(kernel=ROOT / "kernels/fa32.qtx", profile=ROOT / "profiles/nanosm-v0.json",
+                    args=fa.descriptors(QUERY_TILE))
     for base, matrix in [(Q_GLOBAL, q), (K_GLOBAL, k), (V_GLOBAL, v)]:
         values = [value for row in matrix for value in row]
         launch.gmem.write(base, struct.pack(f"<{len(values)}e", *values))
-    # Poison the output and P so unwritten entries cannot pass as launch zeros.
+    # Poison the output and P so unwritten entries cannot pass as launch zeros
+    # (P's addresses are the kernel's; a test's look inside, not part of
+    # launching). Block b's P: 64 rows of 128 bytes from PBUF0 + P_BLOCK_STEP b.
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
     for block in range(2):
-        launch.shmem.write(P_SHARED[block][0], struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
-    launch.shmem.f32(CONSTANTS, [SCALE, -math.inf])
-    # S_READY and O_DONE count one mma.commit each; P_READY and O_STAGED the
-    # two workers of a query tile; each LANDED barrier one TMA load (the
-    # producer's arrive.expect_tx); O_STORED both output stores.
-    for base, count in [(S_READY, 1), (P_READY, 2), (O_DONE, 1), (O_STAGED_BAR, 2),
-                        (Q_LANDED, 1), (K_LANDED, 1), (V_LANDED, 1)]:
-        for address in (base, base + 8):
-            launch.shmem.mbar(address, expected=count)
-    launch.shmem.mbar(O_STORED, expected=1)
-    # One descriptor per tensor, cut at the instruction's coordinates (c0 = 0,
-    # c1 = the first row). All swizzle64 (the profile's mma.layout) with
-    # 128-byte rows: Q a 32-row tile (one per query tile), K a 64-row tile
-    # (one per key block), V the same tile transposed, so its stored rows are
-    # the 64 channels, 64 keys each (the tensor core reads B's K along a row).
-    for desc, gbase, rows, tile_rows, transposed in [
-        (QDESC, Q_GLOBAL, ROWS, QUERY_TILE, False),
-        (KDESC, K_GLOBAL, KEYS, BLOCK, False),
-        (VDESC, V_GLOBAL, KEYS, BLOCK, True),
-    ]:
-        launch.shmem.tma_desc(
-            desc, base=gbase, dimensions=(WIDTH, rows), tile=(WIDTH, tile_rows),
-            element_bytes=2, layout="swizzle64", transposed=transposed,
-        )
-    # The output: 32 fp32 rows (256 bytes, swizzle64 as the workers stage it)
-    # per store, at row 0 and row 32.
-    launch.shmem.tma_desc(
-        ODESC, base=O_GLOBAL, dimensions=(WIDTH, ROWS), tile=(WIDTH, QUERY_TILE),
-        element_bytes=4, layout="swizzle64",
-    )
+        launch.shmem.write(launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP") * block,
+                           struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
 
@@ -167,6 +139,14 @@ def run_case(case: str, trace: Path | None) -> None:
     else:
         assert all(alpha == 1 for alpha in second_alpha), "stable-max control is not stable"
     launch = make_launch(q, k, v)
+    # Where the kernel keeps what the checks look at (its .equ names).
+    STATS = launch.symbol("STATS")
+    K_SHARED = [launch.symbol("KBUF0"), launch.symbol("KBUF1")]     # key block b: 64 rows of 128 bytes
+    V_SHARED = [launch.symbol("VBUF0"), launch.symbol("VBUF1")]     # transposed: 64 channel rows of 64 keys
+    P_BLOCK1 = launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP")
+    P_SHARED = [[launch.symbol("PBUF0"), launch.symbol("PBUF1")],   # [key block][query tile]: 32 rows of 128 bytes
+                [P_BLOCK1, P_BLOCK1 + launch.symbol("PBUF1") - launch.symbol("PBUF0")]]
+    O_STAGED = [launch.symbol("OSTAGE") + launch.symbol("OSTAGE_STEP") * t for t in range(2)]  # 32 rows of 256 bytes
     with launch.run(trace=trace, max_trace_events=1_000_000, cycle_limit=1_000_000) as result:
         output = result.gmem_f32(O_GLOBAL, ROWS * WIDTH)
         model_error = fa.check_close(output, ref["model"], 2e-6, "quantized online reference")
@@ -198,7 +178,10 @@ def run_case(case: str, trace: Path | None) -> None:
         for b in range(2):
             check_tile(result, V_SHARED[b], 128, WIDTH, BLOCK, "e",
                        lambda channel, key: v[BLOCK * b + key][channel], f"V block {b}")
-        check_counters(result.summary, EXPECTED_COUNTERS)
+        # The kernel's own counts, and the launch copy's part: its launch
+        # block (four descriptors, fifteen barrier states, two constants: 384
+        # bytes) comes from global memory as one more TMA load, 12 sectors.
+        check_counters(result.summary, launch_copy_counters(EXPECTED_COUNTERS, launch.copied_bytes))
         print(f"FA32 {case}: PASS, 4096 outputs, cycles={result.cycle}, "
               f"online_error={model_error:.3g}, attention_error={attention_error:.3g}, "
               f"second_alpha=[{min(second_alpha):.5g},{max(second_alpha):.5g}]")

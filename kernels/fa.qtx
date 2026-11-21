@@ -1,7 +1,7 @@
 ; FlashAttention: two 32-row query tiles, each attending to two 64-key blocks.
 ; Warp 0 issues TMA and MMA. Warps 1/2 own Q rows 0..31, warps 3/4 own 32..63.
 ; Unmasked/full tiles, fp16 Q/K/V/P, fp32 S/O/statistics. K/V prefetch overlaps MMA.
-; See fa.launch.py for descriptors, constants, independent reference and census.
+; See fa.launch.py for the four descriptor arguments, the independent reference and the census.
 ;
 ; Worker registers:
 ; r0 the unshuffled address of the current 16- or 32-byte chunk (P, then the
@@ -48,22 +48,29 @@
 ; commit each worker pair can stage 32 fp32 rows over the dead Q or K0.
 .equ OSTAGE0,    0
 .equ OSTAGE1,    8192
-.equ SCORE0,     49152
-.equ SCORE1,     49160
-.equ WORK0,      49168
-.equ WORK1,      49176
-.equ OUTPUT0,    49184
-.equ OUTPUT1,    49192
-.equ STAGED0,    49200
-.equ STAGED1,    49208
-.equ INPUT_DONE, 49216
-.equ OSTORE_DONE,49224
-.equ CONSTANTS,  49280
-.equ QDESC,      49664
-.equ KDESC,      49728
-.equ VDESC,      49792
-.equ ODESC,      49984
 .equ STATS,      50176
+
+; What the launch gives: one TMA descriptor per tensor (Q and O move 32 rows
+; at a time, K and V a 64-key block; V transposed). Everything below it is the
+; kernel's own: five warps, its barriers and its two constants.
+.warps  5
+.param  desc QDESC
+.param  desc KDESC
+.param  desc VDESC
+.param  desc ODESC
+; SCORE and OUTPUT count the issuer's MMA commits; WORK and STAGED the two
+; workers that own each query tile.
+.mbar SCORE0,      expect 1
+.mbar SCORE1,      expect 1
+.mbar WORK0,       expect 2
+.mbar WORK1,       expect 2
+.mbar OUTPUT0,     expect 1
+.mbar OUTPUT1,     expect 1
+.mbar STAGED0,     expect 2
+.mbar STAGED1,     expect 2
+.mbar INPUT_DONE,  expect 1
+.mbar OSTORE_DONE, expect 1
+.data CONSTANTS, f32 0.180336878, -inf      ; log2(e) / sqrt(64), -infinity
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0

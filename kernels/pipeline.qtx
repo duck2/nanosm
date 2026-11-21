@@ -4,23 +4,25 @@
 ; built so far: role dispatch, counted loops, ldg/sts/lds/fadd/stg, full/empty mbar
 ; pairs, try_wait retry loops with uxori parity toggling, and depbar scheduling.
 ;
-; 8 tiles x 16 f32 (one lane-width each) per array. C[i] = A[i] + B[i]. Barriers are launch-image objects
-; (expected=1); stages start free, so the producer peels the first two fills.
+; 8 tiles x 16 f32 (one lane-width each) per array. C[i] = A[i] + B[i]. The launch gives the
+; three arrays' global addresses; the four barriers (.mbar, expect 1) are the kernel's own.
+; Stages start free, so the producer peels the first two fills.
 ; The barrier addresses, their parities and the loop counters are uniform
 ; registers (ur1..ur7; the loops test their counter with usetp); the
 ; per-lane addresses stay vector.
 
-.equ A,      0
-.equ B,      4096
-.equ C,      8192
+.warps  2
+.param  ptr A
+.param  ptr B
+.param  ptr C
 .equ SA0,    0
 .equ SB0,    64
 .equ SA1,    128
 .equ SB1,    192
-.equ FULL0,  1024
-.equ FULL1,  1032
-.equ EMPTY0, 1040
-.equ EMPTY1, 1048
+.mbar FULL0,  expect 1
+.mbar FULL1,  expect 1
+.mbar EMPTY0, expect 1
+.mbar EMPTY1, expect 1
 
         usread ur0, WARP_ID
         usetp.eq.u32 p0, ur0, 0
@@ -33,7 +35,9 @@
         addi  r11, r0, SB0
         addi  r12, r0, SA1
         addi  r13, r0, SB1
-        addi  r1, r0, C
+        umov  ur8, C
+        lds.uni r14, [ur8]      ; C's low word (an stg address is one 32-bit register)
+        add   r1, r0, r14
         umov  ur1, FULL0
         umov  ur2, FULL1
         umov  ur3, EMPTY0
@@ -69,8 +73,12 @@ CDONE:  halt
 PRODUCER:
         sread r0, LANE_ID
         shli  r0, r0, 2
-        addi  r1, r0, A
-        addi  r2, r0, B
+        umov  ur8, A
+        umov  ur9, B
+        lds.uni r14, [ur8]      ; the pointers' low words
+        lds.uni r16, [ur9]
+        add   r1, r0, r14
+        add   r2, r0, r16
         addi  r10, r0, SA0
         addi  r11, r0, SB0
         addi  r12, r0, SA1

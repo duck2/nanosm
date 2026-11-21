@@ -224,6 +224,24 @@ uint32_t nanosm_session_create_qtx(
     }
 }
 
+uint64_t nanosm_qtx_kernel_info(
+    const char* profile_json,
+    uint64_t profile_size,
+    const char* qtx_source,
+    uint64_t qtx_size,
+    char* output,
+    uint64_t capacity) {
+    try {
+        last_error.clear();
+        const auto profile = nanosm::parse_device_profile(input(profile_json, profile_size, "profile"));
+        const auto kernel = nanosm::compile_and_assemble(input(qtx_source, qtx_size, "qtx source"), profile);
+        return copy_string(nanosm::emit_kernel_info(kernel), output, capacity);
+    } catch (const std::exception& error) {
+        fail(error.what());
+        return NANOSM_SIZE_ERROR;
+    }
+}
+
 uint32_t nanosm_session_create_image(
     const char* profile_json,
     uint64_t profile_size,
