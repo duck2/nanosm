@@ -71,7 +71,7 @@ void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, cons
 // a write mask only on an instruction that can be masked (check_write_mask), and ssy, sync
 // and a predicated bra need a stack, which a profile with
 // core.divergence_stack_entries = 0 does not have. Kernel load refuses both
-// too (src/sim.cpp).
+// too (src/machine/machine.cpp).
 void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     check_write_mask(inst, profile, where);
     if (profile.core_divergence_stack_entries == 0 && uses_divergence_stack(inst)) {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "compiler.hpp"
+#include "qtxc/qtxc.hpp"
 #include "layout.hpp"
 
 #include <array>
@@ -182,7 +182,7 @@ inline void validate_tma_descriptor(const TmaDescriptor& descriptor) {
 // caller's bounds check. This is the definition; the machine reaches the
 // same addresses without multiplying: the walker steps an unshuffled row
 // address by adds, a run's elements are that plus a shift, and the shuffle
-// is applied per element (src/sim.hpp TmaWalker, TmaRun).
+// is applied per element (src/machine/machine.hpp TmaWalker, TmaRun).
 inline uint64_t tma_tile_address(const TmaDescriptor& descriptor, uint32_t buffer, uint32_t x, uint32_t y) {
     const uint64_t bytes = descriptor.element_bytes;
     if (descriptor.layout == TileLayout::dense) {

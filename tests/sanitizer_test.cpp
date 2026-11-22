@@ -533,7 +533,7 @@ void test_sanitizer_double_buffer_and_p_tile_are_clean() {
     }
 }
 
-// Row spacing (src/sanitizer.hpp record_mma_row_spacing): a reader states the
+// Row spacing (src/machine/sanitizer.hpp record_mma_row_spacing): a reader states the
 // row spacing its region's writer used. Shared memory: a TMA load lands a
 // swizzle64 tile of 64 rows of 128 bytes at 0; a matmul reading it as A with
 // [ur0, 64] PANICs, with [ur0, 128] runs clean; sts over the words it reads

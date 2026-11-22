@@ -3,8 +3,7 @@
 // The toolchain's public interface (src/qtxc/): qtx -> scheduled assembly
 // (compile_qtx), assembly -> Kernel (assemble_asm), the hex text both ways,
 // and the checks a kernel passes at load. The simulator includes it for those
-// checks and for SimError, which lives here for now; src/compiler.hpp is a
-// one-line include of this file. How each step works is in the .cpp files
+// checks and for SimError, which lives here for now. How each step works is in the .cpp files
 // next to it; internal.hpp is theirs, not part of this interface.
 
 #include "isa.hpp"

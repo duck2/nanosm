@@ -345,7 +345,7 @@ inline uint32_t issue_to_tma_command(uint32_t coordinates, const DeviceProfile& 
 // instruction that reads at most two (each distinct register once,
 // rf_read_round below), none for one that reads none. Two instructions read
 // more, by operand position (a register named twice is read twice), with the
-// TMA's round counter (trash/rfc17.md section 4; src/sim.hpp UrfReadRounds):
+// TMA's round counter (trash/rfc17.md section 4; src/machine/machine.hpp UrfReadRounds):
 //   tma.Nd     urS, urM | c0, c1 | c2, c3     (tma_operand_round)
 //   mma.async  urA, urB | urC                 (2026-11-19: urC, the
 //              result's tmem pointer, joins its dispatch entry from the URF

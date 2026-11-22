@@ -1,13 +1,13 @@
 #pragma once
 
-#include "compiler.hpp"
+#include "qtxc/qtxc.hpp"
 #include "image.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
-#include "reg.hpp"
+#include "machine/reg.hpp"
 #include "rf.hpp"
-#include "sanitizer.hpp"
-#include "trace.hpp"
+#include "machine/sanitizer.hpp"
+#include "machine/trace.hpp"
 #include "tma.hpp"
 
 #include <algorithm>
@@ -146,7 +146,7 @@ RoundRobinGrant round_robin_grant(const std::vector<uint8_t>& ready, uint32_t cu
 
 // The shmem byte address the MMA reads operand element (outer, k) of a
 // command of `shape` from, its operand at `base` with row spacing `spacing`
-// (outer: m for A, n for B): the operand fetch's own addressing (src/sim.cpp
+// (outer: m for A, n for B): the operand fetch's own addressing (src/machine/tensor_core.cpp
 // mma_a_address / mma_b_address, in the profile's layout), named here so
 // tests can hold a TMA tile against it.
 uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
@@ -155,7 +155,7 @@ uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32
 class Machine {
 public:
     Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace_options = {});
-    // The registers are registered by address (src/reg.hpp): never copied or moved.
+    // The registers are registered by address (src/machine/reg.hpp): never copied or moved.
     Machine(const Machine&) = delete;
     Machine& operator=(const Machine&) = delete;
 
@@ -2351,7 +2351,7 @@ private:
     [[noreturn]] void mbar_rmw_panic(
         const MbarRmwRequest& request, const std::string& reason) const;
 
-    // ---- gmem controller + LSU (src/lsu.cpp) ----
+    // ---- gmem controller + LSU (src/machine/gmem.cpp, src/machine/lsu.cpp) ----
     [[nodiscard]] std::size_t gmem_outstanding_sectors() const;
     [[nodiscard]] std::optional<std::size_t> select_controller_entry() const;
     void tick_gmem_controller(Wires& w, bool& return_ready_low);

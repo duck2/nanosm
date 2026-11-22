@@ -1,0 +1,678 @@
+// The tensor core: the MMA engine on port B, tensor memory, and the accumulator transfers.
+// (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
+// src/machine/machine.cpp.)
+
+#include "machine/machine.hpp"
+#include "machine/mma_numeric.hpp"
+#include "machine/internal.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <set>
+#include <tuple>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace nanosm {
+
+// ===========================================================================
+// MMA engine (port B) and accumulator transfers
+// ===========================================================================
+
+namespace {
+
+// An operand element's byte address, in the profile's layout through the
+// layout rule the TMA places tiles with (src/layout.hpp); the same rule for
+// A and B. Under swizzle64 both operands are rows of k -- A m rows, B n rows
+// -- `spacing` bytes apart (the instruction's), and `base` is the operand's
+// first 16-byte piece in its row 0 (tile + 16 x piece: a logical position,
+// not a shuffled one). Element (row, k) is at the logical address base + row
+// x spacing + 2k, shuffled by that address's own row number (address /
+// spacing, src/layout.hpp): a K = 8 command reads one piece of every row; a
+// shape with k > 8 reads k / 8 consecutive pieces of the same rows. The
+// address generator walks the rows in order and adds the spacing once per
+// row (an adder, no multiplier); `row * spacing` here is the simulator's
+// shorthand for that running sum, and the row number is the running
+// address's bits above the spacing (wires, no counter). An operand may start
+// at any row of a taller tile. The dense diagnostic layout is row-major and
+// compact in the command's shape: A m rows of k, B k rows of n (no spacing).
+uint32_t mma_a_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    uint32_t m, uint32_t k) {
+    if (config.mma_layout == TileLayout::dense) return dense_address(base, m, k, shape.k, 2);
+    return swizzle64_shuffle(base + m * spacing + 2 * k, spacing);
+}
+
+uint32_t mma_b_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    uint32_t k, uint32_t n) {
+    if (config.mma_layout == TileLayout::dense) return dense_address(base, k, n, shape.n, 2);
+    return swizzle64_shuffle(base + n * spacing + 2 * k, spacing);
+}
+
+uint32_t mma_operand_element(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    bool a_operand, uint32_t outer, uint32_t k) {
+    return a_operand ? mma_a_address(config, shape, base, spacing, outer, k)
+                     : mma_b_address(config, shape, base, spacing, k, outer);
+}
+
+// The bytes an operand of `shape` reads, as [first, end): the hull of every
+// element it reads (under swizzle64 a later row's piece can sit below or
+// above its logical place, so the ends come from the addresses themselves).
+std::pair<uint64_t, uint64_t> mma_operand_hull(const Config& config, const MmaShape& shape, uint32_t base,
+    uint32_t spacing, bool a_operand) {
+    uint64_t first = std::numeric_limits<uint64_t>::max();
+    uint64_t end = 0;
+    const uint32_t outer = a_operand ? shape.m : shape.n;
+    for (uint32_t i = 0; i < outer; ++i) {
+        for (uint32_t k = 0; k < shape.k; ++k) {
+            const uint64_t address = mma_operand_element(config, shape, base, spacing, a_operand, i, k);
+            first = std::min(first, address);
+            end = std::max(end, address + 2);
+        }
+    }
+    return {first, end};
+}
+
+uint32_t mma_total_steps(const Config& config, const MmaShape& shape) {
+    return (shape.m / config.mma_core_m) * (shape.n / config.mma_core_n) * (shape.k / config.mma_core_k);
+}
+
+} // namespace
+
+uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32_t base, uint32_t spacing,
+    bool a_operand, uint32_t outer, uint32_t k) {
+    return mma_operand_element(config, shape, base, spacing, a_operand, outer, k);
+}
+
+// The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
+// (c)): free if it runs no transfer. The MMA never matters here -- it has
+// tmem services of its own (trash/rfc11.md section 0); a transfer racing MMA
+// work is the sanitizer's business.
+bool Machine::acc_engine_available(const Wires& w, bool load) const {
+    return !w.acc_next[load ? 0 : 1].has_value();
+}
+
+// The MMA engine's cycle, computed on a copy of its queue and pipeline:
+// issue looks ahead at the queue entries it frees (c), so the next state is a
+// wire; drive_mma commits it with issue's new command. Its tmem reads (C) and
+// writes (results) use its own tmem services; the writes land at this
+// cycle's edge (w.tmem_writes).
+void Machine::step_mma(Wires& w) {
+    auto mma = mma_.cur();
+    advance_mma(mma, w);
+    w.mma_next = std::move(mma);
+}
+
+// One cycle of the MMA engine, applied to `mma` (a copy of its Q):
+//   1. the steps in the core: one whose C is at the tmem RAM now samples it
+//      and computes its result; one whose result is at the tmem RAM now
+//      writes it (at this cycle's edge) and retires; retired commands leave
+//      the queue head;
+//   2. the port-B read pipeline: the round at the RAM samples its elements;
+//      the round at the port output adds them to the core's operand latch,
+//      and a step's last round enters the core (C is read from tmem then);
+//   3. port B grants one round: the next round of the step in service, else
+//      a new step's first round (or the head commit's presentation);
+//   4. the read pipeline moves one stage; the granted round enters stage 0.
+// A step granted its last round at g samples it at g + D and enters the core
+// at g + D + Lb (the same D and Lb as port A, rfc10 section 5).
+void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
+    for (auto it = mma.results.begin(); it != mma.results.end();) {
+        if (!it->c_sampled && it->c_sample_cycle == cycle_) sample_mma_c(*it);
+        if (it->land_cycle != cycle_) { ++it; continue; }
+        if (!it->c_sampled) throw SimError("internal MMA result lands before its C sample");
+        for (std::size_t i = 0; i < it->words.size(); ++i) w.tmem_writes.emplace_back(it->words[i], it->values[i]);
+        trace_->mma_result(cycle_, it->command, it->address);
+        const auto id = it->command;
+        auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
+            [id](const auto& candidate) { return candidate.id == id; });
+        if (command == mma.queue.end() || command->outstanding_results == 0)
+            throw SimError("internal MMA result lost its command");
+        --command->outstanding_results;
+        it = mma.results.erase(it);
+    }
+    while (!mma.queue.empty() && !mma.queue.front().commit &&
+           mma.queue.front().operands_consumed && mma.queue.front().outstanding_results == 0) {
+        sanitizer_.record_mma_retired(mma.queue.front().id); // last result retired
+        mma.queue.pop_front();
+    }
+    if (auto& at_ram = mma.reads.at(config_.shmem_port_a_depth - 1); at_ram.has_value())
+        sample_mma_read(mma, *at_ram, w);
+    if (const auto& output = mma.reads.back(); output.has_value()) {
+        mma.arriving.insert(mma.arriving.end(), output->values.begin(), output->values.end());
+        if (output->last_round) {
+            enter_mma_core(mma, output->step);
+            mma.arriving.clear();
+        }
+    }
+    std::optional<MmaRead> granted;
+    if (!mma.fetch.has_value()) mma.fetch = next_mma_step(mma, w);
+    if (mma.fetch.has_value()) {
+        granted = grant_mma_round(mma);
+        if (mma.fetch->next_round == mma.fetch->round_elements.size()) mma.fetch.reset();
+    }
+    for (std::size_t stage = mma.reads.size() - 1; stage > 0; --stage)
+        mma.reads[stage] = std::move(mma.reads[stage - 1]);
+    mma.reads.front() = std::move(granted);
+}
+
+// The next step port B may start now, if any; or the head commit presents
+// into the MMA's event register. Steps walk hold-A / stream-B (rfc11 section
+// 0): for each K block, for each A block (m), every B block (n) in order; the
+// first step of each A block reads A and B, the rest read B only and use the
+// held A block. A command's steps may start once the previous command's last
+// step has been granted (commands overlap in the pipelines).
+std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires& w) {
+    auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(), [this](const auto& command) {
+        return command.commit || command.next_step < mma_total_steps(config_, command.shape);
+    });
+    if (command_it == mma.queue.end()) return std::nullopt;
+    auto& command = *command_it;
+    if (command.commit) {
+        // A commit at the queue head presents into the MMA's own event
+        // register: free if empty in Q, or claimed by the RMW engine now (d).
+        const bool register_free = !mma_mbar_event_.cur().has_value() || w.shmem.mma_event_claimed;
+        if (command_it != mma.queue.begin() || !register_free) return std::nullopt;
+        MbarRmwRequest request;
+        request.operation = MbarRmwOperation::arrive;
+        request.byte_address = command.mbar_address;
+        w.mma_present = std::move(request);
+        mma.queue.pop_front();
+        return std::nullopt;
+    }
+    // The command's shape sets the walk: rows in core_m blocks (8 for m32,
+    // 16 for m64), the n span in core_n blocks, k in core_k steps.
+    const uint32_t blocks_n = command.shape.n / config_.mma_core_n;
+    const uint32_t blocks_per_k = (command.shape.m / config_.mma_core_m) * blocks_n;
+    const uint32_t total_steps = mma_total_steps(config_, command.shape);
+    MmaStep step;
+    const uint32_t k_block = command.next_step / blocks_per_k;
+    const uint32_t block = command.next_step % blocks_per_k;
+    const uint32_t m_block = block / blocks_n;
+    const uint32_t n_block = block % blocks_n;
+    step.command = command.id;
+    step.c_pointer = command.c_pointer;
+    step.m0 = m_block * config_.mma_core_m;
+    step.n0 = n_block * config_.mma_core_n;
+    step.k0 = k_block * config_.mma_core_k;
+    step.a_base = command.a_base;
+    step.b_base = command.b_base;
+    step.a_spacing = command.a_spacing;
+    step.b_spacing = command.b_spacing;
+    step.shape = command.shape;
+    step.init_step = command.init && step.k0 == 0;
+    step.reload_a = n_block == 0;
+    step.last_step = command.next_step + 1 == total_steps;
+    // A step whose tile is still in the core or on its way to tmem (a short
+    // sweep) waits: its C must be the earlier step's result. Tiles are told
+    // apart by the tmem words they write (any shared word: the same tile, or
+    // two commands' overlapping results), so pointers may alias freely.
+    const auto words = mma_block_words(step);
+    const auto shares_words = [&](const std::vector<uint32_t>& other) {
+        return std::any_of(other.begin(), other.end(), [&](uint32_t word) {
+            return std::find(words.begin(), words.end(), word) != words.end();
+        });
+    };
+    const bool tile_in_flight =
+        std::any_of(mma.results.begin(), mma.results.end(), [&](const MmaResult& result) {
+            return shares_words(result.words);
+        }) ||
+        std::any_of(mma.reads.begin(), mma.reads.end(), [&](const std::optional<MmaRead>& read) {
+            return read.has_value() && shares_words(mma_block_words(read->step));
+        });
+    if (tile_in_flight) {
+        trace_->mma_recurrence_stall();
+        return std::nullopt; // explicit recurrence bubble for a profile whose sweep is too short
+    }
+    std::vector<uint32_t> elements;
+    if (step.reload_a) {
+        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+                elements.push_back(mma_a_address(config_, step.shape, step.a_base, step.a_spacing,
+                    step.m0 + mi, step.k0 + kk));
+    }
+    for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
+            elements.push_back(mma_b_address(config_, step.shape, step.b_base, step.b_spacing,
+                step.k0 + kk, step.n0 + ni));
+    // Bank rounds: round r reads every bank's r-th distinct word.
+    std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
+    for (const auto address : elements) {
+        const auto word = address / 4;
+        words_by_bank[word % config_.shmem_banks].insert(word);
+    }
+    uint32_t rounds = 1;
+    std::map<uint32_t, uint32_t> word_round;
+    for (const auto& words : words_by_bank) {
+        rounds = std::max<uint32_t>(rounds, static_cast<uint32_t>(words.size()));
+        uint32_t index = 0;
+        for (const auto word : words) word_round[word] = index++;
+    }
+    MmaFetch fetch;
+    fetch.step = step;
+    fetch.round_elements.resize(rounds);
+    for (const auto address : elements) fetch.round_elements[word_round.at(address / 4)].push_back(address);
+    ++command.next_step;
+    ++command.outstanding_results; // retires at its tmem write
+    sanitizer_.record_mma_fetch_start(command.id);
+    trace_->mma_input(cycle_, command.id, rounds, command.next_step - 1, step.reload_a);
+    return fetch;
+}
+
+// Port B grants the step in service its next round.
+Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
+    auto& fetch = *mma.fetch;
+    MmaRead read;
+    read.step = fetch.step;
+    read.elements = fetch.round_elements.at(fetch.next_round);
+    ++fetch.next_round;
+    read.last_round = fetch.next_round == fetch.round_elements.size();
+    return read;
+}
+
+// A round at the RAM reads its elements from shmem as it is now, before this
+// cycle's writes land at the clock edge (READ_FIRST, rfc12 section 1). The
+// command's last step's last round is its final physical operand read: the
+// operands are consumed and its depbar clears here.
+void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
+    for (const auto address : read.elements) {
+        if (static_cast<uint64_t>(address) + 2 > shmem_.size())
+            throw SimError("MMA operand footprint is outside shmem");
+        uint16_t bits = 0;
+        std::memcpy(&bits, shmem_.data() + address, 2);
+        read.values.emplace_back(address, bits);
+    }
+    if (!read.last_round || !read.step.last_step) return;
+    const auto id = read.step.command;
+    auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
+        [id](const auto& candidate) { return candidate.id == id; });
+    if (command == mma.queue.end()) throw SimError("internal MMA read lost its command");
+    command->operands_consumed = true;
+    sanitizer_.record_mma_operands_consumed(command->id); // final operand read
+    record_depbar_completion(w, command->warp, command->depbar, "internal MMA depbar underflow");
+}
+
+// A step's operands are all at the port output: it enters the core. A
+// reloading step's A block replaces the held one; the others use it. Its C
+// read leaves for tmem now (sampled tmem.port_depth later, sample_mma_c);
+// its result leaves the core result_latency after entry and lands in tmem
+// tmem.port_depth after that.
+void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
+    std::map<uint32_t, uint16_t> latch(mma.arriving.begin(), mma.arriving.end());
+    const auto value = [&](uint32_t address) {
+        const auto found = latch.find(address);
+        if (found == latch.end()) throw SimError("internal MMA operand did not arrive with its step");
+        return found->second;
+    };
+    if (step.reload_a) {
+        mma.a_held.assign(config_.mma_core_m * config_.mma_core_k, 0);
+        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+                mma.a_held[mi * config_.mma_core_k + kk] = value(mma_a_address(config_, step.shape,
+                    step.a_base, step.a_spacing, step.m0 + mi, step.k0 + kk));
+    }
+    if (mma.a_held.size() != config_.mma_core_m * config_.mma_core_k)
+        throw SimError("internal MMA step found no held A block");
+    // B is transposed here only in the simulator's local operand snapshot.
+    std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
+    for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
+        for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
+            b[ni * config_.mma_core_k + kk] = value(mma_b_address(config_, step.shape,
+                step.b_base, step.b_spacing, step.k0 + kk, step.n0 + ni));
+    MmaResult result;
+    result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
+    result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
+    result.command = step.command;
+    result.address = step.c_pointer + step.m0 * step.shape.n + step.n0;
+    result.words = mma_block_words(step);
+    result.init_step = step.init_step;
+    result.a = mma.a_held;
+    result.b = std::move(b);
+    mma.results.push_back(std::move(result));
+}
+
+// A step's C is at the tmem RAM now: its sixteen words are sampled (one
+// round of the MMA's tmem read service; READ_FIRST, before this cycle's
+// writes land) and the fused dot-plus-C result is computed. It arrives in the
+// core tmem.read_latency_cycles later, before the core's last stage (profile
+// validation: result_latency >= port_depth + read_latency).
+void Machine::sample_mma_c(MmaResult& result) {
+    result.values.resize(config_.mma_core_m * config_.mma_core_n);
+    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
+        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
+            const uint32_t c = result.init_step ? 0u : tmem_.at(result.words.at(mi * config_.mma_core_n + ni));
+            result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
+                std::span<const uint16_t>(result.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
+                std::span<const uint16_t>(result.b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
+        }
+    }
+    result.c_sampled = true;
+}
+
+std::size_t Machine::tmem_index(uint64_t logical, uint32_t row_words) const {
+    const uint64_t index = tmem_physical_word(logical, row_words);
+    if (index >= tmem_.size()) throw SimError("internal tmem layout overflow");
+    return static_cast<std::size_t>(index);
+}
+
+std::optional<std::vector<uint32_t>> Machine::tmem_region_words(
+    uint32_t pointer, uint32_t row_words, uint32_t rows, uint32_t columns) const {
+    std::vector<uint32_t> words;
+    words.reserve(static_cast<std::size_t>(rows) * columns);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t column = 0; column < columns; ++column) {
+            const uint64_t physical = tmem_physical_word(
+                uint64_t{pointer} + uint64_t{row} * row_words + column, row_words);
+            if (physical >= tmem_.size()) return std::nullopt;
+            words.push_back(static_cast<uint32_t>(physical));
+        }
+    }
+    return words;
+}
+
+// The tmem words of a matmul step's core_m x core_n result block, row-major:
+// rows m0.. and columns n0.. of the command's result region (rows of n words).
+std::vector<uint32_t> Machine::mma_block_words(const MmaStep& step) const {
+    std::vector<uint32_t> words;
+    words.reserve(config_.mma_core_m * config_.mma_core_n);
+    for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
+        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
+            words.push_back(static_cast<uint32_t>(tmem_index(
+                uint64_t{step.c_pointer} + uint64_t{step.m0 + mi} * step.shape.n + step.n0 + ni, step.shape.n)));
+    return words;
+}
+
+// The two accumulator transfer engines (trash/rfc11.md section 0: one acc.ld
+// engine, one acc.st engine for the whole machine, each with its own tmem
+// service in every fine bank), computed on copies of their registers: issue
+// looks ahead at them (c) and may give a freed engine its next transfer now
+// (d). The acc.ld pipeline before the acc.st beat.
+void Machine::step_acc_transfers(Wires& w) {
+    auto engines = acc_engines_.cur();
+    auto pipe = acc_ld_pipe_.cur();
+    step_acc_ld(engines[0], pipe, w);
+    step_acc_st(engines[1], w);
+    w.acc_next = std::move(engines);
+    w.acc_ld_next = std::move(pipe);
+}
+
+// The acc.ld engine's pipeline (trash/rfc10.md section 2, "Accumulator
+// transfers"). The beat at the tmem RAM stage samples its words now (once).
+// Its output asks the RF write decision for service; this cycle's grant was
+// decided at the top of the cycle.
+//   output empty, or granted -> advance: every stage moves one toward the
+//                               output; stage 0 takes the engine's next read
+//                               if its transfer has a beat left, else stays
+//                               empty
+//   output valid and denied  -> hold: no stage moves, nothing launches
+// A granted beat belongs to the RF write path from its grant on.
+void Machine::step_acc_ld(std::optional<AccTransfer>& engine, AccLdPipeline& pipe, const Wires& w) {
+    if (auto& at_ram = pipe.at(config_.tmem_port_depth - 1); at_ram.has_value() && !at_ram->sampled) {
+        sample_acc_ld_beat(*at_ram);
+    }
+    const bool output_valid = pipe.back().has_value();
+    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, 0)) return;
+    for (std::size_t stage = pipe.size() - 1; stage > 0; --stage) pipe[stage] = std::move(pipe[stage - 1]);
+    pipe.front() = launch_acc_ld_beat(engine);
+}
+
+// The engine's next read leaves for tmem now: the transfer's next column, all
+// lanes. The engine frees with its last read's launch; each beat carries its
+// own destination and context down the pipeline.
+std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(std::optional<AccTransfer>& engine) {
+    if (!engine.has_value()) return std::nullopt;
+    auto& transfer = *engine;
+    AccLdBeat beat;
+    beat.warp = transfer.warp;
+    beat.reg = static_cast<uint8_t>(transfer.rf_base + transfer.next_column);
+    beat.address = transfer.pointer + transfer.next_column;
+    beat.row_words = transfer.row_words;
+    beat.last = transfer.next_column + 1 == transfer.width;
+    beat.depbar = transfer.depbar;
+    ++transfer.next_column;
+    if (beat.last) engine.reset();
+    return beat;
+}
+
+// A beat at the tmem RAM: its sixteen words (sixteen distinct fine banks) are
+// read now, as tmem is before this cycle's writes land (READ_FIRST). The
+// transfer's last sample ends its tmem read-ownership.
+void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
+    beat.values.resize(config_.lanes);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        beat.values[lane] = tmem_[tmem_index(uint64_t{beat.address} + uint64_t{lane} * beat.row_words, beat.row_words)];
+    }
+    beat.sampled = true;
+    trace_->tmem_beat(cycle_, beat.warp, true, beat.address);
+    if (beat.last) sanitizer_.record_acc_transfer_final_beat(true);
+}
+
+// The acc.st engine's transfer: its beats are read from the RF one per cycle
+// when the RF read decision grants them (decide_rf_reads: sampled at the
+// grant, at the RF output Lr later, at the tmem RAM tmem.port_depth after
+// that); a beat at the tmem RAM now is written at this cycle's edge. The last
+// beat's write ends the transfer: its depbar clears, its tmem write-ownership
+// ends and the engine frees.
+void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
+    if (!engine.has_value()) return;
+    auto& transfer = *engine;
+    while (!transfer.in_flight.empty() && transfer.in_flight.front().land_cycle == cycle_) {
+        const auto& beat = transfer.in_flight.front();
+        const uint64_t address = uint64_t{transfer.pointer} + beat.column;
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            w.tmem_writes.emplace_back(
+                static_cast<uint32_t>(tmem_index(address + uint64_t{lane} * transfer.row_words, transfer.row_words)),
+                beat.values[lane]);
+        }
+        trace_->tmem_beat(cycle_, transfer.warp, false, static_cast<uint32_t>(address));
+        transfer.in_flight.pop_front();
+        ++transfer.landed;
+    }
+    if (transfer.landed != transfer.width) return;
+    record_depbar_completion(w, transfer.warp, transfer.depbar, "internal acc.st depbar underflow");
+    // final tmem write: write-ownership ends
+    sanitizer_.record_acc_transfer_final_beat(false);
+    engine.reset();
+}
+
+// What a transfer touches, for the sanitizer: the region and its tmem words.
+TmemRegion Machine::tmem_region(uint32_t pointer, const Instruction& inst, std::vector<uint32_t> words) const {
+    TmemRegion region;
+    region.pointer = pointer;
+    region.row_words = static_cast<uint32_t>(inst.imm);
+    region.rows = config_.lanes;
+    region.columns = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+    std::sort(words.begin(), words.end());
+    region.words = std::move(words);
+    return region;
+}
+
+void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
+    const auto& inst = op.instruction;
+    if (inst.opcode == Opcode::mma_commit) {
+        MmaCommand command;
+        command.id = next_mma_command_id_++;
+        command.commit = true;
+        command.warp = op.warp;
+        command.mbar_address = mbar_address_operand(op);
+        w.dispatch.mma = std::move(command);
+        return;
+    }
+    // The shape is the profile's (its list gives each opcode pair a shape);
+    // its existence was checked at kernel load (check_mma_shapes).
+    const auto shape = *mma_shape_of(config_, inst.opcode);
+    const auto a = uniform_operand(op, inst.src0);
+    const auto b = uniform_operand(op, inst.src1);
+    // urC, from the round counter's round 1 (src/rf.hpp uniform_read_rounds):
+    // the result's tmem pointer, its rows the shape's n words. Every word it
+    // writes must be in tmem (the machine's PANIC, as an operand outside
+    // shmem); a pointer that breaks the alignment rule is the sanitizer's
+    // (src/layout.hpp tmem_pointer_aligned). The machine writes whatever
+    // words the layout names.
+    const auto c = uniform_operand(op, inst.src2);
+    auto c_words = tmem_region_words(c, shape.n, shape.m, shape.n);
+    if (!c_words.has_value()) panic(op, "MMA result region is outside tmem");
+    sanitizer_.check_tmem_pointer(site(op), opcode_name(inst.opcode, &config_.mma_shapes) + " result", c,
+        shape.n, shape.n);
+    // The spacings are instruction constants, checked at kernel load
+    // (check_mma_shapes): under swizzle64 a power of two, 16 or more.
+    const auto a_spacing = mma_row_spacing(inst, true);
+    const auto b_spacing = mma_row_spacing(inst, false);
+    // A swizzle64 operand starts at a 16-byte piece. Every byte it reads must
+    // be in shmem: the hull of the addresses the walk reads (under swizzle64
+    // a row's piece moves inside its row, so not simply base + rows x spacing).
+    const auto inside = [&](uint32_t base, uint32_t spacing, bool a_operand) {
+        return base < shmem_.size() &&
+            mma_operand_hull(config_, shape, base, spacing, a_operand).second <= shmem_.size();
+    };
+    if ((config_.mma_layout == TileLayout::swizzle64 && ((a | b) & 15u) != 0) ||
+        !inside(a, a_spacing, true) || !inside(b, b_spacing, false))
+        panic(op, "MMA operand alignment or footprint is outside shmem");
+    // The machine reads whatever the address-keyed rule names; an operand
+    // whose row-0 bytes are not inside one legally placed row is the
+    // sanitizer's PANIC (src/layout.hpp: a row-0 line on a multiple of the
+    // spacing and of 64).
+    if (config_.mma_layout == TileLayout::swizzle64) {
+        sanitizer_.check_swizzle64_operand(site(op), "A", a, a_spacing, 2 * shape.k);
+        sanitizer_.check_swizzle64_operand(site(op), "B", b, b_spacing, 2 * shape.k);
+    }
+    MmaCommand command;
+    command.id = next_mma_command_id_++;
+    command.init = is_mma_init(inst.opcode);
+    command.shape = shape;
+    command.warp = op.warp;
+    command.c_pointer = c;
+    command.depbar = inst.control.set_depbar;
+    command.a_base = a;
+    command.b_base = b;
+    command.a_spacing = a_spacing;
+    command.b_spacing = b_spacing;
+    TmemRegion result;
+    result.pointer = c;
+    result.row_words = shape.n;
+    result.rows = shape.m;
+    result.columns = shape.n;
+    std::sort(c_words->begin(), c_words->end());
+    result.words = std::move(*c_words);
+    if constexpr (NANOSM_SANITIZER != 0) {
+        // The shmem words each operand reads, for the row spacing check
+        // (computed for the sanitizer only). The dense diagnostic layout
+        // reads no spacing: none.
+        const auto operand_words = [&](uint32_t base, uint32_t spacing, bool a_operand) {
+            std::vector<uint32_t> words;
+            if (config_.mma_layout != TileLayout::swizzle64) return words;
+            for (uint32_t outer = 0; outer < (a_operand ? shape.m : shape.n); ++outer) {
+                for (uint32_t k = 0; k < shape.k; ++k) {
+                    words.push_back(mma_operand_address(config_, shape, base, spacing, a_operand, outer, k) / 4);
+                }
+            }
+            std::sort(words.begin(), words.end());
+            words.erase(std::unique(words.begin(), words.end()), words.end());
+            return words;
+        };
+        sanitizer_.record_mma_row_spacing(site(op), command.id, command.init, result,
+            operand_words(a, a_spacing, true), a_spacing, operand_words(b, b_spacing, false), b_spacing);
+    }
+    sanitizer_.record_mma_accept(site(op), command.id, result, command.depbar,
+        mma_operand_span(a, a_spacing, true, shape), mma_operand_span(b, b_spacing, false, shape));
+    trace_->mma_command(cycle_, command.id, op.warp, command.init);
+    w.dispatch.mma = std::move(command);
+}
+
+// acc.ld / acc.st: the pointer arrives now; the transfer runs one beat per
+// column in its engine (step_acc_transfers, and decide_rf_reads for acc.st):
+// lane l moves row l of the region at the pointer (rows of S words, the
+// instruction's), beat j column j. Every word it touches must be in tmem
+// (the machine's PANIC); the alignment rule is the sanitizer's
+// (src/layout.hpp tmem_pointer_aligned).
+void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
+    const auto& inst = op.instruction;
+    const bool load = is_acc_load(inst.opcode);
+    const uint32_t width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+    const uint8_t rf_base = load ? inst.dst : inst.src1;
+    const auto row_words = static_cast<uint32_t>(inst.imm);
+    const auto pointer = uniform_operand(op, inst.src0);
+    auto words = tmem_region_words(pointer, row_words, config_.lanes, width);
+    if (!words.has_value() || static_cast<unsigned>(rf_base) + width > kernel_.register_count) {
+        panic(op, "accumulator transfer region outside tmem or RF range out of bounds");
+    }
+    const auto region = tmem_region(pointer, inst, std::move(*words));
+    sanitizer_.check_tmem_pointer(site(op), opcode_name(inst.opcode), pointer, row_words, width);
+    // Racing accepted MMA work (check_issue_hazards): an MMA command issued
+    // before this transfer was accepted by the MMA before this dispatch
+    // (dispatch keeps issue order).
+    sanitizer_.check_acc_transfer_vs_mma(site(op), region);
+    sanitizer_.check_acc_transfer_overlap(site(op), region, load);
+    AccTransfer transfer;
+    transfer.load = load;
+    transfer.warp = op.warp;
+    transfer.rf_base = rf_base;
+    transfer.depbar = inst.control.set_depbar;
+    transfer.pointer = pointer;
+    transfer.row_words = row_words;
+    transfer.width = width;
+    sanitizer_.record_acc_transfer_accept(site(op), load, region, inst.control.set_depbar);
+    w.dispatch.acc = DispatchDecision::AccAdmission{load, std::move(transfer)};
+}
+
+// The MMA's event register: a claim and a new commit's presentation may
+// happen in one cycle (d).
+void Machine::drive_mma_event(const Wires& w) {
+    if (!w.shmem.mma_event_claimed && !w.mma_present.has_value()) return;
+    auto next = w.shmem.mma_event_claimed ? std::nullopt : mma_mbar_event_.cur();
+    if (w.mma_present.has_value()) {
+        if (next.has_value()) throw SimError("internal MMA event presented into a full register");
+        next = w.mma_present;
+    }
+    mma_mbar_event_.set_next(std::move(next), "drive_mma_event");
+}
+
+// The MMA queue and pipeline: step_mma's result, plus issue's new command.
+void Machine::drive_mma(const Wires& w) {
+    auto next = w.mma_next;
+    if (w.dispatch.mma.has_value()) next.queue.push_back(*w.dispatch.mma);
+    mma_.set_next(std::move(next), "drive_mma");
+}
+
+// The two acc transfer engines: step_acc_transfers' result (acc.ld launches,
+// acc.st landings), plus this cycle's acc.st RF read (the beat joins the
+// acc.st transfer's in-flight list) and dispatch's new transfer (into an
+// engine freed this cycle, possibly).
+void Machine::drive_acc_transfers(const Wires& w) {
+    auto next = w.acc_next;
+    if (const auto& beat = w.acc_st_read; beat.has_value()) {
+        auto& engine = next[1];
+        if (!engine.has_value()) throw SimError("internal acc.st beat read with no acc.st transfer");
+        engine->in_flight.push_back(*beat);
+        ++engine->next_column;
+    }
+    if (const auto& admission = w.dispatch.acc; admission.has_value()) {
+        auto& engine = next[admission->load ? 0 : 1];
+        if (engine.has_value()) throw SimError("internal acc transfer engine given two transfers");
+        engine = admission->transfer;
+    }
+    acc_engines_.set_next(std::move(next), "drive_acc_transfers");
+}
+
+// The acc.ld pipeline: step_acc_transfers' advance or hold.
+void Machine::drive_acc_ld_pipe(const Wires& w) {
+    if (w.acc_ld_next == acc_ld_pipe_.cur()) return;
+    acc_ld_pipe_.set_next(w.acc_ld_next, "drive_acc_ld_pipe");
+}
+
+std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(
+    uint32_t base, uint32_t spacing, bool a_operand, const MmaShape& shape) const {
+    // Ask the operand geometry itself (the same functions the fetch uses):
+    // the hull of every byte the command's shape reads. Under swizzle64 a
+    // K = 8 operand reads one 16-byte piece per row, but the hull covers
+    // the rows' other pieces too (a conservative owner).
+    const auto [first, last] = mma_operand_hull(config_, shape, base, spacing, a_operand);
+    if (last > std::numeric_limits<uint32_t>::max()) return std::nullopt;
+    return std::pair<uint32_t, uint32_t>{static_cast<uint32_t>(first), static_cast<uint32_t>(last)};
+}
+
+} // namespace nanosm

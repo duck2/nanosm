@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-# The Sanitizer (src/sanitizer.hpp) holds shadow state that only decides
+# The Sanitizer (src/machine/sanitizer.hpp) holds shadow state that only decides
 # whether to PANIC. OFF compiles it to no-ops; the machine must compute exactly
 # the same thing either way. With ON (the default) the build also produces an
 # OFF twin of the library, C API and unit tests, and ctest proves the two
@@ -23,7 +23,6 @@ set(NANOSM_SOURCES
     src/isa.cpp
     src/image.cpp
     src/profile.cpp
-    src/trace.cpp
     src/qtxc/parse.cpp
     src/qtxc/directives.cpp
     src/qtxc/expressions.cpp
@@ -34,10 +33,27 @@ set(NANOSM_SOURCES
     src/qtxc/schedule.cpp
     src/qtxc/assemble.cpp
     src/qtxc/hex.cpp
-    src/sim.cpp
-    src/sanitizer.cpp
-    src/mma_numeric.cpp
-    src/lsu.cpp
+    src/machine/machine.cpp
+    src/machine/launch_copy.cpp
+    src/machine/front_end.cpp
+    src/machine/branch.cpp
+    src/machine/issue.cpp
+    src/machine/dispatch.cpp
+    src/machine/rf.cpp
+    src/machine/urf.cpp
+    src/machine/arith.cpp
+    src/machine/shmem.cpp
+    src/machine/barriers.cpp
+    src/machine/tma.cpp
+    src/machine/tma_ports.cpp
+    src/machine/tensor_core.cpp
+    src/machine/sanitizer_arguments.cpp
+    src/machine/common.cpp
+    src/machine/sanitizer.cpp
+    src/machine/mma_numeric.cpp
+    src/machine/lsu.cpp
+    src/machine/gmem.cpp
+    src/machine/trace.cpp
 )
 
 function(add_nanosm_library NAME SANITIZER)

@@ -1,7 +1,7 @@
 #include "profile.hpp"
 #include "hash.hpp"
 #include "rf.hpp"
-#include "mma_numeric.hpp"
+#include "machine/mma_numeric.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -340,7 +340,7 @@ void validate_device_profile(const DeviceProfile& p) {
     // by 8 or 4 fp16 of k: a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
     // It depends on the row only (any four neighbouring rows, wherever the
     // tile sits), so any m and n in whole core blocks read one bank round per
-    // block (src/layout.hpp; src/sim.cpp mma_a_address). On a 4x4x4 core a
+    // block (src/layout.hpp; src/machine/tensor_core.cpp mma_a_address). On a 4x4x4 core a
     // step that reloads A reads half-pieces of A and B together; whether they
     // share a round depends on the two tiles' row numbers mod 16
     // (trash/address_keyed_census.py).

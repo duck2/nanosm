@@ -2,8 +2,8 @@
 // trash/test-setup-2026-10-22.md). Inline so every test file can include them.
 #pragma once
 
-#include "sim.hpp"
-#include "mma_numeric.hpp"
+#include "machine/machine.hpp"
+#include "machine/mma_numeric.hpp"
 #include "hash.hpp"
 #include "log.hpp"
 

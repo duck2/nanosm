@@ -74,7 +74,7 @@ struct Launch {
 // kernel's section order: src/isa.hpp launch_block) and written into GLOBAL
 // memory at block_address, with the launch record saying where; the kernel's
 // barriers added to the live list. The machine copies the block into shared
-// memory from the first cycle on (src/sim.cpp, the launch copy); there is no
+// memory from the first cycle on (src/machine/launch_copy.cpp); there is no
 // other way for it to get there. A missing, unknown or wrongly typed argument
 // is refused by name. The result has no args left.
 Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& profile);

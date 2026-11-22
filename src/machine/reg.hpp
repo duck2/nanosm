@@ -23,7 +23,7 @@
 // NANOSM_SANITIZER=0 they compile to nothing and a second write would simply
 // replace D. Correct code never writes twice, so both builds compute the same.
 
-#include "sanitizer.hpp"
+#include "machine/sanitizer.hpp"
 
 #include <cstddef>
 #include <optional>

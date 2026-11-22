@@ -1,7 +1,7 @@
 // The Sanitizer: shadow state that only decides whether to PANIC. Read the
 // rule at the top of sanitizer.hpp before adding anything here.
 
-#include "sanitizer.hpp"
+#include "machine/sanitizer.hpp"
 
 #include "mbar.hpp"
 
@@ -968,7 +968,7 @@ void Sanitizer::record_acc_transfer_final_beat(bool load) {
 }
 
 // ---------------------------------------------------------------------------
-// Clocked registers: at most one write per register per tick (src/reg.hpp).
+// Clocked registers: at most one write per register per tick (src/machine/reg.hpp).
 // Only the tags live here; whether D was written is the register's own
 // mechanism.
 // ---------------------------------------------------------------------------

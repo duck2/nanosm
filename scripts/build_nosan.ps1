@@ -1,5 +1,5 @@
 # The sanitizer-OFF configuration in its own build dir (build_nosan):
-# NANOSM_SANITIZER=OFF compiles src/sanitizer.hpp's Sanitizer to no-ops.
+# NANOSM_SANITIZER=OFF compiles src/machine/sanitizer.hpp's Sanitizer to no-ops.
 # Its ctest runs the ordinary targets against the OFF library; the unit tests
 # that expect a sanitizer panic are skipped (GTEST_SKIP). The default
 # build (scripts/build.ps1) already builds an OFF twin and proves it

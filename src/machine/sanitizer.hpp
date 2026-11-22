@@ -27,7 +27,7 @@
 // Classification of all machine state: trash/sanitizer-split-2026-10-07.md.
 // =============================================================================
 
-#include "compiler.hpp"
+#include "qtxc/qtxc.hpp"
 #include "isa.hpp"
 #include "profile.hpp"
 #include "tma.hpp"
@@ -324,7 +324,7 @@ public:
     // The TMA, SIMT writes and acc transfers are handled in
     // record_tma_accept, record_simt_shmem_issue and
     // record_acc_transfer_accept; a matmul here. a_words / b_words: the shmem
-    // words its operands read (src/sim.cpp mma_operand_address, / 4). Its
+    // words its operands read (src/machine/tensor_core.cpp mma_operand_address, / 4). Its
     // result's words are its accumulator (checked unless init) and then
     // written with n.
     void record_mma_row_spacing(const IssueSite& site, uint64_t command, bool init, const TmemRegion& result,
@@ -354,7 +354,7 @@ public:
     // beat's RF write (record_reg_ready), a separate lifetime.
     void record_acc_transfer_final_beat(bool load);
 
-    // ---- clocked registers (src/reg.hpp): at most one write per tick ----
+    // ---- clocked registers (src/machine/reg.hpp): at most one write per tick ----
     // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
     // registers) are retired: those registers are Reg<T>, read through cur().
     void record_register_write(uint32_t id, const char* tag);

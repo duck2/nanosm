@@ -1,4 +1,4 @@
-#include "trace.hpp"
+#include "machine/trace.hpp"
 
 #include <nlohmann/json.hpp>
 

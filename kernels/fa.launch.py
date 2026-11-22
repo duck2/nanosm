@@ -104,7 +104,7 @@ def mma_group(a: list[float], b: list[float], c: float) -> float:
     as_integer_ratio then aligns them using Python integers, not float sums.
     SF Tensor tcgen05's raw-exponent rule, applied per core step: one fused
     group of CORE_K products plus C (rfc11 section 0: dot8 + C at 4x4x8).
-    See third_party/tcgen05-LICENSE and src/mma_numeric.cpp for provenance.
+    See third_party/tcgen05-LICENSE and src/machine/mma_numeric.cpp for provenance.
     """
     assert len(a) == len(b) == CORE_K and all(math.isfinite(x) for x in (*a, *b, c))
     exponents = [max(math.frexp(abs(x))[1] - 1, -14)

@@ -1,0 +1,127 @@
+// What the machine hands the sanitizer: pure reads of hardware state that feed
+// nothing in the machine.
+// (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
+// src/machine/machine.cpp.)
+
+#include "machine/machine.hpp"
+#include "machine/mma_numeric.hpp"
+#include "machine/internal.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <new>
+#include <set>
+#include <tuple>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace nanosm {
+
+// ---------------------------------------------------------------------------
+// Sanitizer argument builders. Pure reads of hardware state; their results go
+// only to sanitizer_ (src/machine/sanitizer.hpp). Nothing here feeds the machine.
+// ---------------------------------------------------------------------------
+
+// An issuing warp's site: its FIFO head's pc.
+IssueSite Machine::site(const Warp& warp, const Instruction& inst) const {
+    return IssueSite{cycle_, warp.id, head_pc(warp.id), inst, &config_.mma_shapes};
+}
+
+// A dispatched instruction's site: the dispatch cycle, its issue's pc.
+IssueSite Machine::site(const DispatchEntry& op) const {
+    return IssueSite{cycle_, op.warp, op.pc, op.instruction, &config_.mma_shapes};
+}
+
+std::vector<uint32_t> Machine::access_addresses(
+    const std::vector<std::vector<LaneAccess>>& rounds) {
+    std::vector<uint32_t> addresses;
+    for (const auto& round : rounds) {
+        for (const auto& access : round) addresses.push_back(static_cast<uint32_t>(access.byte_address));
+    }
+    return addresses;
+}
+
+std::vector<uint32_t> Machine::lane_values(const Warp& warp, uint8_t reg) const {
+    std::vector<uint32_t> values(config_.lanes);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) values[lane] = rf(warp, lane, reg);
+    return values;
+}
+
+// Each bank round's word addresses (the sanitizer's shadow of an access).
+std::vector<std::vector<uint32_t>> Machine::round_addresses(const std::vector<std::vector<LaneAccess>>& rounds) {
+    std::vector<std::vector<uint32_t>> addresses;
+    for (const auto& round : rounds) {
+        auto& words = addresses.emplace_back();
+        for (const auto& access : round) words.push_back(static_cast<uint32_t>(access.byte_address));
+    }
+    return addresses;
+}
+
+// shmem bytes [address, address + size) as they stand after this cycle's
+// clock edge: memory, plus the write rounds at the RAM now (they land at the
+// edge). An access at the RAM in a command's accept cycle has REACHED it
+// (rfc12 section 10), so this is what an engine command accepted now finds.
+std::vector<uint8_t> Machine::shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const {
+    std::vector<uint8_t> bytes(shmem_.begin() + address, shmem_.begin() + address + size);
+    for (const auto& write : w.shmem.writes) {
+        for (std::size_t byte = 0; byte < write.bytes.size(); ++byte) {
+            const uint64_t at = static_cast<uint64_t>(write.address) + byte;
+            if (at >= address && at < static_cast<uint64_t>(address) + size) bytes[at - address] = write.bytes[byte];
+        }
+    }
+    return bytes;
+}
+
+// The descriptor the engine will read: memory as of this cycle's edge. I4
+// (rfc12 section 11) replaced the overlay of in-flight stores this peek had:
+// a write still travelling to the descriptor at accept is now a missing-fence
+// / race PANIC (record_tma_accept), and the descriptor's read-ownership
+// covers every write after it, so the engine reads exactly these bytes.
+std::array<uint8_t, tma_descriptor_bytes> Machine::tma_descriptor_at_accept(uint32_t address, const Wires& w) const {
+    const auto memory = shmem_after_edge(address, static_cast<uint32_t>(tma_descriptor_bytes), w);
+    std::array<uint8_t, tma_descriptor_bytes> bytes{};
+    std::copy(memory.begin(), memory.end(), bytes.begin());
+    return bytes;
+}
+
+// The accept-time peek of a TMA's completion mbar (rfc12 section 8): its word
+// as the RMW engine will leave it -- memory as of this cycle's edge, then the
+// writes already granted and still travelling (the write pipelines' earlier
+// stages, oldest first, then this cycle's grants: an RMW's write among them),
+// then the RMW's computed update (its ALU stages and this cycle's update:
+// its write is granted later). None when the mbar is outside shmem (the
+// dispatch has panicked then).
+// Sanitizer-only: the hardware reads no mbar at TMA start.
+std::optional<uint64_t> Machine::pending_tma_completion_mbar(uint32_t mbar, const Wires& w) const {
+    if (mbar % 8 != 0 || static_cast<uint64_t>(mbar) + 8 > shmem_.size()) return std::nullopt;
+    auto bytes = shmem_after_edge(mbar, 8, w);
+    const auto overlay_beat = [&](const std::optional<WriteBeat>& beat) {
+        if (!beat.has_value()) return;
+        for (const auto& write : beat->writes) {
+            for (std::size_t byte = 0; byte < write.bytes.size(); ++byte) {
+                const uint64_t at = static_cast<uint64_t>(write.address) + byte;
+                if (at >= mbar && at < mbar + 8ull) bytes[at - mbar] = write.bytes[byte];
+            }
+        }
+    };
+    const auto& a_writes = a_write_pipe_.cur();
+    const auto& b_writes = b_write_pipe_.cur();
+    for (std::size_t stage = a_writes.size() - 1; stage-- > 0;) { // the last stage is at the RAM now
+        overlay_beat(a_writes[stage]);
+        overlay_beat(b_writes[stage]);
+    }
+    overlay_beat(w.shmem.a_write_beat);
+    overlay_beat(w.shmem.b_write_beat);
+    const auto& alu = rmw_.cur().alu;
+    for (std::size_t stage = alu.size(); stage-- > 0;) overlay_beat(alu[stage]);
+    overlay_beat(w.shmem.rmw_update);
+    uint64_t word = 0;
+    std::memcpy(&word, bytes.data(), sizeof(word));
+    return word;
+}
+
+} // namespace nanosm

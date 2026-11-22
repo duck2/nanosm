@@ -1,6 +1,6 @@
 """The sanitizer-OFF build must compute exactly what the sanitizer-ON build computes.
 
-src/sanitizer.hpp states the rule: the machine may tell the Sanitizer what
+src/machine/sanitizer.hpp states the rule: the machine may tell the Sanitizer what
 happened and may ask it to check, but nothing the machine computes may depend
 on sanitizer state. Compiling the Sanitizer to no-ops (NANOSM_SANITIZER=0)
 is the mechanical proof: every launch must print byte-identical stdout and

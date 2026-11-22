@@ -1,10 +1,10 @@
 #include "capi.h"
 
-#include "compiler.hpp"
+#include "qtxc/qtxc.hpp"
 #include "image.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
-#include "sim.hpp"
+#include "machine/machine.hpp"
 #include "tma.hpp"
 
 #include <algorithm>

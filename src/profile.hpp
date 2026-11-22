@@ -158,7 +158,7 @@ struct DeviceProfile {
     // The register stages of the walker's start: between the cycle a TMA
     // command's descriptor words are back and the cycle its walker registers
     // are loaded (the three coordinate x stride products and the add chain
-    // into row 0's address; src/sim.hpp TmaWalkerStart). 0..8; canonical 2
+    // into row 0's address; src/machine/machine.hpp TmaWalkerStart). 0..8; canonical 2
     // (HUMAN 2026-11-20: "some configurable delay to those multipliers"). 0 is
     // the timing before the stages existed: products in the return cycle.
     uint32_t tma_walker_start_cycles = 2;
@@ -182,7 +182,7 @@ struct DeviceProfile {
     // Machine-wide outstanding ldg/stg commands (vector, scalar, uniform).
     uint32_t lsu_active_commands = 0;
     // The LSU's two buffers: one load buffer, one store buffer, each held
-    // only while data is in it (sim.hpp AssemblyRegister). A v8 instruction's
+    // only while data is in it (machine.hpp AssemblyRegister). A v8 instruction's
     // lanes pass through them in fixed groups of this many lanes: the load
     // buffer is 8 x load_group_lanes words (256 bits per lane), written to
     // the RF as eight writes with the group's lanes enabled; the store

@@ -1,6 +1,6 @@
 """Register drivers run in any order: every launch must come out byte-identical.
 
-Machine::tick() (src/sim.cpp) computes each cycle's decisions -- the wires --
+Machine::tick() (src/machine/machine.cpp) computes each cycle's decisions -- the wires --
 once, in a fixed dependency order, then runs every register's driver. A driver
 reads only register Q values and the wires and writes only its own register,
 so the drivers' order cannot matter. With NANOSM_DRIVER_SHUFFLE_SEED set, the

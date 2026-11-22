@@ -11,7 +11,7 @@ using namespace nanosm_test;
 // Stepping discipline (trash/stepping-discipline-2026-10-08.md)
 // ===========================================================================
 
-// ---- Reg<T> (src/reg.hpp) ----
+// ---- Reg<T> (src/machine/reg.hpp) ----
 
 void test_reg_hold_write_commit() {
     nanosm::Sanitizer sanitizer;
