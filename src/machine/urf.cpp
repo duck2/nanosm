@@ -57,7 +57,7 @@ void Machine::urf_ram_stage(Wires& w) {
     if (pipe.back().has_value()) w.urf_landing = pipe.back();
 }
 
-// The pipeline's next state: every write moves one stage on. The one leaving
+// The pipeline's work this cycle, by stage. The write leaving
 // stage 0 latches the operands it sampled now (step_rf_reads). A uniform-
 // arithmetic write whose operands are at the URF output now (stage Lu)
 // executes on the uniform ALU, and its result rides the remaining stages as
@@ -70,21 +70,24 @@ void Machine::urf_ram_stage(Wires& w) {
 // port's stage (its predicate is presented now: urf_ram_stage).
 void Machine::step_urf(Wires& w) {
     const auto& pipe = urf_pipe_.cur();
-    UrfWritePipeline next(pipe.size());
     for (std::size_t stage = 0; stage + 1 < pipe.size(); ++stage) {
         if (!pipe[stage].has_value()) continue;
-        if (is_usetp(pipe[stage]->instruction.opcode) && stage + 1 == config_.urf_issue_to_port_cycles) continue;
-        auto write = *pipe[stage];
-        if (stage == 0) write.operands = w.urf_sample.value();
-        if (write.instruction.opcode == Opcode::r2ur) {
-            if (stage == 0) write.value = write.operands.at(0);
-        } else if (stage == config_.urf_read_latency_cycles) {
-            write.value = execute_uniform(write);
+        if (is_usetp(pipe[stage]->instruction.opcode) && stage + 1 == config_.urf_issue_to_port_cycles) {
+            w.urf_stage_work.emplace_back(stage, std::nullopt);
+            continue;
         }
-        next[stage + 1] = std::move(write);
+        const bool r2ur = pipe[stage]->instruction.opcode == Opcode::r2ur;
+        const bool latches = stage == 0;
+        const bool executes = !r2ur && stage == config_.urf_read_latency_cycles;
+        if (!latches && !executes) continue;
+        auto write = *pipe[stage];
+        if (latches) {
+            write.operands = w.urf_sample.value();
+            if (r2ur) write.value = write.operands.at(0);
+        }
+        if (executes) write.value = execute_uniform(write);
+        w.urf_stage_work.emplace_back(stage, std::move(write));
     }
-    next.front() = w.issue.urf_write;
-    w.urf_pipe_next = std::move(next);
 }
 
 // The uniform ALU: one 32-bit result from the write's latched operands (its
@@ -137,13 +140,11 @@ void Machine::land_urf_write(const Wires& w) {
     warps_.at(w.urf_landing->warp).urf.at(w.urf_landing->instruction.dst) = w.urf_landing->value.value();
 }
 
-// The URF write pipeline's next state (step_urf); held while it is empty.
+// The URF write pipeline: each stage's work (step_urf) goes on with its
+// write; issue's accepted writer enters stage 0.
 void Machine::drive_urf_pipe(const Wires& w) {
-    const auto busy = [](const UrfWritePipeline& pipe) {
-        return std::any_of(pipe.begin(), pipe.end(), [](const auto& stage) { return stage.has_value(); });
-    };
-    if (!busy(urf_pipe_.cur()) && !busy(w.urf_pipe_next)) return;
-    urf_pipe_.set_next(w.urf_pipe_next, "drive_urf_pipe");
+    for (const auto& [stage, write] : w.urf_stage_work) urf_pipe_.replace(stage, write, "drive_urf_pipe: stage work");
+    if (w.issue.urf_write.has_value()) urf_pipe_.push(*w.issue.urf_write, "drive_urf_pipe");
 }
 
 } // namespace nanosm

@@ -57,7 +57,7 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
 // Arithmetic pipeline
 // ===========================================================================
 
-void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
+void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
     auto& warp = warps_.at(pending.warp);
     const auto& inst = pending.instruction;
     // A panic names the instruction's own pc (the warp's has moved on).
@@ -237,7 +237,8 @@ void Machine::execute_arithmetic(ArithmeticRead& pending, Wires& w) {
     // lane computes; the issue cycle's active mask AND the instruction's write
     // mask (sampled with the operands) is the write's lane enables (the port, its cycle and the
     // booking are the same whatever the lanes, none included).
-    const auto port_cycle = pending.issue_cycle + issue_to_port(inst, config_);
+    // (It executes issue_to_operands after its issue.)
+    const auto port_cycle = cycle_ - issue_to_operands(config_) + issue_to_port(inst, config_);
     auto writeback = is_setp(inst.opcode)
         ? predicate_writeback(warp, inst.dst, port_cycle, std::move(result))
         : register_writeback(warp, inst.dst, port_cycle, std::move(result), opcode_name(inst.opcode));

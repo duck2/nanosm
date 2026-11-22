@@ -35,6 +35,7 @@
 //   common.cpp         helpers shared by the units: float bit conversions, round-robin grants, the lane mask and
 //                      panics.
 //   reg.hpp            Reg<T>, the clocked register every unit's state is made of.
+//   pipe.hpp           Pipe<T>, N stages in a row: what is in flight for a fixed number of cycles.
 //   internal.hpp       small pure functions that more than one unit uses (setp's comparison, a sector's
 //                      bus beats). The opcode classes are src/isa.hpp's.
 //
@@ -52,6 +53,7 @@
 #include "machine/machine.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -141,22 +143,20 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         gmem_.assign(static_cast<std::size_t>(config_.gmem_bytes), 0);
         tmem_.assign(static_cast<std::size_t>(config_.tmem_fine_banks) * config_.tmem_words_per_fine_bank, 0);
         acc_engines_.poke(AccEngines{});
-        acc_ld_pipe_.poke(AccLdPipeline(config_.tmem_port_depth + config_.tmem_read_latency_cycles));
+        acc_ld_pipe_.build(config_.tmem_port_depth + config_.tmem_read_latency_cycles);
+        acc_st_pipe_.build(config_.rf_read_latency_cycles + config_.tmem_port_depth);
         for (uint32_t index = 0; index < config_.shmem_load_slots; ++index) {
             load_slots_.emplace_back(registers_, "load slot " + std::to_string(index));
         }
         for (uint32_t index = 0; index < config_.shmem_store_slots; ++index) {
             store_slots_.emplace_back(registers_, "store slot " + std::to_string(index));
         }
-        a_read_pipe_.poke(ReadPipeline(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles));
-        a_write_pipe_.poke(WritePipeline(config_.shmem_port_a_depth));
-        b_write_pipe_.poke(WritePipeline(config_.shmem_port_a_depth));
-        MmaPipeline mma;
-        mma.reads.resize(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
-        mma_.poke(std::move(mma));
-        RmwEngine engine;
-        engine.alu.resize(config_.shmem_rmw_compute_cycles);
-        rmw_.poke(std::move(engine));
+        a_read_pipe_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
+        a_write_pipe_.build(config_.shmem_port_a_depth);
+        b_write_pipe_.build(config_.shmem_port_a_depth);
+        rmw_alu_.build(config_.shmem_rmw_compute_cycles);
+        mma_reads_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
+        mma_results_.build(config_.mma_result_latency_cycles + config_.tmem_port_depth);
         RfWritePolicy policy;
         policy.owed.assign(config_.rf_banks, 0);
         policy.cursor.assign(config_.rf_banks, 0);
@@ -179,13 +179,21 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             lsu_buffers_.emplace_back(registers_, name, std::move(empty));
         }
         free_id_tags_.poke(std::vector<uint8_t>(config_.lsu_sectors_in_flight, 0));
+        lsu_read_pipe_.build(config_.rf_read_latency_cycles);
+        dispatch_pipe_.build(issue_to_dispatch(config_));
+        arithmetic_reads_.build(issue_to_operands(config_));
+        // The furthest booking: the slowest fixed result's write port.
+        write_calendar_.build(issue_to_operands(config_) +
+            std::max({config_.timing.alu, config_.timing.fadd, config_.timing.sfu}) + 1);
+        write_calendar_.declare_payload_bits(
+            uint64_t{config_.rf_banks} * static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
         TmaSectorRegister sector;
         sector.data.assign(config_.gmem_sector_bytes, 0);
         tma_sector_.poke(std::move(sector));
         TmaStoreRegisters stores;
         stores.ring.resize(config_.tma_store_sector_registers);
         tma_store_registers_.poke(std::move(stores));
-        tma_walker_start_pipe_.poke(TmaWalkerStartPipeline(config_.tma_walker_start_cycles));
+        tma_walker_start_pipe_.build(config_.tma_walker_start_cycles);
         warps_.reserve(launch.active_warps);
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
             Warp warp;
@@ -195,8 +203,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             warp.urf.resize(config_.urf_registers, 0);
             warps_.push_back(std::move(warp));
         }
-        urf_pipe_.poke(UrfWritePipeline(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles));
-        tma_read_pairs_.poke(TmaReadPairs(config_.urf_read_latency_cycles));
+        urf_pipe_.build(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles);
+        tma_read_pairs_.build(config_.urf_read_latency_cycles);
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
         // from pc 0; a slot not launched stays halted.
         std::vector<WarpFrontEnd> front_end(config_.core_warps);
@@ -386,7 +394,7 @@ void Machine::tick() {
     step_front_end(w);
 
     // The RF read stage: the issue register's round samples now (vector and
-    // uniform registers). Then the URF write pipeline's next state: its
+    // uniform registers). Then the URF write pipeline's work by stage: its
     // sampled write, the uniform ALU and r2ur's results, issue's new write.
     step_rf_reads(w);
     step_urf(w);
@@ -427,29 +435,26 @@ bool Machine::done() const {
     const auto& mma = mma_.cur();
     const auto& acc = acc_engines_.cur();
     const auto empty = [](const auto& reg) { return !reg.cur().has_value(); };
-    const auto drained = [](const auto& pipe) {
-        return std::all_of(pipe.begin(), pipe.end(), [](const auto& stage) { return !stage.has_value(); });
-    };
     // The slots in every state, the probe register, the RMW
     // engine (its SIMT RMW register, operation and ALU stages) and the
     // services' pipelines (a store whose slot is free may still be travelling
     // to its write edge).
     const bool shmem_idle = std::all_of(load_slots_.begin(), load_slots_.end(), empty) &&
         std::all_of(store_slots_.begin(), store_slots_.end(), empty) && empty(mbar_probe_) && empty(simt_rmw_) &&
-        !rmw_.cur().active.has_value() && drained(rmw_.cur().alu) && drained(a_read_pipe_.cur()) &&
-        drained(a_write_pipe_.cur()) && drained(b_write_pipe_.cur()) && empty(tma_read_txn_) &&
+        !rmw_.cur().active.has_value() && rmw_alu_.empty() && a_read_pipe_.empty() &&
+        a_write_pipe_.empty() && b_write_pipe_.empty() && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
-    return warps_halted && wait_slots_empty && shmem_idle && drained(acc_ld_pipe_.cur()) &&
+    return warps_halted && wait_slots_empty && shmem_idle && acc_ld_pipe_.empty() && acc_st_pipe_.empty() &&
         !tma_mbar_event_.cur().has_value() && !mma_mbar_event_.cur().has_value() && gmem_queue_.empty() &&
         !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.cur().empty() &&
         read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
         !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
         tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
-        tma.credits_used == 0 && drained(tma_walker_start_pipe_.cur()) && empty(urf_read_rounds_) &&
-        drained(tma_read_pairs_.cur()) &&
+        tma.credits_used == 0 && tma_walker_start_pipe_.empty() && empty(urf_read_rounds_) &&
+        tma_read_pairs_.empty() &&
         empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
-        dispatch_pipe_.cur().empty() && lsu_read_pipe_.cur().empty() && drained(urf_pipe_.cur()) &&
-        mma.queue.empty() && mma.results.empty() && !mma.fetch.has_value() && drained(mma.reads) &&
+        dispatch_pipe_.empty() && lsu_read_pipe_.empty() && urf_pipe_.empty() &&
+        mma.queue.empty() && mma_results_.empty() && !mma.fetch.has_value() && mma_reads_.empty() &&
         mma.arriving.empty() &&
         !acc[0].has_value() && !acc[1].has_value();
 }
@@ -528,7 +533,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 39> canonical = {
+    static constexpr std::array<Driver, 41> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -566,6 +571,8 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_rf_read_policy,
         &Machine::drive_issue_read_banks,
         &Machine::drive_dispatch_pipe,
+        &Machine::drive_arithmetic_reads,
+        &Machine::drive_write_calendar,
         &Machine::drive_lsu_read_pipe,
         &Machine::drive_urf_pipe,
     };

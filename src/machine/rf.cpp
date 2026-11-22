@@ -35,24 +35,34 @@ namespace nanosm {
 // write PRESENTED at the port lands at the clock edge Wd cycles later and is
 // visible to samples from the next cycle (no same-edge forwarding).
 
-bool Machine::write_slot_free(uint8_t reg, uint64_t at_cycle) const {
-    const auto found = write_reservations_.find(at_cycle);
-    return found == write_reservations_.end() ||
-        found->second.at(reg % config_.rf_banks) < config_.rf_write_ports_per_bank;
+// The calendar's stage that holds the bookings for `at_cycle`: the last stage
+// is this cycle, each stage before it one cycle later.
+std::size_t Machine::write_calendar_stage(uint64_t at_cycle) const {
+    const auto ahead = at_cycle - cycle_;
+    if (at_cycle < cycle_ || ahead >= write_calendar_.stages()) {
+        throw SimError("internal RF write booking beyond the write calendar");
+    }
+    return write_calendar_.stages() - 1 - static_cast<std::size_t>(ahead);
 }
 
-void Machine::reserve_write(uint8_t reg, uint64_t at_cycle) {
+bool Machine::write_slot_free(uint8_t reg, uint64_t at_cycle) const {
+    const auto& booked = write_calendar_.stage(write_calendar_stage(at_cycle));
+    return !booked.has_value() || booked->at(reg % config_.rf_banks) < config_.rf_write_ports_per_bank;
+}
+
+// The booking enters the calendar at this edge (drive_write_calendar), at the
+// stage of its cycle.
+void Machine::reserve_write(uint8_t reg, uint64_t at_cycle, Wires& w) {
     if (at_cycle <= cycle_) throw SimError("internal RF write booking for the current cycle");
     if (!write_slot_free(reg, at_cycle)) throw SimError("internal RF write booking over a full port");
-    auto& slots = write_reservations_[at_cycle];
-    if (slots.empty()) slots.resize(config_.rf_banks, 0);
-    ++slots.at(reg % config_.rf_banks);
+    w.issue.rf_write_stage = write_calendar_stage(at_cycle);
 }
 
-// calendar[0] of a bank: its writes booked (in earlier cycles) for this cycle.
+// The calendar's last stage: a bank's writes booked (in earlier cycles) for
+// this cycle.
 uint32_t Machine::writes_booked_now(uint32_t bank) const {
-    const auto found = write_reservations_.find(cycle_);
-    return found == write_reservations_.end() ? 0 : found->second.at(bank);
+    const auto& now = write_calendar_.last();
+    return now.has_value() ? now->at(bank) : 0;
 }
 
 bool Machine::RfWriteDecision::granted_to(AsyncWriter writer, uint32_t index) const {
@@ -272,7 +282,6 @@ void Machine::rf_write_port(Wires& w) {
         w.new_writebacks.push_back(std::move(writeback));
     }
     count_rf_write_waits(decision);
-    write_reservations_.erase(cycle_);
 }
 
 // The write pipeline's RAM stage: the writes at the RAM now. They land at
@@ -367,8 +376,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         auto values = lane_values(warp, read->reg);
         if (read->reader == RfReader::acc_st) {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::acc_st);
-            w.acc_st_read = AccStBeat{store_engine->next_column,
-                cycle_ + config_.rf_read_latency_cycles + config_.tmem_port_depth, std::move(values)};
+            w.acc_st_read = AccStBeat{store_engine->next_column, std::move(values)};
         } else {
             // A stg.v8 reads rS + j once per lane group; the register is free
             // to be overwritten after the last group's read.
@@ -380,7 +388,6 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             w.lsu_rf_read.beat = read->beat;
             w.lsu_rf_read.lanes = read->lanes;
             w.lsu_rf_read.values = std::move(values);
-            w.lsu_rf_read.arrive_cycle = cycle_ + config_.rf_read_latency_cycles;
         }
     }
     return decision;
@@ -415,35 +422,37 @@ void Machine::step_rf_reads(Wires& w) {
         for (const auto reg : regs) values.push_back(warps_[warp].urf.at(reg));
         return values;
     };
-    for (auto it = arithmetic_reads_.begin(); it != arithmetic_reads_.end();) {
-        if (it->issue_cycle + issue_to_sample == cycle_) {
-            for (std::size_t i = 0; i < it->reads.size(); ++i) it->operands[i] = sample(it->warp, it->reads[i]);
-            it->uniform_operands = sample_uniform(it->warp, it->uniform_reads);
-            // The write mask joins the round: its lanes AND the issue cycle's
-            // active mask are the result's lane enables.
-            if (has_write_mask(it->instruction)) it->active_mask &= write_mask_lanes(warps_[it->warp], it->instruction);
+    // The arithmetic pipeline: the instruction in its last stage has its
+    // operands at the RF output and executes; the one in stage 0 (accepted
+    // last cycle) samples its round.
+    if (const auto& ready = arithmetic_reads_.last(); ready.has_value()) execute_arithmetic(*ready, w);
+    if (const auto& first = arithmetic_reads_.stage(0); first.has_value()) {
+        auto sampled = *first;
+        for (std::size_t i = 0; i < sampled.reads.size(); ++i) {
+            sampled.operands[i] = sample(sampled.warp, sampled.reads[i]);
         }
-        if (it->issue_cycle + issue_to_operands(config_) == cycle_) {
-            execute_arithmetic(*it, w);
-            it = arithmetic_reads_.erase(it);
-        } else {
-            ++it;
+        sampled.uniform_operands = sample_uniform(sampled.warp, sampled.uniform_reads);
+        // The write mask joins the round: its lanes AND the issue cycle's
+        // active mask are the result's lane enables.
+        if (has_write_mask(sampled.instruction)) {
+            sampled.active_mask &= write_mask_lanes(warps_[sampled.warp], sampled.instruction);
         }
+        w.arithmetic_sampled = std::move(sampled);
     }
+    // The dispatch pipeline's stage 0: the instruction accepted last cycle
+    // samples its round.
     const auto& pipe = dispatch_pipe_.cur();
-    for (std::size_t index = 0; index < pipe.size(); ++index) {
-        const auto& op = pipe[index];
+    if (const auto& first = pipe.front(); first.has_value()) {
+        const auto& op = *first;
         const bool masked = has_write_mask(op.instruction);
-        if (op.issue_cycle + issue_to_sample != cycle_ ||
-            (op.reads.empty() && op.uniform_reads.empty() && !masked)) {
-            continue;
+        if (!(op.reads.empty() && op.uniform_reads.empty() && !masked)) {
+            auto operands = op.operands;
+            for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
+            const auto rounds = uniform_read_rounds(op.instruction);
+            w.dispatch_samples.push_back({0, false, std::move(operands), 0,
+                sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front()),
+                masked ? std::optional<uint64_t>{write_mask_lanes(warps_[op.warp], op.instruction)} : std::nullopt});
         }
-        auto operands = op.operands;
-        for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
-        const auto rounds = uniform_read_rounds(op.instruction);
-        w.dispatch_samples.push_back({index, false, std::move(operands), 0,
-            sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front()),
-            masked ? std::optional<uint64_t>{write_mask_lanes(warps_[op.warp], op.instruction)} : std::nullopt});
     }
     // The URF write pipeline's stage 0: uniform arithmetic samples its
     // uniform sources (in operand order; a register named twice is one read),
@@ -478,17 +487,18 @@ void Machine::step_rf_reads(Wires& w) {
             uniform_reads += static_cast<uint32_t>(registers.size());
             w.tma_sampled = std::move(pair);
         } else if (rounds->round > 0) {
-            const auto entry = std::find_if(pipe.begin(), pipe.end(), [&](const DispatchEntry& op) {
-                return op.issue_cycle == rounds->header.issue_cycle && op.warp == rounds->header.warp;
-            });
-            if (entry == pipe.end()) throw SimError("internal: a later uniform round lost its dispatch entry");
+            // Its dispatch entry, accepted at the counter's issue cycle, is in
+            // stage (now - issue - 1).
+            const std::size_t stage = static_cast<std::size_t>(cycle_ - rounds->header.issue_cycle - issue_to_sample);
+            if (stage >= pipe.size() || !pipe[stage].has_value() || pipe[stage]->warp != rounds->header.warp) {
+                throw SimError("internal: a later uniform round lost its dispatch entry");
+            }
             std::size_t first = 0;
             for (uint32_t round = 0; round < rounds->round; ++round) first += plan[round].size();
             std::vector<uint32_t> values;
             for (const auto reg : registers) values.push_back(warps_[rounds->header.warp].urf.at(reg));
             uniform_reads += static_cast<uint32_t>(registers.size());
-            w.dispatch_samples.push_back({static_cast<std::size_t>(entry - pipe.begin()), true, {}, first,
-                std::move(values), std::nullopt});
+            w.dispatch_samples.push_back({stage, true, {}, first, std::move(values), std::nullopt});
         }
     }
     if (uniform_reads > urf_read_ports) {
@@ -542,6 +552,27 @@ void Machine::drive_rf_read_policy(const Wires& w) {
     }
     if (next == rf_read_policy_.cur()) return;
     rf_read_policy_.set_next(std::move(next), "drive_rf_read_policy");
+}
+
+// The arithmetic pipeline's operand latches: the instruction in stage 0 goes
+// on with the round it sampled now; the one in the last stage executed now
+// and leaves; issue's accepted instruction enters stage 0.
+void Machine::drive_arithmetic_reads(const Wires& w) {
+    if (w.arithmetic_sampled.has_value()) {
+        arithmetic_reads_.replace(0, w.arithmetic_sampled, "drive_arithmetic_reads: the sample");
+    }
+    if (w.issue.arithmetic.has_value()) arithmetic_reads_.push(*w.issue.arithmetic, "drive_arithmetic_reads");
+}
+
+// The RF write calendar: this cycle's bookings leave (the last stage); a
+// booking made now enters at the stage of its cycle, added to the bank's
+// count there.
+void Machine::drive_write_calendar(const Wires& w) {
+    if (!w.issue.rf_write_stage.has_value()) return;
+    const auto stage = *w.issue.rf_write_stage;
+    auto booked = write_calendar_.stage(stage).value_or(std::vector<uint32_t>(config_.rf_banks, 0));
+    ++booked.at(w.issue.rf_write_bank.value());
+    write_calendar_.replace(stage, std::move(booked), "drive_write_calendar");
 }
 
 // The issue register's bank use: the round of the instruction accepted now

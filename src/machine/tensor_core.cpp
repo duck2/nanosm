@@ -114,43 +114,44 @@ void Machine::step_mma(Wires& w) {
 // A step granted its last round at g samples it at g + D and enters the core
 // at g + D + Lb (the same D and Lb as port A).
 void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
-    for (auto it = mma.results.begin(); it != mma.results.end();) {
-        if (!it->c_sampled && it->c_sample_cycle == cycle_) sample_mma_c(*it);
-        if (it->land_cycle != cycle_) { ++it; continue; }
-        if (!it->c_sampled) throw SimError("internal MMA result lands before its C sample");
-        for (std::size_t i = 0; i < it->words.size(); ++i) w.tmem_writes.emplace_back(it->words[i], it->values[i]);
-        trace_->mma_result(cycle_, it->command, it->address);
-        const auto id = it->command;
+    if (const auto& at_c = mma_results_.stage(config_.tmem_port_depth - 1); at_c.has_value()) {
+        w.mma_result_sampled = *at_c;
+        sample_mma_c(*w.mma_result_sampled);
+    }
+    if (const auto& landing = mma_results_.last(); landing.has_value()) {
+        if (!landing->c_sampled) throw SimError("internal MMA result lands before its C sample");
+        for (std::size_t i = 0; i < landing->words.size(); ++i) {
+            w.tmem_writes.emplace_back(landing->words[i], landing->values[i]);
+        }
+        trace_->mma_result(cycle_, landing->command, landing->address);
+        const auto id = landing->command;
         auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
             [id](const auto& candidate) { return candidate.id == id; });
         if (command == mma.queue.end() || command->outstanding_results == 0)
             throw SimError("internal MMA result lost its command");
         --command->outstanding_results;
-        it = mma.results.erase(it);
     }
     while (!mma.queue.empty() && !mma.queue.front().commit &&
            mma.queue.front().operands_consumed && mma.queue.front().outstanding_results == 0) {
         sanitizer_.record_mma_retired(mma.queue.front().id); // last result retired
         mma.queue.pop_front();
     }
-    if (auto& at_ram = mma.reads.at(config_.shmem_port_a_depth - 1); at_ram.has_value())
-        sample_mma_read(mma, *at_ram, w);
-    if (const auto& output = mma.reads.back(); output.has_value()) {
+    if (const auto& at_ram = mma_reads_.stage(config_.shmem_port_a_depth - 1); at_ram.has_value()) {
+        w.mma_read_sampled = *at_ram;
+        sample_mma_read(mma, *w.mma_read_sampled, w);
+    }
+    if (const auto& output = mma_reads_.last(); output.has_value()) {
         mma.arriving.insert(mma.arriving.end(), output->values.begin(), output->values.end());
         if (output->last_round) {
-            enter_mma_core(mma, output->step);
+            enter_mma_core(mma, output->step, w);
             mma.arriving.clear();
         }
     }
-    std::optional<MmaRead> granted;
     if (!mma.fetch.has_value()) mma.fetch = next_mma_step(mma, w);
     if (mma.fetch.has_value()) {
-        granted = grant_mma_round(mma);
+        w.mma_read_granted = grant_mma_round(mma);
         if (mma.fetch->next_round == mma.fetch->round_elements.size()) mma.fetch.reset();
     }
-    for (std::size_t stage = mma.reads.size() - 1; stage > 0; --stage)
-        mma.reads[stage] = std::move(mma.reads[stage - 1]);
-    mma.reads.front() = std::move(granted);
 }
 
 // The next step port B may start now, if any; or the head commit presents
@@ -210,11 +211,17 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
             return std::find(words.begin(), words.end(), word) != words.end();
         });
     };
+    // In flight: the steps in the result pipeline whose write has not landed
+    // (the one in the last stage lands at this edge), the step entering the
+    // core now, and the rounds in the read pipeline.
+    const auto& results = mma_results_.cur();
+    const auto& reads = mma_reads_.cur();
     const bool tile_in_flight =
-        std::any_of(mma.results.begin(), mma.results.end(), [&](const MmaResult& result) {
-            return shares_words(result.words);
+        std::any_of(results.begin(), results.end() - 1, [&](const std::optional<MmaResult>& result) {
+            return result.has_value() && shares_words(result->words);
         }) ||
-        std::any_of(mma.reads.begin(), mma.reads.end(), [&](const std::optional<MmaRead>& read) {
+        (w.mma_result_entering.has_value() && shares_words(w.mma_result_entering->words)) ||
+        std::any_of(reads.begin(), reads.end(), [&](const std::optional<MmaRead>& read) {
             return read.has_value() && shares_words(mma_block_words(read->step));
         });
     if (tile_in_flight) {
@@ -294,7 +301,7 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
 // read leaves for tmem now (sampled tmem.port_depth later, sample_mma_c);
 // its result leaves the core result_latency after entry and lands in tmem
 // tmem.port_depth after that.
-void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
+void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w) {
     std::map<uint32_t, uint16_t> latch(mma.arriving.begin(), mma.arriving.end());
     const auto value = [&](uint32_t address) {
         const auto found = latch.find(address);
@@ -317,15 +324,13 @@ void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step) {
             b[ni * config_.mma_core_k + kk] = value(mma_b_address(config_, step.shape,
                 step.b_base, step.b_spacing, step.k0 + kk, step.n0 + ni));
     MmaResult result;
-    result.c_sample_cycle = cycle_ + config_.tmem_port_depth;
-    result.land_cycle = cycle_ + config_.mma_result_latency_cycles + config_.tmem_port_depth;
     result.command = step.command;
     result.address = step.c_pointer + step.m0 * step.shape.n + step.n0;
     result.words = mma_block_words(step);
     result.init_step = step.init_step;
     result.a = mma.a_held;
     result.b = std::move(b);
-    mma.results.push_back(std::move(result));
+    w.mma_result_entering = std::move(result);
 }
 
 // A step's C is at the tmem RAM now: its sixteen words are sampled (one
@@ -386,11 +391,9 @@ std::vector<uint32_t> Machine::mma_block_words(const MmaStep& step) const {
 // (d). The acc.ld pipeline before the acc.st beat.
 void Machine::step_acc_transfers(Wires& w) {
     auto engines = acc_engines_.cur();
-    auto pipe = acc_ld_pipe_.cur();
-    step_acc_ld(engines[0], pipe, w);
+    step_acc_ld(engines[0], w);
     step_acc_st(engines[1], w);
     w.acc_next = std::move(engines);
-    w.acc_ld_next = std::move(pipe);
 }
 
 // The acc.ld engine's pipeline. The beat at the tmem RAM stage samples its
@@ -403,14 +406,17 @@ void Machine::step_acc_transfers(Wires& w) {
 //                               empty
 //   output valid and denied  -> hold: no stage moves, nothing launches
 // A granted beat belongs to the RF write path from its grant on.
-void Machine::step_acc_ld(std::optional<AccTransfer>& engine, AccLdPipeline& pipe, const Wires& w) {
-    if (auto& at_ram = pipe.at(config_.tmem_port_depth - 1); at_ram.has_value() && !at_ram->sampled) {
-        sample_acc_ld_beat(*at_ram);
+void Machine::step_acc_ld(std::optional<AccTransfer>& engine, Wires& w) {
+    if (const auto& at_ram = acc_ld_pipe_.stage(config_.tmem_port_depth - 1); at_ram.has_value() && !at_ram->sampled) {
+        w.acc_ld_sampled = *at_ram;
+        sample_acc_ld_beat(*w.acc_ld_sampled);
     }
-    const bool output_valid = pipe.back().has_value();
-    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, 0)) return;
-    for (std::size_t stage = pipe.size() - 1; stage > 0; --stage) pipe[stage] = std::move(pipe[stage - 1]);
-    pipe.front() = launch_acc_ld_beat(engine);
+    const bool output_valid = acc_ld_pipe_.last().has_value();
+    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, 0)) {
+        w.acc_ld_hold = true;
+        return;
+    }
+    w.acc_ld_launch = launch_acc_ld_beat(engine);
 }
 
 // The engine's next read leaves for tmem now: the transfer's next column, all
@@ -453,8 +459,8 @@ void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
 void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
     if (!engine.has_value()) return;
     auto& transfer = *engine;
-    while (!transfer.in_flight.empty() && transfer.in_flight.front().land_cycle == cycle_) {
-        const auto& beat = transfer.in_flight.front();
+    if (const auto& at_ram = acc_st_pipe_.last(); at_ram.has_value()) {
+        const auto& beat = *at_ram;
         const uint64_t address = uint64_t{transfer.pointer} + beat.column;
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             w.tmem_writes.emplace_back(
@@ -462,7 +468,6 @@ void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
                 beat.values[lane]);
         }
         trace_->tmem_beat(cycle_, transfer.warp, false, static_cast<uint32_t>(address));
-        transfer.in_flight.pop_front();
         ++transfer.landed;
     }
     if (transfer.landed != transfer.width) return;
@@ -629,18 +634,28 @@ void Machine::drive_mma(const Wires& w) {
     auto next = w.mma_next;
     if (w.dispatch.mma.has_value()) next.queue.push_back(*w.dispatch.mma);
     mma_.set_next(std::move(next), "drive_mma");
+    if (w.mma_read_sampled.has_value()) {
+        mma_reads_.replace(config_.shmem_port_a_depth - 1, w.mma_read_sampled, "drive_mma: the shmem RAM's elements");
+    }
+    if (w.mma_read_granted.has_value()) mma_reads_.push(*w.mma_read_granted, "drive_mma: the granted round");
+    if (w.mma_result_sampled.has_value()) {
+        mma_results_.replace(config_.tmem_port_depth - 1, w.mma_result_sampled, "drive_mma: the C sample");
+    }
+    if (w.mma_result_entering.has_value()) {
+        mma_results_.push(*w.mma_result_entering, "drive_mma: a step enters the core");
+    }
 }
 
 // The two acc transfer engines: step_acc_transfers' result (acc.ld launches,
-// acc.st landings), plus this cycle's acc.st RF read (the beat joins the
-// acc.st transfer's in-flight list) and dispatch's new transfer (into an
-// engine freed this cycle, possibly).
+// acc.st landings), plus this cycle's acc.st RF read (the beat enters the
+// acc.st pipeline) and dispatch's new transfer (into an engine freed this
+// cycle, possibly).
 void Machine::drive_acc_transfers(const Wires& w) {
     auto next = w.acc_next;
     if (const auto& beat = w.acc_st_read; beat.has_value()) {
         auto& engine = next[1];
         if (!engine.has_value()) throw SimError("internal acc.st beat read with no acc.st transfer");
-        engine->in_flight.push_back(*beat);
+        acc_st_pipe_.push(*beat, "drive_acc_transfers: acc.st beat");
         ++engine->next_column;
     }
     if (const auto& admission = w.dispatch.acc; admission.has_value()) {
@@ -651,10 +666,17 @@ void Machine::drive_acc_transfers(const Wires& w) {
     acc_engines_.set_next(std::move(next), "drive_acc_transfers");
 }
 
-// The acc.ld pipeline: step_acc_transfers' advance or hold.
+// The acc.ld pipeline: step_acc_transfers' advance or hold. The beat at the
+// tmem RAM stage carries its words from this edge on, held or not.
 void Machine::drive_acc_ld_pipe(const Wires& w) {
-    if (w.acc_ld_next == acc_ld_pipe_.cur()) return;
-    acc_ld_pipe_.set_next(w.acc_ld_next, "drive_acc_ld_pipe");
+    if (w.acc_ld_sampled.has_value()) {
+        acc_ld_pipe_.replace(config_.tmem_port_depth - 1, w.acc_ld_sampled, "drive_acc_ld_pipe: the tmem words");
+    }
+    if (w.acc_ld_hold) {
+        acc_ld_pipe_.hold("drive_acc_ld_pipe: the output is denied");
+    } else if (w.acc_ld_launch.has_value()) {
+        acc_ld_pipe_.push(*w.acc_ld_launch, "drive_acc_ld_pipe");
+    }
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> Machine::mma_operand_span(

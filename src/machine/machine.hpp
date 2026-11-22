@@ -4,6 +4,7 @@
 #include "image.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
+#include "machine/pipe.hpp"
 #include "machine/reg.hpp"
 #include "timing.hpp"
 #include "machine/sanitizer.hpp"
@@ -201,6 +202,12 @@ public:
     [[nodiscard]] uint32_t lsu_buffer_valid_count(uint32_t index) const {
         return lsu_buffers_.at(index).cur().valid_count;
     }
+    [[nodiscard]] uint32_t lsu_buffer_group(uint32_t index) const { return lsu_buffers_.at(index).cur().group; }
+    [[nodiscard]] const std::vector<uint32_t>& lsu_buffer_words(uint32_t index) const {
+        return lsu_buffers_.at(index).cur().words;
+    }
+    // Every clocked register's declared size, in declaration order.
+    [[nodiscard]] std::vector<StateSize> state_sizes() const { return registers_.sizes(); }
     // Test seams (Q, between ticks): whether load slot `index` is held, and
     // whether its gathered vector is complete (a ready async RF writer);
     // whether store slot `index` is held.
@@ -436,9 +443,9 @@ private:
 
     // A fixed-latency instruction in the arithmetic pipeline, from accepted
     // issue until its operands are all at the RF output (issue +
-    // issue_to_operands), when it executes: its operand latches.
+    // issue_to_operands: the last stage of arithmetic_reads_), when it
+    // executes: its operand latches.
     struct ArithmeticRead {
-        uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;                             // (S) PANIC text: the instruction's own pc
         // Its result's lane enables (16 bits): the issue cycle's active mask,
@@ -461,9 +468,9 @@ private:
     // per resource in hardware; dispatch_claims). The pc and the active mask
     // are the issue cycle's; a masked lds / sts / ldg / stg's write mask is
     // ANDed into the active mask at its sample, so from issue + 2 the field
-    // holds its lane enables.
+    // holds its lane enables. It is in stage k of dispatch_pipe_ in cycle
+    // issue + 1 + k: stage 0 is its sample, the last stage its dispatch.
     struct DispatchEntry {
-        uint64_t issue_cycle = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t active_mask = 0;
@@ -506,7 +513,6 @@ private:
         std::vector<uint32_t> operands;   // from the sample: the uniform sources in operand order, or r2ur's lane 0
         std::optional<uint32_t> value;    // the result, from its execution on
     };
-    using UrfWritePipeline = std::vector<std::optional<UrfWrite>>;
 
     struct LaneAccess {
         uint32_t lane = 0;
@@ -579,15 +585,13 @@ private:
     // The acc.ld engine's pipeline: tmem.port_depth stages to the tmem sample,
     // then tmem.read_latency_cycles stages to the output, which asks the RF
     // write decision for service. Stage 0 takes the launched read.
-    using AccLdPipeline = std::vector<std::optional<AccLdBeat>>;
 
     // One acc.st beat between its RF read and its tmem write: read (sampled)
     // at its grant, at the RF output Lr cycles later (where it leaves for
-    // tmem), at the tmem RAM tmem.port_depth after that (land_cycle: written
-    // at that cycle's edge).
+    // tmem), at the tmem RAM tmem.port_depth after that (the last stage of
+    // acc_st_pipe_: written at that cycle's edge).
     struct AccStBeat {
         uint32_t column = 0;
-        uint64_t land_cycle = 0;
         std::vector<uint32_t> values;
     };
 
@@ -604,9 +608,8 @@ private:
         uint32_t row_words = 0;
         uint32_t width = 1;
         uint32_t next_column = 0;   // beats launched (acc.ld: tmem reads; acc.st: RF reads)
-        // acc.st: its beats in flight to tmem, oldest first, and how many
-        // landed. The acc.st engine frees when the last one lands.
-        std::deque<AccStBeat> in_flight;
+        // acc.st: how many of its beats (in flight in acc_st_pipe_) landed.
+        // The acc.st engine frees when the last one lands.
         uint32_t landed = 0;
     };
 
@@ -631,12 +634,11 @@ private:
     // One step in the core, from its entry to its result's tmem write. C (its
     // tile's sixteen accumulator words, one round of the MMA's tmem read
     // service) is requested as the step enters and sampled tmem.port_depth
-    // later; the fused dot-plus-C result leaves the core result_latency after
-    // entry and reaches the tmem RAM tmem.port_depth after that (land_cycle:
-    // written at that cycle's edge). The command's result retires there.
+    // later (stage port_depth - 1 of mma_results_); the fused dot-plus-C result
+    // leaves the core result_latency after entry and reaches the tmem RAM
+    // tmem.port_depth after that (the last stage: written at that cycle's
+    // edge). The command's result retires there.
     struct MmaResult {
-        uint64_t c_sample_cycle = 0;
-        uint64_t land_cycle = 0;
         uint64_t command = 0;
         uint32_t address = 0;            // the block's first logical tmem word (the trace's)
         std::vector<uint32_t> words;     // its core_m x core_n physical tmem words, row-major
@@ -1127,7 +1129,6 @@ private:
         uint64_t command = 0;
         TmaWalker walker;
     };
-    using TmaWalkerStartPipeline = std::vector<std::optional<TmaWalkerStart>>;
 
     enum class TmaPortKind : uint8_t {
         descriptor,
@@ -1260,19 +1261,12 @@ private:
         std::optional<MbarWake> wake;          // an RMW write that flips the phase wakes the waiters
         std::optional<PlacementEnd> placed;    // a TMA placement's last round: its load write ends
     };
-    using ReadPipeline = std::vector<std::optional<ReadBeat>>;   // D + Lb stages
-    using WritePipeline = std::vector<std::optional<WriteBeat>>; // D stages
 
     // The RMW engine: the operation in flight (its presence IS the store
     // PAUSE: store_pause()), its ALU stages and the admission state between
     // its requesters (they change together).
     struct RmwEngine {
         std::optional<ActiveMbarRmw> active;
-        // The ALU (shmem.rmw_compute_cycles = C register stages): the update
-        // computed from the read's words at the port output
-        // enters stage 0 at that cycle's edge; it is ready in the last stage C
-        // cycles after the port output, and its write is granted then.
-        std::vector<std::optional<WriteBeat>> alu;
         // The engine whose event was started last (set on every engine-event
         // start, contested or not). When both engines hold an event, the other
         // engine's goes. Starts at mma, so the first such tie serves the TMA.
@@ -1347,14 +1341,12 @@ private:
     struct MmaPipeline {
         std::deque<MmaCommand> queue;   // mma.queue_commands; issue pushes at the back
         std::optional<MmaFetch> fetch;  // the step whose rounds port B is granting
-        std::vector<std::optional<MmaRead>> reads; // the port-B read pipeline: D + Lb stages
         // The core's operand latch: the values of the step whose rounds are
         // arriving at the port output (A + B of one step: at most 128 B).
         std::vector<std::pair<uint32_t, uint16_t>> arriving;
         // The held A block: core_m x core_k fp16 (64 B at 4x8), written when a
         // reloading step enters the core, used by the steps after it.
         std::vector<uint16_t> a_held;
-        std::deque<MmaResult> results;  // steps in the core and in the tmem write pipeline
     };
 
     // The URF's multi-round operand read (the rounds are src/timing.hpp
@@ -1375,7 +1367,7 @@ private:
     //     register (5 bits); round 0's fields are the issue register's. Here
     //     it keeps the whole instruction.
     // The TMA's operand read is that counter and two registers of its own:
-    //   - the URF read stages (TmaReadPairs, Lu stages): each pair sampled
+    //   - the URF read stages (tma_read_pairs_, Lu stages): each pair sampled
     //     for a tma travels to the URF output with its tag -- which fields it
     //     is (the round) and whether it is the last; round 0's also carries
     //     the instruction's own fields. Without the tag, back-to-back
@@ -1403,7 +1395,6 @@ private:
         std::optional<UrfReadHeader> header; // round 0: the instruction's fields
         std::vector<uint32_t> words;         // the sampled registers' values, in operand order
     };
-    using TmaReadPairs = std::vector<std::optional<TmaReadPair>>;
     struct TmaReadHolding {
         UrfReadHeader header;
         uint32_t buffer = 0;        // urS as read (its low bits are the sanitizer's)
@@ -1672,13 +1663,12 @@ private:
 
     // LSU: RF -> the store buffer (vector stores), below issue in priority.
     // The LSU's store-data RF read (vector stores): sampled at its grant, at
-    // the RF output Lr cycles later (arrive_cycle), when it fills the
-    // store buffer.
+    // the RF output Lr cycles later (the last stage of lsu_read_pipe_), when
+    // it fills the store buffer.
     struct LsuRfRead {
         std::optional<uint64_t> command;
         uint32_t buffer = 0;
         std::vector<uint32_t> values;   // the register, every lane
-        uint64_t arrive_cycle = 0;
         uint32_t group = 0;             // the lane group it is for
         uint32_t beat = 0;              // which of rS .. rS+7
         uint64_t lanes = 0;             // the group's active lanes: the words kept
@@ -1717,6 +1707,8 @@ private:
         std::optional<IssuedBranch> branch;              // ... a branch: into the issue register
         std::optional<DepbarEvent> depbar_admission;
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
+        std::optional<std::size_t> rf_write_stage;       // ... at this stage of the write calendar
+        std::optional<ArithmeticRead> arithmetic;        // a fixed-latency instruction enters the arithmetic pipeline
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
         std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
@@ -1786,9 +1778,22 @@ private:
         // Next state of the units issue looks ahead at (committed by their
         // drivers, with issue's additions).
         MmaPipeline mma_next;
+        // The MMA's two pipelines this cycle: the round at the shmem RAM with
+        // the elements it sampled, and the round port B granted (it enters
+        // the read pipeline); the step at its C sample with its result, and
+        // the step entering the core (it enters the result pipeline).
+        std::optional<MmaRead> mma_read_sampled;
+        std::optional<MmaRead> mma_read_granted;
+        std::optional<MmaResult> mma_result_sampled;
+        std::optional<MmaResult> mma_result_entering;
         std::optional<MbarRmwRequest> mma_present;    // a commit presented into the MMA's event register
         AccEngines acc_next;
-        AccLdPipeline acc_ld_next;
+        // The acc.ld pipeline this cycle: the beat at the tmem RAM stage with
+        // the words it sampled; the engine's next read entering stage 0; or
+        // a hold (its output is valid and was denied the RF write).
+        std::optional<AccLdBeat> acc_ld_sampled;
+        std::optional<AccLdBeat> acc_ld_launch;
+        bool acc_ld_hold = false;
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
@@ -1803,6 +1808,9 @@ private:
         std::optional<TmaCommand> tma_pushed;
         // The dispatch pipeline's end: its unit takes an instruction now.
         bool dispatched = false;
+        // The arithmetic pipeline's stage 0: its instruction with the round
+        // it sampled now.
+        std::optional<ArithmeticRead> arithmetic_sampled;
         DispatchDecision dispatch;
         // The async RF readers (the read ports the issue register leaves free now), before issue.
         RfReadDecision rf_read;
@@ -1812,12 +1820,12 @@ private:
         IssueDecision issue;
         // The front ends after this cycle (step_front_end, after issue).
         std::vector<WarpFrontEnd> front_end_next;
-        // The RF read stage: dispatch entries' operands latched now (index
-        // in the pipeline's Q, operands by read, uniform operands by uniform
+        // The RF read stage: dispatch entries' operands latched now (the
+        // entry's stage, operands by read, uniform operands by uniform
         // read from position uniform_first). A later round of an mma.async
         // (the round counter's) latches only its uniform operands.
         struct DispatchSample {
-            std::size_t index = 0;
+            std::size_t stage = 0;
             bool later_round = false;
             std::vector<std::vector<uint32_t>> operands;
             std::size_t uniform_first = 0;
@@ -1829,10 +1837,13 @@ private:
         std::vector<DispatchSample> dispatch_samples;
         // The URF write pipeline: the write at the RAM now (it lands at this
         // cycle's edge), the operands its stage-0 write samples now (the read
-        // stage), and the pipeline's next state (step_urf).
+        // stage), and the pipeline's work by stage (step_urf).
         std::optional<UrfWrite> urf_landing;
         std::optional<std::vector<uint32_t>> urf_sample;
-        UrfWritePipeline urf_pipe_next;
+        // The URF write pipeline's work this cycle, by stage: the write at
+        // that stage as it goes on (operands latched, value computed), or
+        // nothing for a usetp leaving at the write port's stage.
+        std::vector<std::pair<std::size_t, std::optional<UrfWrite>>> urf_stage_work;
         // The round counter's tma round sampled now (the URF's read ports).
         std::optional<TmaReadPair> tma_sampled;
     };
@@ -1896,9 +1907,17 @@ private:
     Reg<std::optional<MbarReadRequest>> mbar_probe_{registers_, "SIMT mbar probe"};
     Reg<std::optional<MbarRmwRequest>> simt_rmw_{registers_, "SIMT RMW register"};
     Reg<RmwEngine> rmw_{registers_, "RMW engine"};
-    Reg<ReadPipeline> a_read_pipe_{registers_, "A-read pipeline"};
-    Reg<WritePipeline> a_write_pipe_{registers_, "A-write pipeline"};
-    Reg<WritePipeline> b_write_pipe_{registers_, "port-B write pipeline"};
+    // A-read: D stages to the RAM, where the round's words are sampled (stage
+    // D - 1), then Lb to the port output (the last stage). A-write and port-B
+    // write: D stages to the RAM (the last stage), where the bytes land.
+    Pipe<ReadBeat> a_read_pipe_{registers_, "A-read pipeline"};
+    Pipe<WriteBeat> a_write_pipe_{registers_, "A-write pipeline"};
+    Pipe<WriteBeat> b_write_pipe_{registers_, "port-B write pipeline"};
+    // The RMW engine's ALU (shmem.rmw_compute_cycles = C stages): the update
+    // computed from the read's words at the port output enters stage 0 at that
+    // cycle's edge; it is ready in the last stage C cycles after the port
+    // output, and its write is granted then.
+    Pipe<WriteBeat> rmw_alu_{registers_, "RMW engine: ALU stages"};
     Reg<ShmemArbiters> shmem_arbiters_{registers_, "shmem A-read / A-write arbiters"};
     // fence.sh, per warp: how many cycles from now until
     // the warp's latest granted shmem round reaches the RAM (a write's edge,
@@ -1910,11 +1929,26 @@ private:
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
     // MMA and accumulator transfers.
     Reg<MmaPipeline> mma_{registers_, "MMA queue and pipeline"};
+    // The port-B read pipeline: D stages to the shmem RAM (a round's elements
+    // are sampled at stage D - 1), then Lb to the port output, the last stage.
+    Pipe<MmaRead> mma_reads_{registers_, "MMA port-B read pipeline"};
+    // The steps in the core and on their way to tmem: tmem.port_depth stages
+    // to the C sample (stage port_depth - 1), result_latency from entry to
+    // the core's output, tmem.port_depth more to the tmem RAM, the last stage
+    // (result_latency + port_depth stages in all).
+    Pipe<MmaResult> mma_results_{registers_, "MMA core and result pipeline"};
     Reg<AccEngines> acc_engines_{registers_, "acc transfer engines"};
-    Reg<AccLdPipeline> acc_ld_pipe_{registers_, "acc.ld pipeline"};
+    // The acc.ld engine's pipeline: tmem.port_depth stages to the tmem RAM
+    // (sampled at stage port_depth - 1), then tmem.read_latency_cycles to the
+    // output, the last stage, which holds the whole pipeline while the RF
+    // write decision denies it.
+    Pipe<AccLdBeat> acc_ld_pipe_{registers_, "acc.ld pipeline"};
+    // The acc.st engine's beats on their way to tmem: the RF's Lr read stages,
+    // then tmem.port_depth stages to the RAM, the last stage.
+    Pipe<AccStBeat> acc_st_pipe_{registers_, "acc.st pipeline"};
     // TMA.
     Reg<TmaQueue> tma_{registers_, "TMA command queue"};
-    Reg<TmaWalkerStartPipeline> tma_walker_start_pipe_{registers_, "TMA walker start pipeline"};
+    Pipe<TmaWalkerStart> tma_walker_start_pipe_{registers_, "TMA walker start pipeline"};
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
     // tma_requests builds it (bypass (h) in tick()). The placement (port-B
     // write) register holds the rounds after the first; the A-read one holds
@@ -1927,7 +1961,7 @@ private:
     // The URF's round counter (UrfReadRounds above), then the TMA operand
     // read's URF read stages with their tags (Lu stages) and holding register.
     Reg<std::optional<UrfReadRounds>> urf_read_rounds_{registers_, "URF operand read: round counter"};
-    Reg<TmaReadPairs> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
+    Pipe<TmaReadPair> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
     Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, "TMA operand read: holding register"};
     // LSU.
     // Sizes: command slots lsu.active_commands (2; checked in
@@ -1956,34 +1990,41 @@ private:
     Reg<std::vector<uint8_t>> issue_read_banks_{registers_, "issue register: RF read bank use"};
     // Issue -> units: the issue register and the RF read pipeline
     // (issue_to_dispatch stages), carrying memory / engine instructions.
-    Reg<std::deque<DispatchEntry>> dispatch_pipe_{registers_, "dispatch pipeline"};
-    // The LSU's store-data RF reads travelling to the store buffer (Lr
-    // stages: at most one read per cycle, so at most Lr entries; checked in
-    // drive_lsu_read_pipe).
-    Reg<std::deque<LsuRfRead>> lsu_read_pipe_{registers_, "LSU store-data read pipeline"};
+    // issue_to_dispatch stages: an instruction accepted at t is in stage k at
+    // t + 1 + k and dispatches from the last stage.
+    Pipe<DispatchEntry> dispatch_pipe_{registers_, "dispatch pipeline"};
+    // The LSU's store-data RF reads travelling to the store buffer: the RF's
+    // Lr read stages. A read granted at t is in stage 0 at t + 1 and at the RF
+    // output, the last stage, at t + Lr.
+    Pipe<LsuRfRead> lsu_read_pipe_{registers_, "LSU store-data read pipeline"};
     // The URF write pipeline (UrfWrite): L + Wu stages, the uniform ALU's and
     // r2ur's path from the issue register to the URF RAM.
-    Reg<UrfWritePipeline> urf_pipe_{registers_, "URF write pipeline"};
+    Pipe<UrfWrite> urf_pipe_{registers_, "URF write pipeline"};
 
     // ---- Unit-internal state (only its own unit's code touches it) ----
-    // Issue: scheduler cursor, SFU occupancy, the arithmetic operand latches.
-    // (Read only by the scheduler before it accepts, written at acceptance:
-    // fetch never reads them.)
+    // Issue: scheduler cursor, SFU occupancy. (Read only by the scheduler
+    // before it accepts, written at acceptance: fetch never reads them.)
     uint32_t scheduler_cursor_ = 0;
     // First cycle the SFU is free again. The unit is occupied from an SFU
     // op's execution start (issue + issue_to_operands) for ceil(lanes /
     // sfu_lanes) cycles; a later SFU op stalls structurally until its own
     // execution start fits.
     uint64_t sfu_busy_until_ = 0;
-    std::deque<ArithmeticRead> arithmetic_reads_;
-    // The RF write port's reservation calendar (the arbiter's schedule):
-    // fixed issue books a FUTURE cycle only, its write at issue +
-    // issue_to_port; the async writers use the current write port. A map by
-    // absolute cycle; in hardware a shift register per
-    // bank of issue_to_port(slowest fixed op) bits. (There is no read
-    // calendar: reads are one round at issue + 1, owned by the issue
-    // register -- issue_read_banks_.)
-    std::map<uint64_t, std::vector<uint32_t>> write_reservations_;
+    // The arithmetic pipeline's operand latches: issue_to_operands stages. An
+    // instruction accepted at t samples its round in stage 0 (t + 1) and
+    // executes from the last stage (t + issue_to_operands), its operands at
+    // the RF output.
+    Pipe<ArithmeticRead> arithmetic_reads_{registers_, "arithmetic pipeline: operand latches"};
+    // The RF write port's reservation calendar (the arbiter's schedule): a
+    // shift register per bank, one count of booked ports per stage (one bit
+    // per bank at one write port). The last stage is this cycle's port, the
+    // stage before it the next cycle's, and so on: issue_to_port(slowest fixed
+    // op) + 1 stages. Fixed issue books a FUTURE cycle only, its write at
+    // issue + issue_to_port: the booking enters at the stage that many edges
+    // from the last one; the async writers use the current write port. (There
+    // is no read calendar: reads are one round at issue + 1, owned by the
+    // issue register -- issue_read_banks_.)
+    Pipe<std::vector<uint32_t>> write_calendar_{registers_, "RF write calendar"};
     // gmem controller (outside the SM): its queue, bus and B channel. The
     // queue and the bus entry together hold at most gmem.queue_sectors (64;
     // checked in step_gmem_controller). The B channel holds an ack per write
@@ -2076,7 +2117,7 @@ private:
     // ---- units whose next state issue looks ahead at ----
     void step_mma(Wires& w);
     void step_acc_transfers(Wires& w);
-    void step_acc_ld(std::optional<AccTransfer>& engine, AccLdPipeline& pipe, const Wires& w);
+    void step_acc_ld(std::optional<AccTransfer>& engine, Wires& w);
     std::optional<AccLdBeat> launch_acc_ld_beat(std::optional<AccTransfer>& engine);
     void sample_acc_ld_beat(AccLdBeat& beat);
     void step_acc_st(std::optional<AccTransfer>& engine, Wires& w);
@@ -2178,6 +2219,8 @@ private:
     void drive_rf_read_policy(const Wires& w);
     void drive_issue_read_banks(const Wires& w);
     void drive_dispatch_pipe(const Wires& w);
+    void drive_arithmetic_reads(const Wires& w);
+    void drive_write_calendar(const Wires& w);
     void drive_lsu_read_pipe(const Wires& w);
     void drive_urf_pipe(const Wires& w);
     void run_drivers(const Wires& w);
@@ -2203,7 +2246,8 @@ private:
     // issue_to_port), a future cycle; the async writers take the current
     // write port's free ports (decide_rf_writes).
     [[nodiscard]] bool write_slot_free(uint8_t reg, uint64_t at_cycle) const;
-    void reserve_write(uint8_t reg, uint64_t at_cycle);
+    void reserve_write(uint8_t reg, uint64_t at_cycle, Wires& w);
+    [[nodiscard]] std::size_t write_calendar_stage(uint64_t at_cycle) const;
 
     // depbar: completions recorded as they happen; issue sees the counters'
     // Q only (a completion presented at t is visible to issue at t + 1).
@@ -2269,7 +2313,7 @@ private:
     [[nodiscard]] std::optional<MmaFetch> next_mma_step(MmaPipeline& mma, Wires& w);
     [[nodiscard]] MmaRead grant_mma_round(MmaPipeline& mma);
     void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
-    void enter_mma_core(MmaPipeline& mma, const MmaStep& step);
+    void enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w);
     void sample_mma_c(MmaResult& result);
     // The physical tmem word of logical word `logical` in a region whose rows
     // are row_words words (src/layout.hpp); dispatch panicked on any word
@@ -2284,7 +2328,7 @@ private:
     // An acc.ld / acc.st's region for the sanitizer: its pointer, the
     // instruction's words per row and width, its words (sorted here).
     [[nodiscard]] TmemRegion tmem_region(uint32_t pointer, const Instruction& inst, std::vector<uint32_t> words) const;
-    void execute_arithmetic(ArithmeticRead& pending, Wires& w);
+    void execute_arithmetic(const ArithmeticRead& pending, Wires& w);
 
     // TMA.
     void apply_tma_requests(TmaQueue& tma, Wires& w);

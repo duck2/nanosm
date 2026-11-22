@@ -579,9 +579,9 @@ void Machine::drive_simt_rmw(const Wires& w) {
     }
 }
 
-// The RMW engine, in one calculation: its ALU moves one stage (the update
-// computed from the words at the port output now enters stage 0; the last
-// stage's leaves with the write granted now); the write granted now ends the
+// The RMW engine, in one calculation: the update computed from the words at
+// the port output now enters its ALU's stage 0 (the last stage's leaves with
+// the write granted now); the write granted now ends the
 // operation and the PAUSE; an RMW starting now installs its operation (and
 // the admission state: which class, which engine started last); the read
 // granted now marks it.
@@ -590,12 +590,9 @@ void Machine::drive_rmw_engine(const Wires& w) {
     const bool started = w.shmem.rmw_start.has_value();
     const bool read_granted = w.shmem.a_read.user == AReadUser::rmw;
     const bool write_granted = w.shmem.a_write.user == AWriteUser::rmw;
-    const bool computing = w.shmem.rmw_update.has_value() ||
-        std::any_of(cur.alu.begin(), cur.alu.end(), [](const auto& stage) { return stage.has_value(); });
-    if (!started && !read_granted && !write_granted && !computing) return;
+    if (w.shmem.rmw_update.has_value()) rmw_alu_.push(*w.shmem.rmw_update, "drive_rmw_engine: ALU");
+    if (!started && !read_granted && !write_granted) return;
     auto next = cur;
-    for (std::size_t stage = next.alu.size() - 1; stage > 0; --stage) next.alu[stage] = cur.alu[stage - 1];
-    next.alu.front() = w.shmem.rmw_update;
     if (write_granted) next.active.reset();
     if (started) {
         if (next.active.has_value()) throw SimError("internal RMW started over a busy RMW engine");

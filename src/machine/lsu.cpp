@@ -875,11 +875,10 @@ void Machine::drive_lsu_buffers(const Wires& w) {
             for (uint32_t lane = 0; lane < config_.lanes; ++lane) put(reg, lane, (*w.dispatch.lsu->store_data)[lane]);
             reg.expected = config_.lanes;
         }
-        const auto& reads = lsu_read_pipe_.cur();
-        if (!reads.empty() && reads.front().arrive_cycle == cycle_) {
+        if (const auto& arriving = lsu_read_pipe_.last(); arriving.has_value()) {
             // The store-data beat at the RF output now (sampled Lr ago): the
             // group's active lanes of register rS + beat.
-            const auto& beat = reads.front();
+            const auto& beat = *arriving;
             auto& reg = edit();
             const auto lanes = static_cast<uint32_t>(std::popcount(beat.lanes));
             if (!reg.owner.has_value()) {
@@ -1008,20 +1007,11 @@ void Machine::drive_free_id_tags(const Wires& w) {
     free_id_tags_.set_next(std::move(next), "drive_free_id_tags");
 }
 
-// The LSU's store-data reads in flight: the one at the RF output now leaves
-// (it fills the store buffer, drive_lsu_buffers); the one sampled
-// now joins.
+// The LSU's store-data reads in flight: the one sampled now enters the RF's
+// read stages; the one at the RF output leaves at this edge (it fills the
+// store buffer, drive_lsu_buffers).
 void Machine::drive_lsu_read_pipe(const Wires& w) {
-    const auto& cur = lsu_read_pipe_.cur();
-    const bool arrived = !cur.empty() && cur.front().arrive_cycle == cycle_;
-    if (!arrived && !w.lsu_rf_read.command.has_value()) return;
-    auto next = cur;
-    if (arrived) next.pop_front();
-    if (w.lsu_rf_read.command.has_value()) next.push_back(w.lsu_rf_read);
-    if (next.size() > config_.rf_read_latency_cycles) {
-        throw SimError("internal: the LSU store-data read pipeline holds more than its Lr stages");
-    }
-    lsu_read_pipe_.set_next(std::move(next), "drive_lsu_read_pipe");
+    if (w.lsu_rf_read.command.has_value()) lsu_read_pipe_.push(w.lsu_rf_read, "drive_lsu_read_pipe");
 }
 
 } // namespace nanosm

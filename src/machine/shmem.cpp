@@ -205,7 +205,7 @@ Machine::AWriteGrant Machine::select_a_write(const Wires&) const {
     const bool rmw_waiting = !store_pause() && rmw_requester_held();
     const bool stores_turn = store_slot_waiting() && (!rmw_waiting || shmem_arbiters_.cur().rmw_started_last);
     grant.rmw_start = rmw_waiting && !stores_turn;
-    if (rmw_.cur().alu.back().has_value()) { // (the PAUSE is set: no RMW starts)
+    if (rmw_alu_.last().has_value()) { // (the PAUSE is set: no RMW starts)
         grant.user = AWriteUser::rmw;
         return grant;
     }
@@ -374,7 +374,7 @@ void Machine::serve_a_write(Wires& w) {
         shmem.a_write_beat = store_round(shmem.a_write.slot);
         return;
     case AWriteUser::rmw: {
-        const auto& update = *rmw_.cur().alu.back();
+        const auto& update = *rmw_alu_.last();
         const auto& request = rmw_.cur().active->request;
         trace_->shmem_grant(cycle_, ShmemService::a_write, ShmemClient::rmw);
         if (is_atomic_operation(request.operation)) {
@@ -486,9 +486,9 @@ uint32_t Machine::free_store_slot_count(const Wires& w) const {
 // has issued that have no slot yet. They count as unserviced from their
 // issue (a reserved slot is unserviced immediately).
 bool Machine::warp_dispatching(uint32_t warp, bool reads, bool writes, bool probes) const {
-    for (const auto& op : dispatch_pipe_.cur()) {
-        if (op.warp != warp) continue;
-        const auto opcode = op.instruction.opcode;
+    for (const auto& stage : dispatch_pipe_.cur()) {
+        if (!stage.has_value() || stage->warp != warp) continue;
+        const auto opcode = stage->instruction.opcode;
         if (reads && is_shared_load(opcode)) return true;
         if (writes && (opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode))) return true;
         if (probes && is_mbar_predicate_writer(opcode)) return true;
@@ -641,38 +641,21 @@ void Machine::drive_store_slots(const Wires& w) {
     }
 }
 
-// The read pipeline moves one stage: the round granted now enters stage 0,
-// the round sampled now carries its words into stage D, the round at the
-// output leaves.
+// The read pipeline: the round granted now enters stage 0; the round at the
+// RAM now (stage D - 1) goes on carrying the words it sampled; the round at
+// the output leaves.
 void Machine::drive_a_read_pipe(const Wires& w) {
-    const auto& cur = a_read_pipe_.cur();
-    const bool idle = !w.shmem.a_read_beat.has_value() &&
-        std::none_of(cur.begin(), cur.end(), [](const auto& stage) { return stage.has_value(); });
-    if (idle) return;
-    ReadPipeline next(cur.size());
-    next.front() = w.shmem.a_read_beat;
-    for (std::size_t stage = 1; stage < cur.size(); ++stage) next[stage] = cur[stage - 1];
-    // The shift put cur[D - 1] (the round at the RAM now) into next[D]; this
-    // replaces it with the same round carrying the words it sampled.
-    next.at(config_.shmem_port_a_depth) = w.shmem.sampled;
-    a_read_pipe_.set_next(std::move(next), "drive_a_read_pipe");
+    if (w.shmem.a_read_beat.has_value()) a_read_pipe_.push(*w.shmem.a_read_beat, "drive_a_read_pipe");
+    if (w.shmem.sampled.has_value()) {
+        a_read_pipe_.replace(config_.shmem_port_a_depth - 1, w.shmem.sampled, "drive_a_read_pipe: the RAM's words");
+    }
 }
 
-// The A-write and port-B write pipelines move one stage: the round granted
-// now enters stage 0; the round at the last stage reached the RAM now.
+// The A-write and port-B write pipelines: the round granted now enters stage
+// 0; the round at the last stage reached the RAM now.
 void Machine::drive_write_pipes(const Wires& w) {
-    const auto shift = [](Reg<WritePipeline>& pipe, const std::optional<WriteBeat>& entering, const char* tag) {
-        const auto& cur = pipe.cur();
-        const bool idle = !entering.has_value() &&
-            std::none_of(cur.begin(), cur.end(), [](const auto& stage) { return stage.has_value(); });
-        if (idle) return;
-        WritePipeline next(cur.size());
-        next.front() = entering;
-        for (std::size_t stage = 1; stage < cur.size(); ++stage) next[stage] = cur[stage - 1];
-        pipe.set_next(std::move(next), tag);
-    };
-    shift(a_write_pipe_, w.shmem.a_write_beat, "drive_write_pipes: A-write");
-    shift(b_write_pipe_, w.shmem.b_write_beat, "drive_write_pipes: port-B write");
+    if (w.shmem.a_write_beat.has_value()) a_write_pipe_.push(*w.shmem.a_write_beat, "drive_write_pipes: A-write");
+    if (w.shmem.b_write_beat.has_value()) b_write_pipe_.push(*w.shmem.b_write_beat, "drive_write_pipes: port-B write");
 }
 
 void Machine::drive_shmem_arbiters(const Wires& w) {

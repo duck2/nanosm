@@ -15,10 +15,10 @@ namespace nanosm {
 // ===========================================================================
 
 void Machine::dispatch_issued(Wires& w) {
-    const auto& pipe = dispatch_pipe_.cur();
-    if (pipe.empty() || pipe.front().issue_cycle + issue_to_dispatch(config_) != cycle_) return;
+    const auto& leaving = dispatch_pipe_.last();
+    if (!leaving.has_value()) return;
     w.dispatched = true;
-    hand_over(pipe.front(), w);
+    hand_over(*leaving, w);
 }
 
 void Machine::hand_over(const DispatchEntry& op, Wires& w) {
@@ -105,21 +105,19 @@ void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
 }
 
 // The dispatch pipeline: the RF read stage's samples latch into their
-// entries; the entry dispatched now leaves; issue's accepted entry joins.
+// entries, which go on carrying them; the entry in the last stage dispatched
+// now and leaves; issue's accepted entry enters stage 0.
 void Machine::drive_dispatch_pipe(const Wires& w) {
-    if (!w.dispatched && w.dispatch_samples.empty() && !w.issue.dispatch.has_value()) return;
-    auto next = dispatch_pipe_.cur();
     for (const auto& sample : w.dispatch_samples) {
-        auto& entry = next.at(sample.index);
+        auto entry = dispatch_pipe_.stage(sample.stage).value();
         if (!sample.later_round) entry.operands = sample.operands;
         if (sample.write_mask_lanes.has_value()) entry.active_mask &= *sample.write_mask_lanes;
         for (std::size_t i = 0; i < sample.uniform_operands.size(); ++i) {
             entry.uniform_operands.at(sample.uniform_first + i) = sample.uniform_operands[i];
         }
+        dispatch_pipe_.replace(sample.stage, std::move(entry), "drive_dispatch_pipe: the sample");
     }
-    if (w.dispatched) next.pop_front();
-    if (w.issue.dispatch.has_value()) next.push_back(*w.issue.dispatch);
-    dispatch_pipe_.set_next(std::move(next), "drive_dispatch_pipe");
+    if (w.issue.dispatch.has_value()) dispatch_pipe_.push(*w.issue.dispatch, "drive_dispatch_pipe");
 }
 
 // A dispatched instruction's operand, as its RF read latched it at its

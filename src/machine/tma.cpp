@@ -216,9 +216,8 @@ void Machine::step_tma(Wires& w) {
     apply_tma_requests(tma, w);
     // The walker's start at the start pipeline's last stage loads the walker:
     // the command walks from the next cycle.
-    const auto& start_pipe = tma_walker_start_pipe_.cur();
-    if (!start_pipe.empty() && start_pipe.back().has_value()) {
-        const auto& start = *start_pipe.back();
+    if (const auto& leaving = tma_walker_start_pipe_.last(); leaving.has_value()) {
+        const auto& start = *leaving;
         auto& command = tma.commands.at(start.command);
         if (command.state != TmaCommandState::starting || tma.frontend != start.command) {
             throw SimError("internal: a tma walker start left its pipeline for a command not starting");
@@ -653,25 +652,19 @@ void Machine::drive_tma_queue(const Wires& w) {
     tma_.set_next(std::move(next), "drive_tma_queue");
 }
 
-// The walker start pipeline moves one stage: a start whose descriptor came
-// back now enters stage 0; the one in the last stage loaded the walker now
-// (step_tma) and leaves. Only the frontend command starts, so at most one
-// stage is occupied (checked).
+// The walker start pipeline: a start whose descriptor came back now enters
+// stage 0; the one in the last stage loaded the walker now (step_tma) and
+// leaves. Only the frontend command starts, so at most one stage is occupied
+// (checked).
 void Machine::drive_tma_walker_start(const Wires& w) {
+    if (!w.tma_walker_starting.has_value()) return;
     const auto& cur = tma_walker_start_pipe_.cur();
-    if (cur.empty()) {
-        if (w.tma_walker_starting.has_value()) throw SimError("internal: a tma walker start with no start stages");
-        return;
+    if (cur.empty()) throw SimError("internal: a tma walker start with no start stages");
+    // (The start in the last stage leaves at this edge.)
+    if (std::any_of(cur.begin(), cur.end() - 1, [](const auto& stage) { return stage.has_value(); })) {
+        throw SimError("internal: two tma walker starts in the start pipeline");
     }
-    const auto occupied = [](const TmaWalkerStartPipeline& pipe) {
-        return std::count_if(pipe.begin(), pipe.end(), [](const auto& stage) { return stage.has_value(); });
-    };
-    if (!w.tma_walker_starting.has_value() && occupied(cur) == 0) return;
-    TmaWalkerStartPipeline next(cur.size());
-    next.front() = w.tma_walker_starting;
-    for (std::size_t stage = 1; stage < cur.size(); ++stage) next[stage] = cur[stage - 1];
-    if (occupied(next) > 1) throw SimError("internal: two tma walker starts in the start pipeline");
-    tma_walker_start_pipe_.set_next(std::move(next), "drive_tma_walker_start");
+    tma_walker_start_pipe_.push(*w.tma_walker_starting, "drive_tma_walker_start");
 }
 
 // The URF's round counter moves to its next round (it empties after the
@@ -695,14 +688,7 @@ void Machine::drive_tma_operand_read(const Wires& w) {
     if (rounds.has_value() || next_rounds.has_value()) {
         urf_read_rounds_.set_next(std::move(next_rounds), "drive_tma_operand_read: URF round counter");
     }
-    const auto& pairs = tma_read_pairs_.cur();
-    const bool in_flight = std::any_of(pairs.begin(), pairs.end(), [](const auto& stage) { return stage.has_value(); });
-    if (in_flight || w.tma_sampled.has_value()) {
-        TmaReadPairs next(pairs.size());
-        next.front() = w.tma_sampled;
-        for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) next[stage + 1] = pairs[stage];
-        tma_read_pairs_.set_next(std::move(next), "drive_tma_operand_read: URF read stages");
-    }
+    if (w.tma_sampled.has_value()) tma_read_pairs_.push(*w.tma_sampled, "drive_tma_operand_read: URF read stages");
     if (w.tma_holding_changed) tma_holding_.set_next(w.tma_holding_after, "drive_tma_operand_read: holding");
 }
 

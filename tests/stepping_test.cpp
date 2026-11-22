@@ -260,6 +260,175 @@ void test_buffer_reuse_load_to_load() {
     require_old_load_data(*run.machine, old_load);
 }
 
+// ---- Pipe<T> (src/machine/pipe.hpp) ----
+
+// A value pushed in tick t is in stage n - 1 after n edges and gone after N;
+// a hold keeps every stage; a replacement travels with its value; a value
+// replaced by nothing leaves at that stage.
+void test_pipe_advance_hold_replace() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 0;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Pipe<int> pipe(file, "test pipeline", 32);
+    pipe.build(3);
+    const auto tick = [&]() {
+        file.commit();
+        ++cycle;
+        sanitizer.record_cycle_start();
+    };
+    const auto at = [&](std::size_t stage) { return pipe.stage(stage).value_or(-1); };
+    sanitizer.record_cycle_start();
+    require(pipe.stages() == 3 && pipe.empty(), "a new pipeline is not empty");
+    pipe.push(10, "entry");
+    require(pipe.empty(), "push() changed Q before the clock edge");
+    tick();
+    require(at(0) == 10 && at(1) == -1 && at(2) == -1, "a pushed value is not in stage 0 after one edge");
+    pipe.push(11, "entry"); // consecutive: one behind
+    tick();
+    tick();                 // a gap behind 11
+    require(at(0) == -1 && at(1) == 11 && at(2) == 10, "two values and a gap did not keep their distances");
+    require(pipe.last() == std::optional<int>(10), "the output stage does not hold the first value after three edges");
+    pipe.hold("stall");
+    tick();
+    require(at(0) == -1 && at(1) == 11 && at(2) == 10, "a held pipeline moved");
+    pipe.replace(1, 21, "work at stage 1"); // the value at stage 1 carries 21 from the edge on
+    tick();
+    require(at(0) == -1 && at(1) == -1 && at(2) == 21, "a replacement did not travel with its value");
+    pipe.push(12, "entry");
+    tick();
+    require(at(0) == 12 && at(2) == -1, "the output's value did not leave");
+    pipe.replace(0, std::nullopt, "leaves early");
+    tick();
+    require(pipe.empty(), "a value replaced by nothing stayed in the pipeline");
+    pipe.push(13, "entry");
+    tick();
+    pipe.hold("stall");
+    pipe.replace(0, 23, "work under a hold"); // held: the value stays in its stage, with the replacement
+    tick();
+    require(at(0) == 23 && at(1) == -1, "a replacement under a hold did not stay in its stage");
+    const auto size = pipe.size();
+    require(std::string(size.kind) == "pipeline" && size.entries == 3 && size.bits_per_entry == std::optional<uint64_t>(33),
+        "the pipeline does not report its stages and its declared bits (payload + valid)");
+}
+
+// Each write point is one net with one driver: a second push, a second
+// replacement of one stage and a second hold in one tick are PANICs naming
+// the pipeline and both writers.
+void test_pipe_duplicate_write_panics() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 7;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Pipe<int> pipe(file, "test pipeline");
+    pipe.build(2);
+    const auto expect_panic = [&](const std::string& what, const std::function<void(const char*)>& write) {
+        sanitizer.record_cycle_start();
+        write("first");
+        try {
+            write("second");
+        } catch (const nanosm::SimError& error) {
+            const std::string message = error.what();
+            for (const std::string needle : {std::string("test pipeline"), std::string("cycle=7"),
+                     std::string("first by 'first'"), std::string("then by 'second'")}) {
+                require(message.find(needle) != std::string::npos,
+                    what + ": the duplicate-write PANIC lacks '" + needle + "': " + message);
+            }
+            return;
+        }
+        throw std::runtime_error(what + ": a second write in one tick did not panic");
+    };
+    expect_panic("push", [&](const char* tag) { pipe.push(1, tag); });
+    expect_panic("replace", [&](const char* tag) { pipe.replace(0, 2, tag); });
+    expect_panic("hold", [&](const char* tag) { pipe.hold(tag); });
+    // Different points in one tick are different nets.
+    nanosm::Pipe<int> other(file, "other pipeline");
+    other.build(2);
+    sanitizer.record_cycle_start();
+    other.push(1, "entry");
+    other.replace(0, std::nullopt, "stage 0");
+    other.replace(1, std::nullopt, "stage 1");
+}
+
+// The stg.v8 store-data read pipe (lsu_read_pipe_): a register-file read
+// granted at t fills the store buffer at the edge of t + Lr, neither earlier
+// nor later, so a gap between two grants reappears as the same gap at the
+// buffer. Other instructions take the read ports while the store reads, so
+// the grants come both back to back and with gaps. At two read latencies.
+void test_store_data_read_pipe_keeps_gaps() {
+    for (const uint32_t lr : {2u, 3u}) {
+        auto config = canonical_profile();
+        config.rf_read_latency_cycles = lr;
+        config.urf_issue_to_port_cycles = std::max(config.urf_issue_to_port_cycles, 1 + lr);
+        const uint32_t width = config.lsu_store_group_lanes;
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        image_bytes(launch.gmem_image, 4096);
+        // r2 = 2048 + 32 x lane; r(24 + j) = 1000 j + lane.
+        std::string text = "sread r4, LANE_ID\nshli r2, r4, 5\naddi r2, r2, 2048\n";
+        for (uint32_t j = 0; j < 8; ++j)
+            text += "addi r" + std::to_string(24 + j) + ", r4, " + std::to_string(1000 * j) + "\n";
+        text += "stg.v8 [r2], r24\n";
+        // Issue reads r24 (bank 0) and r25 (bank 1) while the store wants them.
+        for (uint32_t i = 0; i < 14; ++i) text += "add r40, r24, r25\n";
+        text += "halt\n";
+        nanosm::Machine machine(config, compile(text, config), std::move(launch), nanosm::TraceOptions{.timeline = true});
+        machine.enable_edge_probe();
+        struct After {
+            std::optional<uint64_t> owner;
+            uint32_t group = 0;
+            std::vector<uint8_t> valid;
+            std::vector<uint32_t> words;
+        };
+        std::map<uint64_t, After> after; // the store buffer after each cycle's edge
+        while (!machine.done()) {
+            const auto cycle = machine.cycle();
+            tick_capped(machine);
+            after[cycle] = {machine.lsu_buffer_owner(1), machine.lsu_buffer_group(1), machine.lsu_buffer_valid(1),
+                machine.lsu_buffer_words(1)};
+        }
+        std::vector<std::pair<uint64_t, uint32_t>> grants; // (cycle, register)
+        for (const auto& event : machine.edge_events())
+            if (event.edge == LsuEdge::rf_read_beat) grants.emplace_back(event.cycle, event.aux);
+        const auto where = " (Lr = " + std::to_string(lr) + ")";
+        require(grants.size() == 8 * (16 / width), "the stg.v8 did not make eight reads per lane group" + where);
+        bool back_to_back = false;
+        bool gap_in_group = false;
+        for (std::size_t i = 0; i < grants.size(); ++i) {
+            const auto [cycle, reg] = grants[i];
+            const uint32_t group = static_cast<uint32_t>(i / 8);
+            const uint32_t beat = static_cast<uint32_t>(i % 8);
+            require(reg == 24 + beat, "the reads are not rS .. rS + 7 in order" + where);
+            if (beat != 0) {
+                back_to_back = back_to_back || cycle == grants[i - 1].first + 1;
+                gap_in_group = gap_in_group || cycle > grants[i - 1].first + 1;
+            }
+            const auto& landed = after.at(cycle + lr);
+            const auto& before = after.at(cycle + lr - 1);
+            const auto at = " at grant " + std::to_string(i) + " (cycle " + std::to_string(cycle) + ")" + where;
+            require(landed.owner == 0u && landed.group == group, "the store buffer has the wrong owner or group" + at);
+            for (uint32_t lane = group * width; lane < (group + 1) * width; ++lane) {
+                const uint32_t slot = (lane - group * width) * 8 + beat;
+                require(landed.valid.at(slot) == 1 && landed.words.at(slot) == 1000 * beat + lane,
+                    "the beat is not in the store buffer Lr after its grant" + at);
+                require(!(before.owner == 0u && before.group == group && before.valid.at(slot) == 1),
+                    "the beat is in the store buffer earlier than Lr after its grant" + at);
+            }
+        }
+        require(back_to_back && gap_in_group,
+            "the run has no back-to-back pair or no gap between a group's reads; the test proves little" + where);
+        // The machine reports the pipe with its stages.
+        bool reported = false;
+        for (const auto& size : machine.state_sizes()) {
+            reported = reported || (size.name == "LSU store-data read pipeline" &&
+                std::string(size.kind) == "pipeline" && size.entries == lr);
+        }
+        require(reported, "the state sizes do not list the store-data read pipe with Lr stages" + where);
+        for (uint32_t lane = 0; lane < 16; ++lane)
+            for (uint32_t j = 0; j < 8; ++j)
+                require(machine.read_gmem_u32(2048 + 32 * lane + 4 * j) == 1000 * j + lane,
+                    "the stg.v8 wrote the wrong word" + where);
+    }
+}
+
 // The sanitizer's check for the case above: a reader of a buffer
 // that takes a lane whose valid bit is clear panics.
 void test_sanitizer_buffer_reader_takes_valid_lanes() {
@@ -608,6 +777,22 @@ TEST(Stepping, reg_hold_write_commit) {
 TEST(Stepping, reg_duplicate_write_panics) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_reg_duplicate_write_panics();
+}
+
+// pipe: advance, hold, replace, leave
+TEST(Stepping, pipe_advance_hold_replace) {
+    test_pipe_advance_hold_replace();
+}
+
+// pipe: a second write of one point PANICs
+TEST(Stepping, pipe_duplicate_write_panics) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_pipe_duplicate_write_panics();
+}
+
+// stg.v8's store-data read pipe: a grant at t lands at t + Lr; gaps are kept
+TEST(Stepping, store_data_read_pipe_keeps_gaps) {
+    test_store_data_read_pipe_keeps_gaps();
 }
 
 // the load buffer's lane groups: eight RF writes each, after the group's last word

@@ -532,12 +532,8 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
 // RF output. A booking of the result's bank is what sets that bank's
 // async_owed bit; the read round sets its banks' read_owed bits.
 void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
-    // One accepted issue per cycle, each living issue_to_operands + 1 cycles.
-    if (arithmetic_reads_.size() > issue_to_operands(config_)) {
-        throw SimError("internal RF read pipeline exceeded its bounded depth");
-    }
     if (plan.write_reg.has_value()) {
-        reserve_write(*plan.write_reg, plan.write_cycle);
+        reserve_write(*plan.write_reg, plan.write_cycle, w);
         w.issue.rf_write_bank = *plan.write_reg % config_.rf_banks;
     }
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
@@ -556,7 +552,6 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
         sanitizer_.record_pred_ready(warp.id, inst.dst, cycle_ + issue_to_predicate_visible(inst, config_));
     }
     ArithmeticRead pending;
-    pending.issue_cycle = cycle_;
     pending.warp = warp.id;
     pending.pc = head_pc(warp.id);
     pending.active_mask = active_mask(warp.id);
@@ -565,7 +560,7 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     pending.operands.resize(plan.reads.size());
     pending.uniform_reads = plan.uniform_reads;
     pending.uniform_operands.resize(plan.uniform_reads.size());
-    arithmetic_reads_.push_back(std::move(pending));
+    w.issue.arithmetic = std::move(pending);
     warp.stall_until = cycle_ + inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
@@ -642,7 +637,6 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
         sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
     }
     DispatchEntry entry;
-    entry.issue_cycle = cycle_;
     entry.warp = warp.id;
     entry.pc = head_pc(warp.id);
     entry.active_mask = active_mask(warp.id);
@@ -680,8 +674,9 @@ void Machine::load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w) {
 // units: the claims every later admission subtracts from the space it sees.
 Machine::DispatchClaims Machine::dispatch_claims() const {
     DispatchClaims claims;
-    for (const auto& op : dispatch_pipe_.cur()) {
-        const auto opcode = op.instruction.opcode;
+    for (const auto& stage : dispatch_pipe_.cur()) {
+        if (!stage.has_value()) continue;
+        const auto opcode = stage->instruction.opcode;
         if (is_shared_load(opcode) || is_atomic(opcode)) ++claims.load_slots;
         if (opcode == Opcode::sts) ++claims.store_slots;
         if (is_mbar_rmw(opcode) || is_atomic(opcode)) ++claims.simt_rmw;

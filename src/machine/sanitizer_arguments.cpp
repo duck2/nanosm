@@ -107,7 +107,7 @@ std::optional<uint64_t> Machine::pending_tma_completion_mbar(uint32_t mbar, cons
     }
     overlay_beat(w.shmem.a_write_beat);
     overlay_beat(w.shmem.b_write_beat);
-    const auto& alu = rmw_.cur().alu;
+    const auto& alu = rmw_alu_.cur();
     for (std::size_t stage = alu.size(); stage-- > 0;) overlay_beat(alu[stage]);
     overlay_beat(w.shmem.rmw_update);
     uint64_t word = 0;
