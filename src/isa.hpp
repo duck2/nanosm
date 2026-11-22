@@ -44,13 +44,13 @@ enum class Opcode : uint8_t {
     bra   = 0x20,
     bra_uni = 0x21,
     shri  = 0x22,    // logical; 0x19..0x1f were full
-    // Interleaved vector (rfc09): rA warp-uniform, 64 B aligned, 512 contiguous
+    // Interleaved vector: rA warp-uniform, 64 B aligned, 512 contiguous
     // bytes; register rD+j, lane l <-> word 16*j + l.
     ldg_v8 = 0x23,
     stg_v8 = 0x24,
     ldg_uni = 0x25,  // base in a uniform register: one sector request, the word fans out to every lane
     lds_uni = 0x26,  // base in a uniform register: one shmem bank access, the word fans out to every lane
-    // No operands (trash/rfc12.md section 10): admitted only once every earlier
+    // No operands: admitted only once every earlier
     // shmem access of the warp has reached the RAM (stores written, loads
     // sampled), so nothing after it issues before that. Never auto-inserted.
     fence_sh = 0x27,
@@ -61,7 +61,7 @@ enum class Opcode : uint8_t {
     setpi_le = 0x2b,
     setpi_gt = 0x2c,
     setpi_ge = 0x2d,
-    // Divergence (trash/divergence-2026-11-21.md), written by the kernel
+    // Divergence, written by the kernel
     // author, never inferred. Every divergence stack entry is a (mask, pc)
     // pair. ssy LABEL (a branch displacement like bra's; any instruction)
     // pushes (the warp's active mask, LABEL). A predicated bra (0x20 with a
@@ -81,7 +81,7 @@ enum class Opcode : uint8_t {
     mbar_test_wait_r = 0x36,
     mbar_try_wait_i = 0x37,
     mbar_try_wait_r = 0x38,
-    // Uniform shared-memory atomics on signed int32 (trash/rfc13.md):
+    // Uniform shared-memory atomics on signed int32:
     // atom.op.uni rD, [urA + imm], urB. ONE 32-bit word per warp instruction:
     // the address (urA + imm) and the operand (urB) are uniform registers, the
     // update is applied once, and every active lane's rD receives the word's old
@@ -93,7 +93,7 @@ enum class Opcode : uint8_t {
     atom_xor_uni = 0x3b,
     atom_exch_uni = 0x3c,
     // tma.load.Nd [urS], [DESC, urC], [urM] and tma.store.Nd [DESC, urC],
-    // [urS], [urM], N = 1..4 (src/tma.hpp, trash/rfc17.md): the direction and
+    // [urS], [urM], N = 1..4 (src/tma_descriptor.hpp): the direction and
     // the coordinate count are the opcode; urS the buffer's shared address,
     // urC .. urC + N - 1 the tile's coordinates, urM the barrier's address,
     // DESC the descriptor's shared address (a constant).
@@ -105,7 +105,7 @@ enum class Opcode : uint8_t {
     tma_store_2d = 0x45,
     tma_store_3d = 0x46,
     tma_store_4d = 0x47,
-    // The signed vector compare (trash/signed-compare-2026-11-18.md):
+    // The signed vector compare:
     // setp.xx.s32 pD, rA, rB | imm for lt, le, gt, ge compares as signed
     // 32-bit; everything else is setp.xx.u32's (encoding, timing, predicate
     // write). eq and ne need no signed form. The immediate is the signed
@@ -127,7 +127,7 @@ enum class Opcode : uint8_t {
     // 0x70..0x7f: the mma.async block (mma_block_first below). The profile's
     // shape list says what each of these opcodes means.
 
-    // The uniform register file (trash/rfc16.md, trash/urf-slice-2026-11-08.md):
+    // The uniform register file:
     // urf.registers 32-bit registers per warp (canonical 32, ur0..ur31). The
     // uniform arithmetic below runs on the SM's one integer uniform ALU, one
     // value per warp instruction; register operands are uniform registers.
@@ -154,13 +154,13 @@ enum class Opcode : uint8_t {
     // register (a fixed-latency vector result, like mov).
     r2ur   = 0x90,
     ur2r   = 0x91,
-    // The uniform compare (trash/uniform-compare-2026-11-18.md): usetp.xx.u32
+    // The uniform compare: usetp.xx.u32
     // pD, urA, urB and usetp.xx.u32 pD, urA, imm, the vector setp's six
     // comparisons (unsigned 32-bit) on uniform registers, and their signed lt,
     // le, gt, ge (usetp.xx.s32, 0x9e..0xa5). It runs on the uniform ALU (a
     // compare is a subtract) and writes predicate pD with the same value in
     // every lane; register and immediate forms have distinct opcodes, as
-    // setp's do. Its timing: src/rf.hpp issue_to_uniform_predicate_visible.
+    // setp's do. Its timing: src/timing.hpp issue_to_uniform_predicate_visible.
     usetp_eq = 0x92,
     usetp_ne = 0x93,
     usetp_lt = 0x94,
@@ -181,7 +181,7 @@ enum class Opcode : uint8_t {
     usetpi_le_s32 = 0xa3,
     usetpi_gt_s32 = 0xa4,
     usetpi_ge_s32 = 0xa5,
-    // No operands, no result, no unit (trash/typed-compare-and-wait-2026-11-18.md):
+    // No operands, no result, no unit:
     // it issues like any instruction and only its control fields act -- a wait
     // mask holds it until those depbars are zero, a stall delays the next
     // issue. qtx's `wait` is a nop that waits for every live depbar. Not 0x00:
@@ -233,7 +233,7 @@ struct Instruction {
 //   ptr   8 bytes: a 64-bit global byte address
 //   u32   4 bytes
 //   f32   4 bytes
-//   desc  64 bytes: a TMA descriptor (src/tma.hpp), built by the host
+//   desc  64 bytes: a TMA descriptor (src/tma_descriptor.hpp), built by the host
 enum class ParamType : uint8_t { ptr, u32, f32, desc };
 
 inline uint32_t param_bytes(ParamType type) {
@@ -465,8 +465,7 @@ namespace encoding {
 // mbar addresses are held in a uniform register; mbar immediates and register
 // operands have distinct opcodes, as do setp immediates and register operands.
 // A uniform register (ur0..) sits in the same 8-bit register fields: which
-// field names which file is the opcode's (uniform_sources / uniform_destination;
-// trash/urf-slice-2026-11-08.md lists every operand form).
+// field names which file is the opcode's (uniform_sources / uniform_destination).
 // tma payload: buffer[8] (urS), coordinates[8] (urC, the first of N),
 // barrier[8] (urM), descriptor[14] (its shared address in 64-byte units,
 // unsigned: 1 MiB of reach). Instruction: src0 urS, src1 urC, src2 urM, imm
@@ -520,7 +519,7 @@ struct MmaShape {
     bool operator==(const MmaShape&) const = default;
 };
 
-// The mma.async block (trash/chan.txt 2026-10-22: shapes are not hardcoded).
+// The mma.async block (shapes are not hardcoded).
 // One opcode per shape and per init variant -- the shape is never an
 // instruction field -- but which shape an opcode means is the profile's:
 // shape i of its mma.shapes list is mma_block_first + 2i (accumulate:
@@ -566,8 +565,7 @@ inline Opcode mma_opcode(uint32_t shape_index, bool init) {
 
 // An mma.async operand is a uniform register holding the shared address of
 // the 16-byte piece it starts at in its row 0 (any row of a taller tile),
-// and a row spacing, an instruction constant (src/layout.hpp;
-// trash/whole-rows-2026-11-18.md, trash/address-keyed-2026-11-18.md).
+// and a row spacing, an instruction constant (src/layout.hpp).
 // The spacings sit in the 14 bits beside the three register fields: A's in
 // bits 7..13, B's in bits 0..6, each in 16-byte units, so 16 .. 2032 bytes
 // (swizzle64 takes the powers of two among them: 16 .. 1024).
@@ -607,8 +605,7 @@ inline bool is_divergent_branch(const Instruction& instruction) {
 // The instruction word's predicate field names something (anything but plain
 // PT). On bra it makes the divergent branch, on bra.uni it is the branch's
 // condition; on every other instruction it is the instruction's write mask,
-// which makes it a masked instruction. (The note that built this is
-// trash/guards-2026-11-21.md; it uses an older word for the same thing.)
+// which makes it a masked instruction.
 inline bool has_write_mask(const Instruction& instruction) {
     return instruction.control.predicate != 7 || instruction.control.predicate_invert;
 }
@@ -635,10 +632,42 @@ inline bool uses_divergence_stack(const Instruction& instruction) {
         is_divergent_branch(instruction);
 }
 
-// The uniform shared atomics (trash/rfc13.md): atom.add/and/xor/exch.uni.
+// The uniform shared atomics: atom.add/and/xor/exch.uni.
 inline bool is_atomic(Opcode opcode) {
     return opcode == Opcode::atom_add_uni || opcode == Opcode::atom_and_uni ||
         opcode == Opcode::atom_xor_uni || opcode == Opcode::atom_exch_uni;
+}
+
+// The barrier instructions by what they do: a test_wait or try_wait probes a
+// barrier and writes a predicate; init, arrive and arrive.expect_tx change
+// the barrier through the read-modify-write engine.
+inline bool is_mbar_test_wait(Opcode opcode) {
+    return opcode == Opcode::mbar_test_wait_i || opcode == Opcode::mbar_test_wait_r;
+}
+
+inline bool is_mbar_try_wait(Opcode opcode) {
+    return opcode == Opcode::mbar_try_wait_i || opcode == Opcode::mbar_try_wait_r;
+}
+
+inline bool is_mbar_predicate_writer(Opcode opcode) {
+    return is_mbar_test_wait(opcode) || is_mbar_try_wait(opcode);
+}
+
+inline bool is_mbar_rmw(Opcode opcode) {
+    return opcode == Opcode::mbar_init_i || opcode == Opcode::mbar_init_r ||
+        opcode == Opcode::mbar_arrive ||
+        opcode == Opcode::mbar_arrive_expect_tx_i ||
+        opcode == Opcode::mbar_arrive_expect_tx_r;
+}
+
+// The loads that write a vector register from shared memory (lds, lds.uni)
+// and from tensor memory (acc.ld, acc.ld.v8).
+inline bool is_shared_load(Opcode opcode) {
+    return opcode == Opcode::lds || opcode == Opcode::lds_uni;
+}
+
+inline bool is_acc_load(Opcode opcode) {
+    return opcode == Opcode::acc_ld || opcode == Opcode::acc_ld_v8;
 }
 
 // Uniform arithmetic: the uniform ALU's opcodes (umov .. usread).
@@ -648,7 +677,7 @@ inline bool is_uniform_arithmetic(Opcode opcode) {
 
 // The writers of the uniform register file: uniform arithmetic and r2ur, and
 // nothing else (no loads into it). Every one presents its result at the URF
-// write port urf.issue_to_port_cycles after its issue (src/rf.hpp).
+// write port urf.issue_to_port_cycles after its issue (src/timing.hpp).
 inline bool writes_uniform_register(Opcode opcode) {
     return is_uniform_arithmetic(opcode) || opcode == Opcode::r2ur;
 }
@@ -676,7 +705,7 @@ inline bool is_usetp_immediate(Opcode opcode) {
         (opcode >= Opcode::usetpi_lt_s32 && opcode <= Opcode::usetpi_ge_s32);
 }
 
-// What the URF write pipeline carries (src/rf.hpp): the uniform-register
+// What the URF write pipeline carries (src/timing.hpp): the uniform-register
 // writers, and usetp, whose uniform-ALU result leaves it at the write port's
 // stage for the predicate file instead of the URF.
 inline bool uses_urf_pipeline(Opcode opcode) {
@@ -685,11 +714,11 @@ inline bool uses_urf_pipeline(Opcode opcode) {
 
 // The uniform registers an instruction reads, in operand order (a register
 // named twice is listed twice). Most read at most two, all in one read round
-// at issue + 1 (src/rf.hpp; the round reads a repeated register once): the
+// at issue + 1 (src/timing.hpp; the round reads a repeated register once): the
 // URF has two read ports. acc.ld / acc.st read their tmem pointer. Two read
 // more over several rounds, two per round, listed in read order and read by
 // operand position (a register named twice is read twice;
-// uniform_read_rounds in src/rf.hpp): a tma, N + 2 registers (urS, urM, then
+// uniform_read_rounds in src/timing.hpp): a tma, N + 2 registers (urS, urM, then
 // urC .. urC + N - 1), and an mma.async, three (urA, urB, then urC).
 std::vector<uint8_t> uniform_sources(const Instruction& instruction);
 // The uniform register an instruction writes, if any.

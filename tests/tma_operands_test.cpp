@@ -1,5 +1,4 @@
-// The TMA's instruction form, its operand read and its descriptor
-// (trash/rfc17.md; trash/rfc17-slice-2026-11-17.md): tma.load.Nd /
+// The TMA's instruction form, its operand read and its descriptor: tma.load.Nd /
 // tma.store.Nd with uniform-register operands, read two per round over the
 // URF's two read ports, and a tile cut from a tensor of up to four
 // dimensions. Smoke tests: the data is right, plus the few timing facts of

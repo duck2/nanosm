@@ -3,19 +3,9 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
 #include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -38,8 +28,8 @@ namespace nanosm {
 //      for its words); a zero fill or a skipped store stretch wants no shared
 //      resource. One TMA read in service at a time: none while a descriptor
 //      read's words are still coming back, or while a store-source read has
-//      rounds left to be granted. There is no mbar read at the start (rfc12
-//      section 8): the walk begins once the descriptor is decoded and the
+//      rounds left to be granted. There is no mbar read at the start: the
+//      walk begins once the descriptor is decoded and the
 //      walker's start has left its pipeline (nothing is wanted meanwhile).
 Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
     TmaRequests want;
@@ -321,9 +311,9 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
 
 // A descriptor read's last round is back: its data is in `request` (the
 // frontend latch). The walker's start enters its pipeline (or, with no
-// stages, loads the walker now); the command walks after it (I3: no mbar
+// stages, loads the walker now); the command walks after it (no mbar
 // phase read and no "enough transaction bytes" check -- the tx count is
-// signed, rfc12 section 8).
+// signed).
 void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w) {
     const auto& request = read.request;
     auto command_it = tma.commands.find(request.run.command);
@@ -362,8 +352,8 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction
 // A placement's last write reached the RAM: its command's load write ends.
 // A placement over an mbar with a live waiter is UB (as on NVIDIA: an
 // mbarrier's memory serves nothing else until mbarrier.inval); the
-// sanitizer's C10 PANICs at the placement write. The machine just wrote the
-// bytes (backlog D12.1).
+// sanitizer PANICs at the placement write. The machine just wrote the
+// bytes.
 void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed) {
     auto command_it = tma.commands.find(placed.command);
     if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
@@ -435,7 +425,7 @@ uint64_t Machine::run_byte_enable(const TmaRun& run) const {
 // Three products, side by side, each a 32-bit coordinate x a 32-bit stride:
 // the row dimension's (c_row x s_row) and the two other dimensions' (c_k x
 // s_k; their in-range test is two compares each); the stages are theirs and
-// the add chain's (trash/walker-followups-2026-11-20.md).
+// the add chain's.
 // Everything else is subtracts, compares and shifts:
 //   x_low  = clamp(-c0, 0, length)        x_high = clamp(d0 - c0, 0, length)
 //   y_low  = clamp(-c_row, 0, rows)       y_high = clamp(d_row - c_row, 0, rows)
@@ -448,7 +438,7 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command, const T
         throw SimError("tma logical byte count is outside the mbar encoding");
     }
     // The buffer address is 64-byte aligned (its low bits are not wired,
-    // src/tma.hpp); the whole tile must lie in shmem.
+    // src/tma_descriptor.hpp); the whole tile must lie in shmem.
     if (command.shmem_address > shmem_.size() ||
         command.logical_bytes > shmem_.size() - command.shmem_address) {
         throw SimError("tma tile does not fit in shmem");
@@ -545,7 +535,7 @@ void Machine::mark_tma_data_complete(TmaCommand& command) {
 
 // ===========================================================================
 // The TMA operand read's end (UrfReadRounds in src/machine/machine.hpp; the timing is
-// src/rf.hpp tma_operand_rounds). The pair in the URF read stages' last stage
+// src/timing.hpp tma_operand_rounds). The pair in the URF read stages' last stage
 // is at the URF output now: it goes into the holding register (round 0 starts
 // the command: its instruction's fields, the buffer and the barrier, the
 // coordinates zero until supplied). With the command's last pair the command
@@ -579,8 +569,8 @@ void Machine::arrive_tma_operands(Wires& w) {
     w.tma_holding_after = std::move(holding);
 }
 
-// The holding register's command, complete now, as the TMA queue takes it
-// (what dispatch did before rfc17): the machine's panics on its operands, and
+// The holding register's command, complete now, as the TMA queue takes it:
+// the machine's panics on its operands, and
 // the sanitizer's checks -- the uniform operation's partial-mask rule, the
 // address operands' low bits, the descriptor's and the tile's footprint.
 Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wires& w) {
@@ -600,7 +590,7 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     command.direction = is_tma_store(inst.opcode) ? TmaDirection::store : TmaDirection::load;
     command.descriptor_address = static_cast<uint32_t>(inst.imm);
     command.coordinates = holding.coordinates;
-    // The two addresses' low bits are not wired (src/tma.hpp).
+    // The two addresses' low bits are not wired (src/tma_descriptor.hpp).
     command.shmem_address = holding.buffer & ~(tma_buffer_alignment - 1);
     command.mbar_address = holding.barrier & ~(tma_barrier_alignment - 1);
     if (static_cast<uint64_t>(command.mbar_address) + 8 > shmem_.size()) {
@@ -608,10 +598,10 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     }
     // Sanitizer: the descriptor the engine will read -- memory as of this
     // cycle's edge; anything still travelling to it PANICs in
-    // record_tma_accept (missing fence.sh / race, rfc12 section 11) -- and the
+    // record_tma_accept (missing fence.sh / race) -- and the
     // phase of its completion mbar now, the accept-time peek a TMA's
-    // complete_tx is checked against (rfc12 section 8; the hardware reads no
-    // mbar). The engine accepts the command now, at its push.
+    // complete_tx is checked against (the hardware reads no mbar). The
+    // engine accepts the command now, at its push.
     const auto descriptor_bytes = tma_descriptor_at_accept(command.descriptor_address, w);
     sanitizer_.record_tma_accept(where, command.id, command.descriptor_address, descriptor_bytes,
         command.direction == TmaDirection::load, command.shmem_address, command.mbar_address,
@@ -627,7 +617,7 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
 // stage arrives now: tma_pushed).
 uint32_t Machine::tma_commands_being_read() const {
     const auto& rounds = urf_read_rounds_.cur();
-    uint32_t commands = rounds.has_value() && is_tma(rounds->header.instruction.opcode) ? 1 : 0;
+    uint32_t commands = rounds.has_value() && is_tma_opcode(rounds->header.instruction.opcode) ? 1 : 0;
     const auto& pairs = tma_read_pairs_.cur();
     for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) {
         if (pairs[stage].has_value() && pairs[stage]->last) ++commands;

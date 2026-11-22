@@ -3,26 +3,11 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
-
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
-#include <utility>
 
 namespace nanosm {
 
 // ===========================================================================
-// The front end (trash/front-end-2026-10-18.md, two-word packets since
-// trash/front-end-packets-2026-10-18.md; the cycles in src/rf.hpp). Every
+// The front end (two-word packets; the cycles in src/timing.hpp). Every
 // decision here reads registers only (tick() (i)).
 // ===========================================================================
 
@@ -75,7 +60,7 @@ std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() const
 }
 
 // Every warp's front end after this cycle, in one calculation per warp
-// (src/rf.hpp for the cycles), from Q, this cycle's front-end wires and
+// (src/timing.hpp for the cycles), from Q, this cycle's front-end wires and
 // issue's acceptance:
 //   - issue: issue accepted the warp's next instruction (captured into the
 //     issue register at this edge); pc moves to the next word, and the head

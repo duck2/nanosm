@@ -101,7 +101,7 @@ Kernel load_hex(std::string_view source);
 Kernel load_hex_file(const std::string& path);
 void validate_kernel(const Kernel& kernel);
 // Kernel load: every instruction's distinct sources fit its RF banks' read
-// ports in one round (src/rf.hpp), else a SimError naming the pc, the
+// ports in one round (src/timing.hpp), else a SimError naming the pc, the
 // instruction and the registers. qtxc and the assembler apply the same rule
 // per source line.
 void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
@@ -114,6 +114,10 @@ void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
 // predicate), else a SimError naming the pc (qtxc and the assembler refuse it
 // per source line).
 void check_write_masks(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: ssy, sync and a predicated bra only on a profile with a
+// divergence stack (core.divergence_stack_entries), else a SimError naming
+// the pc (qtxc and the assembler refuse it per source line).
+void check_divergence_stacks(const Kernel& kernel, const DeviceProfile& profile);
 // Kernel load: an ldg.v8 / stg.v8 only on a profile with 32-byte sectors (a
 // lane's eight words are one sector), else a SimError naming the pc (qtxc
 // and the assembler refuse it per source line).
@@ -137,7 +141,7 @@ Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& p
 
 // Hand assembly: raise each stall to what the kernel's fixed-latency register
 // and predicate dependencies need under `profile` (the distances qtxc
-// schedules with, src/rf.hpp); depbars and waits stay the author's.
+// schedules with, src/timing.hpp); depbars and waits stay the author's.
 Kernel schedule_fixed_stalls(Kernel kernel, const DeviceProfile& profile);
 
 } // namespace nanosm

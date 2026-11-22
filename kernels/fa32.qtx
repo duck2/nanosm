@@ -5,7 +5,7 @@
 ; 0..31, S1/O1 for rows 32..63), so that one tile's softmax runs while the
 ; tensor core works on the other tile. Unmasked full tiles, fp16 Q/K/V/P,
 ; fp32 S/O/statistics. fa32.launch.py passes the four descriptor arguments
-; and has the reference and checks; trash/fa32-2026-11-19.md the measurements.
+; and has the reference and checks.
 ;
 ; Warps:
 ;   0     loads: six TMA loads, in the order the matmuls need them, then the

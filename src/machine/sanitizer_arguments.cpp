@@ -4,26 +4,17 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
-#include <utility>
 
 namespace nanosm {
 
 // ---------------------------------------------------------------------------
 // Sanitizer argument builders. Pure reads of hardware state; their results go
 // only to sanitizer_ (src/machine/sanitizer.hpp). Nothing here feeds the machine.
+// (One more is beside the code it reads: mma_operand_span, in
+// src/machine/tensor_core.cpp with the tensor core's address helpers.)
 // ---------------------------------------------------------------------------
 
 // An issuing warp's site: its FIFO head's pc.
@@ -63,8 +54,8 @@ std::vector<std::vector<uint32_t>> Machine::round_addresses(const std::vector<st
 
 // shmem bytes [address, address + size) as they stand after this cycle's
 // clock edge: memory, plus the write rounds at the RAM now (they land at the
-// edge). An access at the RAM in a command's accept cycle has REACHED it
-// (rfc12 section 10), so this is what an engine command accepted now finds.
+// edge). An access at the RAM in a command's accept cycle has REACHED it,
+// so this is what an engine command accepted now finds.
 std::vector<uint8_t> Machine::shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const {
     std::vector<uint8_t> bytes(shmem_.begin() + address, shmem_.begin() + address + size);
     for (const auto& write : w.shmem.writes) {
@@ -76,9 +67,9 @@ std::vector<uint8_t> Machine::shmem_after_edge(uint32_t address, uint32_t size, 
     return bytes;
 }
 
-// The descriptor the engine will read: memory as of this cycle's edge. I4
-// (rfc12 section 11) replaced the overlay of in-flight stores this peek had:
-// a write still travelling to the descriptor at accept is now a missing-fence
+// The descriptor the engine will read: memory as of this cycle's edge. No
+// overlay of in-flight stores is needed:
+// a write still travelling to the descriptor at accept is a missing-fence
 // / race PANIC (record_tma_accept), and the descriptor's read-ownership
 // covers every write after it, so the engine reads exactly these bytes.
 std::array<uint8_t, tma_descriptor_bytes> Machine::tma_descriptor_at_accept(uint32_t address, const Wires& w) const {
@@ -88,7 +79,7 @@ std::array<uint8_t, tma_descriptor_bytes> Machine::tma_descriptor_at_accept(uint
     return bytes;
 }
 
-// The accept-time peek of a TMA's completion mbar (rfc12 section 8): its word
+// The accept-time peek of a TMA's completion mbar: its word
 // as the RMW engine will leave it -- memory as of this cycle's edge, then the
 // writes already granted and still travelling (the write pipelines' earlier
 // stages, oldest first, then this cycle's grants: an RMW's write among them),

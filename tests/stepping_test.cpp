@@ -1,6 +1,5 @@
 // The stepping discipline: Reg<T>, the LSU assembly contract, simultaneous events, the driver shuffle.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -8,7 +7,7 @@ namespace {
 using namespace nanosm_test;
 
 // ===========================================================================
-// Stepping discipline (trash/stepping-discipline-2026-10-08.md)
+// Stepping discipline
 // ===========================================================================
 
 // ---- Reg<T> (src/machine/reg.hpp) ----
@@ -62,7 +61,7 @@ void test_reg_duplicate_write_panics() {
     require(reg.cur() == 3, "the register did not recover after a duplicate-write PANIC");
 }
 
-// ---- The load buffer's groups (2026-11-21: per-lane ldg.v8) ----
+// ---- The load buffer's groups (per-lane ldg.v8) ----
 
 // A ldg.v8 whose every lane names the same sector (a uniform base): register
 // first_reg + k holds that sector's word k in every lane.
@@ -95,7 +94,7 @@ void test_load_buffer_groups() {
     std::map<uint64_t, uint64_t> first_word, last_word;
     std::vector<nanosm::LsuEdgeEvent> writes;
     for (const auto& event : machine.edge_events()) {
-        if (event.edge == LsuEdge::assembly_write) {
+        if (event.edge == LsuEdge::buffer_write) {
             if (first_word.emplace(event.aux, event.cycle).second) requests.push_back(event.aux);
             last_word[event.aux] = event.cycle;
         }
@@ -125,7 +124,7 @@ void test_load_buffer_groups() {
                 "r" + std::to_string(8 + j) + " lane " + std::to_string(lane) + " is not word j of the lane's sector");
 }
 
-// ---- Same-cycle reuse after a load's final RF drain (staging = active = 1) ----
+// ---- Same-cycle reuse after a load's final RF drain (one command slot) ----
 
 // One of the LSU's two buffers at the end of a cycle.
 struct AssemblyAfter {
@@ -143,12 +142,11 @@ struct ReuseRun {
 };
 
 // `old_load` is LSU command 0, `second` (opcode `second_name`) command 1. With
-// one command slot and one assembly register, the second waits for both: it
-// issues in the cycle the load's final RF write releases them (look-ahead
-// (c)) and the LSU admits it issue_to_dispatch later (I6a), into the register
-// free since then. (Before I6a the admission was that same cycle, a reuse
-// (d) of the register the drain was emptying; a claim now waits for the
-// release, so issue cannot line the two up.)
+// one command slot, the second waits for it: it
+// issues in the cycle the load's final RF write releases it (look-ahead
+// (c)) and the LSU admits it issue_to_dispatch later, into the slot
+// free since then. (A claim waits for the
+// release, so issue cannot line the two up in one cycle.)
 // gmem holds pattern words; r5 = 4 * lane, r6 = 2048 + 4 * lane, r24..r31 =
 // 101..108.
 ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
@@ -173,8 +171,8 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
     while (!machine.done()) {
         const auto cycle = machine.cycle();
         tick_capped(machine);
-        after[cycle] = {machine.assembly_owner(0), machine.assembly_valid(0), machine.assembly_valid_count(0)};
-        store_after[cycle] = {machine.assembly_owner(1), machine.assembly_valid(1), machine.assembly_valid_count(1)};
+        after[cycle] = {machine.lsu_buffer_owner(0), machine.lsu_buffer_valid(0), machine.lsu_buffer_valid_count(0)};
+        store_after[cycle] = {machine.lsu_buffer_owner(1), machine.lsu_buffer_valid(1), machine.lsu_buffer_valid_count(1)};
     }
     uint64_t final_drain = 0;
     for (const auto& event : machine.edge_events())
@@ -204,10 +202,10 @@ void require_old_load_data(const nanosm::Machine& machine, const std::string& ol
 
 // A scalar store admitted after a load's final drain: after its dispatch
 // cycle it owns the STORE buffer with all sixteen lanes valid, and the load
-// buffer is empty and unowned (2026-11-21: one buffer per direction, owned
+// buffer is empty and unowned (one buffer per direction, owned
 // only while data is in it). The output alone cannot show it: scalar-store
 // egress reads the words without valid_count.
-void test_assembly_reuse_load_to_scalar_store() {
+void test_buffer_reuse_load_to_scalar_store() {
     for (const std::string old_load : {"ldg.v8 r8, [r0]", "ldg r8, [r5]"}) {
         const auto run = run_reuse_after_final_drain(old_load, "stg [r5 + 2048], r6", "stg");
         const auto where = " after the reuse cycle " + std::to_string(run.reuse_cycle) + " (" + old_load + ")";
@@ -225,9 +223,9 @@ void test_assembly_reuse_load_to_scalar_store() {
 }
 
 // A stg.v8 admitted then: its first RF read beat is sampled in its admission
-// cycle (bypass (e)) and fills the store buffer Lr later (I6a); the buffer has
+// cycle (bypass (e)) and fills the store buffer Lr later; the buffer has
 // no owner until that data lands.
-void test_assembly_reuse_load_to_vector_store() {
+void test_buffer_reuse_load_to_vector_store() {
     const std::string old_load = "ldg.v8 r8, [r0]";
     const auto run = run_reuse_after_final_drain(old_load, "stg.v8 [r2], r24", "stg.v8");
     bool first_read_now = false;
@@ -250,7 +248,7 @@ void test_assembly_reuse_load_to_vector_store() {
 // A new load admitted then: the load buffer is empty and unowned until its
 // first word returns. (Assembly contract 5 covers ldg.v8 -> ldg.v8 through
 // the data path.)
-void test_assembly_reuse_load_to_load() {
+void test_buffer_reuse_load_to_load() {
     const std::string old_load = "ldg.v8 r8, [r0]";
     const auto run = run_reuse_after_final_drain(old_load, "ldg r16, [r5 + 1024]", "ldg");
     require(!run.after.owner.has_value(), "the load buffer is owned before the new load's first word returned");
@@ -262,19 +260,19 @@ void test_assembly_reuse_load_to_load() {
     require_old_load_data(*run.machine, old_load);
 }
 
-// The sanitizer's guard for the case above: a reader of an assembly register
+// The sanitizer's check for the case above: a reader of a buffer
 // that takes a lane whose valid bit is clear panics.
-void test_sanitizer_assembly_reader_takes_valid_lanes() {
+void test_sanitizer_buffer_reader_takes_valid_lanes() {
     nanosm::Sanitizer sanitizer;
     std::vector<uint8_t> valid(16, 1);
-    sanitizer.check_assembly_lanes_valid(5, 0, valid, 0, 16, "RF drain");
+    sanitizer.check_buffer_lanes_valid(5, 0, valid, 0, 16, "RF drain");
     valid[3] = 0;
-    sanitizer.check_assembly_lanes_valid(5, 0, valid, 4, 12, "egress write port"); // lanes 4..15 only
+    sanitizer.check_buffer_lanes_valid(5, 0, valid, 4, 12, "egress write port"); // lanes 4..15 only
     try {
-        sanitizer.check_assembly_lanes_valid(5, 0, valid, 3, 1, "egress write port");
+        sanitizer.check_buffer_lanes_valid(5, 0, valid, 3, 1, "egress write port");
     } catch (const nanosm::SimError& error) {
         const std::string message = error.what();
-        require(message.find("egress write port read lane 3 of assembly register 0") != std::string::npos,
+        require(message.find("egress write port read lane 3 of LSU buffer 0") != std::string::npos,
             "the lane check's PANIC does not name the reader, lane and register: " + message);
         return;
     }
@@ -285,8 +283,7 @@ void test_sanitizer_assembly_reader_takes_valid_lanes() {
 
 // A TMA load and an MMA commit, far apart: each engine's event, presented in
 // cycle p, is first claimable in p + 1, and the free RMW engine claims it
-// then. (Before 2026-10-08 a TMA event could be claimed in p itself, an
-// accident of the call order in tick().)
+// then, never in p itself.
 void test_mbar_engine_events_visible_next_cycle() {
     constexpr uint32_t commit_mbar = 4096;
     constexpr uint32_t tx_mbar = 4104;
@@ -325,7 +322,7 @@ void test_mbar_engine_events_visible_next_cycle() {
 // ldg that waits on sb0 and sets it again issues in that same cycle: issue
 // sees the completion at once (bypass (b)), and the counter is one
 // calculation, 1 - 1 + 1 = 1. Neither event is deferred.
-// I6a: a completion reaches issue through the counter (Q), so an instruction
+// A completion reaches issue through the counter (Q), so an instruction
 // WAITING on the depbar issues the cycle after its completion. The one
 // calculation still combines a completion and an admission that land in one
 // cycle: here the ldg sets sb0 without waiting on it, issued exactly when the
@@ -409,10 +406,10 @@ void test_simultaneous_full_queue_pop_and_push() {
         if (event.name == "MMA tmem write" && event.id == 1) first_last_result = std::max(first_last_result, event.start_cycle);
         if (event.category == nanosm::TraceCategory::warp && event.detail == "MMA command queue full") waited_full = true;
     }
-    // I6a: the "mma.async" event is the MMA's acceptance, at dispatch. The
+    // The "mma.async" event is the MMA's acceptance, at dispatch. The
     // third issues in the cycle the head retires (look-ahead (c): the queue
     // as that cycle leaves it) and reaches the queue issue_to_dispatch later:
-    // the pop and the push no longer share a cycle (a claim waits for the
+    // the pop and the push do not share a cycle (a claim waits for the
     // pop), so the depth is 2, then 1 until the dispatch, then 2.
     const auto dispatch = nanosm::issue_to_dispatch(canonical_profile());
     const auto third_accept = third_issue;
@@ -425,16 +422,16 @@ void test_simultaneous_full_queue_pop_and_push() {
         "the queue's pop and the dispatched push did not land in their cycles");
 }
 
-// The ingress FIFO's declared full flag is registered (B2.1 implementer
-// choice 3, kept): when the FIFO is full at the start of a cycle, the bus
+// The ingress FIFO's declared full flag is registered (an implementer
+// choice): when the FIFO is full at the start of a cycle, the bus
 // cannot write a beat in that cycle even if the read port frees room in it;
 // the beat lands the next cycle. A FIFO that is not full is read and written
 // in one cycle (count' = count + push - pop).
 void test_simultaneous_ingress_push_and_pop() {
     auto config = fast_bus_profile(8); // one 32 B beat per pop: a pop frees a whole beat's room
     config.lsu_ingress_sectors = 2;
-    // Warp 1's long bookings hold chunk 0's RF write for a while, so the
-    // FIFO fills (I1: a mov storm no longer does; see booking_stream).
+    // Warp 1's long bookings hold the first group's RF write for a while, so
+    // the FIFO fills (a mov storm does not; see booking_stream).
     config.gmem_latency_dram_ticks = 2 * booking_horizon;
     with_long_bookings(config);
     nanosm::Launch launch;
@@ -486,12 +483,12 @@ void test_simultaneous_ingress_push_and_pop() {
     require_vector_data(machine, 0, 8, 0, "ingress push/pop");
 }
 
-// ---- The driver shuffle (regression guard; the launches run under ctest
+// ---- The driver shuffle (regression check; the launches run under ctest
 // via scripts/driver_shuffle_check.py) ----
 
 // Register drivers read only Q and the wires, so permuting their order (and
 // the independent request generators') every cycle changes nothing: not a
-// cycle, a counter, a trace byte or a memory byte. A guard against a future
+// cycle, a counter, a trace byte or a memory byte. A check against a future
 // driver that reads another's D or shared state, not a proof of independence.
 void test_driver_shuffle_unit_kernels() {
     struct Scenario {
@@ -504,7 +501,7 @@ void test_driver_shuffle_unit_kernels() {
         config.tma_sector_credits = 0;
         config.gmem_queue_sectors = 8;
         config.lsu_ingress_sectors = 2;
-        with_long_bookings(config); // I1: a mov storm no longer holds the RF write port
+        with_long_bookings(config); // a mov storm does not hold the RF write port
         nanosm::Launch launch;
         launch.active_warps = 2;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
@@ -619,24 +616,24 @@ TEST(Stepping, load_buffer_groups) {
 }
 
 // assembly reuse: final load drain -> scalar store
-TEST(Stepping, assembly_reuse_load_to_scalar_store) {
-    test_assembly_reuse_load_to_scalar_store();
+TEST(Stepping, buffer_reuse_load_to_scalar_store) {
+    test_buffer_reuse_load_to_scalar_store();
 }
 
 // assembly reuse: final load drain -> vector store
-TEST(Stepping, assembly_reuse_load_to_vector_store) {
-    test_assembly_reuse_load_to_vector_store();
+TEST(Stepping, buffer_reuse_load_to_vector_store) {
+    test_buffer_reuse_load_to_vector_store();
 }
 
 // assembly reuse: final load drain -> load
-TEST(Stepping, assembly_reuse_load_to_load) {
-    test_assembly_reuse_load_to_load();
+TEST(Stepping, buffer_reuse_load_to_load) {
+    test_buffer_reuse_load_to_load();
 }
 
 // sanitizer: assembly reader takes only valid lanes
-TEST(Stepping, sanitizer_assembly_reader_takes_valid_lanes) {
+TEST(Stepping, sanitizer_buffer_reader_takes_valid_lanes) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_sanitizer_assembly_reader_takes_valid_lanes();
+    test_sanitizer_buffer_reader_takes_valid_lanes();
 }
 
 // mbar engines: events visible the next cycle

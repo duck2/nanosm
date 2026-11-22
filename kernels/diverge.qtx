@@ -1,10 +1,10 @@
 ; Per-lane Collatz step counts: a loop whose trip count is each lane's own
-; data (trash/divergence-2026-11-21.md). Lane l of warp w reads n = IN[16 w + l]
+; data. Lane l of warp w reads n = IN[16 w + l]
 ; (n >= 1) and counts the steps n -> n / 2 (n even) or 3 n + 1 (n odd) until
 ; n is 1. Each step is a per-lane if / else whose arms each end in a sync;
 ; the loop sheds lanes as they reach 1. Every sync pops a (mask, pc) entry
-; and switches to it. The loop is laid out as in
-; trash/divergence-loop-astra.py: the first pass goes to the test, and the
+; and switches to it. The loop is laid out so that the first pass goes to
+; the test, and the
 ; lanes that leave fall into the sync, which switches to the lanes that stay
 ; (back at STEP); when none stays it pops the ssy's entry, DONE. So the stack
 ; holds at most the loop's entry and, inside a step, the step's entry and

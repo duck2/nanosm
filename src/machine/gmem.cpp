@@ -6,19 +6,11 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
 #include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
-#include <limits>
-#include <new>
 #include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -361,7 +353,7 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
     }
 }
 
-// One write contract for every client (rfc09 3a): the data went on the bus
+// One write contract for every client: the data went on the bus
 // beat by beat; the acknowledgement comes gmem.latency_dram_ticks after the
 // last beat, and only then are the TMA credit or the LSU slot released.
 void Machine::finish_gmem_write(GmemSectorRequest request) {
@@ -383,7 +375,7 @@ void Machine::finish_gmem_write(GmemSectorRequest request) {
 
 // Acks due now. A TMA ack returns its sector credit; an LSU ack its scatter
 // tag, and the command's last ack completes it: the depbar clears and its
-// slot and assembly register are released at the next cycle's RF write port
+// slot is released at the next cycle's RF write port
 // (a completion with no destination: its port and landing are that cycle).
 void Machine::deliver_write_acks(Wires& w) {
     while (!pending_write_acks_.empty() && pending_write_acks_.front().dram_tick <= dram_tick_) {

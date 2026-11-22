@@ -1,7 +1,7 @@
 // The qtx scheduler (src/qtxc/): turns a parsed qtx program into scheduled
 // assembly by filling in each instruction's control bits: the stall counts
 // its fixed-latency dependencies need (FixedTimeline, distances from
-// src/rf.hpp), depbar set / wait for the asynchronous ones (with all six
+// src/timing.hpp), depbar set / wait for the asynchronous ones (with all six
 // live, an instruction that needs a new one waits for the oldest and reuses
 // it), a wait on a launch flag for an instruction that names a section of
 // the launch block (flag_pending below), a full drain at
@@ -11,7 +11,7 @@
 // encode.
 
 #include "qtxc/internal.hpp"
-#include "rf.hpp"
+#include "timing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +21,7 @@ namespace nanosm {
 namespace {
 
 // The fixed-latency part of the virtual issue timeline (vtime: a warp's issue
-// cycles, relative). Every distance comes from src/rf.hpp, the helper the
+// cycles, relative). Every distance comes from src/timing.hpp, the helper the
 // simulator and the sanitizer use:
 //   reg_visible: the vtime from which an RF sample sees a fixed result (async
 //     results are covered by depbars instead);
@@ -220,13 +220,13 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     }
     std::array<std::optional<uint8_t>, 256> pending_register{};
     std::array<uint8_t, 256> pending_async_read_mask{};
-    // tmem order between one warp's transfers (trash/rfc11.md section 0: the
+    // tmem order between one warp's transfers (the
     // acc.ld and acc.st engines run side by side, nothing orders them): the
     // depbars of the warp's acc.st and acc.ld still in flight. A transfer
     // after an acc.st waits for it (RAW, WAW); an acc.st after an acc.ld
     // waits for that (WAR). One class for all of tmem: the region is a
     // pointer in a uniform register, so two transfers' words cannot be told
-    // apart here (trash/acc-pointer-2026-11-19.md).
+    // apart here.
     uint8_t acc_store_mask = 0;
     uint8_t acc_load_mask = 0;
     std::optional<uint8_t> store_barrier;
@@ -235,7 +235,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     // Virtual issue timeline. Consecutive same-warp issues are at least max(stall, 1)
     // apart, and real gaps only grow (scheduler contention, depbar waits, structural
     // stalls), so any spacing proven here holds on the machine. The fixed-latency
-    // distances are FixedTimeline's (src/rf.hpp). A stall is paid only when a
+    // distances are FixedTimeline's (src/timing.hpp). A stall is paid only when a
     // consumer sits closer than that, and it lands on the instruction just before
     // the consumer.
     FixedTimeline timeline;
@@ -496,7 +496,7 @@ AssemblyProgram compile_qtx_file(const std::string& path, const DeviceProfile& p
 // Hand assembly's fixed-latency stalls: each instruction's stall becomes the
 // larger of its own and what the fixed-latency register and predicate
 // dependencies of the instructions after it need under `profile` -- the
-// distances qtxc schedules with (FixedTimeline, src/rf.hpp) -- so the result
+// distances qtxc schedules with (FixedTimeline, src/timing.hpp) -- so the result
 // never trips the sanitizer's RAW / WAW / WAR checks on a fixed result.
 // Depbars, waits and every other field stay the author's. A branch drains
 // like qtxc's block boundary, and the code after it starts clean. A loop body

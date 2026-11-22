@@ -101,7 +101,7 @@ Kernel load_hex(std::string_view source) {
         }
         if (clean.starts_with(".acc")) {
             throw SimError("line " + std::to_string(line) +
-                ": a hex kernel has no .acc header since 2026-11-19 (an accumulator is a tmem pointer in a "
+                ": a hex kernel has no .acc header (an accumulator is a tmem pointer in a "
                 "uniform register); rebuild it");
         }
         std::size_t consumed = 0;

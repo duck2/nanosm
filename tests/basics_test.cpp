@@ -1,6 +1,5 @@
 // Encoding, the compiler's controls, branches, mbar basics, launch images.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -43,7 +42,7 @@ void test_mbar_word_encoding() {
     state.valid = true;
     state.expected = 0x1234;
     state.remaining = 0x2345;
-    // I3 (rfc12 section 8): the tx field is a signed 32-bit count (two's
+    // The tx field is a signed 32-bit count (two's
     // complement), same bits 32-63: 0x89abcdef is a negative count.
     state.tx_bytes = static_cast<int32_t>(0x89abcdefu);
     const auto word = nanosm::encode_mbar_state(state);
@@ -95,7 +94,7 @@ void test_compiler_controls() {
         sts  [r0 + 128], r4
         halt
     )", canonical_profile());
-    // I6a (src/rf.hpp): a fixed result is visible issue_to_visible after its
+    // src/timing.hpp: a fixed result is visible issue_to_visible after its
     // issue; its consumer samples issue_to_sample (1, the issue register)
     // after its own. The mov's result feeds the very next lds (7 - 1 = 6 at
     // canonical); the fadd's the sts after it (10 - 1 = 9).
@@ -115,7 +114,7 @@ void test_compiler_controls() {
 }
 
 // With all six depbars live, the instruction that needs a seventh waits for
-// the oldest live one and reuses it (it used to be an error).
+// the oldest live one and reuses it.
 void test_seventh_depbar_reuses_the_oldest() {
     const auto program = qtx_program(R"(
         mov r0, 0
@@ -139,7 +138,7 @@ void test_seventh_depbar_reuses_the_oldest() {
 
 void test_stalls_track_consumer_distance() {
     // fadd's result is consumed three instructions later, so only what its
-    // distance (src/rf.hpp: issue_to_visible - the consumer's issue_to_sample)
+    // distance (src/timing.hpp: issue_to_visible - the consumer's issue_to_sample)
     // exceeds those three issues is bought with a stall, and it lands just
     // before the consumer. The mov feeding the fadd stalls the full distance.
     const auto& profile = canonical_profile();
@@ -259,14 +258,14 @@ void test_branch_boundary_drains_async_work() {
     // The fadd issued one cycle before the branch; the block after it must
     // issue no earlier than one cycle before the fadd's result is visible (its
     // first sample is after the issue register): issue_to_visible - 1 cycles
-    // after the fadd, issue_to_visible - 2 after the branch (src/rf.hpp).
+    // after the fadd, issue_to_visible - 2 after the branch (src/timing.hpp).
     require(fixed.instructions[2].control.stall ==
             nanosm::issue_to_visible(fixed.instructions[1], canonical_profile()) -
                 nanosm::issue_register_stages - 1,
         "branch did not drain a live fadd writeback");
 }
 
-// qtx's wait (trash/typed-compare-and-wait-2026-11-18.md) is a nop that waits
+// qtx's wait is a nop that waits
 // for every live depbar, here the matmul's operand-consumed one. The sts
 // after it overwrites the A operand the matmul was reading: ordered by the
 // wait, so the sanitizer stays quiet and the store lands.
@@ -398,8 +397,8 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
         halt
     )"), std::move(launch), {.timeline = true});
 
-    // A guard only: the warp parks once its init, arrive and probe have
-    // crossed issue, dispatch (I6a) and the RMW engine.
+    // A bound only: the warp parks once its init, arrive and probe have
+    // crossed issue, dispatch and the RMW engine.
     while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 200) machine.tick();
     require(machine.trace().summary().mbar_sleeps == 1, "mbar.try_wait never parked the warp");
     machine.complete_mbar_tx(64, 8, 0);
@@ -419,7 +418,7 @@ void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
     for (const auto& event : machine.trace().events()) {
         if (event.name != "mbar RMW") continue;
         ++rmw_slices;
-        // I2: read grant to write grant, D + Lb + 1 cycles (was 2); I2.1: + C.
+        // Read grant to write grant, D + Lb + C + 1 cycles.
         require(event.duration_cycles == rmw_busy_cycles(), "mbar RMW did not hold A for D + Lb + C + 1 cycles");
     }
     require(rmw_slices == 3, "trace did not contain every mbar RMW service interval");
@@ -507,14 +506,13 @@ void test_mbar_try_wait_times_out_false() {
     require(machine.trace().summary().mbar_wakes == 0, "timeout was counted as exact wake");
 }
 
-// I2: the wake comes when the RMW's write reaches the RAM (rfc12 section 6),
-// 2D + Lb (I2.1: + C) cycles after the event's claim, which is the cycle after
-// the park. The timeout puts the deadline in that cycle (was 2: claim, then
-// write).
+// The wake comes when the RMW's write reaches the RAM,
+// 2D + Lb (+ C) cycles after the event's claim, which is the cycle after
+// the park. The timeout puts the deadline in that cycle.
 void test_mbar_phase_flip_wins_on_try_wait_deadline() {
     auto profile = canonical_profile();
     // The wake lands exactly on the deadline: the claim is the cycle after the
-    // park, the wake the RMW write's commit, D + Lb + C + D later (I2.1: + C,
+    // park, the wake the RMW write's commit, D + Lb + C + D later (+ C,
     // the RMW's ALU stages).
     profile.mbar_try_wait_timeout_cycles = 2 * profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
         profile.shmem_rmw_compute_cycles + 1;
@@ -785,8 +783,8 @@ void test_launch_arguments_reach_the_kernel() {
 }
 
 // `.equ XX, X` is another name for section X: an instruction that names XX
-// waits on X's launch flag like one that names X (Astra, 2026-11-21: it got
-// no wait and, with the sanitizer off, read zeros). A chain of such lines too.
+// waits on X's launch flag like one that names X (with no wait it would read
+// zeros when the sanitizer is off). A chain of such lines too.
 void test_section_alias_waits_on_its_flag() {
     const auto run = [](const std::string& name) {
         nanosm::Launch launch;
@@ -799,7 +797,7 @@ void test_section_alias_waits_on_its_flag() {
         machine.run();
         return machine.read_shmem_u32(0);
     };
-    // Sanitizer on or off, the value is the argument (off, it used to be 0).
+    // Sanitizer on or off, the value is the argument.
     for (const std::string name : {"X", "XX", "XXX"}) {
         require(run(name) == 0x12345678u, "umov ur1, " + name + " read its parameter before it landed");
     }
@@ -1172,7 +1170,7 @@ void test_mbar_arrival_underflow_panics() {
     }
 }
 
-// I3 (rfc12 section 8): complete_tx carries no phase in hardware; the phase
+// Complete_tx carries no phase in hardware; the phase
 // a sender meant (here the host's stated parity) is sanitizer metadata, so
 // this is now a sanitizer PANIC (listed in expects_sanitizer_panic).
 void test_mbar_complete_wrong_phase_panics() {

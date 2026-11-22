@@ -1,6 +1,5 @@
 // Integer and float ALU, SFU, conversions.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -124,7 +123,7 @@ void test_integer_alu_menu() {
     }
 
     // Two distinct sources in one bank are a malformed instruction (one read
-    // round, one read port per bank: src/rf.hpp): the assembler refuses it.
+    // round, one read port per bank: src/timing.hpp): the assembler refuses it.
     // (qtxc repairs it with a copy: Rf.i6b1_same_bank_sources_are_malformed.)
     try {
         (void)nanosm::assemble_asm(i1_asm(canonical_profile(), "and r2, r0, r3\nhalt"), canonical_profile());
@@ -311,7 +310,7 @@ void test_sfu_unit_timing() {
         fadd r4, r2, r2
         halt
     )", profile);
-    // The ex2's result feeds the very next fadd: its whole distance (src/rf.hpp),
+    // The ex2's result feeds the very next fadd: its whole distance (src/timing.hpp),
     // the effective SFU latency inside it.
     require(scheduled.instructions[1].control.stall ==
             nanosm::issue_to_visible(scheduled.instructions[1], profile) - nanosm::issue_register_stages,
@@ -473,7 +472,7 @@ void test_sfu_profile_validation() {
             throw std::runtime_error("invalid sfu latency was accepted");
         } catch (const nanosm::ProfileError&) {}
     }
-    // C1: a required integer out of its type's range (or negative, or a
+    // A required integer out of its type's range (or negative, or a
     // fraction) is refused by name, never narrowed (alu_latency_cycles is 8
     // bits: 257 would have read as 1).
     for (const auto& [section, name, value] : std::vector<std::tuple<std::string, std::string, nlohmann::json>>{

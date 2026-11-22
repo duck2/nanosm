@@ -4,27 +4,14 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
 
 // ===========================================================================
 // Dispatch: the dispatch pipeline's end. The unit takes the instruction with
-// its operands -- latched at its RF sample, at the RF output now -- exactly
-// as issue handed it over before I6a.
+// its operands -- latched at its RF sample, at the RF output now.
 // ===========================================================================
 
 void Machine::dispatch_issued(Wires& w) {
@@ -95,10 +82,10 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
 // off. Issue could not know: it took its slot (the
 // admission's claim), set its depbar and booked its read round like any.
 // Here it completes with zero accesses: no load or store slot, no LSU
-// command, no assembly register, no request; its depbar is decremented now,
+// command, no buffer, no request; its depbar is decremented now,
 // so a waiting instruction sees it zero from the next cycle (issue +
 // issue_to_dispatch + 1, canonical issue + 4). A load's destination keeps
-// every lane's old value and is no longer in flight from then on. Only a
+// every lane's old value and is not in flight from then on. Only a
 // write mask can leave no lane: the divergence stack's active mask is never
 // empty, and every other dispatched instruction refuses to be masked.
 void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
@@ -146,22 +133,6 @@ std::vector<uint32_t> Machine::capture(const DispatchEntry& op, uint8_t reg) con
         return op.operands[i];
     }
     throw SimError("internal: r" + std::to_string(reg) + " used at dispatch but not read at issue");
-}
-
-// A declared-uniform operand still taken from a VECTOR register (rfc09 pin
-// 3) -- since the URF slice only the ldg.v8 / stg.v8 bases (the TMA's
-// operands are uniform registers since rfc17): hardware reads lane 0,
-// whatever the active mask (even when lane 0
-// is inactive). Two things are UB and the sanitizer panics on them: a value
-// that differs across lanes (named by the operand: "... is not
-// warp-uniform"), and any uniform operation under a partial mask
-// (backlog D12.1, rfc13 section 2: a program with a partial mask uses the
-// per-lane instruction). bra.uni checks the mask in resolve_branch.
-uint32_t Machine::uniform_reg(const DispatchEntry& op, uint8_t reg, const std::string& name) const {
-    sanitizer_.check_uniform_mask(site(op), op.active_mask, full_mask());
-    const auto lanes = capture(op, reg);
-    sanitizer_.check_warp_uniform(site(op), lanes, name);
-    return lanes[0];
 }
 
 // A uniform-register operand (lds.uni / ldg.uni bases, atom.*.uni address

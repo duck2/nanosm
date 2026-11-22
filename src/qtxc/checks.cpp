@@ -8,14 +8,14 @@
 // assemble.cpp.
 
 #include "qtxc/internal.hpp"
-#include "rf.hpp"
+#include "timing.hpp"
 
 #include <string>
 
 namespace nanosm {
 namespace qtxc_internal {
 
-// The one-round read rule (src/rf.hpp): distinct sources beyond a bank's read
+// The one-round read rule (src/timing.hpp): distinct sources beyond a bank's read
 // ports make the instruction malformed. `where` is "line N" or "pc N".
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (const auto conflict = rf_read_port_conflict(inst, profile, issue_sources(inst)); conflict.has_value()) {
@@ -67,13 +67,17 @@ void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, cons
         std::to_string(profile.gmem_sector_bytes) + "-byte sectors (gmem.sector_bytes)");
 }
 
-// Predication and the divergence stack (trash/divergence-2026-11-21.md):
+// Predication and the divergence stack:
 // a write mask only on an instruction that can be masked (check_write_mask), and ssy, sync
 // and a predicated bra need a stack, which a profile with
 // core.divergence_stack_entries = 0 does not have. Kernel load refuses both
 // too (src/machine/machine.cpp).
 void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     check_write_mask(inst, profile, where);
+    check_divergence_stack(inst, profile, where);
+}
+
+void check_divergence_stack(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (profile.core_divergence_stack_entries == 0 && uses_divergence_stack(inst)) {
         throw SimError(where + ": " + (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
             " needs the divergence stack, which this device profile does not have "
@@ -161,6 +165,12 @@ void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile)
 void check_v8_sectors(const Kernel& kernel, const DeviceProfile& profile) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
         check_v8_sector(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
+    }
+}
+
+void check_divergence_stacks(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        check_divergence_stack(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
     }
 }
 

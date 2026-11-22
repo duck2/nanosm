@@ -3,31 +3,19 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
 
 // The control instruction in the issue register (accepted last cycle)
-// resolves now (issue_to_branch_resolve; trash/divergence-2026-11-21.md),
+// resolves now (issue_to_branch_resolve),
 // from the warp's divergence registers' Q (its active mask, stack depth and
 // top copy) and the predicate file:
 //   - bra.uni: @PT taken, @!PT not; otherwise its predicate is read like an
 //     operand through the issue register, lane 0 (a declared-uniform operand;
 //     the sanitizer checks the other lanes, and the active mask -- bra.uni is
-//     a uniform operation in every form, backlog D12.1).
+//     a uniform operation in every form).
 //   - bra (plain): every active lane goes; taken.
 //   - bra with a predicate (the divergent branch): all its lanes are read;
 //     taken = active AND p, fall = active AND NOT p. No taken lane: not
@@ -146,7 +134,7 @@ void Machine::drive_issue_branch(const Wires& w) {
     issue_branch_.set_next(w.issue.branch, "drive_issue_branch");
 }
 
-// The warps' divergence registers (trash/divergence-2026-11-21.md), in one
+// The warps' divergence registers, in one
 // calculation: the stack memory's output now lands in its warp's top copy (a
 // pop's refill); the control instruction resolving now pushes (the top copy
 // takes the entry the memory takes at this edge, the depth grows), pops (the

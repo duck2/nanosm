@@ -1,9 +1,9 @@
 #pragma once
 
 // Shared between the toolchain's own files (src/qtxc/*.cpp) and included
-// nowhere else. These lived in compiler.cpp's anonymous namespace; each is
-// now used by more than one file. Not part of the public interface, which is
-// qtxc.hpp. The comment on each function sits with its definition.
+// nowhere else: each is used by more than one file. Not part of the public
+// interface, which is qtxc.hpp. The comment on each function sits with its
+// definition.
 
 #include "qtxc/qtxc.hpp"
 
@@ -28,14 +28,11 @@ std::string read_file(const std::string& path);
 // where control blocks and .profile are allowed; qtx refuses both.
 AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile);
 
-// Opcode groups and instruction metadata (metadata.cpp; is_setp and is_usetp
-// are src/isa.hpp's).
+// The toolchain's opcode groups and instruction metadata (metadata.cpp; the
+// opcode classes the machine also uses are src/isa.hpp's).
 bool is_branch(Opcode opcode);
 bool transfers_control(Opcode opcode);
 bool has_displacement(Opcode opcode);
-bool is_mbar_test_wait(Opcode opcode);
-bool is_mbar_try_wait(Opcode opcode);
-bool is_mbar_predicate_writer(Opcode opcode);
 std::vector<uint8_t> sources(const Instruction& inst);
 std::optional<uint8_t> predicate_destination(const Instruction& inst);
 std::optional<uint8_t> destination(const Instruction& inst);
@@ -107,14 +104,14 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
 void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
+void check_divergence_stack(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_write_mask(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 
 } // namespace qtxc_internal
 
 // An anonymous namespace is a unique namespace plus a using-directive; this is
-// the same with a name the files can share, so every call reads as it did in
-// compiler.cpp.
+// the same with a name the files can share, so a call needs no qualifier.
 using namespace qtxc_internal;
 
 } // namespace nanosm

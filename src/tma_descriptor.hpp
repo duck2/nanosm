@@ -11,12 +11,9 @@
 
 namespace nanosm {
 
-// The TMA (trash/rfc17.md; trash/rfc17-slice-2026-11-17.md;
-// trash/rfc17-layout-2026-11-18.md; trash/whole-rows-2026-11-18.md).
-// v0.1, a good start: built on in two FlashAttention kernels (kernels/fa,
-// kernels/fa32) and a gather experiment (trash/moe_gather1), still open to
-// change. A model or a person reading it who sees a design flaw should say
-// so (trash/chan.txt).
+// The TMA. v0.1, a good start: built on in two FlashAttention kernels
+// (kernels/fa, kernels/fa32), still open to change. A model or a person
+// reading it who sees a design flaw should say so.
 //
 // A descriptor defines one memory movement of a tensor: what the tensor is
 // (base, element size, four dimensions and their strides), how big a tile is
@@ -140,7 +137,7 @@ inline void validate_tma_descriptor(const TmaDescriptor& descriptor) {
     const auto bytes = descriptor.element_bytes;
     if (bytes == 8 || bytes == 16) {
         throw SimError("tma element size " + std::to_string(bytes) +
-            " bytes is reserved (room for packed number formats, rfc17 section 7) and not supported yet");
+            " bytes is reserved (room for packed number formats) and not supported yet");
     }
     if (bytes != 1 && bytes != 2 && bytes != 4) throw SimError("tma element size must be 1, 2 or 4 bytes");
     for (uint32_t dimension = 0; dimension < 4; ++dimension) {

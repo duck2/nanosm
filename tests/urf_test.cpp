@@ -1,4 +1,4 @@
-// The uniform register file (trash/rfc16.md, trash/urf-slice-2026-11-08.md):
+// The uniform register file:
 // uniform arithmetic, r2ur / ur2r, usread, the consumers that read uniform
 // registers, the fixed write latency L, the profile fields and the trace.
 // Smoke tests: things run, the data is right, and the few timing facts the
@@ -170,7 +170,7 @@ void test_missing_uniform_stall_panics() {
 }
 
 // r2ur reads lane 0, so under a partial active mask it is UB like every
-// lane-0 operation (backlog D12.1): the sanitizer's PANIC.
+// lane-0 operation: the sanitizer's PANIC.
 void test_r2ur_under_a_partial_mask_panics() {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     nanosm::Launch launch;
@@ -302,7 +302,7 @@ void test_toolchain_forms_and_refusals() {
     }
     refused("usetp.eq.u32 PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");
     refused("usetp.lo.u32 p0, ur1, 0\nhalt\n", "unknown usetp comparison", "an unknown usetp comparison");
-    // Every compare says its type (trash/typed-compare-and-wait-2026-11-18.md);
+    // Every compare says its type;
     // the refusal names the two choices, in qtx and in assembly alike.
     refused("setp.lt p0, r1, r2\nhalt\n", "'setp.lt' needs its type: setp.lt.u32 (unsigned) or setp.lt.s32 (signed)",
         "an untyped setp");
@@ -407,7 +407,7 @@ void test_trace_shows_writes() {
         "Perfetto trace lacks the UR write instants");
 }
 
-// The uniform compare (trash/uniform-compare-2026-11-18.md): each of the six
+// The uniform compare: each of the six
 // comparisons once in each form, several on values whose signed and unsigned
 // orders differ. The comparison is setp's, unsigned 32-bit: each usetp's
 // predicate, gathered into a bit of ur31 through @!p1 bra.uni, equals the
@@ -557,9 +557,9 @@ skip:
     }
 }
 
-// The signed compare (trash/signed-compare-2026-11-18.md): lt, le, gt, ge
-// .s32 in both forms, uniform and vector -- each of the sixteen opcodes once
-// -- on values whose signed and unsigned orders differ. Each usetp's
+// The signed compare: lt, le, gt, ge .s32 in both forms, uniform and vector
+// (each of the sixteen opcodes once), on values whose signed and unsigned
+// orders differ. Each usetp's
 // predicate, gathered into a bit of ur31 through @!p1 bra.uni, and each
 // setp's (ur30) equals the host's signed comparison.
 void test_signed_compare_values() {

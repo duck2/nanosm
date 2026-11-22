@@ -1,9 +1,10 @@
 #include "image.hpp"
 
+#include "json_fields.hpp"
 #include "qtxc/qtxc.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
-#include "tma.hpp"
+#include "tma_descriptor.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -117,21 +118,11 @@ std::vector<ImageSegment> load_segments(const json& value, const std::string& na
     return result;
 }
 
-// An unsigned 32-bit integer field, checked BEFORE it is narrowed (nlohmann's
-// get<uint32_t> is a bare cast: 4294967296 would become 0, 4160.9 4160 and
-// -8 0xfffffff8). Backlog C11 (mbars) and C2 (active_warps).
-std::optional<uint32_t> unsigned_32(const json& value) {
-    if (!value.is_number_unsigned()) return std::nullopt;
-    const auto wide = value.get<uint64_t>();
-    if (wide > std::numeric_limits<uint32_t>::max()) return std::nullopt;
-    return static_cast<uint32_t>(wide);
-}
-
 // Optional: a launch that does not say takes the kernel's `.warps`
 // (bind_launch); 0 is that absence, never written.
 uint32_t load_active_warps(const json& document, const std::string& format) {
     if (!document.contains("active_warps")) return 0;
-    const auto warps = unsigned_32(document.at("active_warps"));
+    const auto warps = unsigned_field<uint32_t>(document.at("active_warps"));
     if (!warps.has_value()) throw SimError(format + ": active warp count is not an unsigned 32-bit integer");
     if (*warps == 0) throw SimError(format + ": active warp count is zero");
     return *warps;
@@ -214,7 +205,7 @@ void emit_kernel_declarations(json& kernel_json, const Kernel& kernel) {
 }
 
 uint32_t declared_u32(const json& item, const char* key, const std::string& field) {
-    const auto value = unsigned_32(item.at(key));
+    const auto value = unsigned_field<uint32_t>(item.at(key));
     if (!value.has_value()) throw SimError("launch image: " + field + "." + key + " is not an unsigned 32-bit integer");
     return *value;
 }
@@ -222,7 +213,7 @@ uint32_t declared_u32(const json& item, const char* key, const std::string& fiel
 void load_kernel_declarations(const json& kernel_json, Kernel& kernel) {
     if (kernel_json.contains("warps")) kernel.warps = declared_u32(kernel_json, "warps", "kernel");
     if (kernel_json.contains("params") || kernel_json.contains("data") || kernel_json.contains("mbars")) {
-        throw SimError("launch image: kernel.params / data / mbars are kernel.sections since 2026-11-21 "
+        throw SimError("launch image: kernel.params / data / mbars are kernel.sections "
             "(the launch block); rebuild the image");
     }
     if (kernel_json.contains("sections")) {
@@ -291,7 +282,7 @@ std::vector<uint32_t> load_mbars(const json& document) {
     if (!value.is_array()) throw SimError("launch: mbars is not an array of shmem addresses");
     std::vector<uint32_t> mbars;
     for (std::size_t index = 0; index < value.size(); ++index) {
-        const auto address = unsigned_32(value.at(index));
+        const auto address = unsigned_field<uint32_t>(value.at(index));
         if (!address.has_value()) {
             throw SimError("launch: mbars[" + std::to_string(index) + "] is not a shmem address");
         }
@@ -611,17 +602,17 @@ LaunchImage load_launch_image(std::string_view source) {
         image.kernel.profile_fingerprint = parse_hex_u64(
             profile.at("fingerprint").get<std::string>(), "profile.fingerprint");
         const auto& kernel = document.at("kernel");
-        const auto register_count = unsigned_32(kernel.at("register_count"));
+        const auto register_count = unsigned_field<uint32_t>(kernel.at("register_count"));
         if (!register_count.has_value()) {
             throw SimError("launch image: kernel.register_count is not an unsigned 32-bit integer");
         }
         if (*register_count > 256) throw SimError("launch image: register count exceeds 256");
         image.kernel.register_count = static_cast<uint16_t>(*register_count);
-        // An image of a kernel built before 2026-11-19 carried an accumulator
-        // table; its mma.async / acc.ld / acc.st words mean something else now.
+        // An image that declares accumulators encodes mma.async / acc.ld /
+        // acc.st differently: its words would be misread.
         if (kernel.contains("accumulators")) {
-            throw SimError("launch image: kernel.accumulators is no longer part of a kernel (an accumulator "
-                "is a tmem pointer in a uniform register since 2026-11-19); rebuild the image");
+            throw SimError("launch image: kernel.accumulators is not part of a kernel (an accumulator "
+                "is a tmem pointer in a uniform register); rebuild the image");
         }
         const auto& words = kernel.at("words");
         if (!words.is_array()) throw SimError("launch image: kernel.words is not an array");

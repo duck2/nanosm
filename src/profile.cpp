@@ -1,6 +1,7 @@
 #include "profile.hpp"
 #include "hash.hpp"
-#include "rf.hpp"
+#include "json_fields.hpp"
+#include "timing.hpp"
 #include "machine/mma_numeric.hpp"
 
 #include <nlohmann/json.hpp>
@@ -124,7 +125,7 @@ T field(const json& object, const char* name) {
         // An integer field takes a non-negative integer that fits its type;
         // anything else is refused by name (never narrowed silently).
         if constexpr (std::is_integral_v<T>) {
-            if (!value.is_number_unsigned() || value.template get<uint64_t>() > std::numeric_limits<T>::max()) {
+            if (!unsigned_field<T>(value).has_value()) {
                 throw ProfileError(std::string("device profile field '") + name + "' must be an integer in 0.." +
                     std::to_string(std::numeric_limits<T>::max()) + " (got " + value.dump() + ")");
             }
@@ -135,13 +136,30 @@ T field(const json& object, const char* name) {
     }
 }
 
+// An integer field with a stated range: `value` must be an integer in
+// [low, high]; `section` and `name` say which field in the message.
+uint32_t ranged_field(const json& value, const char* section, const char* name, uint32_t low, uint32_t high) {
+    if (!value.is_number_unsigned() || value < low || value > high) {
+        throw ProfileError(std::string("device profile: ") + section + " " + name + " must be an integer in " +
+            std::to_string(low) + ".." + std::to_string(high));
+    }
+    return value.get<uint32_t>();
+}
+
+// The same for a field the profile may leave out: absent, `out` keeps its
+// canonical default.
+void optional_field(
+    const json& object, const char* section, const char* name, uint32_t low, uint32_t high, uint32_t& out) {
+    if (object.contains(name)) out = ranged_field(object.at(name), section, name, low, high);
+}
+
 } // namespace
 
 void validate_device_profile(const DeviceProfile& p) {
     if (p.mma_layout != TileLayout::dense && p.mma_layout != TileLayout::swizzle64) {
         throw ProfileError("device profile: unsupported MMA layout");
     }
-    // The RF's own depths (trash/rfc10.md section 5): nonzero register stages.
+    // The RF's own depths: nonzero register stages.
     if (p.rf_read_latency_cycles == 0 || p.rf_read_latency_cycles > 8 ||
         p.rf_write_depth_cycles == 0 || p.rf_write_depth_cycles > 8) {
         throw ProfileError("device profile: rf read_latency_cycles and write_depth_cycles must be in 1..8 "
@@ -150,13 +168,13 @@ void validate_device_profile(const DeviceProfile& p) {
     // The longest fixed-latency dependency must fit the five-bit stall field:
     // a consumer issued d cycles after its producer samples at d + 1 (the
     // issue register), the producer's result is visible from 1 + Lr + E + Wd
-    // + 1 (src/rf.hpp), so d = Lr + E + Wd + 1.
+    // + 1 (src/timing.hpp), so d = Lr + E + Wd + 1.
     const uint32_t longest_execution = std::max({p.timing.alu, p.timing.fadd, p.timing.sfu});
     if (p.rf_read_latency_cycles + longest_execution + p.rf_write_depth_cycles + 1 > encoding::stall_mask) {
         throw ProfileError("device profile: the longest fixed-latency dependency (RF depths and execution) "
             "must fit the five-bit stall field");
     }
-    // The uniform register file (src/rf.hpp). Its depths are nonzero register
+    // The uniform register file (src/timing.hpp). Its depths are nonzero register
     // stages; a uniform operand must reach its unit no later than the vector
     // operands read in the same round (dispatch is issue + 1 + Lr); every
     // writer presents at issue + L, so L covers the longest writer (r2ur
@@ -203,7 +221,7 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
         throw ProfileError("device profile: shmem load and store slots must be at least 1");
     }
-    // Every latency is a nonzero number of register stages (rfc12 section 2).
+    // Every latency is a nonzero number of register stages.
     if (p.shmem_port_a_depth == 0 || p.shmem_port_a_depth > 64 ||
         p.shmem_read_latency_cycles == 0 || p.shmem_read_latency_cycles > 64 ||
         p.shmem_rmw_compute_cycles == 0 || p.shmem_rmw_compute_cycles > 64) {
@@ -255,10 +273,10 @@ void validate_device_profile(const DeviceProfile& p) {
         p.mma_result_latency_cycles == 0) {
         throw ProfileError("device profile: invalid MMA core, timing, or queue capacity");
     }
-    // The MMA shapes (trash/chan.txt 2026-10-22, HUMAN: "m,n,k need to be a
-    // multiple of core m,n,k and if mma k is more than core k, mma m/n needs
-    // to be large enough to hide the accumulator latency"). Each listed shape
-    // takes one opcode pair of the mma.async block, in list order.
+    // The MMA shapes: m, n and k are multiples of the core's m, n and k, and a
+    // shape whose k is more than the core's needs m and n large enough to hide
+    // the accumulator latency. Each listed shape takes one opcode pair of the
+    // mma.async block, in list order.
     if (p.mma_shapes.empty()) throw ProfileError("device profile: mma shapes must list at least one shape");
     if (p.mma_shapes.size() > mma_block_shapes) {
         throw ProfileError("device profile: mma shapes lists " + std::to_string(p.mma_shapes.size()) +
@@ -271,7 +289,7 @@ void validate_device_profile(const DeviceProfile& p) {
             p.mma_shapes.begin() + static_cast<std::ptrdiff_t>(i)) {
             throw ProfileError(name + " is listed twice");
         }
-        // Every dimension is a power of two (HUMAN 2026-10-22: "K also needs to
+        // Every dimension is a power of two ("K also needs to
         // be a power of 2"; "m and n can get that rule too ... it needs to
         // somehow line up with lanes and shmem width").
         for (const auto& [letter, size] :
@@ -337,13 +355,13 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     // The swizzle64 layout puts four neighbouring rows' same 16-byte piece in
     // four different slots of 16 banks, which serves a core block of 4 rows
-    // by 8 or 4 fp16 of k: a 4x4x4 or a 4x4x8 core (rfc11 section 0: 4x4x8).
+    // by 8 or 4 fp16 of k: a 4x4x4 or a 4x4x8 core (4x4x8).
     // It depends on the row only (any four neighbouring rows, wherever the
     // tile sits), so any m and n in whole core blocks read one bank round per
     // block (src/layout.hpp; src/machine/tensor_core.cpp mma_a_address). On a 4x4x4 core a
     // step that reloads A reads half-pieces of A and B together; whether they
     // share a round depends on the two tiles' row numbers mod 16
-    // (trash/address_keyed_census.py).
+    //.
     if (p.mma_layout == TileLayout::swizzle64 && (p.mma_core_m != 4 || p.mma_core_n != 4 ||
                              (p.mma_core_k != 4 && p.mma_core_k != 8))) {
         throw ProfileError("device profile: swizzle64 MMA layout needs a 4x4x4 or 4x4x8 core");
@@ -413,70 +431,36 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.rf_rows_per_bank = field<uint32_t>(rf, "rows_per_bank");
     p.rf_read_ports_per_bank = field<uint32_t>(rf, "read_ports_per_bank");
     p.rf_write_ports_per_bank = field<uint32_t>(rf, "write_ports_per_bank");
-    // Optional (absent: the canonical 2); present: an integer in 1..8.
-    const auto optional_rf = [&](const char* name, uint32_t& out) {
-        if (!rf.contains(name)) return;
-        const auto& value = rf.at(name);
-        if (!value.is_number_unsigned() || value < 1 || value > 8) {
-            throw ProfileError(std::string("device profile: rf ") + name + " must be an integer in 1..8");
-        }
-        out = value.get<uint32_t>();
-    };
-    optional_rf("read_latency_cycles", p.rf_read_latency_cycles);
-    optional_rf("write_depth_cycles", p.rf_write_depth_cycles);
+    // Optional (absent: the canonical 2).
+    optional_field(rf, "rf", "read_latency_cycles", 1, 8, p.rf_read_latency_cycles);
+    optional_field(rf, "rf", "write_depth_cycles", 1, 8, p.rf_write_depth_cycles);
     // The uniform register file: an optional section, each field optional
     // (absent: the canonical values); present: an integer in [low, high].
     if (document.contains("urf")) {
         const auto& urf = document.at("urf");
-        const auto optional_urf = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
-            if (!urf.contains(name)) return;
-            const auto& value = urf.at(name);
-            if (!value.is_number_unsigned() || value < low || value > high) {
-                throw ProfileError(std::string("device profile: urf ") + name + " must be an integer in " +
-                    std::to_string(low) + ".." + std::to_string(high));
-            }
-            out = value.get<uint32_t>();
-        };
-        optional_urf("registers", 1, 64, p.urf_registers);
-        optional_urf("read_latency_cycles", 1, 8, p.urf_read_latency_cycles);
-        optional_urf("write_depth_cycles", 1, 8, p.urf_write_depth_cycles);
-        optional_urf("alu_latency_cycles", 1, 8, p.urf_alu_latency_cycles);
-        optional_urf("issue_to_port_cycles", 1, 30, p.urf_issue_to_port_cycles);
+        optional_field(urf, "urf", "registers", 1, 64, p.urf_registers);
+        optional_field(urf, "urf", "read_latency_cycles", 1, 8, p.urf_read_latency_cycles);
+        optional_field(urf, "urf", "write_depth_cycles", 1, 8, p.urf_write_depth_cycles);
+        optional_field(urf, "urf", "alu_latency_cycles", 1, 8, p.urf_alu_latency_cycles);
+        optional_field(urf, "urf", "issue_to_port_cycles", 1, 30, p.urf_issue_to_port_cycles);
     }
     const auto& shmem = document.at("shmem");
     p.shmem_bytes = field<uint32_t>(shmem, "bytes");
     p.shmem_banks = field<uint32_t>(shmem, "banks");
     // Optional (absent: the struct's canonical default); present: an integer
     // in [low, high]. A 0 is rejected here and again by validation.
-    const auto optional_shmem = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
-        if (!shmem.contains(name)) return;
-        const auto& value = shmem.at(name);
-        if (!value.is_number_unsigned() || value < low || value > high) {
-            throw ProfileError(std::string("device profile: shmem ") + name + " must be an integer in " +
-                std::to_string(low) + ".." + std::to_string(high));
-        }
-        out = value.get<uint32_t>();
-    };
-    optional_shmem("load_slots", 1, 1024, p.shmem_load_slots);
-    optional_shmem("store_slots", 1, 1024, p.shmem_store_slots);
-    optional_shmem("port_a_depth", 1, 64, p.shmem_port_a_depth);
-    optional_shmem("read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
-    optional_shmem("rmw_compute_cycles", 1, 64, p.shmem_rmw_compute_cycles);
+    optional_field(shmem, "shmem", "load_slots", 1, 1024, p.shmem_load_slots);
+    optional_field(shmem, "shmem", "store_slots", 1, 1024, p.shmem_store_slots);
+    optional_field(shmem, "shmem", "port_a_depth", 1, 64, p.shmem_port_a_depth);
+    optional_field(shmem, "shmem", "read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
+    optional_field(shmem, "shmem", "rmw_compute_cycles", 1, 64, p.shmem_rmw_compute_cycles);
     const auto& tmem = document.at("tmem");
     p.tmem_fine_banks = field<uint32_t>(tmem, "fine_banks");
     p.tmem_words_per_fine_bank = field<uint32_t>(tmem, "words_per_fine_bank");
     p.tmem_max_vector_width = field<uint32_t>(tmem, "max_vector_width");
-    // Optional (absent: the canonical 2); present: an integer in 1..64.
-    const auto optional_tmem = [&](const char* name, uint32_t& out) {
-        if (!tmem.contains(name)) return;
-        const auto& value = tmem.at(name);
-        if (!value.is_number_unsigned() || value < 1 || value > 64) {
-            throw ProfileError(std::string("device profile: tmem ") + name + " must be an integer in 1..64");
-        }
-        out = value.get<uint32_t>();
-    };
-    optional_tmem("port_depth", p.tmem_port_depth);
-    optional_tmem("read_latency_cycles", p.tmem_read_latency_cycles);
+    // Optional (absent: the canonical 2).
+    optional_field(tmem, "tmem", "port_depth", 1, 64, p.tmem_port_depth);
+    optional_field(tmem, "tmem", "read_latency_cycles", 1, 64, p.tmem_read_latency_cycles);
     const auto& mma = document.at("mma");
     if (!mma.contains("shapes") || !mma.at("shapes").is_array()) {
         throw ProfileError("device profile: mma shapes must be an array of shape names");
@@ -506,50 +490,21 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& tma = document.at("tma");
     p.tma_queue_commands = field<uint32_t>(tma, "queue_commands");
     p.tma_sector_credits = field<uint32_t>(tma, "sector_credits");
-    if (tma.contains("store_sector_registers")) { // optional (absent: 1); present: an integer in 1..64
-        const auto& value = tma.at("store_sector_registers");
-        if (!value.is_number_unsigned() || value < 1 || value > 64) {
-            throw ProfileError("device profile: tma store_sector_registers must be an integer in 1..64");
-        }
-        p.tma_store_sector_registers = value.get<uint32_t>();
-    }
-    if (tma.contains("walker_start_cycles")) { // optional (absent: 2); present: an integer in 0..8
-        const auto& value = tma.at("walker_start_cycles");
-        if (!value.is_number_unsigned() || value > 8) {
-            throw ProfileError("device profile: tma walker_start_cycles must be an integer in 0..8");
-        }
-        p.tma_walker_start_cycles = value.get<uint32_t>();
-    }
+    optional_field(tma, "tma", "store_sector_registers", 1, 64, p.tma_store_sector_registers); // absent: 1
+    optional_field(tma, "tma", "walker_start_cycles", 0, 8, p.tma_walker_start_cycles);        // absent: 2
     const auto& core = document.at("core");
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");
     p.timing.alu = field<uint8_t>(core, "alu_latency_cycles");
     p.timing.fadd = field<uint8_t>(core, "fadd_latency_cycles");
     // Optional (absent: the canonical 16 warps, 2 packets); present: an integer
     // in [low, high].
-    const auto optional_core = [&](const char* name, uint32_t low, uint32_t high, uint32_t& out) {
-        if (!core.contains(name)) return;
-        const auto& value = core.at(name);
-        if (!value.is_number_unsigned() || value < low || value > high) {
-            throw ProfileError(std::string("device profile: core ") + name + " must be an integer in " +
-                std::to_string(low) + ".." + std::to_string(high));
-        }
-        out = value.get<uint32_t>();
-    };
-    optional_core("warps", 1, 64, p.core_warps);
-    optional_core("instruction_buffer_packets", 1, 16, p.core_instruction_buffer_packets);
-    optional_core("divergence_stack_entries", 0, 64, p.core_divergence_stack_entries); // absent: 8
-    optional_core("launch_flags", 1, 6, p.core_launch_flags); // absent: 4
+    optional_field(core, "core", "warps", 1, 64, p.core_warps);
+    optional_field(core, "core", "instruction_buffer_packets", 1, 16, p.core_instruction_buffer_packets);
+    optional_field(core, "core", "divergence_stack_entries", 0, 64, p.core_divergence_stack_entries); // absent: 8
+    optional_field(core, "core", "launch_flags", 1, 6, p.core_launch_flags); // absent: 4
     const auto& sfu = document.at("sfu");
-    const auto checked_sfu = [&](const char* name, uint32_t low, uint32_t high) {
-        const auto& value = sfu.at(name);
-        if (!value.is_number_integer() || value < low || value > high) {
-            throw ProfileError(std::string("device profile: sfu ") + name +
-                " must be an integer in " + std::to_string(low) + ".." + std::to_string(high));
-        }
-        return value.get<uint32_t>();
-    };
-    p.sfu_lanes = checked_sfu("lanes", 1, p.lanes);
-    p.sfu_latency_cycles = checked_sfu("latency_cycles", 1, 24);
+    p.sfu_lanes = ranged_field(sfu.at("lanes"), "sfu", "lanes", 1, p.lanes);
+    p.sfu_latency_cycles = ranged_field(sfu.at("latency_cycles"), "sfu", "latency_cycles", 1, 24);
     const auto sfu_occupancy = (p.lanes + p.sfu_lanes - 1) / p.sfu_lanes;
     p.timing.sfu = static_cast<uint8_t>(sfu_occupancy - 1 + p.sfu_latency_cycles);
     const auto& gmem = document.at("gmem");
@@ -616,7 +571,7 @@ std::vector<std::string> device_profile_warnings(const DeviceProfile& profile) {
     std::vector<std::string> warnings;
     // A swizzle64 operand row is read in 16-byte pieces of 8 fp16, so a shape
     // whose k is not a multiple of 8 reads only part of its last piece in each
-    // row (HUMAN 2026-10-22: "it should warn you if there is a partially
+    // row ("it should warn you if there is a partially
     // occupied storage block"). The row spacing still counts whole pieces.
     if (profile.mma_layout == TileLayout::swizzle64) {
         for (const auto& shape : profile.mma_shapes) {

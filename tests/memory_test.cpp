@@ -185,9 +185,8 @@ std::string replaced(std::string text, const std::string& from, const std::strin
     return text.replace(found, from.size(), to);
 }
 
-// What the reviewers of the first build found (chan 2026-11-21, Astra and
-// Neon), each as the case they gave.
-void test_review_findings() {
+// Edge cases of placement, names and constant expressions.
+void test_placement_and_name_edge_cases() {
     const auto& profile = canonical_profile();
     // 1. An overlay may use its targets up to the last one's own size, not its
     // stride: the padding after an object belongs to whoever is declared next.
@@ -207,7 +206,7 @@ void test_review_findings() {
             "an overlay over two elements of one array, listed one by one");
     }
     // 2. Names beginning qtxc_ are the compiler's (ld.param's register, its
-    // copies): a writer's use is refused, where it used to share the register.
+    // copies): a writer's use is refused (it would share the register).
     refused(".param u32 VALUE\numov %qtxc_param, 123\nld.param.u32 %x, [VALUE]\nhalt\n",
         "%qtxc_param: names beginning %qtxc_ are qtxc's own", "a writer's register named like ld.param's");
     refused(".reg %qtxc_copy<8>\nhalt\n", "names beginning %qtxc_ are qtxc's own", "a group named like qtxc's copies");
@@ -256,6 +255,6 @@ void test_review_findings() {
 } // namespace
 
 TEST(Memory, objects_place_and_compute) { test_objects_place_and_compute(); }
-TEST(Memory, review_findings) { test_review_findings(); }
+TEST(Memory, placement_and_name_edge_cases) { test_placement_and_name_edge_cases(); }
 TEST(Memory, overlay) { test_overlay(); }
 TEST(Memory, refusals) { test_refusals(); }

@@ -23,18 +23,18 @@ enum class WarpState : uint8_t {
     mbar_wait,
     mbar_wait_slot,
     structural,
-    shmem_slot,   // an lds / sts with no free load / store slot (rfc12 section 3)
-    shmem_order,  // a shmem access ordered behind the warp's own unserviced access (rfc12 section 4)
+    shmem_slot,   // an lds / sts with no free load / store slot
+    shmem_order,  // a shmem access ordered behind the warp's own unserviced access
     // The warp has no instruction to offer issue: its instruction FIFO is
-    // empty, or its branch has not resolved (trash/front-end-2026-10-18.md).
+    // empty, or its branch has not resolved.
     // Instruction supply, not a dependency or resource wait.
     no_instruction,
     halted,
     count,
 };
 
-// The shmem services that the trace attributes grants to (trash/rfc12.md
-// section 1, rfc11 section 0). The MMA's port-B reads are counted by the MMA.
+// The shmem services that the trace attributes grants to. The MMA's port-B
+// reads are counted by the MMA.
 enum class ShmemService : uint8_t { a_read, a_write, b_write };
 enum class ShmemClient : uint8_t { simt, probe, rmw, tma };
 
@@ -96,7 +96,7 @@ struct TraceSummary {
     uint64_t shmem_store_slot_waits = 0;
     uint64_t shmem_order_waits = 0;
     // Cycles a store waited to start (a store slot held, not started) while
-    // an RMW's store pause held A-write (rfc12 section 6).
+    // an RMW's store pause held A-write.
     uint64_t shmem_store_paused = 0;
     // Rounds granted, per service and client.
     uint64_t shmem_a_read_simt = 0;
@@ -106,8 +106,8 @@ struct TraceSummary {
     uint64_t shmem_a_write_simt = 0;
     uint64_t shmem_a_write_rmw = 0;
     uint64_t shmem_b_write_tma = 0;
-    // The RF write decision (rfc10 section 3): vector beats written by async
-    // holders (load slots, LSU assemblies, acc.ld pipelines); holder-cycles a
+    // The RF write decision: vector beats written by async
+    // holders (load slots, the load buffer, acc.ld pipelines); holder-cycles a
     // ready holder was not granted; warp-cycles a SIMT instruction was refused
     // because its result bank was inhibited (async service owed); and the
     // mirrored read rule's: warp-cycles refused because a bank its reads
@@ -118,7 +118,7 @@ struct TraceSummary {
     uint64_t rf_simt_read_inhibited = 0;
     // Uniform-register writes presented at the URF write port; warp-cycles a
     // uniform reader was refused because a tma's later operand rounds held
-    // the URF read ports (src/rf.hpp tma_operand_rounds).
+    // the URF read ports (src/timing.hpp tma_operand_rounds).
     uint64_t urf_writes = 0;
     uint64_t urf_read_ports_held = 0;
     uint64_t mbar_rmw_requests = 0;
@@ -138,7 +138,7 @@ struct TraceSummary {
     uint64_t gmem_bytes = 0;
     uint64_t gmem_command_latency_cycles = 0;
     uint64_t gmem_max_queue_depth = 0;
-    // LSU (trash/lsu-b2-2026-10-04.md has the exact definitions).
+    // LSU.
     uint64_t lsu_vector_loads = 0;
     uint64_t lsu_vector_stores = 0;
     uint64_t lsu_scalar_loads = 0;
@@ -148,7 +148,7 @@ struct TraceSummary {
     uint64_t lsu_bytes = 0;             // their sector bytes on the bus
     uint64_t lsu_useful_bytes = 0;      // bytes the instructions named
     uint64_t lsu_no_slot_cycles = 0;    // warp-cycles: LSU op ineligible, no command slot
-    uint64_t lsu_no_staging_cycles = 0; // warp-cycles: a scalar stg waits for the store buffer
+    uint64_t lsu_store_buffer_wait_cycles = 0; // warp-cycles: a scalar stg waits for the store buffer
     uint64_t lsu_request_wait_cycles = 0; // LSU request ready, controller queue full
     uint64_t lsu_ingress_full_cycles = 0; // cycles a read beat was held: ingress FIFO full
     uint64_t lsu_rf_write_wait_cycles = 0;
@@ -230,10 +230,10 @@ public:
     // This cycle's running warps with an empty instruction FIFO.
     void instruction_fifo_empty(uint64_t warps) { summary_.instruction_fifo_empty += warps; }
     void rf_read(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank);
-    // Debug only: a write presented at the RF write port (src/rf.hpp: it is
+    // Debug only: a write presented at the RF write port (src/timing.hpp: it is
     // at the RAM Wd cycles later and visible from the cycle after that).
     void rf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t bank);
-    // A uniform-register write presented at the URF write port (src/rf.hpp:
+    // A uniform-register write presented at the URF write port (src/timing.hpp:
     // visible Wu + 1 later): an instant on the warp's track with the register
     // and its value, in every timeline trace (one per uniform writer).
     void urf_write(uint64_t cycle, uint32_t warp, uint8_t reg, uint32_t value);

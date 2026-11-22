@@ -1,46 +1,39 @@
-// The memory front end of rfc09 (slice B2, corrected by B2.1 to the section
-// 3a handoff table; stepped as decisions + register drivers since 2026-10-08).
-// Read top to bottom:
+// The load / store unit: the register file's path to global memory. The
+// memory front end, read top to bottom:
 //
-//   1. controller: one request channel (TMA and LSU alternate; one select), a
-//      FIFO queue of gmem.queue_sectors entries, one bus beat per DRAM tick
-//      (reads into the ingress FIFO, writes out of the egress FIFO), one
-//      write contract
+//   1. controller (src/machine/gmem.cpp): one request channel (TMA and LSU
+//      alternate; one select), a FIFO queue of gmem.queue_sectors entries, one
+//      bus beat per DRAM tick (reads into the ingress FIFO, writes out of the
+//      egress FIFO), one write contract
 //   2. LSU admission (at issue) and request generation (one per core cycle;
 //      reads from the command, writes from the egress FIFO's request pointer)
-//   3. ingress: ingress FIFO -> TMA sector register (TMA stream) or straight
-//      into the owning command's assembly register (vector, gather, uni)
-//   4. RF stages: assembly -> RF (loads, in machine/rf.cpp's RF write port),
-//      RF -> assembly (vector stores)
-//   5. egress write port: assembly (stores) / TMA store sector registers ->
-//      egress FIFO, one client per cycle, TMA priority
+//   3. ingress: ingress FIFO -> TMA sector register (TMA stream) or the load
+//      buffer (ldg.v8, gather, ldg.uni)
+//   4. RF stages: load buffer -> RF (in src/machine/rf.cpp's RF write port),
+//      RF -> store buffer (stg.v8)
+//   5. egress write port: store buffer / TMA store sector registers -> egress
+//      FIFO, one client per cycle, TMA priority
 //
 // Every named storage element is a register (Reg<T>, read through cur()), so
 // a datum written in cycle t is visible to the next stage at t+1; the two
 // BRAM FIFOs add their declared latency on top. Every edge moves at most its
 // declared width per cycle. No coalescer, no address comparison: every lane
-// of a scalar access is its own request. Structures, owners and lifetimes:
-// machine.hpp and trash/lsu-b21-2026-10-04.md.
+// of a scalar access is its own request. One load buffer and one store buffer,
+// each held only while data is in it: a store can never hold the buffer that
+// returning data needs. Structures, owners and lifetimes: machine.hpp.
 //
-// In this file: parts 2 to 5, then how a command enters the unit (dispatch_lsu) and the unit's
-// register drivers. Part 1, the controller, is src/machine/gmem.cpp.
+// In this file: parts 2 to 5, then how a command enters the unit
+// (dispatch_lsu) and the unit's register drivers.
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
 #include "machine/internal.hpp"
 
 #include <algorithm>
 #include <bit>
-#include <cmath>
 #include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
 #include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -69,8 +62,8 @@ bool Machine::is_store(LsuKind kind) {
 // Capture and check an accepted LSU instruction's addresses. Contract
 // violations panic here: a misaligned or out-of-bounds lane (a v8 lane must
 // be sector-aligned) or uniform base (and, in the sanitizer, two lanes of a
-// stg.v8 naming one sector, or two lanes of a scalar store naming one word,
-// backlog D12: UB, as on NVIDIA -- the machine sends every lane's write, one
+// stg.v8 naming one sector, or two lanes of a scalar store naming one word:
+// UB, as on NVIDIA -- the machine sends every lane's write, one
 // request per lane in lane order, and with the placeholder controller's
 // queue-front order the highest lane's lands last; a reordering controller
 // may land another, which is why no program may rely on it).
@@ -166,8 +159,8 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
 // a store holds the store buffer or is waiting for it; stores take the buffer
 // in command order.
 bool Machine::store_has_data_left(const LsuCommand& command) {
-    return (command.kind == LsuKind::vector_store && command.chunks_plucked < command.requests_total) ||
-        (command.kind == LsuKind::scalar_store && command.words_plucked < command.sectors.size());
+    return (command.kind == LsuKind::vector_store && command.sectors_pushed < command.requests_total) ||
+        (command.kind == LsuKind::scalar_store && command.words_pushed < command.sectors.size());
 }
 
 // The lanes a command's buffer group holds (fixed lane groups, so a lane's
@@ -309,7 +302,7 @@ Machine::GmemSectorRequest Machine::lsu_read_request(const LsuCommand& command, 
 // the head, only from beats whose BRAM latency has passed, each word to its
 // stream's consumer. A consumer that cannot take its word (the TMA sector
 // register still holds an unplaced sector; the load buffer still holds a
-// group waiting for the RF write port, the previous chunk of this load or an
+// group waiting for the RF write port, the previous group of this load or an
 // older load's) stalls the head: shared-FIFO head-of-line blocking. Gathers
 // read the whole sector at this rate and keep one word. The destinations are seen as this cycle's drains leave them
 // (same-cycle space reuse (d)): a register drained now takes new words now,
@@ -402,8 +395,8 @@ void Machine::pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t tak
 // The load buffer's group whose LAST RF write is granted now: the buffer is
 // free from now on (same-cycle reuse (d)).
 bool Machine::load_buffer_released(const Wires& w) const {
-    const auto& start = staging_.at(load_buffer).cur();
-    return w.rf_write.granted_to(AsyncWriter::assembly, load_buffer) && start.beats + 1 == start.beats_total;
+    const auto& start = lsu_buffers_.at(load_buffer).cur();
+    return w.rf_write.granted_to(AsyncWriter::lsu_buffer, load_buffer) && start.beats + 1 == start.beats_total;
 }
 
 // The load buffer as a word arriving for group `group` of `command` sees it
@@ -415,7 +408,7 @@ bool Machine::load_buffer_released(const Wires& w) const {
 // group complete. Returns whether the word may enter.
 bool Machine::load_buffer_takes(const LsuCommand& command, uint32_t group, IngressPluck& pluck,
     const Wires& w) const {
-    const auto& start = staging_.at(load_buffer).cur();
+    const auto& start = lsu_buffers_.at(load_buffer).cur();
     const bool released = load_buffer_released(w);
     if (pluck.load_claim.has_value()) {
         const auto& claim = *pluck.load_claim;
@@ -464,7 +457,7 @@ bool Machine::pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t
         std::memcpy(&word, beat.bytes.data() + consumed + byte, 4);
         pluck.lanes.push_back({load_buffer, index, word});
     }
-    probe(LsuEdge::assembly_write, command->id, beat.request, take);
+    probe(LsuEdge::buffer_write, command->id, beat.request, take);
     record.received += take;
     sanitizer_.record_ordered_pluck(record.stream, take);
     return true;
@@ -491,7 +484,7 @@ bool Machine::pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint
         uint32_t word = 0;
         std::memcpy(&word, beat.bytes.data() + (record.word_offset - beat.offset), sizeof(word));
         pluck.lanes.push_back({load_buffer, uniform ? 0 : record.lane - group * width, word});
-        probe(LsuEdge::assembly_write, command->id, beat.request, 4);
+        probe(LsuEdge::buffer_write, command->id, beat.request, 4);
     }
     record.received += take;
     sanitizer_.record_ordered_pluck(record.stream, take);
@@ -509,7 +502,7 @@ void Machine::note_first_return(uint64_t command) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. RF read stage (vector stores). The RF write stage (assembly -> RF) is a
+// 4. RF read stage (vector stores). The RF write stage (load buffer -> RF) is a
 // client of the RF write decision: decide_rf_writes in machine/rf.cpp.
 // ---------------------------------------------------------------------------
 
@@ -531,13 +524,13 @@ std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wire
     for (const auto* command : commands) {
         if (!store_has_data_left(*command)) continue;
         if (command->kind != LsuKind::vector_store) return std::nullopt;
-        const bool drained_now = w.egress.lsu_chunk_drained && w.egress.lsu_command == command->id;
-        const uint32_t sector = command->chunks_plucked + (drained_now ? 1 : 0);
+        const bool drained_now = w.egress.lsu_group_drained && w.egress.lsu_command == command->id;
+        const uint32_t sector = command->sectors_pushed + (drained_now ? 1 : 0);
         if (sector == command->requests_total) return std::nullopt; // its last group has just left
-        const uint32_t beat = drained_now ? 0 : command->chunks_done;
+        const uint32_t beat = drained_now ? 0 : command->group_beats_read;
         if (beat == 8) return std::nullopt; // the group's eight beats are read; it is landing or draining
         if (beat == 0 && !drained_now && !w.egress.lsu_store_drained &&
-            staging_.at(store_buffer).cur().owner.has_value()) {
+            lsu_buffers_.at(store_buffer).cur().owner.has_value()) {
             return std::nullopt;
         }
         const auto width = config_.lsu_store_group_lanes;
@@ -564,7 +557,7 @@ std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wire
 // store sector register (the ring's head), once complete, wins over the LSU.
 // The LSU's only candidate is its oldest store with data left (egress is in
 // command order). A slot holds one
-// sector: a TMA sector (8 words, its byte enables), half a vector chunk
+// sector: a TMA sector (8 words, its byte enables), one lane of a stg.v8
 // (8 words), or one scatter lane (1 word, 4 byte enables, a whole slot).
 // Sources are read through Q: written in an earlier cycle.
 Machine::EgressWrite Machine::decide_egress_write() {
@@ -585,7 +578,7 @@ Machine::EgressWrite Machine::decide_egress_write() {
             }
         }
         if (lsu != nullptr && lsu->kind == LsuKind::vector_store) {
-            const auto& buffer = staging_.at(store_buffer).cur();
+            const auto& buffer = lsu_buffers_.at(store_buffer).cur();
             if (buffer.owner != lsu->id || buffer.valid_count != buffer.expected) {
                 lsu = nullptr; // its group's eight RF read beats have not all landed yet
             }
@@ -611,15 +604,15 @@ Machine::EgressWrite Machine::decide_egress_write() {
             // The next active lane's sector, in lane order.
             slot.client = GmemClient::lsu;
             slot.command = lsu->id;
-            slot.index = lsu->chunks_plucked;
-            slot.sector_address = lsu->sectors.at(lsu->chunks_plucked).sector_address;
+            slot.index = lsu->sectors_pushed;
+            slot.sector_address = lsu->sectors.at(lsu->sectors_pushed).sector_address;
             slot.byte_enable = full_byte_enable(config_.gmem_sector_bytes);
             slot.words_total = sector_words;
         } else {
-            const auto& sector = lsu->sectors.at(lsu->words_plucked);
+            const auto& sector = lsu->sectors.at(lsu->words_pushed);
             slot.client = GmemClient::lsu;
             slot.command = lsu->id;
-            slot.index = lsu->words_plucked;
+            slot.index = lsu->words_pushed;
             slot.sector_address = sector.sector_address;
             slot.byte_enable = 0xfull << sector.word_offset; // just this lane's word
             slot.words_total = 1;
@@ -647,34 +640,34 @@ Machine::EgressWrite Machine::decide_egress_write() {
     } else {
         const auto* command = find_lsu_command(open->command);
         if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(open->command));
-        const auto& assembly = staging_.at(store_buffer).cur();
-        if (assembly.owner != command->id) throw SimError("internal: the egress port read another store's buffer");
+        const auto& buffer = lsu_buffers_.at(store_buffer).cur();
+        if (buffer.owner != command->id) throw SimError("internal: the egress port read another store's buffer");
         write.lsu_command = command->id;
         for (uint32_t word = 0; word < words; ++word) {
-            const uint32_t index = command->words_plucked + word;
+            const uint32_t index = command->words_pushed + word;
             if (command->kind == LsuKind::vector_store) {
                 // Word `index` of the current lane's sector.
                 const auto width = config_.lsu_store_group_lanes;
-                const auto& sector = command->sectors.at(command->chunks_plucked);
-                const uint32_t at = (sector.lane - assembly.group * width) * 8 + index;
-                sanitizer_.check_assembly_lanes_valid(cycle_, store_buffer, assembly.valid, at, 1,
+                const auto& sector = command->sectors.at(command->sectors_pushed);
+                const uint32_t at = (sector.lane - buffer.group * width) * 8 + index;
+                sanitizer_.check_buffer_lanes_valid(cycle_, store_buffer, buffer.valid, at, 1,
                     "egress write port");
-                write.words.emplace_back(index * 4, assembly.words[at]);
+                write.words.emplace_back(index * 4, buffer.words[at]);
                 if (index + 1 == sector_words) {
                     // The lane's sector is complete; the group has left the
                     // buffer when this was its last active lane (d).
-                    const auto next = command->chunks_plucked + 1;
+                    const auto next = command->sectors_pushed + 1;
                     if (next == command->requests_total ||
-                        command->sectors.at(next).lane / width != assembly.group) {
-                        write.lsu_chunk_drained = true;
+                        command->sectors.at(next).lane / width != buffer.group) {
+                        write.lsu_group_drained = true;
                     }
                 }
             } else {
                 // A scatter's sectors are its active lanes', in lane order.
                 const auto& sector = command->sectors.at(index);
-                sanitizer_.check_assembly_lanes_valid(cycle_, store_buffer, assembly.valid, sector.lane, 1,
+                sanitizer_.check_buffer_lanes_valid(cycle_, store_buffer, buffer.valid, sector.lane, 1,
                     "egress write port");
-                write.words.emplace_back(sector.word_offset, assembly.words[sector.lane]);
+                write.words.emplace_back(sector.word_offset, buffer.words[sector.lane]);
                 // Its last word leaves: the store buffer is free from the
                 // next cycle (the command still waits for its acks).
                 if (index + 1 == command->sectors.size()) write.lsu_store_drained = true;
@@ -700,8 +693,7 @@ std::string Machine::lsu_phase_detail(const LsuCommand& command) const {
     return out.str();
 }
 
-// An LSU command ends: its slot and assembly register are free for a new
-// owner this same cycle (d).
+// An LSU command ends: its slot is free for a new owner this same cycle (d).
 void Machine::release_lsu_command(Wires& w, uint64_t id) {
     const auto* command = find_lsu_command(id);
     if (command == nullptr) throw SimError("internal release of an unknown LSU command");
@@ -711,15 +703,14 @@ void Machine::release_lsu_command(Wires& w, uint64_t id) {
 }
 
 // ldg / stg / ldg.v8 / stg.v8 / ldg.uni: the addresses arrive and are
-// checked now; the command takes the slot and assembly register admission
-// secured.
+// checked now; the command takes the slot admission secured.
 void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     auto& counters = trace_->lsu_counters();
     auto command = plan_lsu_command(op);
     command.id = next_lsu_command_id_++;
     command.depbar = inst.control.set_depbar;
-    command.assembly = is_store(command.kind) ? store_buffer : load_buffer;
+    command.buffer = is_store(command.kind) ? store_buffer : load_buffer;
     // Every load rides the one ordered LSU read stream (accept_lsu_request).
     command.stream = lsu_stream;
     DispatchDecision::LsuAdmission admission;
@@ -738,7 +729,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
         break;
     case LsuKind::scalar_store:
         // Its RF read beat (booked with the address operand) lands the store
-        // data in the command's assembly register.
+        // data in the store buffer.
         admission.store_data = capture(op, inst.src1);
         probe(LsuEdge::rf_read_beat, command.id, inst.src1, config_.lanes * 4);
         ++counters.lsu_scalar_stores;
@@ -764,7 +755,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
     // A load group whose last RF write is granted now: its lanes are done.
     std::optional<std::pair<uint64_t, uint32_t>> drained; // (command, lanes)
     if (load_buffer_released(w)) {
-        const auto& buffer = staging_[load_buffer].cur();
+        const auto& buffer = lsu_buffers_[load_buffer].cur();
         const auto* owner = find_lsu_command(*buffer.owner);
         drained = std::make_pair(*buffer.owner, owner->kind == LsuKind::uniform_load
             ? 1u : static_cast<uint32_t>(std::popcount(buffer.lanes)));
@@ -780,16 +771,16 @@ void Machine::drive_lsu_commands(const Wires& w) {
         }
         throw SimError("internal reference to a retired LSU command #" + std::to_string(id));
     };
-    if (drained.has_value()) command(drained->first).chunks_done += drained->second;
+    if (drained.has_value()) command(drained->first).lanes_written += drained->second;
     if (w.egress.client == GmemClient::lsu) {
         auto& store = command(w.egress.lsu_command);
-        store.words_plucked += static_cast<uint32_t>(w.egress.words.size());
+        store.words_pushed += static_cast<uint32_t>(w.egress.words.size());
         if (store.kind == LsuKind::vector_store && w.egress.slot_complete) {
-            store.words_plucked = 0; // the lane's sector is in the egress FIFO
-            ++store.chunks_plucked;
+            store.words_pushed = 0; // the lane's sector is in the egress FIFO
+            ++store.sectors_pushed;
         }
         // The group has left the store buffer: the next group's RF reads start.
-        if (w.egress.lsu_chunk_drained) store.chunks_done = 0;
+        if (w.egress.lsu_group_drained) store.group_beats_read = 0;
     }
     if (w.channel.granted == GmemClient::lsu) ++command(w.channel.lsu_command).requests_emitted;
     for (const auto& [id, acks] : w.controller.lsu_acks) command(id).acks += acks;
@@ -798,7 +789,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
             w.released_lsu_commands.end();
     });
     if (w.dispatch.lsu.has_value()) next.push_back(w.dispatch.lsu->command);
-    if (w.lsu_rf_read.command.has_value()) ++command(*w.lsu_rf_read.command).chunks_done;
+    if (w.lsu_rf_read.command.has_value()) ++command(*w.lsu_rf_read.command).group_beats_read;
     if (next.size() > config_.lsu_active_commands) {
         throw SimError("internal: the LSU holds more than lsu.active_commands commands");
     }
@@ -806,7 +797,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
 }
 
 // The LSU's two buffers, each in one calculation. A buffer has an owner only
-// while data is in it (machine.hpp, AssemblyRegister).
+// while data is in it (machine.hpp, LsuBuffer).
 //   load buffer   1. one of its group's RF writes is granted now: the beat
 //                    counter moves; the group's LAST write empties it, no
 //                    owner;
@@ -821,8 +812,8 @@ void Machine::drive_lsu_commands(const Wires& w) {
 // The emptying comes first, so a buffer reused in the cycle it empties (d)
 // keeps everything the new data put in. A fill is the next value; it is read
 // from the next cycle on.
-void Machine::drive_assembly_pool(const Wires& w) {
-    const auto clear = [&](AssemblyRegister& reg) {
+void Machine::drive_lsu_buffers(const Wires& w) {
+    const auto clear = [&](LsuBuffer& reg) {
         std::fill(reg.valid.begin(), reg.valid.end(), 0);
         reg.valid_count = 0;
         reg.expected = 0;
@@ -832,20 +823,20 @@ void Machine::drive_assembly_pool(const Wires& w) {
         reg.group = 0;
         reg.owner.reset();
     };
-    const auto put = [&](AssemblyRegister& reg, uint32_t at, uint32_t word) {
+    const auto put = [&](LsuBuffer& reg, uint32_t at, uint32_t word) {
         reg.words.at(at) = word;
         if (reg.valid.at(at) != 0) throw SimError("internal: an LSU buffer word was written twice");
         reg.valid[at] = 1;
         ++reg.valid_count;
     };
     {
-        const auto& cur = staging_[load_buffer].cur();
-        std::optional<AssemblyRegister> next;
-        const auto edit = [&]() -> AssemblyRegister& {
+        const auto& cur = lsu_buffers_[load_buffer].cur();
+        std::optional<LsuBuffer> next;
+        const auto edit = [&]() -> LsuBuffer& {
             if (!next.has_value()) next = cur;
             return *next;
         };
-        if (w.rf_write.granted_to(AsyncWriter::assembly, load_buffer)) {
+        if (w.rf_write.granted_to(AsyncWriter::lsu_buffer, load_buffer)) {
             if (load_buffer_released(w)) clear(edit());
             else ++edit().beats;
         }
@@ -865,16 +856,16 @@ void Machine::drive_assembly_pool(const Wires& w) {
             if (!reg.owner.has_value()) throw SimError("internal: a word plucked into the unowned load buffer");
             put(reg, write.lane, write.word);
         }
-        if (next.has_value()) staging_[load_buffer].set_next(std::move(*next), "drive_assembly_pool");
+        if (next.has_value()) lsu_buffers_[load_buffer].set_next(std::move(*next), "drive_lsu_buffers");
     }
     {
-        const auto& cur = staging_[store_buffer].cur();
-        std::optional<AssemblyRegister> next;
-        const auto edit = [&]() -> AssemblyRegister& {
+        const auto& cur = lsu_buffers_[store_buffer].cur();
+        std::optional<LsuBuffer> next;
+        const auto edit = [&]() -> LsuBuffer& {
             if (!next.has_value()) next = cur;
             return *next;
         };
-        if (w.egress.lsu_chunk_drained || w.egress.lsu_store_drained) clear(edit());
+        if (w.egress.lsu_group_drained || w.egress.lsu_store_drained) clear(edit());
         if (w.dispatch.lsu.has_value() && w.dispatch.lsu->store_data.has_value()) {
             // A scatter: every lane's word (the inactive ones are never sent).
             auto& reg = edit();
@@ -906,7 +897,7 @@ void Machine::drive_assembly_pool(const Wires& w) {
             }
             ++reg.beats;
         }
-        if (next.has_value()) staging_[store_buffer].set_next(std::move(*next), "drive_assembly_pool");
+        if (next.has_value()) lsu_buffers_[store_buffer].set_next(std::move(*next), "drive_lsu_buffers");
     }
 }
 
@@ -1018,7 +1009,7 @@ void Machine::drive_free_id_tags(const Wires& w) {
 }
 
 // The LSU's store-data reads in flight: the one at the RF output now leaves
-// (it fills its assembly register, drive_assembly_pool); the one sampled
+// (it fills the store buffer, drive_lsu_buffers); the one sampled
 // now joins.
 void Machine::drive_lsu_read_pipe(const Wires& w) {
     const auto& cur = lsu_read_pipe_.cur();

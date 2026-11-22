@@ -1,7 +1,6 @@
 #pragma once
 
-// Clocked registers: the storage boundaries of the declared hardware
-// (trash/rfc09.md 3a; trash/stepping-discipline-2026-10-08.md).
+// Clocked registers: the storage boundaries of the declared hardware.
 //
 // A Reg<T> holds Q, the value every reader sees for the whole tick (cur()),
 // and D, the value it takes at the clock edge. set_next() supplies D. A

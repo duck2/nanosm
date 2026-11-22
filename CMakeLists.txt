@@ -178,7 +178,7 @@ add_executable(nanosm_capi_tests tests/capi_tests.cpp)
 target_link_libraries(nanosm_capi_tests PRIVATE nanosm_capi)
 
 if(NANOSM_SANITIZER)
-    # The sanitizer-OFF twin, for the regression guard below.
+    # The sanitizer-OFF twin, for the regression check below.
     add_nanosm_library(nanosm_nosan 0)
     add_nanosm_capi(nanosm_capi_nosan nanosm_nosan)
     add_nanosm_tests(nanosm_tests_nosan nanosm_nosan)
@@ -272,7 +272,7 @@ if(Python3_Interpreter_FOUND)
             ${Python3_EXECUTABLE} -B -m nanosm kernels/diverge_masked.launch.py
     )
     set_tests_properties(nanosm_python_diverge_masked PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    # The stepping discipline's regression guard: register drivers run in a
+    # The stepping discipline's regression check: register drivers run in a
     # random order every cycle (NANOSM_DRIVER_SHUFFLE_SEED); every launch's
     # stdout and Perfetto trace must be byte-identical to the unshuffled run.
     add_test(

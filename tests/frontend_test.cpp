@@ -1,6 +1,5 @@
-// The front end: instruction FIFOs, fetch, branch redirect (I6b-2).
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// The front end: instruction FIFOs, fetch, branch redirect.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -8,8 +7,7 @@ namespace {
 using namespace nanosm_test;
 
 // ---------------------------------------------------------------------------
-// I6b-2: the front end (trash/front-end-2026-10-18.md, two-word packets
-// since trash/front-end-packets-2026-10-18.md; the cycles in src/rf.hpp).
+// The front end (two-word packets; the cycles in src/timing.hpp).
 // Per warp an instruction FIFO of core.instruction_buffer_packets fetch
 // packets (2 at canonical; a packet is the two words at an aligned 16-byte
 // address); one instruction-memory read of one packet per cycle, fixed at
@@ -66,7 +64,7 @@ std::string i6b2_independent_movs(uint32_t count) {
 // four cycles, two entries (canonical) one word per cycle from c2, three or
 // four no faster. With C = min(N, 2) credits doing work, instruction k issues
 // at fetch_to_issue + (k / 2C) x 4 + k mod 2C.
-void test_i6b2_lone_warp_issue_rate() {
+void test_lone_warp_issue_rate() {
     for (const uint32_t packets : {1u, 2u, 3u, 4u}) {
         auto profile = canonical_profile();
         profile.core_instruction_buffer_packets = packets;
@@ -96,7 +94,7 @@ void test_i6b2_lone_warp_issue_rate() {
 // port has room to spare). From launch every warp has room for both its
 // packet entries, so the first 2W fetches go round the W warps twice: fetch
 // i at ci, warp i mod W, packet 16 x (i / W).
-void test_i6b2_warps_interleave() {
+void test_warps_interleave() {
     for (const uint32_t warps : {2u, 16u}) {
         const auto& profile = canonical_profile();
         auto machine = i6b2_machine(profile, i6b2_independent_movs(8) + "halt\n", warps);
@@ -140,7 +138,7 @@ void test_i6b2_warps_interleave() {
 // issue slots from the hot warp, whose FIFO is then full for a few cycles:
 // the rotation passes over it there, and only there -- a warp is passed over
 // only while its packets and read in flight fill its FIFO.)
-void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
+void test_fetch_round_robin_hot_and_waiting_warps() {
     const auto& profile = canonical_profile();
     const auto depth = profile.core_instruction_buffer_packets;
     auto machine = i6b2_machine(profile, R"(
@@ -221,7 +219,7 @@ void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
     require(machine->read_reg(0, 0, 13) == 29, "hot warp data");
 }
 
-// Conditional branches (HUMAN 10-18: the predicate is read one cycle after
+// Conditional branches (the predicate is read one cycle after
 // issue), with two-word packets. Words: 0 setp, 1..5 movs, 6 bra.uni (the
 // first half of packet 48), 7 mov r6 (its second half), 8 mov r7 and 9 the
 // target mov r8 (packet 64: the target is a second half), 10 halt. A lone
@@ -243,7 +241,7 @@ void test_i6b2_fetch_round_robin_hot_and_waiting_warps() {
 //               half) issues at t + 2 (branch_not_taken_interval) and packet
 //               64's first half at t + 3; nothing is fetched again.
 // Nothing of the warp issues or is fetched at t + 1.
-void test_i6b2_conditional_branch() {
+void test_conditional_branch() {
     const auto& profile = canonical_profile();
     for (const bool taken : {true, false}) {
         const auto what = std::string(taken ? "taken: " : "not taken: ");
@@ -320,7 +318,7 @@ void test_i6b2_conditional_branch() {
 // rule for every branch, one target adder): bra and bra.uni @PT are taken
 // (the next instruction at t + branch_taken_interval), bra.uni @!PT is not
 // (t + branch_not_taken_interval).
-void test_i6b2_unconditional_branches() {
+void test_unconditional_branches() {
     const auto& profile = canonical_profile();
     for (const auto& [form, taken] : std::vector<std::pair<std::string, bool>>{
              {"bra target", true}, {"bra.uni target", true}, {"bra.uni target {pred=!PT, stall=0, set=-, wait=-}", false}}) {
@@ -352,7 +350,7 @@ void test_i6b2_unconditional_branches() {
 // it had issued, r2 would be 0). A warp that really runs past its last word
 // is reported when that word reaches issue: "fell off kernel", nothing
 // earlier.
-void test_i6b2_words_past_the_end() {
+void test_words_past_the_end() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
             mov r1, 7
@@ -387,7 +385,7 @@ void test_i6b2_words_past_the_end() {
 // waiting word's packet and the next), so when the wait ends the waiting
 // instruction and the next two issue on consecutive cycles, and the warp is
 // never "waiting for instruction" after its first two cycles.
-void test_i6b2_prefetch_through_waits() {
+void test_prefetch_through_waits() {
     const auto check = [](nanosm::Machine& machine, uint32_t waiting_pc, uint64_t release, const std::string& what) {
         const auto depth = canonical_profile().core_instruction_buffer_packets;
         std::map<uint64_t, std::size_t> packets; // the FIFO's valid packets (Q) in each cycle
@@ -423,7 +421,7 @@ void test_i6b2_prefetch_through_waits() {
         check(*machine, 8, release, "depbar");
     }
     {   // A refused head: one load slot; the second lds.uni (c3) is refused
-        // until the first's RF write frees the slot (the I1 timeline: the
+        // until the first's RF write frees the slot (the
         // cycle after its grant, 2 + i1_lds_shift cycles after the refusal
         // starts).
         auto one = profile;
@@ -440,7 +438,7 @@ void test_i6b2_prefetch_through_waits() {
     }
 }
 
-// setp -> bra.uni (src/rf.hpp): a conditional branch samples its predicate
+// setp -> bra.uni (src/timing.hpp): a conditional branch samples its predicate
 // issue_to_predicate_sample after its issue, so it may issue that much
 // before the setp's predicate is in the file: issue_to_predicate_visible -
 // issue_to_predicate_sample after the setp (4 at canonical; 5 before the
@@ -448,7 +446,7 @@ void test_i6b2_prefetch_through_waits() {
 // all use that distance. At it, the branch sees the new predicate; one cycle
 // less is a sanitizer PANIC (without the sanitizer the machine quietly reads
 // the old predicate).
-void test_i6b2_setp_to_branch_distance() {
+void test_setp_to_branch_distance() {
     const auto& profile = canonical_profile();
     const auto setp = nanosm::decode(nanosm::assemble_asm(i1_asm(profile, "setp.eq.u32 p0, r0, r0\nhalt"), profile).words[0]);
     const auto distance = nanosm::issue_to_predicate_visible(setp, profile) - nanosm::issue_to_predicate_sample;
@@ -483,8 +481,8 @@ void test_i6b2_setp_to_branch_distance() {
 
 // A loop head (src/qtxc/schedule.cpp LoopEntry): what the code before a
 // loop leaves pending is paid once, by the instruction before the head, not
-// by a stall inside the loop on every iteration (trash/fa32-2026-11-19.md
-// section 4a: the branch at the top of this loop carried the ex2's drain).
+// by a stall inside the loop on every iteration (the branch at the top of
+// this loop would otherwise carry the ex2's drain).
 // Both passes. The loop body reads the ex2's result on the first pass, so
 // the sanitizer checks the fall-through edge; later passes arrive drained.
 void test_loop_head_pays_the_entry_once() {
@@ -526,11 +524,11 @@ void test_loop_head_pays_the_entry_once() {
 
 // core.warps (16 at canonical) declares the SM's warp slots and is enforced
 // at launch, before the RF rows: a one-register kernel launches 16 warps
-// and is refused at 17 and 32 (before I6b-2 the RF alone decided, and
-// accepted both). core.instruction_buffer_packets (2) is the FIFO depth in
+// and is refused at 17 and 32 (the RF rows alone would accept both).
+// core.instruction_buffer_packets (2) is the FIFO depth in
 // two-word packets. Both are optional in the JSON (absent: 16, 2), checked
 // (warps 1..64, packets 1..16) and part of the fingerprint.
-void test_i6b2_warp_slots_and_profile_fields() {
+void test_warp_slots_and_profile_fields() {
     const auto& profile = canonical_profile();
     require(profile.core_warps == 16 && profile.core_instruction_buffer_packets == 2,
         "the canonical profile does not declare 16 warps and 2 instruction packets");
@@ -595,7 +593,7 @@ void test_i6b2_warp_slots_and_profile_fields() {
 // at t + 5) its unissued second half (1), and packet 96, granted in the
 // halt's cycle and dropped as it lands (2): 7. The same from the totals: 8
 // fetches (packets 0, 16, 32, 48, 64, 64, 80, 96) of 16 words, 9 issued.
-void test_i6b2_trace_supply_state() {
+void test_trace_supply_state() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
         setp.eq.u32 p0, r0, 0
@@ -642,7 +640,7 @@ void test_i6b2_trace_supply_state() {
 }
 
 // Every warp's trace state comes from its own registers, however far the
-// scheduler scanned (Codex's reproducer: two warps, mov, mov, halt). Warp 0's
+// scheduler scanned (two warps, mov, mov, halt). Warp 0's
 // first packet is fetched at c0 and warp 1's at c1; warp 0 issues at c2,
 // warp 1 at c3, then they alternate. At c2 the scheduler stops at warp 0,
 // the winner, but warp 1's FIFO is empty (its packet lands at c2's edge): it
@@ -651,7 +649,7 @@ void test_i6b2_trace_supply_state() {
 // winner with an instruction is "not examined (another warp issued)", never
 // "ready": warp 0 at c3 and c5, warp 1 at c4 and c6 (warp 0's halt at c6,
 // warp 1's at c7).
-void test_i6b2_trace_counts_every_warp() {
+void test_trace_counts_every_warp() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, "mov r0, 1\nmov r1, 2\nhalt\n", 2);
     machine->run();
@@ -676,15 +674,15 @@ void test_i6b2_trace_counts_every_warp() {
             summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::not_examined)] == 4,
         "the summary undercounts the warps past the winner");
     // Its summary line: the name is wider than the column, a space still
-    // separates it from the count (Codex's packet review, backlog D13).
+    // separates it from the count.
     const auto text = machine->trace().summary_text();
     require(text.find("\n  not examined (another warp issued) 4\n") != std::string::npos,
         "the summary's not-examined line has no space before its count:\n" + text);
     require(machine->read_reg(1, 0, 1) == 2, "data");
 }
 
-// Discarded words are the fetched words that never issue (Codex's packet
-// review, backlog D13), including the first half of a packet fetched for a
+// Discarded words are the fetched words that never issue, including the
+// first half of a packet fetched for a
 // second-half branch target, skipped as it lands. `bra target`, `target:
 // halt`: the target is word 1, packet 0's second half. Packet 0 is fetched at
 // c0 and packet 16 at c1; the bra issues at t = c2 (packet 16 lands behind
@@ -697,7 +695,7 @@ void test_i6b2_trace_counts_every_warp() {
 // packet 16 is read again at t + 2 and packet 32 at t + 3, the halt issues
 // at t + 4 with its packet's second half unissued (1) and packet 32 is
 // dropped as it lands (2): 6 as well.
-void test_i6b2_skipped_first_half_is_discarded() {
+void test_skipped_first_half_is_discarded() {
     const auto& profile = canonical_profile();
     const uint64_t t = nanosm::fetch_to_issue;
     for (const auto& [body, target_packet, what] : std::vector<std::tuple<std::string, uint32_t, std::string>>{
@@ -739,7 +737,7 @@ void test_i6b2_skipped_first_half_is_discarded() {
 //   - fetch: warp 0's packet 48 again at c12 (warp 1's branch is still in the
 //     issue register), warp 1's at c13; the targets issue at c14 and c15,
 //     each branch's t + 4 (branch_taken_interval).
-void test_i6b2_redirects_across_warps() {
+void test_redirects_across_warps() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
             mov r1, 1
@@ -802,7 +800,7 @@ void test_i6b2_redirects_across_warps() {
 // target packet), so its target issues at c18 -- fifteen cycles after the
 // resolve instead of branch_taken_interval's three. No priority: just the
 // round-robin.
-void test_i6b2_redirect_behind_many_fetchers() {
+void test_redirect_behind_many_fetchers() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, R"(
             bra target
@@ -832,7 +830,7 @@ void test_i6b2_redirect_behind_many_fetchers() {
 // The front end's consistency check: while a warp runs, its fetch pc is pc
 // rounded down to 16 plus 16 per packet held or in flight. Breaking it
 // between ticks is caught at the next tick, in both builds.
-void test_i6b2_front_end_consistency_check() {
+void test_front_end_consistency_check() {
     const auto& profile = canonical_profile();
     auto machine = i6b2_machine(profile, i6b2_independent_movs(8) + "halt\n");
     for (int i = 0; i < 3; ++i) tick_capped(*machine);
@@ -848,81 +846,81 @@ void test_i6b2_front_end_consistency_check() {
 
 } // namespace
 
-// I6b-2: lone warp issue rate at 1-4 packets
-TEST(FrontEnd, i6b2_lone_warp_issue_rate) {
-    test_i6b2_lone_warp_issue_rate();
+// Lone warp issue rate at 1-4 packets
+TEST(FrontEnd, lone_warp_issue_rate) {
+    test_lone_warp_issue_rate();
 }
 
-// I6b-2: warps interleave (2, 16)
-TEST(FrontEnd, i6b2_warps_interleave) {
-    test_i6b2_warps_interleave();
+// Warps interleave (2, 16)
+TEST(FrontEnd, warps_interleave) {
+    test_warps_interleave();
 }
 
-// I6b-2: fetch round-robin, hot and waiting warps
-TEST(FrontEnd, i6b2_fetch_round_robin_hot_and_waiting_warps) {
-    test_i6b2_fetch_round_robin_hot_and_waiting_warps();
+// Fetch round-robin, hot and waiting warps
+TEST(FrontEnd, fetch_round_robin_hot_and_waiting_warps) {
+    test_fetch_round_robin_hot_and_waiting_warps();
 }
 
-// I6b-2: conditional branch taken / not taken
-TEST(FrontEnd, i6b2_conditional_branch) {
-    test_i6b2_conditional_branch();
+// Conditional branch taken / not taken
+TEST(FrontEnd, conditional_branch) {
+    test_conditional_branch();
 }
 
-// I6b-2: unconditional branches
-TEST(FrontEnd, i6b2_unconditional_branches) {
-    test_i6b2_unconditional_branches();
+// Unconditional branches
+TEST(FrontEnd, unconditional_branches) {
+    test_unconditional_branches();
 }
 
-// I6b-2: words past the end and on a cleared path
-TEST(FrontEnd, i6b2_words_past_the_end) {
-    test_i6b2_words_past_the_end();
+// Words past the end and on a cleared path
+TEST(FrontEnd, words_past_the_end) {
+    test_words_past_the_end();
 }
 
-// I6b-2: prefetch through waits
-TEST(FrontEnd, i6b2_prefetch_through_waits) {
-    test_i6b2_prefetch_through_waits();
+// Prefetch through waits
+TEST(FrontEnd, prefetch_through_waits) {
+    test_prefetch_through_waits();
 }
 
-// I6b-2: setp -> bra.uni distance
-TEST(FrontEnd, i6b2_setp_to_branch_distance) {
-    test_i6b2_setp_to_branch_distance();
+// Setp -> bra.uni distance
+TEST(FrontEnd, setp_to_branch_distance) {
+    test_setp_to_branch_distance();
 }
 
-// I6b-2: warp slots and profile fields
+// Warp slots and profile fields
 TEST(FrontEnd, loop_head_pays_the_entry_once) {
     test_loop_head_pays_the_entry_once();
 }
 
-TEST(FrontEnd, i6b2_warp_slots_and_profile_fields) {
-    test_i6b2_warp_slots_and_profile_fields();
+TEST(FrontEnd, warp_slots_and_profile_fields) {
+    test_warp_slots_and_profile_fields();
 }
 
-// I6b-2: trace supply state
-TEST(FrontEnd, i6b2_trace_supply_state) {
-    test_i6b2_trace_supply_state();
+// Trace supply state
+TEST(FrontEnd, trace_supply_state) {
+    test_trace_supply_state();
 }
 
-// I6b-2: trace counts every warp
-TEST(FrontEnd, i6b2_trace_counts_every_warp) {
-    test_i6b2_trace_counts_every_warp();
+// Trace counts every warp
+TEST(FrontEnd, trace_counts_every_warp) {
+    test_trace_counts_every_warp();
 }
 
-// I6b-2: a second-half target's skipped first half is discarded
-TEST(FrontEnd, i6b2_skipped_first_half_is_discarded) {
-    test_i6b2_skipped_first_half_is_discarded();
+// A second-half target's skipped first half is discarded
+TEST(FrontEnd, skipped_first_half_is_discarded) {
+    test_skipped_first_half_is_discarded();
 }
 
-// I6b-2: redirects across warps
-TEST(FrontEnd, i6b2_redirects_across_warps) {
-    test_i6b2_redirects_across_warps();
+// Redirects across warps
+TEST(FrontEnd, redirects_across_warps) {
+    test_redirects_across_warps();
 }
 
-// I6b-2: redirect behind many fetchers
-TEST(FrontEnd, i6b2_redirect_behind_many_fetchers) {
-    test_i6b2_redirect_behind_many_fetchers();
+// Redirect behind many fetchers
+TEST(FrontEnd, redirect_behind_many_fetchers) {
+    test_redirect_behind_many_fetchers();
 }
 
-// I6b-2: front-end consistency check
-TEST(FrontEnd, i6b2_front_end_consistency_check) {
-    test_i6b2_front_end_consistency_check();
+// Front-end consistency check
+TEST(FrontEnd, front_end_consistency_check) {
+    test_front_end_consistency_check();
 }

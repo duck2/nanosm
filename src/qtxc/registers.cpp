@@ -7,7 +7,7 @@
 // What it decides, in order:
 //   1. Banks (vector file). An instruction's issue reads at most
 //      rf.read_ports_per_bank different registers from one bank (register
-//      number mod rf.banks; src/rf.hpp). Every name or group (`.reg %a<8>`:
+//      number mod rf.banks; src/timing.hpp). Every name or group (`.reg %a<8>`:
 //      neighbours, so one choice for all eight) that is read beside another
 //      gets a bank: a search for a choice with no conflict, and when there
 //      is none (or the search runs out) the choice with the least conflict,
@@ -26,7 +26,7 @@
 // table (register_names) for the assembly's `.name` lines.
 
 #include "qtxc/internal.hpp"
-#include "rf.hpp"
+#include "timing.hpp"
 
 #include <algorithm>
 #include <array>

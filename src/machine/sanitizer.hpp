@@ -24,13 +24,12 @@
 // sanitizer_off_check.py, which requires every launch's stdout and Perfetto
 // trace and every non-sanitizer-panic unit test to be byte-identical between
 // the two. A change that makes computation depend on sanitizer state fails it.
-// Classification of all machine state: trash/sanitizer-split-2026-10-07.md.
 // =============================================================================
 
 #include "qtxc/qtxc.hpp"
 #include "isa.hpp"
 #include "profile.hpp"
-#include "tma.hpp"
+#include "tma_descriptor.hpp"
 
 #include <array>
 #include <cstddef>
@@ -68,7 +67,7 @@ struct IssueSite {
 // Which async reader of a register finished (selects the internal-underflow text).
 enum class AsyncReader : uint8_t { acc_st, stg_v8 };
 
-// Where a SIMT shmem access waits for its grants (rfc12 sections 3, 6, 9):
+// Where a SIMT shmem access waits for its grants:
 // a load slot, a store slot (by slot index), the probe register or the SIMT
 // RMW register / engine (by warp: a warp has at most one probe and one SIMT
 // RMW outstanding).
@@ -98,12 +97,12 @@ public:
     void record_cycle_start();
 
     // ---- RF / predicate hazards (there is no scoreboard; a violation PANICS) ----
-    // Cycles follow src/rf.hpp. An RF register's READY cycle is its latest
+    // Cycles follow src/timing.hpp. An RF register's READY cycle is its latest
     // write's VISIBILITY, the first cycle an RF sample sees it (a pending
     // asynchronous write: never, until it lands). READ_UNTIL is the exclusive
     // end of its pending fixed samples. A predicate's ready cycle is the first
     // cycle it is in the file: a conditional branch's sample (issue +
-    // issue_to_predicate_sample, src/rf.hpp) must be at or after it, and a
+    // issue_to_predicate_sample, src/timing.hpp) must be at or after it, and a
     // predicate writer may not issue before it.
     void record_reg_ready(uint32_t warp, uint32_t reg, uint64_t visible_cycle);
     void record_reg_read_until(uint32_t warp, uint32_t reg, uint64_t exclusive_end);
@@ -121,11 +120,11 @@ public:
     // reader may still own the register.
     void check_rf_waw_war(const IssueSite& site, uint8_t dst, unsigned width, uint64_t earliest_visible) const;
 
-    // ---- uniform-register hazards (src/rf.hpp) ----
+    // ---- uniform-register hazards (src/timing.hpp) ----
     // A uniform register's READY cycle is its latest write's visibility (every
     // writer is fixed-latency: issue + L + Wu + 1). RAW: each uniform source,
     // sampled at sample_cycle, must be visible by then (a tma's registers:
-    // each at its own round's sample, src/rf.hpp tma_operand_round). WAW: the
+    // each at its own round's sample, src/timing.hpp tma_operand_round). WAW: the
     // younger write (visible from visible_cycle) must land after the older
     // one. No WAR: a uniform register is read at issue + 1 (a tma's last round
     // at issue + 3 at most), written L + Wu >= 4 after its writer's issue.
@@ -135,43 +134,42 @@ public:
     void check_uniform_raw(const IssueSite& site, const std::vector<uint8_t>& sources, uint64_t sample_cycle) const;
     void check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t visible_cycle) const;
 
-    // ---- admission reads no operand (rfc10 section 1) ----
+    // ---- admission reads no operand ----
     // Every issue attempt opens with record_issue_attempt; record_issue_accepted
     // marks the moment admission has decided. A capture in an attempt not
     // (yet) accepted is an internal PANIC (a refused attempt must consume
-    // nothing). No machine path reads an operand at issue today: RF operands
-    // (I6a) and, since the front end (I6b-2), a conditional branch's
+    // nothing). No machine path reads an operand at issue: RF operands and a
+    // conditional branch's
     // predicate are sampled through the issue register, a cycle after
     // acceptance. The tripwire stays for any future issue-time read.
     void record_issue_attempt(uint32_t warp);
     void record_issue_accepted();
     void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;
 
-    // ---- declared uniformity (rfc09 pin 3) ----
-    // A declared-uniform operand still taken from a vector register (the
-    // ldg.v8 / stg.v8 bases, the bra.uni predicate; every other uniform
-    // operand is a uniform register since the URF slice and rfc17) must
+    // ---- declared uniformity ----
+    // A declared-uniform operand taken from a per-lane file (the bra.uni
+    // predicate; every other uniform operand is a uniform register) must
     // hold one value in every lane. Hardware reads lane 0 only; anything else
     // is UB, diagnosed here. lane_values: the operand, by lane.
     void check_warp_uniform(
         const IssueSite& site, const std::vector<uint32_t>& lane_values, const std::string& what) const;
     // A uniform operation -- every instruction with a declared-uniform
     // operand (the list above and every uniform-register operand of a ".uni"
-    // consumer; the machine calls this from uniform_reg and uniform_operand)
+    // consumer; the machine calls this from uniform_operand)
     // and bra.uni -- under a partial active mask (inside a divergent arm; a
     // mask is never empty). Hardware reads lane 0
-    // whatever the mask, so this is UB, diagnosed here (HUMAN 2026-10-12,
-    // backlog D12 / D12.1, rfc13 section 2); what the machine does then is
-    // no contract.
+    // whatever the mask, so this is UB, diagnosed here: a program with a
+    // partial mask uses the per-lane instruction. What the machine does then
+    // is no contract.
     void check_uniform_mask(const IssueSite& site, uint64_t active_mask, uint64_t full_mask) const;
-    // ---- divergence (trash/divergence-2026-11-21.md) ----
+    // ---- divergence ----
     // A halt must find its warp converged: an empty divergence stack and
     // every lane active. Halting inside an arm drops the other lanes' work;
     // the machine just halts the warp.
     void check_halt_converged(const IssueSite& site, uint32_t stack_depth, uint64_t active_mask,
         uint64_t full_mask) const;
     // A tma's buffer address must be 64-byte aligned and its barrier address
-    // 8-byte aligned (src/tma.hpp). The machine does not wire the low bits
+    // 8-byte aligned (src/tma_descriptor.hpp). The machine does not wire the low bits
     // (it ignores them); a program that sets them is wrong, diagnosed here.
     void check_tma_operand_alignment(const IssueSite& site, uint32_t buffer, uint32_t barrier) const;
     // A swizzle64 tensor-core operand (src/layout.hpp): `pointer` is a
@@ -192,7 +190,7 @@ public:
     void check_tmem_pointer(const IssueSite& site, const std::string& what, uint32_t pointer,
         uint32_t row_words, uint32_t columns) const;
 
-    // ---- same-word stores (HUMAN 2026-10-12, backlog D12) ----
+    // ---- same-word stores ----
     // Two active lanes of one sts / stg naming one 4-byte word: UB, as on
     // NVIDIA (one write lands; which is undefined). The machine lets one
     // land quietly (the highest active lane); no program may rely on which.
@@ -201,7 +199,7 @@ public:
     void check_store_word_collision(
         const IssueSite& site, const std::vector<uint64_t>& word_addresses, const std::string& space) const;
 
-    // ---- shmem ownership (trash/shmem-ownership-sanitizer-2026-10-03.md) ----
+    // ---- shmem ownership ----
     // word_addresses: every lane access of every round, duplicates included.
     void check_simt_shmem_access(
         const IssueSite& site, const std::vector<uint32_t>& word_addresses, bool load) const;
@@ -212,7 +210,7 @@ public:
     void check_simt_mbar_probe(const IssueSite& site, uint32_t address) const;
     void check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool complete_tx) const;
 
-    // ---- missing fence.sh / race (trash/rfc12.md sections 10 and 11) ----
+    // ---- missing fence.sh / race ----
     // A shadow of every SIMT shmem access until it REACHES THE RAM (a write's
     // edge, a read's sample: its round's grant + D). An access is recorded
     // when issue accepts it -- an lds / lds.uni / sts with its bank rounds'
@@ -227,20 +225,20 @@ public:
     // at least one side writes PANICs -- with the issuing warp's own access
     // "missing fence.sh", with another warp's "shmem race". Read/read overlap
     // never PANICs. This diagnoses the PHYSICAL hazard present at accept; it
-    // does not track whether a fence.sh was issued (backlog D10), so an
+    // does not track whether a fence.sh was issued, so an
     // unfenced command whose warp's accesses already reached the RAM passes.
     void record_simt_shmem_issue(const IssueSite& site, SimtShmemHolder holder, uint32_t index,
         const std::vector<std::vector<uint32_t>>& rounds, uint32_t access_bytes, bool write);
     // The next round of the access in (holder, index) is granted now (cycle);
     // it reaches the RAM at ram_cycle. An sts round is also checked against
-    // the live mbars (C10, below).
+    // the live mbars (below).
     void record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, uint32_t index, uint64_t ram_cycle);
 
-    // ---- C10 live-mbar opacity (trash/rfc12.md section 11) ----
+    // ---- live mbars are opaque ----
     // An accepted SIMT mbar.init makes [address, address + 8) a LIVE mbar
     // until kernel end (v0 retirement); so does the launch's declaration of an
     // mbar the host initialized in the shmem image (Launch::mbars, live from
-    // launch; I5). From then on only mbar operations (init, arrive,
+    // launch). From then on only mbar operations (init, arrive,
     // expect_tx, the probes, the engines' complete_tx and commit arrive) may
     // touch it: an sts round (checked at its grant), a TMA placement round
     // (port-B write, check_live_mbar_write) or a uniform atomic's write
@@ -263,7 +261,7 @@ public:
     // load / shmem_address / completion_mbar: the instruction's direction, its
     // buffer and its barrier (low bits dropped). completion_mbar_word: that
     // mbar as it stands at accept (none: outside shmem). Its phase is
-    // recorded for the command's complete_tx (rfc12 section 8: the hardware
+    // recorded for the command's complete_tx (the hardware
     // reads no mbar at TMA start; this peek is sanitizer-only metadata).
     void record_tma_accept(
         const IssueSite& site, uint64_t command, uint32_t descriptor_address,
@@ -355,8 +353,9 @@ public:
     void record_acc_transfer_final_beat(bool load);
 
     // ---- clocked registers (src/machine/reg.hpp): at most one write per tick ----
-    // The B2.1 fall-through tripwires (TMA sector, TMA store sector, assembly
-    // registers) are retired: those registers are Reg<T>, read through cur().
+    // (The TMA sector register, the TMA store register and the load / store
+    // unit's buffers need no fall-through tripwire: they are Reg<T>, read
+    // through cur().)
     void record_register_write(uint32_t id, const char* tag);
     void check_register_rewrite(
         uint32_t id, const std::string& name, uint64_t cycle, const char* tag) const;
@@ -366,12 +365,12 @@ public:
     void check_ordered_beat(uint64_t cycle, uint32_t stream, uint64_t request, uint32_t byte_offset) const;
     void record_ordered_pluck(uint32_t stream, uint32_t bytes);
 
-    // ---- rfc09 3: admitted LSU commands never exceed the assembly pool ----
+    // ---- admitted LSU commands never exceed the command slots ----
     void check_lsu_admitted(std::size_t admitted) const;
-    // A reader of an assembly register (the RF drain, the egress write port)
+    // A reader of the load or store buffer (the RF drain, the egress write port)
     // takes only lanes marked valid: lanes [first_lane, first_lane + lanes)
     // of `valid`, the register's Q. A lost valid bit panics here.
-    void check_assembly_lanes_valid(uint64_t cycle, uint32_t assembly, const std::vector<uint8_t>& valid,
+    void check_buffer_lanes_valid(uint64_t cycle, uint32_t buffer, const std::vector<uint8_t>& valid,
         uint32_t first_lane, uint32_t lanes, const char* reader) const;
 
 private:
@@ -415,7 +414,7 @@ private:
     };
 
     struct WarpHazards {
-        std::vector<uint64_t> ready_cycle;   // RAW/WAW: the latest write's visibility (src/rf.hpp)
+        std::vector<uint64_t> ready_cycle;   // RAW/WAW: the latest write's visibility (src/timing.hpp)
         std::vector<uint64_t> read_until;    // WAR: last scheduled sample, exclusive end
         std::vector<uint32_t> async_readers; // WAR: acc.st / stg.v8 sources not yet read
         std::array<uint64_t, 7> predicate_ready_cycle{};
@@ -513,7 +512,7 @@ private:
     // SIMT shmem accesses that may not have reached the RAM yet (pruned at
     // each issue: bounded by the slots, the probe / RMW registers and D).
     std::vector<SimtShmemAccess> simt_shmem_;
-    // C10: mbars the launch declared or a SIMT mbar.init made live, until kernel end.
+    // Live mbars: those the launch declared or a SIMT mbar.init made live, until kernel end.
     std::vector<LiveMbar> live_mbars_;
     // TMA command -> its completion mbar's phase at accept, until its complete_tx.
     std::vector<std::pair<uint64_t, bool>> tma_completion_phases_;
@@ -599,7 +598,7 @@ public:
     NANOSM_SANITIZER_NOOP(check_ordered_beat)
     NANOSM_SANITIZER_NOOP(record_ordered_pluck)
     NANOSM_SANITIZER_NOOP(check_lsu_admitted)
-    NANOSM_SANITIZER_NOOP(check_assembly_lanes_valid)
+    NANOSM_SANITIZER_NOOP(check_buffer_lanes_valid)
 #undef NANOSM_SANITIZER_NOOP
 };
 

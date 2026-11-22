@@ -1,10 +1,10 @@
 """FlashAttention on 32-row query tiles: 64 queries, 128 keys, width 64; six warps.
 
 Run from emu2: python -B -m nanosm kernels/fa32.launch.py
-Optional trace: --case rising --trace trash/fa32.perfetto.json
+Optional trace: --case rising --trace fa32.perfetto.json
 
 The same problem, inputs, outputs and checks as the 64-row kernel
-(kernels/fa.launch.py at a5d0652), computed by kernels/fa32.qtx on two 32-row
+(kernels/fa.launch.py), computed by kernels/fa32.qtx on two 32-row
 query tiles with m32n64k8 commands on four 32 x 64 accumulators (S0/O0 for
 query rows 0..31, S1/O1 for rows 32..63). Plain row-major fp16 inputs enter
 through TMA (Q as two 32-row tiles, K and V as two 64-key blocks); the fp32

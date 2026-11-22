@@ -4,24 +4,12 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
 
-// The launch copy (README "Launch"; trash/launch-timed-2026-11-21.md). The
+// The launch copy (README "Launch"). The
 // host wrote the kernel's launch block into global memory and the launch
 // record says where it is, where it goes in shared memory and how long it
 // is. Nothing of it is in shared memory at the first cycle. The copy is the

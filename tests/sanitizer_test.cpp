@@ -1,6 +1,5 @@
 // The race sanitizer's ownership checks.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -8,8 +7,8 @@ namespace {
 using namespace nanosm_test;
 
 void test_sanitizer_sts_into_tma_store_source() {
-    // tma-out break (1): the issuer fires the store before the workers finished
-    // staging. The store read-owns its source from accept until its last source
+    // The issuer fires the store before the workers finished
+    // staging their output. The store read-owns its source from accept until its last source
     // read, so the late sts panics whatever the port timing.
     const auto& profile = canonical_profile();
     const auto launch_with_store = [] {
@@ -259,7 +258,7 @@ void test_sanitizer_tmem_ownership_both_directions() {
         umov ur10, 1024
         umov ur11, 0
     )";
-    // C4, new direction: an MMA accepted while an acc.st on its result is
+    // The other direction: an MMA accepted while an acc.st on its result is
     // still writing tmem.
     auto message = run_expecting_panic(profile, compile(header + R"(
         acc.st.v8 [ur8, 64], r16
@@ -269,8 +268,8 @@ void test_sanitizer_tmem_ownership_both_directions() {
     require_mentions(message, {"tmem race: mma.async #1 on tmem 0 (64 words per row) rows [0, 64) cols [0, 64)",
         "acc.st #0", "write-owner of tmem 0 (64 words per row) rows [0, 16) cols [0, 8) until its final tmem write",
         "wait that transfer's depbar sb"}, "MMA vs acc.st");
-    // ... and while an acc.ld still reads it (WAR on tmem). I2.1 (F6): the
-    // read-ownership ends at the final tmem read (I8: the last beat's tmem
+    // ... and while an acc.ld still reads it (WAR on tmem). The
+    // read-ownership ends at the final tmem read (the last beat's tmem
     // sample), not the final RF write.
     message = run_expecting_panic(profile, compile(header + R"(
         acc.ld.v8 r24, [ur8, 64]
@@ -289,7 +288,7 @@ void test_sanitizer_tmem_ownership_both_directions() {
     require_mentions(message, {"accumulator transfer of tmem 0 (64 words per row) rows [0, 16) cols [0, 8) "
         "races accepted MMA work: mma.async #1", "write-owner of tmem 0 (64 words per row) rows [0, 64) cols [0, 64) "
         "until its last result retires", "wait on the mma.commit mbar phase first"}, "acc.ld vs MMA");
-    // Transfer vs transfer (I8): the acc.ld and acc.st engines run side by
+    // Transfer vs transfer: the acc.ld and acc.st engines run side by
     // side and nothing orders them, so an overlapping pair is a race. qtxc
     // orders one warp's transfers by depbar; hand assembly without that wait
     // shows the sanitizer's diagnosis.
@@ -324,7 +323,7 @@ void test_sanitizer_tmem_ownership_both_directions() {
     require(disjoint.read_reg(0, 0, 24) == 0, "disjoint acc.ld read the concurrent store's rows");
 }
 
-// Pointers alias (trash/acc-pointer-2026-11-19.md): an m32n64 matmul writes
+// Pointers alias: an m32n64 matmul writes
 // rows 32..63 of a 64-row view at 0 (its pointer 2048). A transfer through a
 // DIFFERENT pointer that names some of those words races it -- acc.ld at row
 // 48 (3072) while the matmul runs PANICs; one at rows 0..15 (pointer 0) and
@@ -629,8 +628,8 @@ void test_sanitizer_row_spacing_tmem() {
 }
 
 // A swizzle64 TMA store checks the row spacing of the words it READS, at its
-// source rounds' grants -- not its whole tile (Astra's false alarm,
-// trash/chan.txt 2026-11-20; trash/tma_clipped_spacing_astra.launch.py). A
+// source rounds' grants -- not its whole tile (checking the whole tile gave
+// a false alarm on a clipped store). A
 // 2-row fp32 tile of 64-byte stored rows at shmem 1024 is stored to a
 // tensor one row tall; a swizzle64 load with 32-byte rows wrote `load_at`
 // (64 bytes) before it. Store coordinate y = 0 reads row 0 (1024..1087)

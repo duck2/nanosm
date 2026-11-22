@@ -1,7 +1,7 @@
 """FlashAttention over 64 queries and 128 keys with two 32x64 query tiles.
 
 Run from emu2: python -B -m nanosm kernels/fa.launch.py
-Optional trace: --case rising --trace trash/fa-tma-out.perfetto.json
+Optional trace: --case rising --trace fa.perfetto.json
 
 Plain row-major FP16 inputs enter through TMA, not prepacked shared memory, and
 the FP32 output leaves through TMA: workers stage normalized O in shmem as
@@ -103,7 +103,7 @@ def mma_group(a: list[float], b: list[float], c: float) -> float:
     Inputs here are already exact FP16 values. Products are exact in double;
     as_integer_ratio then aligns them using Python integers, not float sums.
     SF Tensor tcgen05's raw-exponent rule, applied per core step: one fused
-    group of CORE_K products plus C (rfc11 section 0: dot8 + C at 4x4x8).
+    group of CORE_K products plus C (dot8 + C at 4x4x8).
     See third_party/tcgen05-LICENSE and src/machine/mma_numeric.cpp for provenance.
     """
     assert len(a) == len(b) == CORE_K and all(math.isfinite(x) for x in (*a, *b, c))

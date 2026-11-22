@@ -4,40 +4,30 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
 #include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
 
 // ===========================================================================
 // The RF ports: the reservation calendars, the RF read and write decisions,
-// the write port and the write pipeline (trash/rfc10.md sections 3 and 5;
-// every cycle number follows src/rf.hpp)
+// the write port and the write pipeline (every cycle number follows
+// src/timing.hpp)
 // ===========================================================================
 
 // Fixed issue never contests the current cycle's RF ports (the issue
 // register): its read round samples at issue + 1, its fixed write is booked
 // in the write calendar at issue + issue_to_port. What the current cycle
 // leaves goes to the asynchronous clients, decided from Q before issue:
-//   READS   decide_rf_reads (trash/rfc14.md sections 4 and 5): the issue
+//   READS   decide_rf_reads: the issue
 //           register's instruction owns the read ports its round samples
 //           now; acc.st beats and the LSU's store-data read share the rest
 //           by round-robin. A denied reader whose bank's read_owed bit is
 //           set inhibits the acceptance of new SIMT reads of that bank, so
 //           the bank's ports are free one cycle later (the mirrored rule).
-//   WRITES  decide_rf_writes: load slots, the LSU's assembly register and the
+//   WRITES  decide_rf_writes: load slots, the LSU's load buffer and the
 //           acc.ld pipelines share the current write port's unbooked ports;
 //           a denied writer whose bank's async_owed bit is set inhibits new
 //           fixed write bookings to that bank.
@@ -82,26 +72,26 @@ bool Machine::RfReadDecision::granted_to(RfReader reader, uint32_t index) const 
 // The load buffer as an async RF holder: its next write when it holds a
 // complete group (in Q), else none (the store buffer never writes the RF). A
 // v8 group is eight writes, rD + j one after another.
-std::optional<Machine::AsyncWrite> Machine::assembly_rf_write(uint32_t index) const {
+std::optional<Machine::AsyncWrite> Machine::lsu_buffer_rf_write(uint32_t index) const {
     if (index != load_buffer) return std::nullopt;
-    const auto& assembly = staging_.at(index).cur();
-    if (!assembly.owner.has_value() || assembly.valid_count != assembly.expected) return std::nullopt;
-    const auto* command = find_lsu_command(*assembly.owner);
+    const auto& buffer = lsu_buffers_.at(index).cur();
+    if (!buffer.owner.has_value() || buffer.valid_count != buffer.expected) return std::nullopt;
+    const auto* command = find_lsu_command(*buffer.owner);
     if (command == nullptr || is_store(command->kind)) throw SimError("internal: the load buffer's owner is not a load");
     const bool vector = command->kind == LsuKind::vector_load;
-    const auto reg = static_cast<uint8_t>(command->reg + (vector ? assembly.beats : 0));
-    return AsyncWrite{AsyncWriter::assembly, index, command->warp, reg};
+    const auto reg = static_cast<uint8_t>(command->reg + (vector ? buffer.beats : 0));
+    return AsyncWrite{AsyncWriter::lsu_buffer, index, command->warp, reg};
 }
 
 // The LSU's one RF write path: the load buffer, when it holds a complete
 // group (one write a cycle).
 std::optional<uint32_t> Machine::lsu_rf_presented() const {
-    if (assembly_rf_write(load_buffer).has_value()) return load_buffer;
+    if (lsu_buffer_rf_write(load_buffer).has_value()) return load_buffer;
     return std::nullopt;
 }
 
 // Every async RF holder, in round-robin order, with its write when its vector
-// is complete in Q: the load slots, the assembly register on the LSU's write
+// is complete in Q: the load slots, the load buffer on the LSU's write
 // path, then each tmem bank's acc.ld pipeline output.
 std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
     std::optional<uint32_t> lsu_presented) const {
@@ -114,8 +104,8 @@ std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
             holders.emplace_back();
         }
     }
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        holders.push_back(lsu_presented == index ? assembly_rf_write(index) : std::nullopt);
+    for (uint32_t index = 0; index < lsu_buffers_.size(); ++index) {
+        holders.push_back(lsu_presented == index ? lsu_buffer_rf_write(index) : std::nullopt);
     }
     if (const auto& output = acc_ld_pipe_.cur().back(); output.has_value()) {
         holders.push_back(AsyncWrite{AsyncWriter::acc_ld, 0, output->warp, output->reg});
@@ -125,8 +115,8 @@ std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
     return holders;
 }
 
-// The RF write decision (trash/rfc10.md section 3, "make an opening, then
-// choose a writer"): one per RF bank, from Q only, before issue.
+// The RF write decision (make an opening, then choose a writer): one per RF
+// bank, from Q only, before issue.
 //   async_ready  = a ready async holder targets the bank
 //   async_grant  = async_ready AND one of this cycle's write ports is unbooked
 //   inhibit_simt = async_ready AND NOT async_grant AND async_owed
@@ -180,32 +170,32 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         writeback.visible_regs = {write.reg};
         return writeback;
     }
-    case AsyncWriter::assembly: {
+    case AsyncWriter::lsu_buffer: {
         // One write of the load buffer's group: a v8 group's register rD + j
         // with the group's active lanes enabled (lane l's word j); a gather
         // group's active lanes; a uniform load's one word to every lane.
-        const auto& assembly = staging_.at(write.index).cur();
-        const auto& command = *find_lsu_command(*assembly.owner);
+        const auto& buffer = lsu_buffers_.at(write.index).cur();
+        const auto& command = *find_lsu_command(*buffer.owner);
         const auto width = lsu_group_width(command);
         const bool vector = command.kind == LsuKind::vector_load;
         const bool uniform = command.kind == LsuKind::uniform_load;
         writeback.values.assign(config_.lanes, 0);
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             if (uniform) {
-                writeback.values[lane] = assembly.words[0];
+                writeback.values[lane] = buffer.words[0];
                 continue;
             }
-            if ((assembly.lanes >> lane & 1) == 0) continue;
-            const uint32_t at = vector ? (lane - assembly.group * width) * 8 + assembly.beats
-                                       : lane - assembly.group * width;
-            sanitizer_.check_assembly_lanes_valid(cycle_, write.index, assembly.valid, at, 1, "RF drain");
-            writeback.values[lane] = assembly.words[at];
+            if ((buffer.lanes >> lane & 1) == 0) continue;
+            const uint32_t at = vector ? (lane - buffer.group * width) * 8 + buffer.beats
+                                       : lane - buffer.group * width;
+            sanitizer_.check_buffer_lanes_valid(cycle_, write.index, buffer.valid, at, 1, "RF drain");
+            writeback.values[lane] = buffer.words[at];
         }
-        if (!uniform) writeback.lane_enables = assembly.lanes;
+        if (!uniform) writeback.lane_enables = buffer.lanes;
         writeback.reason = opcode_name(command.instruction.opcode);
-        const bool group_done = assembly.beats + 1 == assembly.beats_total;
-        const uint32_t lanes_done = uniform ? 1 : static_cast<uint32_t>(std::popcount(assembly.lanes));
-        if (group_done && command.chunks_done + lanes_done == command.requests_total) {
+        const bool group_done = buffer.beats + 1 == buffer.beats_total;
+        const uint32_t lanes_done = uniform ? 1 : static_cast<uint32_t>(std::popcount(buffer.lanes));
+        if (group_done && command.lanes_written + lanes_done == command.requests_total) {
             // The command's last write: rD..rD+7 count as in flight until it lands.
             const uint32_t registers = vector ? 8 : 1;
             for (uint32_t j = 0; j < registers; ++j) writeback.visible_regs.push_back(static_cast<uint8_t>(command.reg + j));
@@ -214,7 +204,7 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         }
         // The bytes written: the group's enabled lanes (every lane for ldg.uni).
         probe(LsuEdge::rf_write_beat, command.id, write.reg,
-            static_cast<uint32_t>(std::popcount(assembly.lanes)) * 4);
+            static_cast<uint32_t>(std::popcount(buffer.lanes)) * 4);
         return writeback;
     }
     case AsyncWriter::acc_ld: {
@@ -232,19 +222,18 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
     throw SimError("internal unknown async RF writer");
 }
 
-// (T) Ready holders not written this cycle, including assembly registers the
-// LSU's output mux did not present.
+// (T) Ready holders not written this cycle.
 void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
     for (std::size_t holder = 0; holder < decision.holders.size(); ++holder) {
         const auto& write = decision.holders[holder];
-        if (!write.has_value() || write->writer == AsyncWriter::assembly || decision.granted[holder] != 0) continue;
+        if (!write.has_value() || write->writer == AsyncWriter::lsu_buffer || decision.granted[holder] != 0) continue;
         trace_->rf_async_wait();
     }
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        if (!assembly_rf_write(index).has_value() || decision.granted_to(AsyncWriter::assembly, index)) continue;
+    for (uint32_t index = 0; index < lsu_buffers_.size(); ++index) {
+        if (!lsu_buffer_rf_write(index).has_value() || decision.granted_to(AsyncWriter::lsu_buffer, index)) continue;
         trace_->rf_async_wait();
         ++trace_->lsu_counters().lsu_rf_write_wait_cycles;
-        ++lsu_phases_[*staging_.at(index).cur().owner].rf_wait;
+        ++lsu_phases_[*lsu_buffers_.at(index).cur().owner].rf_wait;
     }
 }
 
@@ -274,7 +263,7 @@ void Machine::rf_write_port(Wires& w) {
     uint32_t lsu_writes = 0;
     for (std::size_t holder = 0; holder < decision.holders.size(); ++holder) {
         if (decision.granted[holder] == 0) continue;
-        if (decision.holders[holder]->writer == AsyncWriter::assembly && ++lsu_writes > 1) {
+        if (decision.holders[holder]->writer == AsyncWriter::lsu_buffer && ++lsu_writes > 1) {
             throw SimError("internal: more than one LSU RF write at cycle " + std::to_string(cycle_));
         }
         auto writeback = async_writeback(*decision.holders[holder]);
@@ -319,9 +308,8 @@ void Machine::land_rf_writes(const Wires& w) {
     }
 }
 
-// The async RF readers' decision (trash/rfc10.md section 3, "RF reads: the
-// same rule, mirrored"; trash/rfc14.md section 5), per RF bank, from Q
-// before issue:
+// The async RF readers' decision (the write decision's rule, mirrored), per
+// RF bank, from Q before issue:
 //   read_ready   = an async reader wants the bank now
 //   read_grant   = read_ready AND the issue register's round leaves one of
 //                  the bank's read ports free (simt_read_now: its bank use)
@@ -331,8 +319,8 @@ void Machine::land_rf_writes(const Wires& w) {
 // next cycle: the hole the denied reader is owed. Reads already accepted are
 // never stopped. The readers granted (round-robin from the bank's cursor)
 // sample the RF now: an acc.st beat is at the RF output Lr later and at the
-// tmem RAM tmem.port_depth after that; the LSU's beat fills its assembly
-// register Lr later. A denied
+// tmem RAM tmem.port_depth after that; the LSU's beat fills the store
+// buffer Lr later. A denied
 // reader holds (an acc.st keeps its beat, the LSU its candidate; a source
 // stays read-owned). The owed bit and cursor change in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
@@ -387,7 +375,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             if (read->last_group) sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::stg_v8);
             probe(LsuEdge::rf_read_beat, read->lsu_command, read->reg, config_.lanes * 4);
             w.lsu_rf_read.command = read->lsu_command;
-            w.lsu_rf_read.assembly = read->assembly;
+            w.lsu_rf_read.buffer = read->buffer;
             w.lsu_rf_read.group = read->group;
             w.lsu_rf_read.beat = read->beat;
             w.lsu_rf_read.lanes = read->lanes;
@@ -398,7 +386,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     return decision;
 }
 
-// The RF read stage (src/rf.hpp): the round of the instruction in the issue
+// The RF read stage (src/timing.hpp): the round of the instruction in the issue
 // register (accepted last cycle) samples the RF now -- before this cycle's
 // writes land at its edge (READ_FIRST). An arithmetic instruction whose
 // operands are all at the RF output now (issue + issue_to_operands)
@@ -472,7 +460,7 @@ void Machine::step_rf_reads(Wires& w) {
             w.urf_sample = std::move(values);
         }
     }
-    // The round counter's round now (src/rf.hpp uniform_read_rounds): its
+    // The round counter's round now (src/timing.hpp uniform_read_rounds): its
     // registers by operand position, in the counter's warp. A tma's pair and
     // its tag enter the TMA operand read's URF read stages; an mma.async's
     // later round (round 0 is its dispatch entry's own sample, above) joins
@@ -481,7 +469,7 @@ void Machine::step_rf_reads(Wires& w) {
         const auto& inst = rounds->header.instruction;
         const auto plan = uniform_read_rounds(inst);
         const auto& registers = plan.at(rounds->round);
-        if (is_tma(inst.opcode)) {
+        if (is_tma_opcode(inst.opcode)) {
             TmaReadPair pair;
             pair.round = rounds->round;
             pair.last = rounds->round + 1 == plan.size();
@@ -523,7 +511,7 @@ void Machine::step_rf_reads(Wires& w) {
     }
 }
 
-// The RF write decision's state, per bank (trash/rfc10.md section 3):
+// The RF write decision's state, per bank:
 //   async_owed_next = simt_booked_this_cycle OR (async_owed AND NOT async_grant)
 // (a successful SIMT booking sets it, an actual async grant clears it, set
 // wins); the cursor moves past the holder granted last, only on a grant.
@@ -539,8 +527,7 @@ void Machine::drive_rf_write_policy(const Wires& w) {
     rf_write_policy_.set_next(std::move(next), "drive_rf_write_policy");
 }
 
-// The RF read decision's state, per bank (trash/rfc10.md section 3,
-// mirrored; trash/rfc14.md section 5):
+// The RF read decision's state, per bank (the write decision's, mirrored):
 //   read_owed_next = simt_accepted_using_bank OR (read_owed AND NOT read_grant)
 // (an accepted instruction whose round uses the bank sets it, an actual async
 // read grant clears it, set wins); the cursor moves past the reader granted

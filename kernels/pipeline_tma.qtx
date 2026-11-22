@@ -1,7 +1,7 @@
 ; Double-buffered vector add with a TMA producer and a SIMT consumer.
 ; Two descriptor arguments (A, B: dense one-dimensional tensors, a
 ; 16-element tile); each stage's buffer and full barrier are tma.load.1d
-; operands (src/tma.hpp). The coordinate advances by one tile. Barriers,
+; operands (src/tma_descriptor.hpp). The coordinate advances by one tile. Barriers,
 ; parities, buffers and the coordinate are uniform registers, and so is each
 ; role's loop counter (%left, tested with usetp).
 

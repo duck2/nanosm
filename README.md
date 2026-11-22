@@ -61,7 +61,7 @@ also call `write_image(path)` to produce a self-contained `.launch.json` replay 
 truth.
 
 **Registers.** In qtx a register is a name, `%x`. It exists from its first use and qtxc picks its
-number (src/qtxc/registers.cpp; trash/qtxc-registers-2026-11-21.md). The instruction decides the
+number (src/qtxc/registers.cpp). The instruction decides the
 file: an operand position takes a vector register (sixteen lanes) or a uniform one (one value per
 warp), and a name used as both is refused (`ur2r` and `r2ur` carry a value from one file to the
 other). Predicates are `p0`..`p6` and a mask is `@p0`; a predicate may have a name too: `%odd` in a
@@ -114,7 +114,7 @@ bank: `tests/test_support.hpp` renames them on the way in (`r5` becomes `%r5`, a
 which keeps its number).
 
 **Memory.** A kernel names its own memory and qtxc places it (src/qtxc/objects.cpp,
-expressions.cpp; trash/qtxc-memory-2026-11-21.md). Names are bare (`%` is for registers):
+expressions.cpp). Names are bare (`%` is for registers):
 
 ```
 .shmem QBUF[2],   rows=32, cols=64, elem=2        ; a tile: rows back to back, a row is cols x elem bytes
@@ -179,8 +179,7 @@ and the tensor core's, both keyed by the address), and nothing ties a tile to a 
 
 **Launch.** A qtx file is self-contained: it declares everything a launch needs to know beside its
 code, and the host knows only the kernel's signature. (v0.1, a first working version: the copy and
-the flags below are expected to change; trash/launch-timed-2026-11-21.md and
-trash/launch-fixes-umov-2026-11-21.md.)
+the flags below are expected to change.)
 
 ```
 .warps  6                          ; how many warps the kernel is written for (optional)
@@ -250,7 +249,7 @@ trash/launch-fixes-umov-2026-11-21.md.)
 - **There is no untimed way in.** The launch block reaches shared memory only by the copy
   (`core.launch_flags` 0 is refused: a kernel with sections needs a flag to wait on). The kernel's
   code is the one thing still in place before the first cycle without being timed (the instruction
-  memory is loaded by the launch; HUMAN 2026-11-21: "can be skipped for now").
+  memory is loaded by the launch).
 - **Float constants need no memory.** `umov urD, imm` takes any 32-bit word, so a constant is one
   instruction (`umov %bits, 0.180336878`, then `ur2r %scale, %bits` if every lane needs it). `.data` is for
   tables.
@@ -291,8 +290,8 @@ two distinct sources in one bank -- is malformed: qtxas and kernel load reject i
 registers named. qtxc never writes one: it picks the numbers, and inserts a copy where none fit
 (Registers, above).
 
-Each warp also has a uniform register file (the profile's `urf` section; trash/rfc16.md and
-trash/urf-slice-2026-11-08.md): `urf.registers` 32-bit registers (32 in the canonical profile,
+Each warp also has a uniform register file (the profile's `urf` section): `urf.registers`
+32-bit registers (32 in the canonical profile,
 `ur0`..`ur31`), two read ports, one write port. `umov urD, imm` holds a whole 32-bit word (its
 payload is the register in 6 bits and the word in 32; every other immediate is 22 bits signed): an
 integer from -2^31 to 2^32 - 1, or a float literal (`1.5`, `1e-3`, `-inf`, `nan`), taken as its
@@ -303,7 +302,7 @@ arithmetic (`umov`, `uadd`, `uaddi`,
 the URF write port the same fixed `urf.issue_to_port_cycles` after issue, so one issue per cycle is
 one URF write per cycle: no calendar. `ur2r rD, urS` copies a uniform register into every lane of a
 vector register. The uniform compare `usetp.{eq,ne,lt,le,gt,ge}.{u32,s32} pD, urA, urB | imm`
-(trash/uniform-compare-2026-11-18.md) runs on the same uniform ALU with `setp`'s comparisons
+ runs on the same uniform ALU with `setp`'s comparisons
 and, at that same fixed cycle, writes predicate `pD` with one value in every lane;
 a `bra.uni` on it may issue `urf.issue_to_port_cycles` (3) later, so a loop can count in a uniform
 register with no vector register at all. An instruction reads its uniform registers (at most two) in
@@ -323,7 +322,7 @@ registers), and `@p0 bra.uni label`. The type is required, as in PTX: `.u32` com
 the signed 22-bit field sign-extended in both. A
 `bra.uni` predicate must agree across every lane in its warp or the simulator PANICs.
 
-Divergence is pre-Volta (trash/divergence-2026-11-21.md): one warp, one pc, a per-warp active mask
+Divergence is pre-Volta: one warp, one pc, a per-warp active mask
 and a divergence stack (`core.divergence_stack_entries`, 8; 0 means none, and qtxc, the assembler
 and kernel load then refuse the three forms below). The kernel author writes them; qtxc infers
 nothing. Every stack entry is a (mask, pc) pair. `ssy L` pushes (the active mask, L); L may be
@@ -344,8 +343,7 @@ the sanitizer's PANIC too; stack overflow and a `sync` on an empty stack are the
 `kernels/diverge.launch.py` counts Collatz steps per lane.
 
 Masked instructions: `@p` / `@!p` on a per-lane instruction. The operation runs as usual and
-its result is written with a mask (the note that built this, trash/guards-2026-11-21.md, uses
-an older word for it). The per-lane instructions are exactly the writers above: every fixed
+its result is written with a mask. The per-lane instructions are exactly the writers above: every fixed
 arithmetic instruction (ALU, FPU, the SFU, `cvt.pack`, `mov`, `sread`, `ur2r`, `setp`) and
 `lds`, `sts`, `ldg`, `stg`, `ldg.v8`, `stg.v8`. The instruction's write mask is its predicate's lanes (inverted for
 `@!p`); the lanes it writes are the active mask AND its write mask. The write mask is
@@ -378,7 +376,7 @@ instruction-memory read of one packet per cycle (a fixed one-cycle read), round-
 with room. A branch into a packet's second half starts there.
 A branch resolves one cycle after it issues -- a conditional `bra.uni` reads its predicate then --
 and nothing after it issues before that: a not-taken branch continues with the words already
-fetched, a taken one clears its warp's FIFO and fetches the target (`src/rf.hpp` has the cycles).
+fetched, a taken one clears its warp's FIFO and fetches the target (`src/timing.hpp` has the cycles).
 A divergent `bra` and a `sync` resolve there too (a `sync` reads a registered copy of the stack's
 top); a `sync` whose popped pc is the instruction after it continues like a not-taken branch (one
 address compare), any other popped pc redirects like a taken one. An `ssy` pushes there without
@@ -402,7 +400,7 @@ select the maximum nonzero term's raw exponent (operand exponent sums for produc
 to a quantum of `2^(maximum - 25)` with magnitude truncation, sum signed integer units, and
 normalize/truncate once to FP32. Subnormal operands are preserved; exact zero and underflowed
 zero become +0, generated NaNs are `0x7fffffff`, and overflow produces signed infinity.
-Only FP32 survives between steps. The canonical core is 4x4x8 (trash/rfc11.md section 0): each
+Only FP32 survives between steps. The canonical core is 4x4x8: each
 step fuses eight products and C, which with K = 8 is one group per command, not the whole MMA
 instruction across commands. The walker holds one 4x8 A block and streams the 8x4 B blocks across
 N, reading each A block once per command; port B's reads have port A's depth and read latency.
@@ -418,7 +416,7 @@ enough to hide the accumulator latency: (m / core_m) x (n / core_n) >= port-A de
 latency + MMA result latency + tmem port depth (14 on the canonical profile). A kernel using a
 shape the profile lacks is refused by qtxc, the assembler and kernel load.
 
-An accumulator is not a declared object (2026-11-19, trash/acc-pointer-2026-11-19.md): it is a
+An accumulator is not a declared object: it is a
 pointer into tmem, a word address in a uniform register. `mma.async.m32n64k8 [urC], [urA, 128],
 [urB, 128]` writes (or adds to) m rows of n words at urC; `acc.ld.v8 rD, [urT, S]` reads, in lane
 l, row l of the region at urT whose rows are S words (eight columns into rD .. rD + 7), and
@@ -464,17 +462,17 @@ only on its unshuffled address and the spacing: every reader and writer agrees w
 a tile starts, and one row loaded on its own lands exactly where a load of the whole tile puts it.
 On 16 banks any 4 neighbouring rows' tensor-core block, a TMA sector, a 16-lane column store over
 any 16 neighbouring rows and a transposed TMA sector are one bank round each, whatever row they
-start at (trash/address_keyed_census.py; on a 4x4x4 core a step that reloads A reads A's and B's
+start at (on a 4x4x4 core a step that reloads A reads A's and B's
 half-pieces together, and whether they share a round depends on the two tiles' row numbers mod
 16). Future swizzles
 belong here as profile choices for different physical core/bank arrangements, with matching TMA
 placement and SIMT address generation. This does not imply hardware that switches between swizzles
 per instruction.
 
-**This is v0.1 of the layout and of the tensor core's operand interface.** It replaced a sliced
-layout (`xor64`, rows cut into 16-byte pieces stored K slices apart) on 2026-11-18, because rows
-that are scattered cannot take gathered rows or small pieces. A model or a person reading it who
-sees a design flaw should say so (trash/chan.txt) rather than build on it.
+**This is v0.1 of the layout and of the tensor core's operand interface.** Rows stay whole
+because a layout that cuts rows into 16-byte pieces stored K slices apart scatters each row, and
+scattered rows cannot take gathered rows or small pieces. A model or a person reading it who
+sees a design flaw should say so rather than build on it.
 
 The arithmetic is adapted from [SF Tensor's tcgen05 model](https://github.com/sf-tensor/tcgen05)
 at commit `d96b82180ac9041c09295f3a6a3c2c4e592ddce6`; attribution is in
@@ -483,8 +481,8 @@ rules, not B200's fusion extent, and does not claim whole-instruction B200 equiv
 Tests include frozen B200 FP16 vectors, an upstream-derived 20,000-case regression digest,
 all FP16 encodings, and physical fusion-boundary checks. FA separately checks a logical
 eight-product-group reference (the same arithmetic, so it checks the flow, not the numerics) and
-double-precision attention. Older profiles must name the new model and regenerate
-their fingerprinted artifacts; serial scalar-FMA MMA arithmetic is no longer supported.
+double-precision attention. A profile names this model, and its fingerprint covers it; serial
+scalar-FMA MMA arithmetic is not supported.
 
 A `.launch.json` file is the complete cycle-0 input: profile-stamped kernel words, register count,
 what the kernel declares (`warps`, its `sections` in order, its launch `flags`), the launch's
@@ -502,7 +500,7 @@ of a global load or store is its own 32-byte sector request, in lane order.
 
 - `ldg rD, [rA + imm]` / `stg [rA + imm], rS`: each active lane names one word (4-byte aligned);
   a load keeps that word of its sector and drops the rest, a store writes it with byte enables.
-- `ldg.v8 rD, [rA + imm]` / `stg.v8 [rA + imm], rS` (per lane since 2026-11-21): each active lane
+- `ldg.v8 rD, [rA + imm]` / `stg.v8 [rA + imm], rS` (per lane): each active lane
   names one whole sector at its own address (32-byte aligned; the machine PANICs otherwise; on a
   profile whose sectors are not 32 bytes qtxc, the assembler and kernel load refuse both) and
   the sector's eight words are `rD .. rD+7` (`rS .. rS+7`) at that lane. A contiguous 512-byte
@@ -538,10 +536,10 @@ was idle anyway count); the summary's `gmem bus:` line counts the changes of dir
 ticks waited. This is the replaceable timing policy in front of the eventual bank/row scheduler,
 not a fixed-latency whole-load shortcut.
 
-**The TMA interface below is v0.1: a good start.** It grew out of trash/rfc17.md and has been
-built on in two FlashAttention kernels and a gather experiment, but its instruction form, operand
+**The TMA interface below is v0.1: a good start.** It has been
+built on in two FlashAttention kernels, but its instruction form, operand
 read and descriptor fields are still open to change. A model or a person reading it who sees a
-design flaw should say so (trash/chan.txt).
+design flaw should say so.
 
 The TMA moves tiles through that same controller and through contended shmem port A. A 64-byte
 descriptor in shmem describes one tensor and its tile: the global base, the element size (1, 2 or
@@ -552,7 +550,7 @@ layout: `dense` (row after row) or `swizzle64` (the rules above), and for swizzl
 transposed (not transposed: the tile's rows are the stored rows; transposed: dimension 0's
 positions are the stored rows and the tile's row index runs along them). The
 descriptor says nothing about who reads the tile: a kernel that feeds the tensor core chooses the
-profile's `mma.layout`, any other kernel whatever layout suits it (`src/tma.hpp` has the byte
+profile's `mma.layout`, any other kernel whatever layout suits it (`src/tma_descriptor.hpp` has the byte
 layout). The instruction says which tile, where it lands and who to tell:
 `tma.load.Nd [urS], [DESC, urC], [urM]` and `tma.store.Nd [DESC, urC], [urS], [urM]`, N = 1..4:
 the buffer's shared address in urS (64-byte aligned), the tile's signed coordinates c0..c(N-1) in

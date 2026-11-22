@@ -55,7 +55,7 @@ struct Launch {
     std::vector<ImageSegment> gmem_image;
     // Barriers the shmem image initializes by hand (byte addresses,
     // 8-aligned). Declared, not detected: the sanitizer treats them as LIVE
-    // from launch (C10, trash/rfc12.md section 11), like a SIMT mbar.init's
+    // from launch, like a SIMT mbar.init's
     // and like a kernel's `.mbar`. Optional in the launch formats.
     std::vector<uint32_t> mbars;
     // Last, so that tests written as Launch{warps, shmem, gmem, mbars} stand.

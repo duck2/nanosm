@@ -4,26 +4,16 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
 
 // ===========================================================================
-// shmem (trash/rfc12.md sections 1-5, rfc11 section 0). Four services, each
-// granting at most one bank round per core cycle:
+// shmem. Four services, each granting at most one bank round per core cycle:
 //   A-read   SIMT lds / lds.uni (load slots), mbar probes, RMW reads, TMA reads
 //   A-write  SIMT sts (store slots), RMW writes
 //   B-read   the MMA's operand fetch (step_mma)
@@ -37,45 +27,18 @@ namespace nanosm {
 // update then crosses the RMW engine's shmem.rmw_compute_cycles (C) ALU
 // stages before its write is granted. A read and a write of one word at the
 // RAM in one cycle: READ_FIRST (the write lands at the clock edge). The MMA's
-// port-B read pipeline lives in the MMA engine's register (advance_mma).
+// port-B read pipeline lives in the MMA engine's register (advance_mma,
+// src/machine/tensor_core.cpp); the RMW engine's own timeline is at the top of
+// src/machine/barriers.cpp, the TMA's rounds are src/machine/tma_ports.cpp.
 //
-// The RMW engine (rfc12 section 6): one operation at a time, each one
-// coherent 8-byte mbar RMW (both words in one read round, one write round)
-// or one uniform atomic (trash/rfc13.md: one 4-byte word, read and written
-// the same way). Its requester waits in a register (the SIMT RMW register,
-// the TMA's or the MMA's event register). One RMW, with D, Lb and C as above:
-//   s          START. A-write's alternation lets an RMW begin
-//              (select_a_write step 4) and the engine takes a requester
-//              (select_rmw_admission). The global store PAUSE -- the engine's
-//              operation register -- is set from s + 1: no new store
-//              transaction starts. A store transaction under way keeps its
-//              rounds.
-//   r >= s     READ, granted on A-read before any new requester, strictly
-//              after that store transaction's last round (r = s when no store
-//              and no A-read transaction is under way)
-//   r + D      the RAM sample
-//   r + D + Lb the words at the port output; the ALU computes the update (an
-//              atomic's old word also goes to its return load slot now)
-//   w = r + D + Lb + C
-//              WRITE (the final write) granted on A-write; the PAUSE ends at
-//              this cycle's edge
-//   w + 1      stores may start again: one granted now reaches the RAM at
-//              w + 1 + D, after the RMW's write (matched D, no drain)
-//   w + D      the write reaches the RAM; a phase flip wakes the waiters now
-// Reads are never paused: between r and w A-read serves loads, probes and
-// TMA reads, and a read of the mbar sampling at w + D sees the old word
-// (READ_FIRST). An atomic's old value waits in its return slot for the RF
-// write decision, so rD may be written before w; the warp's next shmem
-// access still waits for w (its unserviced write), fence.sh for w + D.
-//
-// fence.sh (rfc12 section 10) is admitted in the cycle its warp's last
+// fence.sh is admitted in the cycle its warp's last
 // earlier shmem access REACHES THE RAM (a store's write edge, a load's
 // sample: its round's grant + D), so the instruction after it issues once
 // that edge has passed. Its declared state is one count per warp
 // (shmem_to_ram_: cycles until the warp's latest granted round is at the
 // RAM); own_shmem_at_ram is the admission term. Whether an engine command
 // needed one is the sanitizer's question at the command's accept (missing
-// fence.sh / race, rfc12 section 11).
+// fence.sh / race).
 // ===========================================================================
 
 // shmem this cycle, in wire order:
@@ -125,7 +88,7 @@ void Machine::shmem_ram_stage(ShmemCycle& shmem) const {
 
 // What a write round carries to the RAM happens there: an sts's last round
 // clears its depbar; an RMW write that flipped the phase wakes the waiters
-// (rfc12 section 6: at the commit, never at the grant); a placement's last
+// (at the commit, never at the grant); a placement's last
 // round ends the TMA's load write (step_tma).
 void Machine::commit_shmem_writes(Wires& w) {
     if (const auto& beat = a_write_pipe_.cur().back(); beat.has_value()) {
@@ -180,7 +143,7 @@ void Machine::deliver_shmem_read(Wires& w) {
 
 // ---- The requesters, from Q ----
 
-// The global store PAUSE (rfc12 section 6) is a register: the RMW engine's
+// The global store PAUSE is a register: the RMW engine's
 // operation register, held from the RMW's start to its final write grant.
 // While it is set no new store transaction starts on A-write. It clears at
 // the edge of the final write grant w, so stores may start at w + 1 (matched
@@ -215,7 +178,7 @@ bool Machine::store_slot_waiting() const {
     });
 }
 
-// ---- The selects: one per shared resource (rfc12 sections 5 and 6) ----
+// ---- The selects: one per shared resource ----
 
 // A-write, in order:
 //   1. the RMW's write, when its update is in the ALU's last stage (Q):
@@ -416,7 +379,7 @@ void Machine::serve_a_write(Wires& w) {
         trace_->shmem_grant(cycle_, ShmemService::a_write, ShmemClient::rmw);
         if (is_atomic_operation(request.operation)) {
             trace_->atomic_rmw_end(cycle_ + 1);
-            // C10 (sanitizer): an ordinary atomic may not write a live mbar --
+            // The sanitizer's live-mbar check: an ordinary atomic may not write a live mbar --
             // using the RMW engine does not authorize it.
             sanitizer_.check_live_mbar_write(cycle_, format_instruction(request.instruction, false) + " (warp " +
                 std::to_string(*request.warp) + " pc " + std::to_string(request.pc) + ")",
@@ -446,7 +409,7 @@ Machine::WriteBeat Machine::store_round(uint32_t index) {
             "warp=" + std::to_string(slot.warp) + ", rounds=" + std::to_string(rounds), TraceCategory::shmem);
     }
     trace_->shmem_grant(cycle_, ShmemService::a_write, ShmemClient::simt, index);
-    // (The sanitizer also checks C10 here: the round must not write a live mbar.)
+    // (The sanitizer checks here too that the round does not write a live mbar.)
     sanitizer_.record_simt_shmem_grant(cycle_, SimtShmemHolder::store_slot, index, cycle_ + config_.shmem_port_a_depth);
     WriteBeat beat;
     for (const auto& access : slot.access.rounds[round]) {
@@ -480,7 +443,7 @@ void Machine::serve_b_write(Wires& w) {
 }
 
 // ---- What issue sees of shmem (look-ahead (c), reuse (d)): the service
-// slots and the warp's own order (rfc12 sections 3, 4 and 6) ----
+// slots and the warp's own order ----
 
 // Dispatch's slot: an empty one, or one whose RF write is granted now (d).
 std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
@@ -493,8 +456,8 @@ std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
 
 // Issue's count: the slots empty in Q only. A slot whose RF write is granted
 // at t counts from t + 1 (the slot register's next value); this cycle's grant
-// does not reach the warp selection (trash/issue-depth-2026-11-20/findings.md:
-// RF winner -> slot space -> winning warp was the longest issue path).
+// does not reach the warp selection (RF winner -> slot space -> winning warp
+// would be the longest path through issue).
 uint32_t Machine::free_load_slot_count() const {
     uint32_t count = 0;
     for (uint32_t index = 0; index < load_slots_.size(); ++index) {
@@ -521,7 +484,7 @@ uint32_t Machine::free_store_slot_count(const Wires& w) const {
 
 // The warp's instructions still in the dispatch pipeline (Q): accesses it
 // has issued that have no slot yet. They count as unserviced from their
-// issue (rfc12 section 3: a reserved slot is unserviced immediately).
+// issue (a reserved slot is unserviced immediately).
 bool Machine::warp_dispatching(uint32_t warp, bool reads, bool writes, bool probes) const {
     for (const auto& op : dispatch_pipe_.cur()) {
         if (op.warp != warp) continue;
@@ -559,7 +522,7 @@ bool Machine::warp_unserviced_read(const Wires& w, uint32_t warp) const {
 
 // An unserviced write: the warp holds a store slot, or its SIMT RMW waits in
 // the SIMT RMW register or runs in the engine with its final write not
-// granted by the end of this cycle (rfc12 section 6: a SIMT RMW counts as
+// granted by the end of this cycle (a SIMT RMW counts as
 // unserviced until its FINAL write grant).
 bool Machine::warp_unserviced_write(const Wires& w, uint32_t warp) const {
     if (warp_dispatching(warp, false, true, false)) return true;
@@ -572,7 +535,7 @@ bool Machine::warp_unserviced_write(const Wires& w, uint32_t warp) const {
     return active.has_value() && active->request.warp == warp && w.shmem.a_write.user != AWriteUser::rmw;
 }
 
-// fence.sh (rfc12 section 10): every earlier shmem access of the warp has
+// fence.sh: every earlier shmem access of the warp has
 // REACHED THE RAM by now (stores written, loads sampled) -- none unserviced
 // after this cycle's grants (in the dispatch pipeline or in a slot), none
 // granted now (that round reaches the RAM D cycles from now), and the latest
@@ -585,13 +548,13 @@ bool Machine::own_shmem_at_ram(const Wires& w, uint32_t warp) const {
     return shmem_to_ram_.cur().at(warp) == 0;
 }
 
-// lds / lds.uni (trash/rfc10.md section 2, rfc12 section 3): the address
+// lds / lds.uni: the address
 // arrives now and the bank rounds come from it (active lanes only). The load
 // takes the load slot admission secured; A-read serves it from the next
 // cycle; its gathered vector waits in the slot for the RF write decision. No
 // RF booking: the depbar completes it. lds.uni ignores the mask (its base is
 // a uniform register; the mask gates only its RF write's lanes): a partial
-// mask is the sanitizer's PANIC (backlog D12, in uniform_operand).
+// mask is the sanitizer's PANIC (in uniform_operand).
 void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool uniform = inst.opcode == Opcode::lds_uni;
@@ -611,10 +574,10 @@ void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     w.dispatch.load_slot = std::make_pair(index, std::move(slot));
 }
 
-// sts (rfc12 section 3): address and data arrive now (its RF reads were
+// sts: address and data arrive now (its RF reads were
 // booked with the issue) into the store slot admission secured; A-write
 // serves it from the next cycle. Two lanes on one word is UB (the
-// sanitizer's PANIC, backlog D12); the machine just writes both, in round
+// sanitizer's PANIC); the machine just writes both, in round
 // order, so the highest active lane's word lands.
 void Machine::dispatch_shared_store(const DispatchEntry& op, Wires& w) {
     auto rounds = build_shmem_rounds(op, false);
@@ -657,13 +620,6 @@ void Machine::drive_load_slots(const Wires& w) {
     }
 }
 
-// GCC's -Wmaybe-uninitialized misreads the std::optional moved at the end of this function when
-// it is compiled in this file (it did not in the one file the function came from). Nothing here
-// is read uninitialized: a granted slot holds a store.
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
 // Each store slot: A-write grants its next round, and its last grant frees
 // it -- for a dispatch in this same cycle (d).
 void Machine::drive_store_slots(const Wires& w) {
@@ -673,6 +629,7 @@ void Machine::drive_store_slots(const Wires& w) {
         if (!granted && !admitted) continue;
         auto next = store_slots_[index].cur();
         if (granted) {
+            if (!next.has_value()) throw SimError("internal shmem round for an empty store slot");
             ++next->access.granted;
             if (next->access.serviced()) next.reset();
         }
@@ -683,9 +640,6 @@ void Machine::drive_store_slots(const Wires& w) {
         store_slots_[index].set_next(std::move(next), "drive_store_slots");
     }
 }
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 // The read pipeline moves one stage: the round granted now enters stage 0,
 // the round sampled now carries its words into stage D, the round at the
@@ -740,15 +694,15 @@ void Machine::drive_shmem_to_ram(const Wires& w) {
 }
 
 // ---------------------------------------------------------------------------
-// SIMT shmem bank rounds (rfc09 pin 3: uniformity is declared, never
+// SIMT shmem bank rounds (uniformity is declared, never
 // detected). Every ACTIVE lane of an lds/sts is one access to bank
 // (byte_address / 4) % shmem_banks, even when lanes name the same word; an
-// inactive lane is no access at all (rfc12 section 3). Round r serves, in
+// inactive lane is no access at all. Round r serves, in
 // every bank, that bank's r-th active lane in ascending lane order, so rounds
 // = the most active lanes on any one bank. lds.uni is the declared broadcast.
 // An sts with two lanes on one word (UB: the sanitizer's PANIC) writes both,
 // in round order, so the higher lane's word lands last; one over a live mbar
-// (UB: the sanitizer's C10) simply writes it.
+// (UB: the sanitizer's live-mbar check) simply writes it.
 // ---------------------------------------------------------------------------
 
 std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(const DispatchEntry& op, bool load) const {

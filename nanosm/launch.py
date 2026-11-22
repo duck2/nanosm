@@ -54,7 +54,7 @@ def tma_desc(
     layout: str = "dense",
     transposed: bool = False,
 ) -> bytes:
-    """A TMA descriptor (src/tma.hpp), the argument for a `.param desc`.
+    """A TMA descriptor (src/tma_descriptor.hpp), the argument for a `.param desc`.
 
     One tensor, its tile size and layout, as its 64 bytes.
     dimensions: d0 .. d3 in elements, dimension 0 the contiguous one (one

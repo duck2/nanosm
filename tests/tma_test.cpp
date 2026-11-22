@@ -1,9 +1,8 @@
 // The TMA's commands: the direction, swizzle64 placement and its census
 // against the MMA's operand addressing, the limits of swizzle64 tiles, the
-// rows-stay-whole smoke tests (trash/whole-rows-2026-11-18.md),
-// out-of-bounds handling; and the profile stamp and the DRAM clock. Moved
-// from the original tests/tests.cpp (trash/test-setup-2026-10-22.md). The
-// descriptor (64 bytes in shared memory, src/tma.hpp) holds the global
+// rows-stay-whole smoke tests,
+// out-of-bounds handling; and the profile stamp and the DRAM clock. The
+// descriptor (64 bytes in shared memory, src/tma_descriptor.hpp) holds the global
 // tensor, the tile's shape and its shared-memory layout (dense, or swizzle64
 // and whether it is transposed; the rules are src/layout.hpp's, which the MMA
 // reads its operands with). The
@@ -220,7 +219,7 @@ void test_tma_swizzle64_feeds_mma_orientations() {
         for (const uint32_t mbar : {512u, 520u, 528u, 536u}) write_u64(shmem, mbar, nanosm::encode_mbar_state(ready));
         nanosm::MbarState commit{false, true, 1, 1, 0};
         write_u64(shmem, 544, nanosm::encode_mbar_state(commit));
-        // Chunk 1's coordinates per rfc07's table: A's K advances along
+        // Chunk 1's coordinates: A's K advances along
         // dimension 0 in both orientations, (8, 0); B's along dimension 0
         // under QK^T, (8, 0), but along dimension 1 under PV, (0, 8).
         const std::string chunk1_b = pv
@@ -299,7 +298,7 @@ void test_tma_swizzle64_feeds_mma_orientations() {
     }
 }
 
-// The census (trash/tma_generalize_proto.py check 3, for whole rows): for
+// The census, for whole rows: for
 // stored-row counts R (4 .. 128) and fp16 K extents 8, 16, 32, 64 (rows of
 // 16, 32, 64, 128 bytes), a TMA load of a swizzle64 R x K tile writes exactly
 // what an MMA with m = R (as A) or n = R (as B), k = K and row spacing 2K
@@ -526,7 +525,7 @@ std::string tile_piece_loads(uint32_t commands, uint32_t tile, uint32_t mbar, co
 // fp16, 128-byte stored rows, not transposed (the pieces step along the
 // global rows) and transposed (they step along dimension 0, whose positions
 // are the stored rows). The tile is at 0x4080, so its row 0 is row 1 of the
-// shuffle (Astra's control, trash/chan.txt "one-row gather control"): its
+// shuffle (the one-row gather case): its
 // first logical byte is stored at 0x4090 and its logical byte 16 at 0x4080,
 // which a reader or writer still counting rows from the tile would miss.
 void test_tma_swizzle64_pieces_land_anywhere() {
@@ -639,7 +638,7 @@ void test_tma_swizzle64_sector_economics() {
 }
 
 // The layout function (src/layout.hpp) against the rule written out
-// (reference_swizzle64; trash/address_keyed_census.py) for spacings 16 ..
+// (reference_swizzle64) for spacings 16 ..
 // 512, at base 0 and at a legal base 17 x max(spacing, 64) that is not a
 // multiple of 16 rows: the same address for every byte, every row keeps
 // exactly its own bytes [base + row x spacing, base + (row + 1) x spacing),
@@ -843,7 +842,7 @@ void test_tma_fp32_swizzle64_store_and_load() {
         "fp32 swizzle64 TMA load did not write one port-A round per sector");
 }
 
-// ---- rows stay whole (trash/whole-rows-2026-11-18.md): smoke tests ----
+// ---- rows stay whole: smoke tests ----
 
 uint16_t whole_rows_fp16(uint32_t value) {
     static constexpr std::array<uint16_t, 5> bits{0x0000, 0x3c00, 0x4000, 0x4200, 0x4400}; // 0..4
@@ -1225,7 +1224,7 @@ void test_dram_uses_its_own_clock() {
 }
 
 // ---------------------------------------------------------------------------
-// The walker's runs (trash/tma-walker-cleanup-2026-11-20.md): one run, zero
+// The walker's runs: one run, zero
 // fill or skipped stretch per cycle, never past a row's end.
 
 const std::string tma_wait = "wait:\nmbar.try_wait p0, [ur3], 0\n@!p0 bra.uni wait\nhalt\n";
@@ -1477,8 +1476,8 @@ void test_tma_byte_tile_longest_run() {
     }
 }
 
-// The walker's start stages (tma.walker_start_cycles; trash/walker-followups-
-// 2026-11-20.md): the canonical profile declares 2, absent is 2, 0..8 are
+// The walker's start stages (tma.walker_start_cycles): the canonical
+// profile declares 2, absent is 2, 0..8 are
 // legal (0: no stages), anything else is refused, and the value is in the
 // fingerprint. A lone 2 x 16 fp32 load at (-4, 0) (zero fills and sectors)
 // makes its first placement exactly one cycle later per stage, with the same
@@ -1674,7 +1673,7 @@ TEST(Tma, tma_store_preserves_other_sector_bytes) {
     test_tma_store_preserves_other_sector_bytes();
 }
 
-// tma rank-2 strides, planes walked in software (was rank-3 strides)
+// tma rank-2 strides, planes walked in software
 TEST(Tma, tma_rank2_strides_planes_in_software) {
     test_tma_rank2_strides_planes_in_software();
 }

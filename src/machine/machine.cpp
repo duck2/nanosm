@@ -14,7 +14,7 @@
 //   dispatch.cpp       dispatch: the dispatch pipeline and its end, where each unit takes an issued instruction
 //                      (a unit's own dispatch_* function is in the unit's file), and a dispatch entry's operands.
 //   rf.cpp             the vector register file: the write calendar, the read and write port decisions, the
-//                      RAM stages, and writebacks. (Its timing rules are src/rf.hpp.)
+//                      RAM stages, and writebacks. (Its timing rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
 //   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit.
 //   shmem.cpp          shared memory: ports A and B, the selects, load and store slots, bank rounds, and what
@@ -35,21 +35,26 @@
 //   common.cpp         helpers shared by the units: float bit conversions, round-robin grants, the lane mask and
 //                      panics.
 //   reg.hpp            Reg<T>, the clocked register every unit's state is made of.
-//   internal.hpp       file-local helpers that more than one unit uses
+//   internal.hpp       small pure functions that more than one unit uses (setp's comparison, a sector's
+//                      bus beats). The opcode classes are src/isa.hpp's.
+//
+// What the machine shares with the toolchain (src/, beside src/qtxc/) and which unit it goes with:
+//   isa.hpp            the instruction set: opcodes, their classes, the instruction word. Every unit.
+//   profile.hpp        the device profile: every size and delay. Every unit.
+//   timing.hpp         every distance counted from an instruction's issue, and the read-port rule:
+//                      issue.cpp, dispatch.cpp, rf.cpp, urf.cpp, arith.cpp, branch.cpp, and the operand
+//                      reads of tma.cpp and tensor_core.cpp.
+//   layout.hpp         where a tile's bytes sit in shared memory and tmem: tma.cpp, tma_ports.cpp,
+//                      tensor_core.cpp.
+//   tma_descriptor.hpp the TMA descriptor, its encoding and a tile's addresses: tma.cpp, tma_ports.cpp.
+//   mbar.hpp           a barrier's eight bytes: barriers.cpp.
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -87,23 +92,16 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     }
     if (config_.tma_queue_commands == 0) {
         for (const auto word : kernel_.words) {
-            if (is_tma(decode(word).opcode)) {
+            if (is_tma_opcode(decode(word).opcode)) {
                 throw SimError("tma.load / tma.store are unsupported by this device profile");
             }
         }
     }
-    if (config_.core_divergence_stack_entries == 0) {
-        for (std::size_t index = 0; index < kernel_.words.size(); ++index) {
-            const auto inst = decode(kernel_.words[index]);
-            if (!uses_divergence_stack(inst)) continue;
-            throw SimError("kernel pc " + std::to_string(8 * index) + ": " +
-                (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
-                " needs the divergence stack, which this device profile does not have "
-                "(core.divergence_stack_entries = 0)");
-        }
-    }
+    // ssy, sync and a predicated bra need the divergence stack
+    // (core.divergence_stack_entries).
+    check_divergence_stacks(kernel_, config_);
     // Distinct sources beyond a bank's read ports are a property of the
-    // instruction (src/rf.hpp): refused here, at kernel load, in both builds.
+    // instruction (src/timing.hpp): refused here, at kernel load, in both builds.
     check_rf_read_rounds(kernel_, config_);
     // A write mask only on an instruction that can be masked (src/isa.hpp
     // can_be_masked).
@@ -175,10 +173,10 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         const uint32_t store_words = std::max(8 * config_.lsu_store_group_lanes, config_.lanes);
         for (const auto& [name, words] : {std::pair<const char*, uint32_t>{"LSU load buffer", load_words},
                                           std::pair<const char*, uint32_t>{"LSU store buffer", store_words}}) {
-            AssemblyRegister empty;
+            LsuBuffer empty;
             empty.words.assign(words, 0);
             empty.valid.assign(words, 0);
-            staging_.emplace_back(registers_, name, std::move(empty));
+            lsu_buffers_.emplace_back(registers_, name, std::move(empty));
         }
         free_id_tags_.poke(std::vector<uint8_t>(config_.lsu_sectors_in_flight, 0));
         TmaSectorRegister sector;
@@ -228,8 +226,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     apply_image(gmem_, launch.gmem_image, "gmem");
     // The mbars the launch declares (the kernel's `.mbar` sections, and a
     // test's own, initialized by hand in the shmem
-    // preload): live from launch for the sanitizer's C10 opacity,
-    // like a SIMT mbar.init's (rfc12 section 11). A declaration is metadata;
+    // preload): live from launch for the sanitizer's live-mbar check,
+    // like a SIMT mbar.init's. A declaration is metadata;
     // the machine only checks that it names an mbar slot.
     for (const auto address : launch.mbars) {
         if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_.size()) {
@@ -246,7 +244,7 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 }
 
 // ===========================================================================
-// One core cycle (trash/stepping-discipline-2026-10-08.md).
+// One core cycle.
 //
 // 1. WIRES. Every decision of the cycle is computed once, in the order below.
 //    A decision reads register Q values (cur()), memories, and the wires
@@ -254,7 +252,7 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //    select function grants, data flows downstream. No register's next value
 //    is visible here. Same-cycle visibility exists only where a wire carries
 //    it. The declared ones:
-//      (a) None through the RF, the URF or the predicate file (slice I6a, src/rf.hpp):
+//      (a) None through the RF, the URF or the predicate file (src/timing.hpp):
 //          a write lands at the clock edge of its RAM cycle, after every
 //          read of that cycle (READ_FIRST); no same-edge forwarding.
 //      (b) None from a completion to issue: a depbar clear, an mbar wait
@@ -263,18 +261,19 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //      (c) Issue looks ahead: an instruction accepted at t occupies its
 //          resources from t+1, so issue sees the space this cycle frees
 //          (queue entries, slots freed by this cycle's grants, the SIMT RMW
-//          register emptied by an RMW start, assembly registers) and the
-//          warp's shmem accesses as this cycle's grants leave them (rfc12
-//          section 4) -- less the space the dispatch pipeline's
+//          register emptied by an RMW start, the store buffer) and the
+//          warp's shmem accesses as this cycle's grants leave them -- less
+//          the space the dispatch pipeline's
 //          instructions will take (dispatch_claims). Not the load slots
 //          (an lds's or an atomic's return slot): issue counts the slots
 //          empty in Q, so a slot whose RF write is granted at t is free for
-//          a new admission from t + 1 (HUMAN 11-20, trash/slot-return-cut-
-//          2026-11-20.md). The RF write decision's fairness inhibit, the
-//          LSU command slot and assembly register its grant releases, and
+//          a new admission from t + 1 (RF winner -> slot space -> winning
+//          warp would be the longest path through issue). The RF write
+//          decision's fairness inhibit, the LSU command slot its grant
+//          releases, and
 //          the acc.ld engine its grant lets advance are still seen at t.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
-//          t (the assembly register, a load slot whose RF write is granted
+//          t (the load and store buffers, a load slot whose RF write is granted
 //          at t -- by dispatch, which issue admitted earlier against the
 //          slots' Q -- the TMA sector / store registers, the MMA event register,
 //          an LSU slot or acc slot reallocated by dispatch). The refill's
@@ -298,8 +297,8 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          admission, A-read). A SIMT access or RMW accepted at issue sits in
 //          its slot / register and is served from the next cycle. A new MMA
 //          fetch serves its first port-B round in the cycle it starts.
-//      (i) None from issue into fetch (HUMAN 10-18, trash/front-end-
-//          2026-10-18.md): the fetch decision reads registers only (the
+//      (i) None from issue into fetch: the fetch decision reads registers
+//          only (the
 //          FIFOs' valid words, the read in flight, halted, the issue
 //          register's branch). A slot an issue frees at t is seen by fetch
 //          at t + 1; a branch accepted at t blocks its warp's fetch from
@@ -337,8 +336,8 @@ void Machine::tick() {
     // contends for them (one writer per stage by construction).
     urf_ram_stage(w);
 
-    // The store path's last stage frees a TMA store register / a store
-    // assembly register for a refill this same cycle (d).
+    // The store path's last stage frees a TMA store register / the store
+    // buffer for a refill this same cycle (d).
     w.egress = decide_egress_write();
 
     // Request generation: independent of each other.
@@ -431,7 +430,7 @@ bool Machine::done() const {
     const auto drained = [](const auto& pipe) {
         return std::all_of(pipe.begin(), pipe.end(), [](const auto& stage) { return !stage.has_value(); });
     };
-    // rfc12 section 13: the slots in every state, the probe register, the RMW
+    // The slots in every state, the probe register, the RMW
     // engine (its SIMT RMW register, operation and ALU stages) and the
     // services' pipelines (a store whose slot is free may still be travelling
     // to its write edge).
@@ -484,7 +483,7 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
     if (parity > 1) throw SimError("invalid engine mbar parity");
     // A DMA complete_tx: it belongs in the TMA's event register. It changes the
     // mbar's current phase; `parity` (the phase the host means) is sanitizer
-    // metadata only (rfc12 section 8).
+    // metadata only.
     if (tma_mbar_event_.cur().has_value()) {
         throw SimError("TMA mbar event register is occupied; an engine holds one event at a time");
     }
@@ -516,10 +515,11 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 }
 
 // ===========================================================================
-// Register drivers. Each computes its register's next value from Q and the
+// Register drivers: the order they run in (each drive_* function is in its
+// unit's file). Each computes its register's next value from Q and the
 // wires, and writes it once (or not at all: hold). They read no other
 // register's D and no state another driver writes, so they run in any order;
-// set_driver_shuffle_seed() permutes them every cycle as a regression guard.
+// set_driver_shuffle_seed() permutes them every cycle as a regression check.
 // Simultaneous events combine in one calculation (a release and a
 // reallocation, a pop and a push, completions and an admission); the
 // one-write rule is never a reason to defer an event. Inside a calculation
@@ -556,7 +556,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_tma_store_registers,
         &Machine::drive_tma_operand_read,
         &Machine::drive_lsu_commands,
-        &Machine::drive_assembly_pool,
+        &Machine::drive_lsu_buffers,
         &Machine::drive_ingress,
         &Machine::drive_egress,
         &Machine::drive_read_records,

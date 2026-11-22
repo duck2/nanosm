@@ -11,8 +11,8 @@ signature: ptr A, ptr B, ptr C) and writes the inputs; nothing else.
 Checks every output bit-exactly against a Python fp32 reference, checks the
 guard bytes after C, pins the algorithmic traffic counters (3 x 32 KiB, zero
 waste), and reports achieved bytes per core cycle against the declared bus.
-The cycle count is reported, not pinned: gmem-phase cycles are placeholder-
-controller numbers until B4 (rfc09 section 4).
+The cycle count is reported, not pinned: the memory controller is a
+placeholder, so cycles spent in global memory are not final.
 """
 
 from __future__ import annotations

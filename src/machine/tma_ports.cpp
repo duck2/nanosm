@@ -4,19 +4,10 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
-#include <limits>
-#include <new>
-#include <set>
 #include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -194,7 +185,7 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
         bytes += size;
     }
     if (bytes > 4 * config_.shmem_banks) throw SimError("internal: a tma placement round writes more than its banks");
-    // C10 (sanitizer): a placement round must not write a live mbar.
+    // The sanitizer's live-mbar check: a placement round must not write a live mbar.
     std::vector<std::pair<uint32_t, uint32_t>> written;
     for (const auto& write : beat.writes) {
         written.emplace_back(write.address, write.address + static_cast<uint32_t>(write.bytes.size()));
@@ -221,8 +212,8 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
 // multiples of the element size (the descriptor's base is; the strides count
 // elements; the buffer is 64-byte aligned) and the shuffle moves whole words.
 //
-// A load's placement from the sector register has one more rule (HUMAN
-// 2026-11-18): in a round a bank takes its bytes from ONE 4-byte word of the
+// A load's placement from the sector register has one more rule: in a
+// round a bank takes its bytes from ONE 4-byte word of the
 // sector register, rotated by one byte amount, and writes them with byte
 // enables. That is all the wiring the path has per bank: a word select, a
 // four-way byte rotate, four byte enables. A shared word whose bytes come

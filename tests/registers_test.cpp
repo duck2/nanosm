@@ -94,7 +94,7 @@ void test_refusals() {
 
 // The bank rule is qtxc's business. One register in several slots is one
 // read; two groups read pairwise get different banks (a group has one choice,
-// its base: Neon's case); a value read beside registers of every bank gets a
+// its base); a value read beside registers of every bank gets a
 // copy just before the read, a warning, and the right answer.
 void test_banks_and_copies() {
     const auto& profile = canonical_profile();

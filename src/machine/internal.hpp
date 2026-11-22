@@ -1,6 +1,6 @@
-// File-local helpers of the machine's files: opcode classes and small pure functions that
-// more than one unit uses. Included by src/machine/*.cpp only; each file gets its own copy
-// (an anonymous namespace, as in the one file they came from).
+// Small pure functions that more than one of the machine's files uses. Included by
+// src/machine/*.cpp only; each file gets its own copy (an anonymous namespace). The opcode
+// classes are src/isa.hpp's.
 #pragma once
 
 #include "machine/machine.hpp"
@@ -12,37 +12,6 @@
 namespace nanosm {
 
 namespace {
-
-inline bool is_mbar_test_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_test_wait_i || opcode == Opcode::mbar_test_wait_r;
-}
-
-inline bool is_mbar_try_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_try_wait_i || opcode == Opcode::mbar_try_wait_r;
-}
-
-inline bool is_mbar_predicate_writer(Opcode opcode) {
-    return is_mbar_test_wait(opcode) || is_mbar_try_wait(opcode);
-}
-
-inline bool is_mbar_rmw(Opcode opcode) {
-    return opcode == Opcode::mbar_init_i || opcode == Opcode::mbar_init_r ||
-        opcode == Opcode::mbar_arrive ||
-        opcode == Opcode::mbar_arrive_expect_tx_i ||
-        opcode == Opcode::mbar_arrive_expect_tx_r;
-}
-
-inline bool is_tma(Opcode opcode) {
-    return is_tma_opcode(opcode);
-}
-
-inline bool is_shared_load(Opcode opcode) {
-    return opcode == Opcode::lds || opcode == Opcode::lds_uni;
-}
-
-inline bool is_acc_load(Opcode opcode) {
-    return opcode == Opcode::acc_ld || opcode == Opcode::acc_ld_v8;
-}
 
 // setp's and usetp's comparisons: unsigned 32-bit, the .s32 ones signed. An
 // immediate arrives sign-extended from its 22-bit field either way.

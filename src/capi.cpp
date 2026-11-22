@@ -5,7 +5,7 @@
 #include "mbar.hpp"
 #include "profile.hpp"
 #include "machine/machine.hpp"
-#include "tma.hpp"
+#include "tma_descriptor.hpp"
 
 #include <algorithm>
 #include <cstdlib>

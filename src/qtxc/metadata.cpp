@@ -3,7 +3,7 @@
 // which predicate it writes, the opcode groups the scheduler, the assembler
 // and the checks test for, and a program's register count. The uniform side
 // (uniform_sources, uniform_destination) is src/isa.hpp's, the timing of a
-// read or a write src/rf.hpp's. Nothing here parses, schedules or refuses.
+// read or a write src/timing.hpp's. Nothing here parses, schedules or refuses.
 
 #include "qtxc/internal.hpp"
 
@@ -18,7 +18,7 @@ bool is_branch(Opcode opcode) {
 }
 
 // Where control may go somewhere other than the next instruction: the
-// branches, and sync (trash/divergence-2026-11-21.md), whose implicit edge
+// branches, and sync, whose implicit edge
 // goes to the pc of the entry it pops: a divergent bra's target or an ssy's
 // label (the instruction after the sync when that is the pc). The
 // scheduler drains at each of them.
@@ -30,18 +30,6 @@ bool transfers_control(Opcode opcode) {
 // branches and ssy (its label).
 bool has_displacement(Opcode opcode) {
     return is_branch(opcode) || opcode == Opcode::ssy;
-}
-
-bool is_mbar_test_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_test_wait_i || opcode == Opcode::mbar_test_wait_r;
-}
-
-bool is_mbar_try_wait(Opcode opcode) {
-    return opcode == Opcode::mbar_try_wait_i || opcode == Opcode::mbar_try_wait_r;
-}
-
-bool is_mbar_predicate_writer(Opcode opcode) {
-    return is_mbar_test_wait(opcode) || is_mbar_try_wait(opcode);
 }
 
 // The VECTOR registers an instruction reads (its uniform registers:

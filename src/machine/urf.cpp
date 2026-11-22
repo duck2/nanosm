@@ -3,19 +3,9 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
 #include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -38,7 +28,7 @@ uint32_t Machine::uniform_at_next_sample(uint32_t warp, uint8_t reg) const {
 }
 
 // ===========================================================================
-// The URF write pipeline (src/rf.hpp, UrfWrite in src/machine/machine.hpp)
+// The URF write pipeline (src/timing.hpp, UrfWrite in src/machine/machine.hpp)
 // ===========================================================================
 
 // From Q: the write in stage L - 1 is presented at the URF write port now

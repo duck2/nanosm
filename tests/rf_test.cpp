@@ -1,6 +1,5 @@
-// The register file: one-round reads, the RF write decision (I1), read / write depth (I6a), the read side and 16 warps (I6b-1).
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// The register file: one-round reads, the RF write decision, read / write depth, the read side and 16 warps.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -19,12 +18,12 @@ void check_read_capacity(const nanosm::Machine& machine, const nanosm::DevicePro
     }
 }
 
-// One round (src/rf.hpp): the fadd's two sources (r0 in bank 0, r1 in bank
+// One round (src/timing.hpp): the fadd's two sources (r0 in bank 0, r1 in bank
 // 1) are both sampled at issue + issue_to_sample; its operands are at the RF
 // output Lr later, its result at the write port fadd later, landing at the
 // edge Wd after that -- read_reg sees it after that cycle's tick. The
 // source-free mov issues right behind it. setp p0, r0, r0 issues at c2 (its
-// word fetched at c0: fetch_to_issue, src/rf.hpp) and reads r0 once, at c3;
+// word fetched at c0: fetch_to_issue, src/timing.hpp) and reads r0 once, at c3;
 // its predicate reaches the file at its port cycle c2 + 1 + Lr + alu (c6), at
 // that edge, and done() waits for it: the run ends at c7.
 void test_rf_one_round_fadd_and_halt() {
@@ -85,8 +84,7 @@ void test_rf_one_round_fadd_and_halt() {
 // One round ends a reader's samples at issue + issue_to_sample, before the
 // earliest any later write of the warp can land (earliest_rf_visible: 7 at
 // canonical). So qtxc buys no WAR stall, neither for a fixed writer nor for
-// an async one, and the reader captures the old value. (With a read window
-// of 8, before RFC14, the async writer needed one.) A counted loop in four
+// an async one, and the reader captures the old value. A counted loop in four
 // warps still drains its fixed reads and predicates at every branch.
 void test_rf_one_round_war_and_branch() {
     const auto& profile = canonical_profile();
@@ -175,30 +173,29 @@ void test_rf_seeded_competing_warps() {
 }
 
 // ---------------------------------------------------------------------------
-// I1: the admission/execution split (trash/rfc10.md section 1), load slots
-// (rfc12 section 3), the RF write decision (rfc10 section 3: async_owed plus
-// round-robin among ready async holders) and the freezeable acc.ld pipeline.
-// trash/i1-admission-c8-rf-2026-10-10.md. The timelines below are hand
+// The admission/execution split, load slots, the RF write decision
+// (async_owed plus round-robin among ready async holders) and the freezeable
+// acc.ld pipeline. The timelines below are hand
 // assembly with explicit controls, so every cycle is the program's own.
 // ---------------------------------------------------------------------------
 
-// I2 (rfc12 section 2): an lds's words come back D + Lb cycles after its
-// grant -- the I1 timelines below were written for D = Lb = 0. They keep
-// their RF scenarios by moving the fadd bookings and the instructions after
+// An lds's words come back D + Lb cycles after its
+// grant. The timelines below keep their RF scenarios at any depths by moving
+// the fadd bookings and the instructions after
 // each lds.uni by the same amount (fadd latency + X, the lds.uni's stall
-// 1 + X), so every cycle after the lds.uni is the old one + X.
-// I6a: the lds.uni also reaches its slot at dispatch, issue_to_dispatch after
+// 1 + X), so every cycle after the lds.uni is the D = Lb = 0 one + X.
+// The lds.uni also reaches its slot at dispatch, issue_to_dispatch after
 // its issue, so X = D + Lb + issue_to_dispatch. A fadd's booking moves
 // issue_to_dispatch (the issue register and Lr ahead of its execution) by
 // itself, so its latency only adds D + Lb (i1_fadd_latency). And a result
 // written at the RF port in cycle t lands at t + Wd: a test that watches the
 // register sees it then. The scenarios' address register ur1 (a uniform
 // register: lds.uni's base) is zero from launch: a `umov ur1, 0` feeding the
-// lds.uni would need four cycles before it (six when this was a vector
-// `mov r1, 0`), which would move the scenario, so the first instruction
+// lds.uni would need four cycles before it, which would move the scenario,
+// so the first instruction
 // writes r61.
-// I6b-2 (the front end): the first instruction issues at fetch_to_issue
-// (c2: its word fetched at c0, src/rf.hpp), and the three-word FIFO then
+// The front end: the first instruction issues at fetch_to_issue
+// (c2: its word fetched at c0, src/timing.hpp), and the three-word FIFO then
 // supplies one instruction per cycle -- through every stall and refusal, the
 // FIFO fills behind them. So a scenario's cycles (the comments' c0, c1, ...)
 // all move by i1_launch_shift; the tests add it to every absolute cycle.
@@ -218,15 +215,13 @@ std::unique_ptr<nanosm::Machine> i1_machine(
         std::move(launch), nanosm::TraceOptions{.timeline = true});
 }
 
-// C8, Fable's probe A (trash/causality-audit-fable-2026-10-08.md section 7):
+// An lds's issue does not depend on its own addresses:
 // one instruction stream; shmem word 0 is the lane mask the plain lds's
 // addresses are built from. Mask 15: sixteen lanes on sixteen banks, one
 // round. Mask 7: lanes l and l + 8 share a bank, two rounds, and the result
-// would meet the fadd's booked write of bank 0. Before I1 the lds issued at c7
-// with mask 15 and was refused at c7 with mask 7 (its own addresses decided
-// its issue). Now both issue in the same cycle; the rounds move only the
-// completion.
-// I6a: the lds at L reaches its slot at dispatch, its first round is granted
+// would meet the fadd's booked write of bank 0. Both issue in the same
+// cycle; the rounds move only the completion.
+// The lds at L reaches its slot at dispatch, its first round is granted
 // one cycle later, its words come back D + Lb after its last grant and its
 // gather register is complete one cycle after that: one round -> its RF write
 // port cycle is L + one_round_port, two rounds -> one more. The fadd, issued
@@ -234,7 +229,7 @@ std::unique_ptr<nanosm::Machine> i1_machine(
 // books bank 0's port at its issue + issue register + Lr + latency: the
 // latency below puts it on the two-round result's port cycle, which is denied
 // and written one cycle later. Every result lands Wd after its port.
-void test_i1_lds_issue_ignores_its_rounds() {
+void test_lds_issue_ignores_its_rounds() {
     auto profile = canonical_profile();
     const auto dispatch = nanosm::issue_to_dispatch(profile);
     const auto one_round_port = dispatch + 1 + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
@@ -280,7 +275,7 @@ void test_i1_lds_issue_ignores_its_rounds() {
     require(one_round.rounds == std::vector<uint32_t>{1, 1} && two_rounds.rounds == std::vector<uint32_t>{1, 2},
         "the masks did not give one and two bank rounds");
     require(one_round.issue == two_rounds.issue,
-        "the lds's issue cycle depends on its own addresses (C8): " + std::to_string(one_round.issue) + " vs " +
+        "the lds's issue cycle depends on its own addresses: " + std::to_string(one_round.issue) + " vs " +
             std::to_string(two_rounds.issue));
     const auto wd = profile.rf_write_depth_cycles;
     require(one_round.written == one_round.issue + one_round_port + wd,
@@ -318,11 +313,11 @@ void test_sanitizer_issue_capture_before_acceptance() {
 // Refused attempts of every kind that carries operands complete without the
 // tripwire firing (sanitizer ON), and the refusals really happened. Admission
 // itself (depbar_wait, structural_refusal) takes no register at all.
-void test_i1_refused_attempts_read_nothing() {
+void test_refused_attempts_read_nothing() {
     std::set<std::string> reasons;
     const auto collect = [&](const nanosm::Machine& machine) {
         for (const auto& event : machine.trace().events()) {
-            // I2: shmem refusals have their own warp states.
+            // Shmem refusals have their own warp states.
             const bool refused = event.name == "structural" || event.name == "no free slot" ||
                 event.name == "ordered behind own access";
             if (event.category == nanosm::TraceCategory::warp && refused) reasons.insert(event.detail);
@@ -365,7 +360,7 @@ void test_i1_refused_attempts_read_nothing() {
         machine->run();
         collect(*machine);
     }
-    {   // ordered behind own access (I2; was "port A busy"): an lds behind a two-round sts
+    {   // ordered behind own access: an lds behind a two-round sts
         auto machine = i1_machine(canonical_profile(), R"(
             sread r0, LANE_ID
             shli r0, r0, 3
@@ -411,7 +406,7 @@ void test_i1_refused_attempts_read_nothing() {
 // is inhibited and the fadd at c5 is refused (c5, c6); at c7 the old
 // bookings have drained and the result is written. In that cycle the fadd
 // books c11: owed is set again (a booking and a grant in one cycle: set wins).
-void test_i1_rf_owed_inhibits_after_denial() {
+void test_rf_owed_inhibits_after_denial() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
     const auto wd = profile.rf_write_depth_cycles;
@@ -452,7 +447,7 @@ void test_i1_rf_owed_inhibits_after_denial() {
 // granted on a free port and clears owed; the second's (c6) is denied with
 // owed = 0, so the fadd at c6 still books (and sets owed); at c7 the result
 // is denied again and the next fadd is inhibited; c8 it is written.
-void test_i1_rf_owed_one_more_booking() {
+void test_rf_owed_one_more_booking() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
     const auto wd = profile.rf_write_depth_cycles;
@@ -488,8 +483,8 @@ void test_i1_rf_owed_one_more_booking() {
                 bank0.at(s + 7 + x).second == 1 && bank0.at(s + 8 + x).second == 2,
             "the cursor moved without a grant, or not on one");
     }
-    {   // A refused booking (its port taken) does not set the bit. I6a: the add
-        // after the lds.uni moved X with it, but its booking is only
+    {   // A refused booking (its port taken) does not set the bit. The add
+        // after the lds.uni moves X with it, but its booking is only
         // issue_to_dispatch + alu ahead of its issue: the fadd latency that
         // puts their ports on one cycle is 5 + X here.
         auto refusing = profile;
@@ -518,7 +513,7 @@ void test_i1_rf_owed_one_more_booking() {
 // while bank 0 is inhibited (c5, c6) a mov writing bank 1 issues, and so does
 // an lds.uni whose destination is in bank 0 (a destination is not a booking).
 // (e) With no async writer ready, a set async_owed inhibits nothing.
-void test_i1_rf_inhibition_is_bank_and_booking_local() {
+void test_rf_inhibition_is_bank_and_booking_local() {
     {
         auto profile = canonical_profile();
         const auto x = i1_lds_shift(profile);
@@ -570,10 +565,10 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
 }
 
 // (c) Round-robin among ready holders. One RF bank (two read ports), so every
-// holder targets it. I8: one acc.ld engine for the machine, so the holders
+// holder targets it. One acc.ld engine for the machine, so the holders
 // are four load slots (four lds.uni results, shmem.load_slots = 4: holders
-// 0-3) and the acc.ld pipeline (holder 6, after the two assembly registers
-// 4-5). Twelve fadds book the bank's write
+// 0-3) and the acc.ld pipeline (the last holder, after the load / store
+// unit's). Twelve fadds book the bank's write
 // port for twelve consecutive cycles from R, the cycle the first holder is
 // ready (a calibration run with fadd latency 1 measures R and the first
 // fadd's issue F0; the fadd latency that puts F0's booking on R is used), so
@@ -590,7 +585,7 @@ void test_i1_rf_inhibition_is_bank_and_booking_local() {
 // pipeline. Every cycle from W + 1 writes once: no refill bubble (the
 // pipeline was full while it held). Alternation between two persistently
 // ready holders is the unit test below (the machine has one acc.ld engine).
-void test_i1_rf_round_robin_among_holders() {
+void test_rf_round_robin_among_holders() {
     auto profile = canonical_profile();
     profile.rf_banks = 1;
     profile.rf_read_ports_per_bank = 2;
@@ -697,7 +692,7 @@ void test_i1_rf_round_robin_among_holders() {
 
 // The round-robin choice itself (one bank): scan from the cursor, skip holders
 // not ready, grant up to the free ports, move past the last one granted.
-void test_i1_round_robin_grant() {
+void test_round_robin_grant() {
     using Grant = nanosm::RoundRobinGrant;
     const auto grant = [](std::vector<uint8_t> ready, uint32_t cursor, uint32_t ports) {
         return nanosm::round_robin_grant(ready, cursor, ports);
@@ -722,7 +717,7 @@ void test_i1_round_robin_grant() {
     require(turns == std::vector<uint32_t>{1, 3, 1, 3, 1, 3}, "two persistently ready holders did not alternate");
 }
 
-// The acc.ld transfer pipeline freezes and resumes (rfc10 section 2). Six
+// The acc.ld transfer pipeline freezes and resumes. Six
 // fadds (released when the acc.st's depbar clears, by an add that waits on
 // it, so their bookings sit near P) book RF bank 1 for six consecutive cycles from P,
 // the cycle beat 0 (r16, bank 1) is first the pipeline's output. Denied, the
@@ -731,7 +726,7 @@ void test_i1_round_robin_grant() {
 // its own booked port, then by the inhibition. At P + 6 the beat is written
 // and the pipeline refills with no bubble; later beats hold one cycle behind
 // each add's booking. The depbar clears as the last beat's write lands.
-// I8: the acc.ld engine takes the transfer at its dispatch (A +
+// The acc.ld engine takes the transfer at its dispatch (A +
 // issue_to_dispatch) and launches beat 0 the next cycle, L; beat k launches
 // at L + k while the pipeline moves and samples tmem tmem.port_depth (Dt)
 // later; beat 0 is the output tmem.read_latency_cycles (Lt) after its
@@ -750,7 +745,7 @@ void test_i1_round_robin_grant() {
 // bank-1 booking at P + 10 is not beat 4's bank), beat 6 (bank 1) meets
 // r43's booking at P + 12 and goes at P + 13, beat 7 at P + 14. Every
 // register changes Wd after its write.
-void test_i1_acc_ld_pipeline_freeze() {
+void test_acc_ld_pipeline_freeze() {
     auto profile = canonical_profile();
     const auto t = nanosm::issue_to_dispatch(profile);
     const auto dt = profile.tmem_port_depth;
@@ -852,28 +847,27 @@ void test_i1_acc_ld_pipeline_freeze() {
         "beats launched or written more than once");
 }
 
-// Load slots (rfc12 section 3; shmem.load_slots = 2). Two lds.uni hold both
+// Load slots (shmem.load_slots = 2). Two lds.uni hold both
 // slots, their results complete and waiting for the RF (eight fadds keep RF
 // bank 0 booked over them); a third is refused (structural, counted) through
 // the cycle the RF write decision grants slot 0 and issues the cycle after
-// (issue counts the slots empty in Q: trash/slot-return-cut-2026-11-20.md).
+// (issue counts the slots empty in Q).
 // Meanwhile port A serves a store while both slots hold results.
-// I6a re-derivation (was two warps, qtxc): one warp, hand assembly, so the
-// fadd bookings are contiguous (a second warp's issues used to leave holes in
+// One warp, hand assembly, so the
+// fadd bookings are contiguous (a second warp's issues would leave holes in
 // them, and a hole under a ready result grants it). Relative to the first
 // lds.uni at L0: the eight fadds issue at L0 - 8 .. L0 - 1 and book bank 0
 // for L0 - 5 + latency .. L0 + 2 + latency (issue register, Lr, latency:
-// src/rf.hpp); latency 13 covers L0 + 8 .. L0 + 15. Each lds.uni's result is
+// src/timing.hpp); latency 13 covers L0 + 8 .. L0 + 15. Each lds.uni's result is
 // at its RF port x + 2 after its issue (x = i1_lds_shift): L0 + 9 and
 // L0 + 10, denied until the bookings end, so slot 0's write is granted at
 // G0 = L0 + 16. The sts (a write) is ordered behind the two loads until the
 // second one's round is granted (L0 + 5), issues then and is granted at
 // L0 + 9 (dispatch, slot register), reaching the RAM at L0 + 11 while both
 // results wait. The third lds.uni is ordered behind the sts until that grant
-// (L0 + 6 .. L0 + 8; before I6a the sts was granted the cycle after its
-// issue, so no order wait showed), then refused for load slots from L0 + 9
+// (L0 + 6 .. L0 + 8), then refused for load slots from L0 + 9
 // through G0, and issues at G0 + 1. Results land Wd after their grants.
-void test_i1_load_slots() {
+void test_load_slots() {
     auto profile = canonical_profile();
     const auto x = i1_lds_shift(profile);
     const auto wd = profile.rf_write_depth_cycles;
@@ -946,7 +940,7 @@ void test_i1_load_slots() {
 // at least 1, part of the fingerprint. With one slot, back-to-back lds.uni
 // serialize on it: the second takes it the cycle after the first's write is
 // granted (issue counts the slot empty in Q).
-void test_i1_load_slots_profile_field() {
+void test_load_slots_profile_field() {
     std::ifstream input("profiles/nanosm-v0.json");
     nlohmann::json document;
     input >> document;
@@ -982,7 +976,7 @@ void test_i1_load_slots_profile_field() {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )");
     const auto written = i1_run(*machine, {3, 6});
-    // I2: the slot is held while the first load's words come back (D + Lb).
+    // The slot is held while the first load's words come back (D + Lb).
     const auto refused = refusals(*machine, 0, "load slots full");
     require(refused == std::vector<std::pair<uint64_t, uint64_t>>{{i1_launch_shift + 2, 2 + i1_lds_shift(one)}},
         "the second lds.uni was not refused until the one slot freed:" + describe(refused));
@@ -994,9 +988,9 @@ void test_i1_load_slots_profile_field() {
 }
 
 // ---------------------------------------------------------------------------
-// I6a: the RF's read latency Lr and write depth Wd, the issue register, and
-// src/rf.hpp as the ONE timing helper of qtxc, the simulator and the
-// sanitizer (trash/rfc10.md section 5, trash/i6a-rf-pipeline-2026-10-13.md).
+// The RF's read latency Lr and write depth Wd, the issue register, and
+// src/timing.hpp as the ONE timing helper of qtxc, the simulator and the
+// sanitizer.
 // Port A's edge convention: a read SAMPLED at S has its operand at S + Lr; a
 // write PRESENTED at the RF write port at W is at the RAM at W + Wd, lands at
 // that edge and is visible to samples from W + Wd + 1 -- no forwarding.
@@ -1043,7 +1037,7 @@ std::string i6a_what(const nanosm::DeviceProfile& profile) {
 // issue. The shli's stall lets every fixed result reach the RAM before the
 // async section, and the acc.ld goes before the lds (its waiter first), so
 // no write port or issue slot is contested: the uncontended pipeline.
-void test_i6a_helper_contract() {
+void test_helper_contract() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
@@ -1149,7 +1143,7 @@ void test_i6a_helper_contract() {
             for (const auto& event : machine->trace().events()) {
                 if (event.name == "acc.ld beat") beats.push_back(event.start_cycle);
             }
-            // I8: the engine launches the read at dispatch + 1; it samples tmem
+            // The engine launches the read at dispatch + 1; it samples tmem
             // tmem.port_depth later and is at the pipeline's output (the RF
             // port) tmem.read_latency_cycles after that.
             const auto launch = i + t + 1;
@@ -1176,7 +1170,7 @@ void test_i6a_helper_contract() {
 // the sanitizer PANICs (RF RAW); without it the machine is quiet and the
 // sample sees the OLD word -- the write lands at that edge, after every read
 // of the cycle (READ_FIRST, no forwarding).
-void test_i6a_dependent_add_distance() {
+void test_dependent_add_distance() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
@@ -1212,7 +1206,7 @@ void test_i6a_dependent_add_distance() {
 // lands last and stays. (One cycle less the two results meet at one write
 // port in one cycle and the add is refused for the port: structurally
 // safe.)
-void test_i6a_waw_order() {
+void test_waw_order() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
@@ -1247,9 +1241,9 @@ void test_i6a_waw_order() {
 // RF write port at P (issue + i1_lds_shift + 2) in bank 0, where an add
 // accepted earlier (at P - issue_to_port) booked bank 0's one port. The
 // booking wins; the lds's write is denied (one wait), granted at P + 1 and
-// lands Wd later; the add's lands at P + Wd. (I6b-2: the lds.uni issues at
+// lands Wd later; the add's lands at P + Wd. (the lds.uni issues at
 // fetch_to_issue; its stall places the add.)
-void test_i6a_async_writer_vs_fixed_booking() {
+void test_async_writer_vs_fixed_booking() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
@@ -1280,7 +1274,7 @@ void test_i6a_async_writer_vs_fixed_booking() {
 // slot register is still empty (A is in the dispatch pipeline). One store
 // slot, two warps: warp 1's sts, tried the cycle after warp 0's, is refused
 // "store slots full" while warp 0's sts travels and its slot is still empty.
-void test_i6a_slots_claimed_while_operands_travel() {
+void test_slots_claimed_while_operands_travel() {
     auto profile = canonical_profile();
     profile.shmem_load_slots = 1;
     profile.shmem_store_slots = 1;
@@ -1375,7 +1369,7 @@ void check_rf_read_latency_field() {
         "rf.read_latency_cycles was omitted from the profile fingerprint");
 }
 
-void test_i6a_profile_fields() {
+void test_profile_fields() {
     check_rf_read_latency_field();
     i21_check_optional_field("rf", "write_depth_cycles", 2, &nanosm::DeviceProfile::rf_write_depth_cycles);
     auto profile = canonical_profile();
@@ -1395,13 +1389,13 @@ void test_i6a_profile_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// I6b-1: the RF read side of trash/rfc14.md (sections 3-5) and 16 warps.
+// The RF read side and 16 warps.
 // Every instruction reads its operands in ONE round, sampled at issue +
 // issue_to_sample; one instruction is accepted per cycle, so reads of
 // different instructions never meet. The issue register's bank use owns the
 // RF read ports in its sample cycle; acc.st beats and the LSU's store-data
 // reads take the rest, with read_owed / inhibit making a hole for a denied
-// reader. trash/rf-read-side-16-warps-2026-10-18.md.
+// reader.
 // ---------------------------------------------------------------------------
 
 // Every debug "RF read" sample of warp 0, by cycle: (register, bank).
@@ -1425,7 +1419,7 @@ std::map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> i6b1_reads(const 
 // arrive, never when or whether an instruction is accepted. Then four warps
 // run the arithmetic part of it: their issues interleave one per cycle with
 // no gap, and bank 0 is sampled once per cycle.
-void test_i6b1_back_to_back_same_bank_reads() {
+void test_back_to_back_same_bank_reads() {
     const std::string setup = R"(
         sread r9, LANE_ID
         usread ur4, WARP_ID
@@ -1562,7 +1556,7 @@ void test_i6b1_back_to_back_same_bank_reads() {
 // take uniform registers, which are no RF reads: those forms cannot conflict
 // (and an acc.st's uniform tmem pointer beside its vector data does not
 // either).
-void test_i6b1_same_bank_sources_are_malformed() {
+void test_same_bank_sources_are_malformed() {
     const auto& canonical = canonical_profile();
     struct Case {
         std::string line;
@@ -1670,8 +1664,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
     check_read_capacity(machine, canonical);
 }
 
-// One async reader under continuous SIMT reads of its bank (RFC14 section
-// 5). An acc.st's data beat (r0, bank 0) against addis that read r27 (bank
+// One async reader under continuous SIMT reads of its bank. An acc.st's data beat (r0, bank 0) against addis that read r27 (bank
 // 0) every cycle (its coordinates ur2, ur3 are uniform registers: its own
 // read round takes no RF port). The acc.st, accepted at a, reaches its unit
 // at a + t (issue_to_dispatch) and its beat wants bank 0 from a + t + 1 =
@@ -1684,7 +1677,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
 // accepted in the same cycle (read_owed: the acceptance sets it, the grant
 // clears it, set wins; the cursor moves past the acc.st). Every accepted
 // instruction samples at its issue + 1; the stream loses exactly one cycle.
-void test_i6b1_async_reader_gets_the_hole() {
+void test_async_reader_gets_the_hole() {
     const auto& profile = canonical_profile();
     auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
         umov ur2, 0
@@ -1743,7 +1736,7 @@ void test_i6b1_async_reader_gets_the_hole() {
 // The two async readers of one bank take the holes in round-robin order:
 // the acc.st engine's beat (holder 0) and stg.v8's first store-data beat (the
 // LSU, holder 1), both wanting bank 0 (r0, r18) while addis read r27 (bank 0)
-// every cycle they may. (I8: one acc.st engine for the machine, so there are
+// every cycle they may. (one acc.st engine for the machine, so there are
 // two async readers, not one per tmem bank.) The acc.st (a) reaches its
 // engine at a + 3 and wants its read from a + 4; the stg.v8 (a + 1) reaches
 // the LSU at a + 4 and its first beat may read in that cycle. At a + 4 the
@@ -1753,7 +1746,7 @@ void test_i6b1_async_reader_gets_the_hole() {
 // a + 5; at a + 6 the LSU is denied again (refusal), at a + 7 it takes the
 // hole. The LSU's later beats in bank 0 (r21, r24) wait at most one cycle
 // each. Data: tmem (read back) and gmem.
-void test_i6b1_async_readers_round_robin() {
+void test_async_readers_round_robin() {
     // One lane group per stg.v8: it reads each of r18 .. r25 once.
     auto profile = canonical_profile();
     profile.lsu_store_group_lanes = 16;
@@ -1824,7 +1817,7 @@ void test_i6b1_async_readers_round_robin() {
 }
 
 // Continuous SIMT pressure on bank 0 (60 addis reading r27) with the two
-// persistent async readers (I8: one acc.st engine), whose beats come back to
+// persistent async readers (one acc.st engine), whose beats come back to
 // bank 0 every third register: acc.st.v8 C0 (r0..r7) and stg.v8 (r18..r25).
 // No accepted read is ever stopped (each addi samples r27 at its issue + 1);
 // every acc.st beat is granted within 2 x 2 - 1 = 3 cycles of wanting its
@@ -1832,7 +1825,7 @@ void test_i6b1_async_readers_round_robin() {
 // it; in banks 1 and 2 only the readers compete); every inhibited cycle's
 // hole goes to an async reader the next cycle; and the data (tmem read back,
 // gmem) are right.
-void test_i6b1_persistent_readers_under_pressure() {
+void test_persistent_readers_under_pressure() {
     const auto& profile = canonical_profile();
     std::string setup = "sread r0, LANE_ID\n";
     for (uint32_t j = 1; j < 8; ++j) setup += "addi r" + std::to_string(j) + ", r0, " + std::to_string(10 * j) + "\n";
@@ -1903,7 +1896,7 @@ void test_i6b1_persistent_readers_under_pressure() {
 // a + 3 -- denied, inhibited: warp 1's bank-0 addi is refused at a + 4, and
 // warp 2's bank-1 addi is accepted in that same cycle. At a + 5 the beat
 // takes the hole.
-// I6b-2: warp 2 can take the cycle only if it has an instruction then. Its
+// Warp 2 can take the cycle only if it has an instruction then. Its
 // stream starts after a taken branch (an empty FIFO), and three warps
 // issuing every cycle get one fetch per cycle between them: the words
 // buffered stay as few as when the streams started (they grow only in
@@ -1913,7 +1906,7 @@ void test_i6b1_persistent_readers_under_pressure() {
 // wait, fetch fills their FIFOs, and each stream starts with words in hand.
 // (warp 0's bank-0 stream is its own copy: a branch to warp 1's would
 // drain the acc.st's depbar first.)
-void test_i6b1_unrelated_banks_proceed() {
+void test_unrelated_banks_proceed() {
     const auto& profile = canonical_profile();
     std::string pad;
     for (uint32_t i = 0; i < 12; ++i) pad += "addi r1, r27, 1\n";
@@ -1984,9 +1977,9 @@ void test_i6b1_unrelated_banks_proceed() {
     check_read_capacity(machine, profile);
 }
 
-// 16 warps (HUMAN 10-17: "lets do 16 warps"). rf.rows_per_bank (352 at
+// 16 warps. rf.rows_per_bank (352 at
 // canonical, about as much RF as shmem) = 16 warps x 22 rows, so a
-// 66-register kernel fits 16 warps and not 17. (I6b-2: core.warps, 16, now
+// 66-register kernel fits 16 warps and not 17. (core.warps, 16,
 // refuses a 17th warp first; with 32 warp slots declared, the RF rows still
 // refuse it.) A 16-warp run in which every warp touches its own state:
 // its RF rows and predicates, its uniform registers (WARP_ID through usread,
@@ -1994,7 +1987,7 @@ void test_i6b1_unrelated_banks_proceed() {
 // order (lds behind its own sts), the stall count, an mbar arrival and a
 // try_wait on a barrier all 16 arrive at (more waiters than the 8 wait
 // slots), and its trace track.
-void test_i6b1_sixteen_warps() {
+void test_sixteen_warps() {
     const auto& profile = canonical_profile();
     auto more_slots = profile;
     more_slots.core_warps = 32;
@@ -2086,9 +2079,9 @@ TEST(RfSlow, rf_seeded_competing_warps) {
     test_rf_seeded_competing_warps();
 }
 
-// I1: lds issue ignores its own rounds (C8 probe A)
-TEST(Rf, i1_lds_issue_ignores_its_rounds) {
-    test_i1_lds_issue_ignores_its_rounds();
+// lds issue ignores its own rounds
+TEST(Rf, lds_issue_ignores_its_rounds) {
+    test_lds_issue_ignores_its_rounds();
 }
 
 // sanitizer: issue capture before acceptance
@@ -2097,112 +2090,112 @@ TEST(Rf, sanitizer_issue_capture_before_acceptance) {
     test_sanitizer_issue_capture_before_acceptance();
 }
 
-// I1: refused attempts read nothing
-TEST(Rf, i1_refused_attempts_read_nothing) {
-    test_i1_refused_attempts_read_nothing();
+// Refused attempts read nothing
+TEST(Rf, refused_attempts_read_nothing) {
+    test_refused_attempts_read_nothing();
 }
 
-// I1: RF owed inhibits after a denial
-TEST(Rf, i1_rf_owed_inhibits_after_denial) {
-    test_i1_rf_owed_inhibits_after_denial();
+// RF owed inhibits after a denial
+TEST(Rf, rf_owed_inhibits_after_denial) {
+    test_rf_owed_inhibits_after_denial();
 }
 
-// I1: RF owed permits one more booking
-TEST(Rf, i1_rf_owed_one_more_booking) {
-    test_i1_rf_owed_one_more_booking();
+// RF owed permits one more booking
+TEST(Rf, rf_owed_one_more_booking) {
+    test_rf_owed_one_more_booking();
 }
 
-// I1: RF inhibition is bank- and booking-local
-TEST(Rf, i1_rf_inhibition_is_bank_and_booking_local) {
-    test_i1_rf_inhibition_is_bank_and_booking_local();
+// RF inhibition is bank- and booking-local
+TEST(Rf, rf_inhibition_is_bank_and_booking_local) {
+    test_rf_inhibition_is_bank_and_booking_local();
 }
 
-// I1: RF round-robin among ready holders
-TEST(Rf, i1_rf_round_robin_among_holders) {
-    test_i1_rf_round_robin_among_holders();
+// RF round-robin among ready holders
+TEST(Rf, rf_round_robin_among_holders) {
+    test_rf_round_robin_among_holders();
 }
 
-// I1: round_robin_grant
-TEST(Rf, i1_round_robin_grant) {
-    test_i1_round_robin_grant();
+// Round_robin_grant
+TEST(Rf, round_robin_grant) {
+    test_round_robin_grant();
 }
 
-// I1: acc.ld pipeline freeze
-TEST(Rf, i1_acc_ld_pipeline_freeze) {
-    test_i1_acc_ld_pipeline_freeze();
+// Acc.ld pipeline freeze
+TEST(Rf, acc_ld_pipeline_freeze) {
+    test_acc_ld_pipeline_freeze();
 }
 
-// I1: load slots
-TEST(Rf, i1_load_slots) {
-    test_i1_load_slots();
+// Load slots
+TEST(Rf, load_slots) {
+    test_load_slots();
 }
 
-// I1: load slots profile field
-TEST(Rf, i1_load_slots_profile_field) {
-    test_i1_load_slots_profile_field();
+// Load slots profile field
+TEST(Rf, load_slots_profile_field) {
+    test_load_slots_profile_field();
 }
 
-// I6a: the RF timing helper is the trace's (Lr/Wd 1/1, 2/2, 3/1)
-TEST(Rf, i6a_helper_contract) {
-    test_i6a_helper_contract();
+// The RF timing helper is the trace's (Lr/Wd 1/1, 2/2, 3/1)
+TEST(Rf, helper_contract) {
+    test_helper_contract();
 }
 
-// I6a: dependent add at the qtxc distance; one less is a RAW
-TEST(Rf, i6a_dependent_add_distance) {
-    test_i6a_dependent_add_distance();
+// Dependent add at the qtxc distance; one less is a RAW
+TEST(Rf, dependent_add_distance) {
+    test_dependent_add_distance();
 }
 
-// I6a: WAW order
-TEST(Rf, i6a_waw_order) {
-    test_i6a_waw_order();
+// WAW order
+TEST(Rf, waw_order) {
+    test_waw_order();
 }
 
-// I6a: async writer vs a fixed booking
-TEST(Rf, i6a_async_writer_vs_fixed_booking) {
-    test_i6a_async_writer_vs_fixed_booking();
+// Async writer vs a fixed booking
+TEST(Rf, async_writer_vs_fixed_booking) {
+    test_async_writer_vs_fixed_booking();
 }
 
-// I6a: slots claimed while operands travel
-TEST(Rf, i6a_slots_claimed_while_operands_travel) {
-    test_i6a_slots_claimed_while_operands_travel();
+// Slots claimed while operands travel
+TEST(Rf, slots_claimed_while_operands_travel) {
+    test_slots_claimed_while_operands_travel();
 }
 
-// I6a: profile fields Lr, Wd; the stall-field bound
-TEST(Rf, i6a_profile_fields) {
-    test_i6a_profile_fields();
+// Profile fields Lr, Wd; the stall-field bound
+TEST(Rf, profile_fields) {
+    test_profile_fields();
 }
 
-// I6b-1: back-to-back same-bank reads (Lr 1, 2, 3)
-TEST(Rf, i6b1_back_to_back_same_bank_reads) {
-    test_i6b1_back_to_back_same_bank_reads();
+// Back-to-back same-bank reads (Lr 1, 2, 3)
+TEST(Rf, back_to_back_same_bank_reads) {
+    test_back_to_back_same_bank_reads();
 }
 
-// I6b-1: same-bank distinct sources are malformed
-TEST(Rf, i6b1_same_bank_sources_are_malformed) {
-    test_i6b1_same_bank_sources_are_malformed();
+// Same-bank distinct sources are malformed
+TEST(Rf, same_bank_sources_are_malformed) {
+    test_same_bank_sources_are_malformed();
 }
 
-// I6b-1: an async reader gets the hole
-TEST(Rf, i6b1_async_reader_gets_the_hole) {
-    test_i6b1_async_reader_gets_the_hole();
+// An async reader gets the hole
+TEST(Rf, async_reader_gets_the_hole) {
+    test_async_reader_gets_the_hole();
 }
 
-// I6b-1: async readers round-robin
-TEST(Rf, i6b1_async_readers_round_robin) {
-    test_i6b1_async_readers_round_robin();
+// Async readers round-robin
+TEST(Rf, async_readers_round_robin) {
+    test_async_readers_round_robin();
 }
 
-// I6b-1: persistent readers under SIMT pressure
-TEST(Rf, i6b1_persistent_readers_under_pressure) {
-    test_i6b1_persistent_readers_under_pressure();
+// Persistent readers under SIMT pressure
+TEST(Rf, persistent_readers_under_pressure) {
+    test_persistent_readers_under_pressure();
 }
 
-// I6b-1: unrelated banks proceed
-TEST(Rf, i6b1_unrelated_banks_proceed) {
-    test_i6b1_unrelated_banks_proceed();
+// Unrelated banks proceed
+TEST(Rf, unrelated_banks_proceed) {
+    test_unrelated_banks_proceed();
 }
 
-// I6b-1: 16 warps
-TEST(Rf, i6b1_sixteen_warps) {
-    test_i6b1_sixteen_warps();
+// 16 warps
+TEST(Rf, sixteen_warps) {
+    test_sixteen_warps();
 }

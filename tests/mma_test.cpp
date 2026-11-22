@@ -1,6 +1,6 @@
-// The tensor core and tmem: numerics, the walker, mbar engine events, I7, I9, D15, I8.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// The tensor core and tmem: numerics, the walker, mbar engine events, the
+// 4x4x8 core, shapes from the profile, tmem transfers beside matmuls. Each
+// test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -381,15 +381,13 @@ void test_worker_acc_store_mbar_handoff() {
 // commit is accepted in cycle r and starts fetching in r + 1, exactly as in a
 // run with no TMA event at all: the commit presents into the MMA's own register.
 // (The alternation here follows the last-served bit: T1 was served last, so
-// the tie at r - 1 + busy goes to the MMA.) I2: services are busy = D + Lb + 1
-// cycles apart (was 2; I2.1: D + Lb + C + 1); the commit, held from r + 1, waits busy - 2 cycles
-// for T1 and T2 waits busy cycles for the commit (was 0 + 2).
-// Before 2026-10-07 the two engines shared ONE event slot. In cycle r the
-// commit found it holding the TMA event and stayed at the head of the MMA
-// queue: the order was TMA, TMA, MMA, and the mma.async behind it (accepted
-// at r into the entry the retired init command freed) could not start
-// fetching until r + 2, one cycle late -- one cycle for every cycle the TMA
-// event sat in the slot. (Measured on 29e320f: fetch 525 instead of 524.)
+// the tie at r - 1 + busy goes to the MMA.) Services are busy = D + Lb + C + 1
+// cycles apart; the commit, held from r + 1, waits busy - 2 cycles
+// for T1 and T2 waits busy cycles for the commit.
+// Each engine has its OWN event register: with one shared slot the commit
+// would find it holding the TMA event and stay at the head of the MMA queue,
+// and the mma.async behind it would start fetching a cycle late for every
+// cycle the TMA event sat there.
 void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
     constexpr uint32_t commit_mbar = 4096;
     constexpr uint32_t tx_mbar = 4104;
@@ -425,7 +423,7 @@ void test_mbar_engine_tma_event_does_not_stall_mma_queue() {
     // Reference, no TMA event: the commit presents in cycle r, the cycle its
     // predecessor retires, and frees the queue slot the mma.async waits for:
     // the mma.async issues in r and reaches the MMA queue at its dispatch,
-    // accept = r + issue_to_dispatch (I6a), fetching from the next cycle.
+    // accept = r + issue_to_dispatch, fetching from the next cycle.
     nanosm::Machine reference(canonical_profile(), kernel, make_launch(), {.timeline = true});
     reference.run(5000);
     const auto [accept, fetch] = queued_accept_and_fetch(reference);
@@ -504,7 +502,7 @@ void test_mbar_engine_events_alternate_tma_first() {
     machine.complete_mbar_tx(tx_mbar, 64, 0); // pending again from first + 2, before the next free point
     machine.run(1000);
 
-    // I2: services are busy = D + Lb + 1 cycles apart (was 2); I2.1: + C.
+    // Services are busy = D + Lb + C + 1 cycles apart.
     const auto busy = rmw_busy_cycles();
     require(mbar_rmw_services(machine) == std::vector<RmwService>{
                 {first, "complete_tx (tma), address=4104"},
@@ -535,18 +533,10 @@ void test_mbar_engine_events_alternate_tma_first() {
 // the TMA; the tma.load's operand reads are long over by then) and the TMA
 // command ends the cycle after its event is claimed.
 // Two-cycle steps reach r only at one phase of r against the DRAM clock, and
-// which phase the kernel lands on follows its issue distances: when the MMA
-// addresses moved to uniform registers (2026-11-08; umov -> mma.async is 4
-// cycles, a vector mov's was 6), r moved by one cycle and no delay aligned. So the sweep
+// which phase the kernel lands on follows its issue distances (umov ->
+// mma.async is 4 cycles), so it may happen that no delay aligns. So the sweep
 // runs with no lead filler and, if no delay aligned, again with one filler mov
 // at the start of the kernel, which moves r (and every later cycle) by one.
-// Before 2026-10-08 (stepping discipline) the TMA's event could be claimed in
-// the cycle it was presented, an artifact of tick()'s call order, while the
-// MMA's waited a cycle: at the aligned delay the TMA was served at r and the
-// commit at r + 2 (one cycle of waiting). Before 2026-10-07, at the aligned
-// delay the commit filled the shared slot right behind the TMA's claimed
-// event, and the TMA command could not end (nor free its queue entry) until
-// that slot emptied (measured on 29e320f: 529 instead of 527).
 void test_mbar_engine_real_tma_and_commit_same_cycle() {
     constexpr uint32_t commit_mbar = 4096;
     constexpr uint32_t tx_mbar = 4104;
@@ -607,7 +597,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
     for (uint32_t lead = 0; lead < 2 && !aligned; ++lead) {
         const auto reference = run(lead, std::nullopt); // no TMA
         // The commit presents in r; the mma.async behind it issues then and
-        // reaches the queue at its dispatch (I6a).
+        // reaches the queue at its dispatch.
         const auto r = reference.accept - nanosm::issue_to_dispatch(canonical_profile());
         require(reference.services == std::vector<RmwService>{at(mma_service, r + 1)},
             "reference commit was not served at r + 1");
@@ -627,7 +617,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
                 "the TMA command outlived its claimed event (held by the MMA's?)" + where);
             if (tma_claim != r + 1) continue; // the TMA presented in r too
             aligned = true;
-            const auto busy = rmw_busy_cycles(); // I2: D + Lb + 1 (was 2); I2.1: + C
+            const auto busy = rmw_busy_cycles(); // D + Lb + C + 1
             require(observed.services ==
                     std::vector<RmwService>{at(tma_service, r + 1), at(mma_service, r + 1 + busy)},
                 "same-cycle TMA completion and commit were not served TMA, then MMA" + where);
@@ -638,7 +628,7 @@ void test_mbar_engine_real_tma_and_commit_same_cycle() {
 }
 
 void test_mma_dense_profile_recurrence_bubbles() {
-    // D15: a shape with k > core_k must revisit each accumulator block late
+    // A shape with k > core_k must revisit each accumulator block late
     // enough to hide the accumulator latency, so a profile whose result
     // latency outruns one command's sweep is refused (m32n64k8 on a 4x4x4
     // core: 128 steps between visits). Recurrence bubbles remain for
@@ -744,7 +734,7 @@ void test_mma_bare_transfer_race_panics() {
 }
 
 void test_mma_multi_round_fetch_timing() {
-    // Case 03/05/06 (I9: the m32n64k8 shape): one bank makes every port-B
+    // Case 03/05/06 (the m32n64k8 shape): one bank makes every port-B
     // round one word. Steps run k block, then the 8 m blocks, then the 16 n
     // blocks; a step at n block 0 reloads A (eight A words + eight B words =
     // 16 rounds), every other step reads B only (8 rounds). A step granted its
@@ -752,7 +742,7 @@ void test_mma_multi_round_fetch_timing() {
     // reaches the RAM D later and the port output D + Lb later, where the step
     // enters the core (the port-B read pipeline has port A's D and Lb); its
     // result leaves the core at entry + latency and lands in tmem
-    // tmem.port_depth later (I8); the next step's first round is granted at
+    // tmem.port_depth later; the next step's first round is granted at
     // t + rounds; and the operand-consumed depbar clears at the LAST PHYSICAL
     // READ of the final step: its last round's RAM sample.
     const auto profile = dense_one_bank_profile(12);
@@ -819,7 +809,7 @@ void test_mma_multi_round_fetch_timing() {
 
 void test_mma_varying_round_service() {
     // Unswizzled dense 64x64x8 on 16 banks has steps of different conflict
-    // costs (the 2026-09-04 audit counted four- and five-round steps). Each
+    // costs (four- and five-round steps). Each
     // fetch must occupy the port for exactly its own rounds: the span of all
     // input steps equals the sum of served rounds plus counted stalls.
     auto profile = canonical_profile();
@@ -871,7 +861,7 @@ void test_mma_varying_round_service() {
             "varying-round service changed the numerical result");
 }
 
-// ---- I7: tensor core 4x4x8, hold A / stream B (trash/rfc11.md section 0) ----
+// ---- Tensor core 4x4x8, hold A / stream B ----
 
 // Canonical swizzle64 operand addresses at the default row spacing (16 bytes:
 // a K = 8 tile), restated independently of the production helper: A element
@@ -907,12 +897,12 @@ std::unique_ptr<nanosm::Machine> i7_machine(const std::array<uint16_t, 8>& a,
         nanosm::TraceOptions{.timeline = true, .debug = true});
 }
 
-// A 4x4x8 step is ONE fused group of eight products plus C (rfc11 section 0),
+// A 4x4x8 step is ONE fused group of eight products plus C,
 // not two successive four-product groups. These eight products tell them
 // apart: 4096 * 4096 + 1 * 1 is 2^24 + 1, which a four-product group
 // truncates to 2^24 in FP32 before the second group's -2^24 cancels it (0);
 // one eight-product group keeps the unit (1.0).
-void test_i7_dot8_group_boundary() {
+void test_dot8_group_boundary() {
     const std::array<uint16_t, 8> a{0x6c00, 0x3c00, 0, 0, 0xec00, 0, 0, 0}; // 4096, 1, 0, 0, -4096, 0...
     const std::array<uint16_t, 8> b{0x6c00, 0x3c00, 0, 0, 0x6c00, 0, 0, 0}; // 4096, 1, 0, 0, 4096, 0...
     const auto eight = nanosm::mma_dot_f16(a, b, 0);
@@ -936,8 +926,8 @@ void test_i7_dot8_group_boundary() {
 // last, so step s + 1 starts rounds(s) cycles after step s. A step whose
 // last round is granted at g enters the core at g + D + Lb; its result
 // leaves the core result_latency later and is written at the tmem RAM
-// tmem.port_depth after that (I8).
-void test_i7_hold_a_stream_b_walker() {
+// tmem.port_depth after that.
+void test_hold_a_stream_b_walker() {
     const auto& profile = canonical_profile();
     std::array<uint16_t, 8> a{}, b{};
     a.fill(0x3c00); // 1
@@ -981,9 +971,9 @@ void test_i7_hold_a_stream_b_walker() {
 // Back-to-back commands into one accumulator: the next command's first step
 // is granted the cycle after the previous command's last round, so N
 // commands take 272 N rounds = 272 N cycles of port B from the first input
-// step: 256 steps per 272 cycles, 16/17 of one step per cycle (the rfc11
-// section 0 ceiling, here measured, with no recurrence or transfer stalls).
-void test_i7_back_to_back_throughput() {
+// step: 256 steps per 272 cycles, 16/17 of one step per cycle (the ceiling,
+// here measured, with no recurrence or transfer stalls).
+void test_back_to_back_throughput() {
     constexpr uint32_t commands = 8;
     std::array<uint16_t, 8> a{}, b{};
     a.fill(0x3c00);
@@ -1008,8 +998,7 @@ void test_i7_back_to_back_throughput() {
     require(machine->trace().summary().mma_recurrence_stalls == 0, "back-to-back commands hit recurrence stalls");
 }
 
-// ---- I9: MMA shapes as opcodes, the profile's shape list, the 32x64 tile ----
-// (trash/chan.txt 2026-10-19; trash/i9-32x64-tile-proposal-fable-2026-10-19.md)
+// ---- MMA shapes as opcodes, the profile's shape list, the 32x64 tile ----
 
 // Independent restatements (not the production helpers): swizzle64 operand
 // element addresses at the default 16-byte row spacing for objects at any
@@ -1061,13 +1050,13 @@ void i9_write_operands(nanosm::Launch& launch) {
         for (uint32_t n = 0; n < 64; ++n) write_u16(shmem, i9_b_address(2048, k, n), i9_fp16(i9_b(k, n)));
 }
 
-// D15 (trash/chan.txt 2026-10-22): the mma.async block. Shape i of the
+// The mma.async block. Shape i of the
 // profile's list is opcode 0x70 + 2i (accumulate) and 0x70 + 2i + 1 (init);
 // names follow the profile, and without one an opcode is named by its place
 // in the block. A lossless encoding; the text qtxc and the hand assembler
 // parse; shape names parsed strictly; the shape-less spellings are not
 // instructions.
-void test_i9_mma_opcodes() {
+void test_mma_opcodes() {
     const auto& profile = canonical_profile();
     struct Expected {
         uint32_t index;
@@ -1172,7 +1161,7 @@ void test_i9_mma_opcodes() {
     }
 }
 
-// The profile lists its MMA shapes by name (D15: any shape that follows the
+// The profile lists its MMA shapes by name (any shape that follows the
 // rules, each once): m, n, k whole multiples of the core; an accumulator of
 // at least `lanes` rows that fits in tmem; k > core_k only with enough
 // blocks per K block to hide the accumulator latency; at most eight shapes
@@ -1180,7 +1169,7 @@ void test_i9_mma_opcodes() {
 // the opcodes) is too. A kernel using a shape or an opcode the profile does
 // not define is refused by qtxc, by the hand assembler and at kernel load;
 // the result operand is a tmem pointer alone, [urC].
-void test_i9_profile_shapes_and_refusals() {
+void test_profile_shapes_and_refusals() {
     const auto& profile = canonical_profile();
     require(profile.mma_shapes == std::vector<nanosm::MmaShape>{{64, 64, 8}, {32, 64, 8}},
         "the canonical profile does not list m64n64k8 and m32n64k8");
@@ -1212,7 +1201,7 @@ void test_i9_profile_shapes_and_refusals() {
             require_mentions(error.what(), {std::string("mma shape ") + shape, expected}, what);
         }
     };
-    // Every dimension is a power of two (HUMAN 2026-10-22), checked first.
+    // Every dimension is a power of two, checked first.
     rule("m6n64k8", "m, n and k must be powers of two (m is 6)", "an m that is not a power of two");
     rule("m48n64k8", "m, n and k must be powers of two (m is 48)", "m = 48");
     rule("m64n12k8", "m, n and k must be powers of two (n is 12)", "n = 12");
@@ -1311,7 +1300,7 @@ void test_i9_profile_shapes_and_refusals() {
     }
     // The result operand is a pointer alone (its rows are the shape's n
     // words): a row length, a vector register or a name is refused. There is
-    // no accumulator to compare a shape with (2026-11-19).
+    // no accumulator to compare a shape with.
     for (const auto& [result, needle] : {std::pair{"[ur2, 64]", "without a row length"},
              std::pair{"[r2]", "%r2 is used here as a uniform register"},
              std::pair{"T", "a uniform register holding its tmem pointer"}}) {
@@ -1330,7 +1319,7 @@ void test_i9_profile_shapes_and_refusals() {
 // and B block (8 k x 4 columns) are each 16 distinct words in 16 distinct
 // banks, together two rounds; so a step that reloads A is 2 rounds and every
 // other step 1, for m32 exactly as for m64 (no layout change needed).
-void test_i9_bank_census() {
+void test_bank_census() {
     for (const uint32_t rows : {32u, 64u}) {
         for (uint32_t a_base = 0; a_base < 4096; a_base += 64) {
             for (uint32_t m0 = 0; m0 < rows; m0 += 4) {
@@ -1367,7 +1356,7 @@ void test_i9_bank_census() {
 // rounds; tiles in hold-A order; each result written at last round + D + Lb
 // + result latency + tmem port depth; every element equal to the logical
 // reference of rows 32..63.
-void test_i9_m32_walker() {
+void test_m32_walker() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -1423,7 +1412,7 @@ void test_i9_m32_walker() {
 // halves (bases 0 and 512): the halves equal the m64 result bit for bit, and
 // both equal the logical reference. Then two m32 commands back to back keep
 // port B busy exactly 2 x 136 = 272 cycles from the first input step.
-void test_i9_two_m32_halves_equal_one_m64() {
+void test_two_m32_halves_equal_one_m64() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -1473,7 +1462,7 @@ void test_i9_two_m32_halves_equal_one_m64() {
 // A mixed queue: m64 init into F, m32 init into T (top half), m64 adding into
 // F, m32 init into L (bottom half). F holds twice the m64 product, T and L
 // the halves once; 768 steps, 816 rounds.
-void test_i9_mixed_queue() {
+void test_mixed_queue() {
     const auto& profile = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -1516,7 +1505,7 @@ void test_i9_mixed_queue() {
 // acc.ld.v8 at row bases 0 and 16 of each: the kernel chooses the row base,
 // nothing in hardware ties rows to warps. Every stored word lands at its
 // restated tmem word and loads back.
-void test_i9_four_8k_accumulators() {
+void test_four_8k_accumulators() {
     const auto& profile = canonical_profile();
     require(profile.tmem_fine_banks * profile.tmem_words_per_fine_bank == 4 * 2048,
         "tmem is not four 32x64 FP32 accumulators");
@@ -1560,7 +1549,7 @@ void test_i9_four_8k_accumulators() {
 // SANITIZER. The sanitizer's MMA operand spans come from the command's shape: an m32
 // command on A at 0 read-owns [0, 512), so an sts into the other half of a
 // 64-row object ([512, 1024)) is quiet while one inside its span PANICs.
-void test_i9_operand_span_follows_the_shape() {
+void test_operand_span_follows_the_shape() {
     const auto& profile = canonical_profile();
     const auto program = [](uint32_t sts_base) {
         return "umov ur0, 0\numov ur1, 2048\numov ur4, 8192\numov ur2, 4096\nmbar.init [ur4], 1\n"
@@ -1582,7 +1571,7 @@ void test_i9_operand_span_follows_the_shape() {
     require_mentions(message, {"mma.async #1", "A operand [0, 512)"}, "m32 operand span");
 }
 
-// ---- D15: MMA shapes configurable from the profile (trash/chan.txt 2026-10-22) ----
+// ---- MMA shapes configurable from the profile ----
 
 // The operand layout for any k: rows of k fp16, whole, `d15_spacing(k)`
 // bytes apart (the smallest swizzle64 spacing that holds them; the command
@@ -1654,7 +1643,7 @@ nanosm::DeviceProfile d15_profile(std::vector<nanosm::MmaShape> shapes, uint32_t
 // a 128-row shape that fills tmem. Steps and port-B rounds follow the walk:
 // per K block every (m, n) block, A read once per m block (two rounds), and
 // no step of one command ever waits on its own accumulator.
-void test_d15_more_shapes_run() {
+void test_more_shapes_run() {
     const auto profile = d15_profile({{64, 64, 8}, {16, 64, 32}, {16, 64, 8}, {128, 64, 8}});
     for (const nanosm::MmaShape shape : {nanosm::MmaShape{16, 64, 32}, nanosm::MmaShape{16, 64, 8},
              nanosm::MmaShape{128, 64, 8}}) {
@@ -1681,7 +1670,7 @@ void test_d15_more_shapes_run() {
 // (2 rounds) leaves 4 - 1 = 3 cycles and any other leaves 4: the validated
 // bound counts one round per step and is short of exact by the reloads.
 // With result latency 11 the bound is 17 and the shape is refused.
-void test_d15_latency_bound() {
+void test_latency_bound() {
     const nanosm::MmaShape shape{16, 16, 16};
     const auto profile = d15_profile({{64, 64, 8}, shape}, 10);
     require(nanosm::mma_min_blocks_per_k(profile) == 16 && nanosm::mma_blocks_per_k(profile, shape) == 16,
@@ -1715,16 +1704,16 @@ void test_d15_latency_bound() {
     }
 }
 
-// D15 follow-ups (trash/chan.txt 2026-10-22). On a 4x4x4 core, m16n16k4 is
+// On a 4x4x4 core, m16n16k4 is
 // legal (every dimension a power of two and whole core blocks) but reads
 // only 4 of the 8 fp16 in each 16-byte swizzle64 operand row: a warning, not
 // an error. Admission counts the bytes the walk actually reads: at the
 // default 16-byte spacing rows 12..15 keep their four fp16 in the second
 // half of their row (word XOR 3), so A's last byte read is 256 B past its
-// base, not 15 x 16 + 8. Codex's reproducer puts A at 65536 - 128: refused at
+// base, not 15 x 16 + 8. A at 65536 - 128 is refused at
 // admission. At 65536 - 256 it runs. k = 12 is not a power of two: refused
 // at load.
-void test_d15_partial_k_block_footprint_and_warning() {
+void test_partial_k_block_footprint_and_warning() {
     auto profile = canonical_profile();
     profile.mma_core_k = 4;
     profile.mma_shapes = {{16, 16, 4}};
@@ -1761,7 +1750,7 @@ void test_d15_partial_k_block_footprint_and_warning() {
 }
 
 // ---------------------------------------------------------------------------
-// I8 (trash/rfc11.md section 0): tmem is 16 fine banks, each with two read
+// Tmem is 16 fine banks, each with two read
 // and two write services per cycle -- the MMA's accumulator read and write,
 // the acc.ld engine's read, the acc.st engine's write. Nobody arbitrates for
 // them: the MMA never waits for a transfer, a transfer never waits for the
@@ -1772,7 +1761,7 @@ void test_d15_partial_k_block_footprint_and_warning() {
 // words are at the output tmem.read_latency_cycles (Lt) after its sample.
 // ---------------------------------------------------------------------------
 
-// A machine with I7's operand patterns (A all `a`, B all `b`) and `body` as
+// A machine with the walker tests' operand patterns (A all `a`, B all `b`) and `body` as
 // qtx, for `warps` warps.
 std::unique_ptr<nanosm::Machine> i8_machine(const nanosm::DeviceProfile& profile, const std::string& body,
     uint32_t warps, uint16_t a, uint16_t b) {
@@ -1792,11 +1781,11 @@ std::unique_ptr<nanosm::Machine> i8_machine(const nanosm::DeviceProfile& profile
 // takes its accumulator read and write every step on its own services: every
 // step starts the cycle after the previous step's last round and writes tmem
 // exactly (rounds - 1) + D + Lb + result latency + Dt after its start, the
-// I7 walker's timing with nothing else running, and back to back the
+// walker's timing with nothing else running, and back to back the
 // commands still keep port B busy one round per cycle (16/17 of a step per
 // cycle). The transfers really run alongside (beats of both kinds inside the
 // MMA's span), and every value is right.
-void test_i8_mma_beside_transfers() {
+void test_mma_beside_transfers() {
     const auto& profile = canonical_profile();
     constexpr uint32_t commands = 4;
     std::string mma = "mma.async.init.m64n64k8 [ur2], [ur0], [ur1]\n"; // S: 64x64 at tmem 0
@@ -1886,7 +1875,7 @@ void test_i8_mma_beside_transfers() {
 // cycle; the second warp's transfer of a kind waits at admission ("acc
 // transfer engine busy") while the first warp's runs; an acc.ld and an
 // acc.st do run in the same cycles; every value is right.
-void test_i8_one_engine_of_each_kind() {
+void test_one_engine_of_each_kind() {
     const auto& profile = canonical_profile();
     const std::string body = R"(
         sread r0, LANE_ID
@@ -1959,7 +1948,7 @@ void test_i8_one_engine_of_each_kind() {
 // L = its dispatch + 1 samples tmem ("acc.ld beat") at L + Dt and is at the RF
 // port ("RF write") at L + Dt + Lt; an MMA step writes tmem ("MMA tmem
 // write") (rounds - 1) + D + Lb + result latency + Dt after its start.
-void test_i8_tmem_depths() {
+void test_tmem_depths() {
     for (const auto& [dt, lt] : std::vector<std::pair<uint32_t, uint32_t>>{{1, 1}, {2, 2}, {3, 1}}) {
         auto profile = canonical_profile();
         profile.tmem_port_depth = dt;
@@ -2037,7 +2026,7 @@ void test_i8_tmem_depths() {
 // without it the machine is quiet and the sample sees the OLD words (the
 // write lands at that cycle's edge, after every read of the cycle). One
 // cycle later (gap 3), it sees the new ones.
-void test_i8_read_first_same_word() {
+void test_read_first_same_word() {
     const auto& profile = canonical_profile();
     require(profile.rf_read_latency_cycles == 2, "the derivation needs Lr = 2");
     for (const uint32_t gap : {2u, 3u}) {
@@ -2072,7 +2061,7 @@ void test_i8_read_first_same_word() {
 
 // Racing accepted MMA work is UB: the sanitizer PANICs; without it the
 // machine runs quietly to the end (no ownership hardware stops anything).
-void test_i8_transfer_racing_mma_is_quiet_without_the_sanitizer() {
+void test_transfer_racing_mma_is_quiet_without_the_sanitizer() {
     const auto& profile = canonical_profile();
     for (const bool load : {true, false}) {
         const std::string transfer = load ? "acc.ld.v8 r24, [ur8, 64]\n" : "acc.st.v8 [ur8, 64], r16\n";
@@ -2092,7 +2081,7 @@ void test_i8_transfer_racing_mma_is_quiet_without_the_sanitizer() {
     }
 }
 
-// ---- an accumulator is a tmem pointer (trash/acc-pointer-2026-11-19.md) ----
+// ---- an accumulator is a tmem pointer ----
 
 // The layout (src/layout.hpp tmem_physical_word) against an independent
 // statement of the rule as bit fields: with S = 2^s words per row, logical
@@ -2195,7 +2184,7 @@ void test_acc_pointer_at_a_row_and_column() {
     }
 }
 
-// The case that needed a branch (trash/fa32-2026-11-19.md "what hurt" 1): two
+// Two tiles in one region, with no branch to pick the accumulator: two
 // m32n64k8 matmuls write rows 0..31 (pointer 0, A rows 0..31) and rows
 // 32..63 (pointer 2048, A rows 32..63) of one region of 64-word rows. Four
 // warps run the same code with no branch on the half: warp w points at rows
@@ -2251,7 +2240,7 @@ void test_acc_view_over_two_matmul_results() {
 
 // An mma.async reads three uniform registers: urA and urB in its issue round
 // (issue + 1), urC in a second round at issue + 2 (the TMA's round counter,
-// src/rf.hpp uniform_read_rounds). At the canonical depths it still reaches
+// src/timing.hpp uniform_read_rounds). At the canonical depths it still reaches
 // the MMA at issue + 3 (issue_to_dispatch). A uniform reader right behind it
 // is refused once ("uniform read ports held") and issues at issue + 2; so is
 // a second matmul. A vector instruction is not refused, nor is a uniform
@@ -2436,100 +2425,100 @@ TEST(Mma, mma_varying_round_service) {
     test_mma_varying_round_service();
 }
 
-// I7: one eight-product group at the 4x4x8 boundary
-TEST(Mma, i7_dot8_group_boundary) {
-    test_i7_dot8_group_boundary();
+// One eight-product group at the 4x4x8 boundary
+TEST(Mma, dot8_group_boundary) {
+    test_dot8_group_boundary();
 }
 
-// I7: hold A / stream B walker
-TEST(Mma, i7_hold_a_stream_b_walker) {
-    test_i7_hold_a_stream_b_walker();
+// Hold A / stream B walker
+TEST(Mma, hold_a_stream_b_walker) {
+    test_hold_a_stream_b_walker();
 }
 
-// I7: back-to-back MMA throughput
-TEST(Mma, i7_back_to_back_throughput) {
-    test_i7_back_to_back_throughput();
+// Back-to-back MMA throughput
+TEST(Mma, back_to_back_throughput) {
+    test_back_to_back_throughput();
 }
 
-// I8: MMA beside acc transfers
-TEST(Mma, i8_mma_beside_transfers) {
-    test_i8_mma_beside_transfers();
+// MMA beside acc transfers
+TEST(Mma, mma_beside_transfers) {
+    test_mma_beside_transfers();
 }
 
-// I8: one acc.ld and one acc.st engine
-TEST(Mma, i8_one_engine_of_each_kind) {
-    test_i8_one_engine_of_each_kind();
+// One acc.ld and one acc.st engine
+TEST(Mma, one_engine_of_each_kind) {
+    test_one_engine_of_each_kind();
 }
 
-// I8: tmem depths (Dt/Lt 1/1, 2/2, 3/1)
-TEST(Mma, i8_tmem_depths) {
-    test_i8_tmem_depths();
+// Tmem depths (Dt/Lt 1/1, 2/2, 3/1)
+TEST(Mma, tmem_depths) {
+    test_tmem_depths();
 }
 
-// I8: same word, same cycle (READ_FIRST)
-TEST(Mma, i8_read_first_same_word) {
-    test_i8_read_first_same_word();
+// Same word, same cycle (READ_FIRST)
+TEST(Mma, read_first_same_word) {
+    test_read_first_same_word();
 }
 
-// I8: a transfer racing an MMA is quiet without the sanitizer
-TEST(Mma, i8_transfer_racing_mma_is_quiet_without_the_sanitizer) {
-    test_i8_transfer_racing_mma_is_quiet_without_the_sanitizer();
+// A transfer racing an MMA is quiet without the sanitizer
+TEST(Mma, transfer_racing_mma_is_quiet_without_the_sanitizer) {
+    test_transfer_racing_mma_is_quiet_without_the_sanitizer();
 }
 
-// I9: MMA opcodes per shape and init
-TEST(Mma, i9_mma_opcodes) {
-    test_i9_mma_opcodes();
+// MMA opcodes per shape and init
+TEST(Mma, mma_opcodes) {
+    test_mma_opcodes();
 }
 
-// I9: profile shape list; unsupported shape and accumulator mismatch refused
-TEST(Mma, i9_profile_shapes_and_refusals) {
-    test_i9_profile_shapes_and_refusals();
+// Profile shape list; unsupported shape and accumulator mismatch refused
+TEST(Mma, profile_shapes_and_refusals) {
+    test_profile_shapes_and_refusals();
 }
 
-// I9: bank census for both shapes
-TEST(Mma, i9_bank_census) {
-    test_i9_bank_census();
+// Bank census for both shapes
+TEST(Mma, bank_census) {
+    test_bank_census();
 }
 
-// I9: m32n64k8 walker
-TEST(Mma, i9_m32_walker) {
-    test_i9_m32_walker();
+// M32n64k8 walker
+TEST(Mma, m32_walker) {
+    test_m32_walker();
 }
 
-// I9: two m32 halves equal one m64
-TEST(Mma, i9_two_m32_halves_equal_one_m64) {
-    test_i9_two_m32_halves_equal_one_m64();
+// Two m32 halves equal one m64
+TEST(Mma, two_m32_halves_equal_one_m64) {
+    test_two_m32_halves_equal_one_m64();
 }
 
-// I9: mixed m64 / m32 queue
-TEST(Mma, i9_mixed_queue) {
-    test_i9_mixed_queue();
+// Mixed m64 / m32 queue
+TEST(Mma, mixed_queue) {
+    test_mixed_queue();
 }
 
-// I9: four 8 KiB accumulators, row bases 0 and 16
-TEST(Mma, i9_four_8k_accumulators) {
-    test_i9_four_8k_accumulators();
+// Four 8 KiB accumulators, row bases 0 and 16
+TEST(Mma, four_8k_accumulators) {
+    test_four_8k_accumulators();
 }
 
-// I9: sanitizer operand span follows the shape
-TEST(Mma, i9_operand_span_follows_the_shape) {
+// Sanitizer operand span follows the shape
+TEST(Mma, operand_span_follows_the_shape) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_i9_operand_span_follows_the_shape();
+    test_operand_span_follows_the_shape();
 }
 
-// D15: more MMA shapes run (k > core_k, 16 and 128 rows)
-TEST(Mma, d15_more_shapes_run) {
-    test_d15_more_shapes_run();
+// More MMA shapes run (k > core_k, 16 and 128 rows)
+TEST(Mma, more_shapes_run) {
+    test_more_shapes_run();
 }
 
-// D15: the accumulator latency bound at equality
-TEST(Mma, d15_latency_bound) {
-    test_d15_latency_bound();
+// The accumulator latency bound at equality
+TEST(Mma, latency_bound) {
+    test_latency_bound();
 }
 
-// D15: a partly filled K block warns and counts its whole storage
-TEST(Mma, d15_partial_k_block_footprint_and_warning) {
-    test_d15_partial_k_block_footprint_and_warning();
+// A partly filled K block warns and counts its whole storage
+TEST(Mma, partial_k_block_footprint_and_warning) {
+    test_partial_k_block_footprint_and_warning();
 }
 
 // acc pointer: the tmem layout against an independent statement of the rule

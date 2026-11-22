@@ -4,18 +4,11 @@
 
 #include "machine/machine.hpp"
 #include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
 #include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
@@ -90,7 +83,7 @@ uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32
 
 // The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
 // (c)): free if it runs no transfer. The MMA never matters here -- it has
-// tmem services of its own (trash/rfc11.md section 0); a transfer racing MMA
+// tmem services of its own; a transfer racing MMA
 // work is the sanitizer's business.
 bool Machine::acc_engine_available(const Wires& w, bool load) const {
     return !w.acc_next[load ? 0 : 1].has_value();
@@ -119,7 +112,7 @@ void Machine::step_mma(Wires& w) {
 //      a new step's first round (or the head commit's presentation);
 //   4. the read pipeline moves one stage; the granted round enters stage 0.
 // A step granted its last round at g samples it at g + D and enters the core
-// at g + D + Lb (the same D and Lb as port A, rfc10 section 5).
+// at g + D + Lb (the same D and Lb as port A).
 void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
     for (auto it = mma.results.begin(); it != mma.results.end();) {
         if (!it->c_sampled && it->c_sample_cycle == cycle_) sample_mma_c(*it);
@@ -161,8 +154,8 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
 }
 
 // The next step port B may start now, if any; or the head commit presents
-// into the MMA's event register. Steps walk hold-A / stream-B (rfc11 section
-// 0): for each K block, for each A block (m), every B block (n) in order; the
+// into the MMA's event register. Steps walk hold-A / stream-B: for each K
+// block, for each A block (m), every B block (n) in order; the
 // first step of each A block reads A and B, the rest read B only and use the
 // held A block. A command's steps may start once the previous command's last
 // step has been granted (commands overlap in the pipelines).
@@ -275,7 +268,7 @@ Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
 }
 
 // A round at the RAM reads its elements from shmem as it is now, before this
-// cycle's writes land at the clock edge (READ_FIRST, rfc12 section 1). The
+// cycle's writes land at the clock edge (READ_FIRST). The
 // command's last step's last round is its final physical operand read: the
 // operands are consumed and its depbar clears here.
 void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
@@ -386,7 +379,7 @@ std::vector<uint32_t> Machine::mma_block_words(const MmaStep& step) const {
     return words;
 }
 
-// The two accumulator transfer engines (trash/rfc11.md section 0: one acc.ld
+// The two accumulator transfer engines (one acc.ld
 // engine, one acc.st engine for the whole machine, each with its own tmem
 // service in every fine bank), computed on copies of their registers: issue
 // looks ahead at them (c) and may give a freed engine its next transfer now
@@ -400,8 +393,8 @@ void Machine::step_acc_transfers(Wires& w) {
     w.acc_ld_next = std::move(pipe);
 }
 
-// The acc.ld engine's pipeline (trash/rfc10.md section 2, "Accumulator
-// transfers"). The beat at the tmem RAM stage samples its words now (once).
+// The acc.ld engine's pipeline. The beat at the tmem RAM stage samples its
+// words now (once).
 // Its output asks the RF write decision for service; this cycle's grant was
 // decided at the top of the cycle.
 //   output empty, or granted -> advance: every stage moves one toward the
@@ -507,7 +500,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     const auto shape = *mma_shape_of(config_, inst.opcode);
     const auto a = uniform_operand(op, inst.src0);
     const auto b = uniform_operand(op, inst.src1);
-    // urC, from the round counter's round 1 (src/rf.hpp uniform_read_rounds):
+    // urC, from the round counter's round 1 (src/timing.hpp uniform_read_rounds):
     // the result's tmem pointer, its rows the shape's n words. Every word it
     // writes must be in tmem (the machine's PANIC, as an operand outside
     // shmem); a pointer that breaks the alignment rule is the sanitizer's

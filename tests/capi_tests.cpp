@@ -92,7 +92,7 @@ int main() {
             NANOSM_TRACE_TIMELINE, 1000);
         require(handle != NANOSM_INVALID_HANDLE, "C API could not create qtx session");
         require(nanosm_session_run(handle, 100) == NANOSM_OK, "C API run failed");
-        // The front end (src/rf.hpp, two-word packets): the halt's packet,
+        // The front end (src/timing.hpp, two-word packets): the halt's packet,
         // fetched at c0, issues at c2 (fetch_to_issue); the next packet (past
         // the kernel's end), granted at c1 while the FIFO had room, is at the
         // memory output at c2 and dropped by the halt; at c2 the FIFO and the

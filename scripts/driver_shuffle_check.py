@@ -10,7 +10,7 @@ byte-identical to the unshuffled run.
 
     python -B scripts/driver_shuffle_check.py --lib LIB [--seed N] [--jobs N]
 
-A regression guard, not a proof: it catches a driver that reads another
+A regression check, not a proof: it catches a driver that reads another
 register's D or state another driver writes, but only where these launches
 exercise it.
 """

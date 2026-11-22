@@ -6,14 +6,13 @@ namespace nanosm {
 
 // v0.1 of the shared-memory tile layout and of the tensor core's operand
 // interface (an operand is a 16-byte piece's address in row 0 plus a row
-// spacing). On 2026-11-18 swizzle64 replaced a sliced layout ("xor64") that
-// cut every row into 16-byte pieces stored K slices apart: a row that is
-// scattered over K / 8 places cannot take gathered rows or small pieces. The
-// same day the shuffle's row number became the byte's own address divided by
-// the spacing instead of a count from the tile's row 0
-// (trash/address-keyed-2026-11-18.md). This is a first version. A model or a
-// person reading it who sees a design flaw should say so (trash/chan.txt)
-// rather than build on it.
+// spacing). Two choices shape it. Rows stay whole: a layout that cuts every
+// row into 16-byte pieces stored K slices apart scatters a row over K / 8
+// places and cannot take gathered rows or small pieces. And the shuffle's row
+// number is the byte's own address divided by the spacing, not a count from
+// the tile's row 0, so a piece lands the same wherever it starts. This is a
+// first version. A model or a person reading it who sees a design flaw
+// should say so rather than build on it.
 //
 // How a two-dimensional tile sits in shared memory: the one place a layout's
 // address rule lives. A tile is stored as rows; a layout says where byte
@@ -48,14 +47,14 @@ namespace nanosm {
 // four different slots (the tensor core's 4-row block: one bank round), the
 // two pieces of a 32-byte sector side by side (the TMA: one round), and any
 // sixteen neighbouring rows' same word on sixteen banks (a column store, a
-// transposed load: one round) -- whatever row they start at:
-// trash/address_keyed_census.py counts it. (One thing does depend on where a
+// transposed load: one round) -- whatever row they start at. (One thing does
+// depend on where a
 // tile sits: on a 4x4x4 core, a step that reloads A reads half-pieces of A
 // and B together, and whether they share a round depends on the two tiles'
 // row numbers mod 16; the canonical 4x4x8 core reads whole pieces and does
 // not care.)
 //
-// The TMA places and reads tiles with these functions (src/tma.hpp
+// The TMA places and reads tiles with these functions (src/tma_descriptor.hpp
 // tma_tile_address, which a run's elements step through: src/machine/machine.hpp TmaRun;
 // the layout is its descriptor's) and the tensor core reads
 // its operands with them (src/machine/tensor_core.cpp mma_a_address / mma_b_address; the
@@ -100,7 +99,7 @@ inline uint32_t swizzle64_address(uint32_t base, uint32_t spacing, uint32_t row,
 }
 
 // ---------------------------------------------------------------------------
-// Tensor-core memory (tmem), v0.1 of 2026-11-19 (trash/acc-pointer-2026-11-19.md).
+// Tensor-core memory (tmem), v0.1.
 // An accumulator is no declared object: an instruction names a POINTER (a
 // word address, held in a uniform register) and the words per row S of the
 // region it treats as rows (an instruction constant; the matmul's result

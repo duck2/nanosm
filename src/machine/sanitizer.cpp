@@ -73,7 +73,7 @@ void Sanitizer::record_cycle_start() {
 }
 
 // ---------------------------------------------------------------------------
-// Admission reads no operand (rfc10 section 1). Issue decides from metadata
+// Admission reads no operand. Issue decides from metadata
 // and resource state, then captures operands; the machine's admission
 // functions cannot see the RF at all, and this tripwire catches a capture
 // placed before the decision.
@@ -186,7 +186,7 @@ void Sanitizer::check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t v
 }
 
 // ---------------------------------------------------------------------------
-// Declared uniformity (rfc09 pin 3): hardware never compares lanes; it reads
+// Declared uniformity: hardware never compares lanes; it reads
 // a declared-uniform operand from lane 0. One that differs across lanes is
 // UB, diagnosed here.
 // ---------------------------------------------------------------------------
@@ -240,7 +240,7 @@ void Sanitizer::check_swizzle64_operand(const IssueSite& site, const std::string
 }
 
 // ---------------------------------------------------------------------------
-// Same-word stores (backlog D12): which lane's word lands is not part of the
+// Same-word stores: which lane's word lands is not part of the
 // contract, so two lanes of one store naming one word is UB, diagnosed here.
 // ---------------------------------------------------------------------------
 
@@ -260,7 +260,7 @@ void Sanitizer::check_store_word_collision(
 // Shmem ownership. An outstanding engine command is modeled as owning shmem
 // byte ranges from its accepted issue until an existing completion event; a
 // conflicting access PANICS naming the owner and the wait that would have
-// ordered it. See trash/shmem-ownership-sanitizer-2026-10-03.md.
+// ordered it.
 // ---------------------------------------------------------------------------
 
 const Sanitizer::ShmemOwner* Sanitizer::shmem_owner_overlapping(
@@ -386,7 +386,7 @@ void Sanitizer::check_engine_mbar_rmw(uint64_t cycle, uint32_t address, bool com
 }
 
 // ---------------------------------------------------------------------------
-// Missing fence.sh / race (trash/rfc12.md sections 10 and 11). The shadow of
+// Missing fence.sh / race. The shadow of
 // the SIMT shmem accesses that may still be travelling to the RAM, and the
 // check an engine command's footprint makes against it at accept.
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ void Sanitizer::record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, 
     auto& round = access->rounds.at(access->granted++);
     round.ram_cycle = ram_cycle;
     if (holder != SimtShmemHolder::store_slot) return;
-    // C10: an sts round writing a live mbar, at its grant.
+    // An sts round writing a live mbar, at its grant.
     std::vector<std::pair<uint32_t, uint32_t>> written;
     for (const auto address : round.addresses) written.emplace_back(address, address + 4);
     if (const auto hit = live_mbar_hit(written); hit.has_value()) {
@@ -471,7 +471,7 @@ void Sanitizer::check_engine_footprint(
 }
 
 // ---------------------------------------------------------------------------
-// C10 live-mbar opacity (trash/rfc12.md section 11).
+// Live mbars are opaque.
 // ---------------------------------------------------------------------------
 
 const Sanitizer::LiveMbar* Sanitizer::live_mbar_overlapping(uint64_t begin, uint64_t end) const {
@@ -589,7 +589,7 @@ void Sanitizer::record_tma_accept(
     descriptor_owner.pc = site.pc;
     descriptor_owner.issue_cycle = site.cycle;
 
-    // rfc12 section 11: nothing the engine will read may still be travelling
+    // Nothing the engine will read may still be travelling
     // to the RAM -- first the descriptor itself (an sts that wrote it needs a
     // fence.sh), so the bytes decoded below are the ones the engine reads.
     check_engine_footprint(site, "tma #" + std::to_string(command) + " descriptor", descriptor_owner.begin,
@@ -743,7 +743,7 @@ void Sanitizer::record_mma_accept(
         if (!span.has_value()) continue; // the machine's footprint check already panicked
         const auto label = "mma.async #" + std::to_string(command) +
             (a_operand ? " A operand" : " B operand");
-        // rfc12 section 11: the port-B reads against SIMT writes still
+        // The port-B reads against SIMT writes still
         // travelling to the RAM (an sts into the tile needs a fence.sh).
         check_engine_footprint(site, label, span->first, span->second, false);
         if (const auto* owner = shmem_owner_overlapping(span->first, span->second, true))
@@ -991,8 +991,8 @@ void Sanitizer::check_register_rewrite(
 // ---------------------------------------------------------------------------
 // Boundary tripwire: an ordered ID's beats belong to its oldest outstanding
 // request, contiguous and in order. The placeholder controller cannot
-// violate this; a B4 controller that does panics here instead of corrupting
-// a register.
+// violate this; a reordering controller that does panics here instead of
+// corrupting a register.
 // ---------------------------------------------------------------------------
 
 std::string Sanitizer::stream_name(uint32_t stream) const {
@@ -1041,7 +1041,7 @@ void Sanitizer::record_ordered_pluck(uint32_t stream, uint32_t bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// rfc09 3: the admitted commands never exceed the command slots.
+// The admitted commands never exceed the command slots.
 // ---------------------------------------------------------------------------
 
 void Sanitizer::check_lsu_admitted(std::size_t admitted) const {
@@ -1052,13 +1052,13 @@ void Sanitizer::check_lsu_admitted(std::size_t admitted) const {
     }
 }
 
-void Sanitizer::check_assembly_lanes_valid(uint64_t cycle, uint32_t assembly, const std::vector<uint8_t>& valid,
+void Sanitizer::check_buffer_lanes_valid(uint64_t cycle, uint32_t buffer, const std::vector<uint8_t>& valid,
     uint32_t first_lane, uint32_t lanes, const char* reader) const {
     for (uint32_t lane = first_lane; lane < first_lane + lanes; ++lane) {
         if (valid.at(lane) != 0) continue;
         throw SimError(
             "internal LSU sanitizer: cycle " + std::to_string(cycle) + ": the " + reader +
-            " read lane " + std::to_string(lane) + " of assembly register " + std::to_string(assembly) +
+            " read lane " + std::to_string(lane) + " of LSU buffer " + std::to_string(buffer) +
             ", which is not valid");
     }
 }

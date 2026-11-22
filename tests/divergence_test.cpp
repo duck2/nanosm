@@ -1,9 +1,9 @@
-// Divergence (trash/divergence-2026-11-21.md): ssy, the divergent bra
+// Divergence: ssy, the divergent bra
 // (@p bra), sync, the per-warp active mask and the SM's divergence stack.
 // Every entry is a (mask, pc) pair; a sync always pops one and switches to
 // it. Each arm ends in its own sync; the label after the last arm is an
 // ordinary instruction. Smoke tests: per-lane if / else, a nested if, an arm
-// no lane takes, the loop that sheds one lane at a time (Astra's layout, two
+// no lane takes, the loop that sheds one lane at a time (two
 // entries), every writer class under a partial mask, the timing facts the
 // design rests on, and the refusals and PANICs. At the end, masked
 // instructions (@p / @!p on the per-lane instructions).
@@ -69,7 +69,7 @@ std::vector<uint64_t> issues_named(const nanosm::Machine& machine, const std::st
     return cycles;
 }
 
-// A per-lane if / else, Astra's first kernel: even lanes write 11, odd lanes
+// A per-lane if / else: even lanes write 11, odd lanes
 // 22, into the same register; one stg after the join stores all sixteen.
 // The fall-through arm (odd) runs first and ends in a sync that pops the
 // even lanes (EVEN, the next instruction); theirs pops the ssy's entry
@@ -242,7 +242,7 @@ K:      stg [r3 + 0], r2
     }
 }
 
-// Astra's loop (trash/chan.txt 2026-11-21, trash/divergence-loop-astra.py):
+// A loop that sheds lanes:
 // lane l runs the body l times (0 .. 15). The first pass goes to the test;
 // on a mixed test the leaving lanes fall into the sync, which pops the
 // staying lanes (BODY) straight back to the body, so the stack never holds
@@ -662,7 +662,7 @@ void test_timing_ignores_the_write_mask() {
     require(std::equal(issues[0].begin(), issues[0].begin() + 3, issues[1].begin()),
         "fixed issue cycles depend on the write mask");
 
-    // Astra's case (trash/chan.txt): a real store still in flight and an
+    // A real store still in flight and an
     // empty one on the same depbar (qtxc gives every store one), then a wait.
     // The empty store owes exactly one decrement (an extra one would
     // underflow, a missing one would never let the wait go) and the real
@@ -730,7 +730,7 @@ void test_write_mask_refusals() {
     require(move.opcode == nanosm::Opcode::addi && move.dst == 1 && move.src0 == 2 && move.imm == 0 &&
             nanosm::format_instruction(move, false) == "addi r1, r2, 0",
         "mov r1, r2: " + nanosm::format_instruction(move));
-    require(nanosm::decode(moves.words.at(1)).opcode == nanosm::Opcode::mov, "mov r1, 2 is no longer mov");
+    require(nanosm::decode(moves.words.at(1)).opcode == nanosm::Opcode::mov, "mov r1, 2 is not mov");
     // A masked instruction needs no divergence stack: a profile without one
     // runs it (here the register form of mov, masked).
     std::ifstream input("profiles/nanosm-v0.json");

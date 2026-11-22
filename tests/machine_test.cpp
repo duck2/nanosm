@@ -1,6 +1,5 @@
 // Machine-level basics: nonblocking lds, depbars, bank rounds, profile and allocation errors, the trace.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -10,7 +9,7 @@ using namespace nanosm_test;
 // A test that must write a file writes it here: the system temp directory
 // plus this process's id and a per-process counter, so overlapping runs of
 // this binary (ctest -j, the sanitizer ON/OFF twin, build and build_nosan at
-// once) never share a path. The file is removed when the guard goes away.
+// once) never share a path. The file is removed when the object goes away.
 class ScratchFile {
 public:
     explicit ScratchFile(const std::string& stem) {
@@ -37,8 +36,7 @@ private:
 };
 
 void test_lds_is_nonblocking_and_depbar_waits() {
-    // Re-pinned in B3: was `mov r0, 0` (all sixteen lanes on one word, one
-    // round by the old same-word merge). Without the merge that is sixteen
+    // Not `mov r0, 0`: all sixteen lanes on one word are sixteen
     // rounds (sixteen lanes on bank 0), which holds port A and would block the
     // second lds structurally. Lane-strided addresses keep each lds at one
     // round (one lane per bank), the premise of this test.
@@ -101,10 +99,10 @@ void test_missing_wait_panics_instead_of_scoreboarding() {
     }
 }
 
-// Re-pinned in B3 (was "broadcast", 1 round): sixteen lanes reading one word
-// were merged into one round. Uniformity is now declared, never detected:
+// Sixteen lanes reading one word are not merged into one round.
+// Uniformity is declared, never detected:
 // they are sixteen lanes on bank 0, served one per round, 16 rounds. Every
-// lane still gets the word. The one-round broadcast is lds.uni (B3 tests).
+// lane still gets the word. The one-round broadcast is lds.uni.
 void test_plain_lds_of_one_word_is_sixteen_rounds() {
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -257,7 +255,7 @@ void test_perfetto_overlapping_commands_are_async() {
     require(begins >= 2 && begins == ends, "concurrent gmem commands did not emit async pairs");
 }
 
-// trash/rfc14.md section 3: every instruction reads its operands in ONE
+// Every instruction reads its operands in ONE
 // round, sampled at issue + issue_to_sample, so the profile has no read
 // window; the canonical profile holds about as much RF as shmem (352 rows
 // per bank). A round reads each distinct source once, in source order.

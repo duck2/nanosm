@@ -1088,7 +1088,7 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::halt:
         return 0;
     // The uniform register writers are not vector arithmetic: they present at
-    // the URF write port urf.issue_to_port_cycles after issue (src/rf.hpp).
+    // the URF write port urf.issue_to_port_cycles after issue (src/timing.hpp).
     // usetp rides the same pipeline and presents its predicate then.
     case Opcode::usetp_eq:
     case Opcode::usetp_ne:

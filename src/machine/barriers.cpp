@@ -3,29 +3,52 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstring>
 #include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
 #include <utility>
 
 namespace nanosm {
+
+// ===========================================================================
+// The RMW engine: one operation at a time, each one
+// coherent 8-byte mbar RMW (both words in one read round, one write round)
+// or one uniform atomic (one 4-byte word, read and written
+// the same way). Its requester waits in a register (the SIMT RMW register,
+// the TMA's or the MMA's event register). One RMW:
+//   s          START. A-write's alternation lets an RMW begin
+//              (select_a_write step 4) and the engine takes a requester
+//              (select_rmw_admission). The global store PAUSE -- the engine's
+//              operation register -- is set from s + 1: no new store
+//              transaction starts. A store transaction under way keeps its
+//              rounds.
+//   r >= s     READ, granted on A-read before any new requester, strictly
+//              after that store transaction's last round (r = s when no store
+//              and no A-read transaction is under way)
+//   r + D      the RAM sample
+//   r + D + Lb the words at the port output; the ALU computes the update (an
+//              atomic's old word also goes to its return load slot now)
+//   w = r + D + Lb + C
+//              WRITE (the final write) granted on A-write; the PAUSE ends at
+//              this cycle's edge
+//   w + 1      stores may start again: one granted now reaches the RAM at
+//              w + 1 + D, after the RMW's write (matched D, no drain)
+//   w + D      the write reaches the RAM; a phase flip wakes the waiters now
+// Reads are never paused: between r and w A-read serves loads, probes and
+// TMA reads, and a read of the mbar sampling at w + D sees the old word
+// (READ_FIRST). An atomic's old value waits in its return slot for the RF
+// write decision, so rD may be written before w; the warp's next shmem
+// access still waits for w (its unserviced write), fence.sh for w + D.
+// (D, Lb and C are shared memory's depths: the top of src/machine/shmem.cpp.)
+// ===========================================================================
 
 // A probe's words at the port output. test_wait writes its predicate now
 // (write-first (a)); its warp issues again now (b). try_wait completes its
 // wait slot or parks it. The probing warp was blocked while the probe
 // travelled, so if its slot is gone, completed now (commit_shmem_writes ran
 // first) or another warp's, a wake ended the wait first: the stale probe does
-// nothing (rfc12 section 9).
+// nothing.
 void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
     const auto& request = *beat.probe;
     auto& warp = warps_.at(request.warp);
@@ -86,8 +109,8 @@ bool Machine::rmw_awaits_read(const Wires& w) const {
     return (active.has_value() && !active->read_granted) || w.shmem.rmw_start.has_value();
 }
 
-// The RMW engine's admission (rfc12 section 6): when A-write lets an RMW
-// start, which requester the idle engine takes. Implementer choice (I3), one
+// The RMW engine's admission: when A-write lets an RMW
+// start, which requester the idle engine takes. Implementer choice, one
 // simple fairness rule: the SIMT RMW register and the engines' event
 // registers alternate BY CLASS -- when both classes hold a request, the class
 // that did not start last goes (RmwEngine::simt_started_last); within the
@@ -134,7 +157,7 @@ void Machine::serve_rmw_start(Wires& w) {
 // result enters ALU stage 0 at this cycle's edge and its write is granted C
 // cycles from now (select_a_write).
 //
-// The tx count is signed (rfc12 section 8, as in PTX): arrive.expect_tx adds,
+// The tx count is signed: arrive.expect_tx adds,
 // complete_tx subtracts, in either order --
 //     completion first:  (1, 0) -complete_tx 128-> (1, -128) -arrive.expect_tx 128-> (0, 0) done
 //     expectation first: (1, 0) -arrive.expect_tx 128-> (0, 128) -complete_tx 128-> (0, 0) done
@@ -174,9 +197,8 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
     case MbarRmwOperation::init:
         // An init over an mbar with a live waiter is UB (as on NVIDIA: an
         // mbarrier is reinitialized only after mbarrier.inval); the
-        // sanitizer's C10 PANICs (mbar.init over a live mbar). The machine
-        // just writes the new state: a waiter is not woken by it (backlog
-        // D12.1).
+        // sanitizer PANICs (mbar.init over a live mbar). The machine
+        // just writes the new state: a waiter is not woken by it.
         if (request.value == 0 || request.value > mbar_encoding::max_count) {
             mbar_rmw_panic(request, "expected arrival count is outside 1..32767");
         }
@@ -228,7 +250,7 @@ bool Machine::is_atomic_operation(MbarRmwOperation operation) {
         operation == MbarRmwOperation::atom_xor || operation == MbarRmwOperation::atom_exch;
 }
 
-// A uniform atomic's update (trash/rfc13.md section 3), on signed int32: the
+// A uniform atomic's update, on signed int32: the
 // new word from the old one and the operand, written back as one 4-byte
 // word. add wraps: the sum is taken in unsigned 32-bit arithmetic, i.e.
 // modulo 2^32 -- defined 32-bit two's-complement wrap, never host signed
@@ -388,7 +410,7 @@ void Machine::decide_mbar_timeouts(Wires& w) {
 
 // mbar.init / arrive / arrive.expect_tx: a uniform operation, its operands
 // uniform registers whatever the active mask (a partial mask is the
-// sanitizer's PANIC, backlog D12, in uniform_operand).
+// sanitizer's PANIC, in uniform_operand).
 void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     MbarRmwRequest request;
@@ -427,7 +449,7 @@ void Machine::dispatch_mbar_rmw(const DispatchEntry& op, Wires& w) {
     w.dispatch.rmw = std::move(request);
 }
 
-// atom.op.uni rD, [urA + imm], urB (trash/rfc13.md). Admission found the warp
+// atom.op.uni rD, [urA + imm], urB. Admission found the warp
 // with no unserviced read or write and secured a load slot and the SIMT RMW
 // register. Now the address (4-byte aligned, in bounds: PANIC otherwise) and
 // the operand, uniform registers, arrive -- whatever the active mask; a
@@ -475,9 +497,9 @@ void Machine::dispatch_atomic(const DispatchEntry& op, Wires& w) {
 }
 
 // mbar.test_wait / try_wait: the probe goes into the probe register; A-read
-// serves it from the next cycle and its warp waits until it comes back
-// (rfc12 section 9) -- from its issue on, since it was in the dispatch
-// pipeline before (probe_in_flight). try_wait installs its wait slot first,
+// serves it from the next cycle and its warp waits until it comes back --
+// from its issue on, since it is in the dispatch pipeline first
+// (probe_in_flight). try_wait installs its wait slot first,
 // so a wake that comes while the probe travels finds it.
 void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;

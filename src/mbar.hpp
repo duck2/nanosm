@@ -5,8 +5,8 @@
 namespace nanosm {
 
 // One mbar: two shmem words, read and written as one coherent 8-byte RMW.
-// tx_bytes is the SIGNED transaction count (trash/rfc12.md section 8, as in
-// PTX): expect_tx adds, complete_tx subtracts, in either order, so a
+// tx_bytes is the SIGNED transaction count (as in PTX): expect_tx adds,
+// complete_tx subtracts, in either order, so a
 // complete_tx that runs ahead of its expect_tx leaves it negative. A phase
 // completes when the pending arrivals (remaining) AND tx_bytes are both zero.
 // Its range is +/-(2^20 - 1) (mbar_encoding::tx_limit); leaving it PANICs.

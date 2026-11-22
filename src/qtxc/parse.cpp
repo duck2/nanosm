@@ -1216,7 +1216,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             if (op == "stg.v8" && static_cast<unsigned>(inst.src1) + 8 > 256)
                 throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
         } else if (op == "atom.add.uni" || op == "atom.and.uni" || op == "atom.xor.uni" || op == "atom.exch.uni") {
-            // trash/rfc13.md: uniform shared atomics on signed int32. One word
+            // Uniform shared atomics on signed int32. One word
             // per warp instruction (its address and operand are uniform
             // registers); its old value comes back to every lane's rD (async,
             // through a load slot: a depbar like lds.uni). The offset is a
@@ -1293,7 +1293,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 " needs its coordinate count: " + op + ".1d .. " + op + ".4d");
         } else if (const auto tma = tma_mnemonic(op); tma.has_value()) {
             // tma.load.Nd [urS], [DESC, urC], [urM] / tma.store.Nd [DESC, urC],
-            // [urS], [urM] (src/tma.hpp): the buffer, the descriptor (a
+            // [urS], [urM] (src/tma_descriptor.hpp): the buffer, the descriptor (a
             // constant) with the first of N coordinate registers, the barrier.
             expect_count(args, 3, line_number);
             const auto [store, coordinates] = *tma;
@@ -1356,7 +1356,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = parse_mbar_address(args[0], line_number, profile);
         } else if (op == "bra" || op == "bra.uni" || op == "ssy") {
             // bra / bra.uni TARGET; @p bra TARGET is the divergent branch.
-            // ssy LABEL (trash/divergence-2026-11-21.md): the pc its entry
+            // ssy LABEL: the pc its entry
             // holds, where a sync that pops it sends the warp; any instruction.
             expect_count(args, 1, line_number);
             static const std::regex target_pattern(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
@@ -1369,7 +1369,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             expect_count(args, 0, line_number);
             inst.opcode = Opcode::sync;
         } else if (op == "fence.sh") {
-            // rfc12 section 10: explicit only. qtxc schedules it like any
+            // Explicit only. qtxc schedules it like any
             // instruction and never inserts one.
             expect_count(args, 0, line_number);
             inst.opcode = Opcode::fence_sh;

@@ -4,20 +4,8 @@
 // src/machine/machine.cpp.)
 
 #include "machine/machine.hpp"
-#include "machine/mma_numeric.hpp"
-#include "machine/internal.hpp"
 
-#include <algorithm>
 #include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-#include <new>
-#include <set>
-#include <tuple>
-#include <sstream>
-#include <stdexcept>
-#include <utility>
 
 namespace nanosm {
 
@@ -90,10 +78,6 @@ RoundRobinGrant round_robin_grant(const std::vector<uint8_t>& ready, uint32_t cu
 uint64_t Machine::full_mask() const {
     return config_.lanes >= 64 ? ~0ull : (1ull << config_.lanes) - 1;
 }
-
-// ===========================================================================
-// Helpers
-// ===========================================================================
 
 [[noreturn]] void Machine::panic(
     const Warp& warp, const Instruction& inst, const std::string& reason) const {

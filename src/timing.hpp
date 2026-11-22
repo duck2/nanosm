@@ -9,10 +9,9 @@
 
 // The RF's timing: the one helper the compiler (qtxc's stall distances), the
 // simulator (its bookings and pipelines) and the sanitizer (its ready /
-// read-until horizons) all derive their numbers from (trash/rfc10.md
-// section 5, slice I6a).
+// read-until horizons) all derive their numbers from.
 //
-// The cycle convention is shmem port A's (rfc12 section 2): a DEPTH counts
+// The cycle convention is shmem port A's: a DEPTH counts
 // the register stages from a request's presentation up to and including the
 // RAM.
 //   - Issue register (fixed, one cycle): an instruction accepted at c0
@@ -27,7 +26,7 @@
 //   - The predicate file is flip-flops, not an SRAM: a predicate presented at
 //     W is in the file from W + 1.
 //
-// RF reads (trash/rfc14.md sections 3 and 4): every instruction reads all
+// RF reads: every instruction reads all
 // its operands in ONE round, sampled at the same offset after its accepted
 // issue -- the issue register's cycle, c0 + 1. At most one instruction is
 // accepted per cycle, so the reads of two instructions never meet in one
@@ -56,11 +55,10 @@
 // c0 + 1 + Lr, unless the profile's URF is as slow as its RF (then one later:
 // issue_to_dispatch).
 //
-// The front end (trash/front-end-2026-10-18.md; two-word packets since
-// trash/front-end-packets-2026-10-18.md): every warp issues from its
+// The front end: every warp issues from its
 // instruction FIFO's head packet, the half its pc names. One instruction-
 // memory read per cycle, one packet (the two words at an aligned 16-byte
-// address), fixed at one cycle (HUMAN 10-18): a fetch granted at f (its
+// address), fixed at one cycle: a fetch granted at f (its
 // address sampled at f's edge) has its packet at the memory output at f + 1,
 // written into the warp's FIFO at that edge, and its words can issue from
 // f + 2. Fetch decides from registered state only (the FIFO's valid packets
@@ -71,14 +69,14 @@
 // cycle: one packet entry, two issues in four cycles; two or more, one per
 // cycle.
 //
-// Branches (HUMAN 10-18: "it can be one cycle later ... long latency is
-// ok"): nothing after a branch issues until it resolves, and it resolves in
+// Branches (a branch may cost a cycle more: a long branch latency is
+// acceptable): nothing after a branch issues until it resolves, and it resolves in
 // the issue register's cycle, c0 + 1, where a conditional branch reads its
 // predicate like any operand (bra and the PT / !PT forms resolve there too).
 // Not taken: the buffered fall-through issues from c0 + 2. Taken: the FIFO is
 // cleared, the target is fetched from c0 + 2 and issues from c0 + 4 (at the
 // soonest: the target's fetch competes with the other warps' fetches).
-// Divergence (trash/divergence-2026-11-21.md) uses the same stage: a
+// Divergence uses the same stage: a
 // divergent bra reads every lane of its predicate at c0 + 1 and either
 // pushes the taken lanes and falls through (c0 + 2), or moves the whole mask
 // (c0 + 2 or c0 + 4); a sync pops at c0 + 1 from a registered copy of the
@@ -92,7 +90,7 @@
 // qtxc models none of this (issuing later is always safe); only the
 // predicate's sample point enters its distances (issue_to_predicate_sample).
 //
-// The uniform register file (trash/rfc16.md; trash/urf-slice-2026-11-08.md):
+// The uniform register file:
 // per warp urf.registers 32-bit registers, TWO read ports and ONE write port,
 // the same edge convention as the RF with its own depths Lu
 // (urf.read_latency_cycles) and Wu (urf.write_depth_cycles):
@@ -100,7 +98,7 @@
 //     ports always suffice) are sampled in its one read round, at the issue
 //     register's cycle c0 + 1, beside its vector registers; their values are
 //     at the URF output Lu later (no later than the vector operands: Lu <=
-//     Lr, validated). The exceptions are a tma (trash/rfc17.md section 4),
+//     Lr, validated). The exceptions are a tma,
 //     which reads N + 2 registers over R rounds, two per round, and an
 //     mma.async, which reads three over two rounds (uniform_read_rounds
 //     below); each holds the two ports for its later rounds.
@@ -130,8 +128,8 @@
 //     register) is a fixed-latency VECTOR result: its uniform operand is
 //     sampled at c0 + 1 and it rides the arithmetic pipeline like mov, its
 //     write booked on the RF write calendar at issue_to_port.
-//   - usetp pD, urA, urB | imm (the uniform compare;
-//     trash/uniform-compare-2026-11-18.md) is uniform arithmetic whose result
+//   - usetp pD, urA, urB | imm (the uniform compare) is uniform arithmetic
+//     whose result
 //     is one bit for the predicate file: it rides the URF write pipeline like
 //     every uniform-ALU instruction (operands sampled at c0 + 1, the ALU at
 //     c0 + 1 + Lu) and at the write port's cycle, c0 + L, presents pD -- the
@@ -232,8 +230,8 @@ inline uint32_t issue_to_predicate_visible(const Instruction& inst, const Device
 // is written from something the instruction read through the issue register
 // and the RF (Lr), held in at least one register before the write port, then
 // written through Wd. The fastest fixed result (E 1) meets it exactly; every
-// asynchronous writer (an lds's gather, an atomic's return slot, an LSU
-// assembly register, an acc.ld pipeline) is slower.
+// asynchronous writer (an lds's gather, an atomic's return slot, the load
+// buffer, an acc.ld pipeline) is slower.
 inline uint32_t earliest_rf_visible(const DeviceProfile& profile) {
     return issue_to_sample + profile.rf_read_latency_cycles + 1 + profile.rf_write_depth_cycles + 1;
 }
@@ -245,7 +243,7 @@ inline uint32_t issue_to_visible_min(const Instruction& inst, const DeviceProfil
     return uses_arithmetic_pipeline(inst) ? issue_to_visible(inst, profile) : earliest_rf_visible(profile);
 }
 
-// The URF's ports (fixed, HUMAN 2026-11-08: two read ports, one write port).
+// The URF's ports (fixed: two read ports, one write port).
 inline constexpr uint32_t urf_read_ports = 2;
 inline constexpr uint32_t urf_write_ports = 1;
 
@@ -287,7 +285,7 @@ inline uint32_t issue_to_uniform_predicate_visible(const DeviceProfile& profile)
     return issue_to_urf_port(profile) + 1;
 }
 
-// The tma's operand read (trash/rfc17.md section 4). The URF's two read
+// The tma's operand read. The URF's two read
 // ports serve the whole SM. A tma.Nd reads N + 2 registers by operand
 // position (a register named twice is read twice), two per round: round 0
 // samples urS and urM at the issue register's cycle like any read, then one
@@ -345,9 +343,9 @@ inline uint32_t issue_to_tma_command(uint32_t coordinates, const DeviceProfile& 
 // instruction that reads at most two (each distinct register once,
 // rf_read_round below), none for one that reads none. Two instructions read
 // more, by operand position (a register named twice is read twice), with the
-// TMA's round counter (trash/rfc17.md section 4; src/machine/machine.hpp UrfReadRounds):
+// TMA's round counter (src/machine/machine.hpp UrfReadRounds):
 //   tma.Nd     urS, urM | c0, c1 | c2, c3     (tma_operand_round)
-//   mma.async  urA, urB | urC                 (2026-11-19: urC, the
+//   mma.async  urA, urB | urC                 (urC, the
 //              result's tmem pointer, joins its dispatch entry from the URF
 //              output at issue + 2 + Lu, by its dispatch: issue_to_dispatch)
 // While an instruction still has rounds to start, issue refuses every

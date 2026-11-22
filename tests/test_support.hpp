@@ -1,5 +1,4 @@
-// Shared helpers of the unit tests (moved from the original tests/tests.cpp;
-// trash/test-setup-2026-10-22.md). Inline so every test file can include them.
+// Shared helpers of the unit tests. Inline so every test file can include them.
 #pragma once
 
 #include "machine/machine.hpp"
@@ -82,7 +81,7 @@ inline void write_tma_descriptor(
 }
 
 // A one-dimensional fp32 tensor of `elements` at gmem `base`, its tile the
-// whole tensor, dense (src/tma.hpp): the descriptor most tests use.
+// whole tensor, dense (src/tma_descriptor.hpp): the descriptor most tests use.
 inline nanosm::TmaDescriptor plain_tma_1d(uint32_t elements, uint64_t base = 0) {
     nanosm::TmaDescriptor descriptor;
     descriptor.base = base;
@@ -92,7 +91,7 @@ inline nanosm::TmaDescriptor plain_tma_1d(uint32_t elements, uint64_t base = 0) 
 }
 
 // The swizzle64 layout (src/layout.hpp), written out independently of the
-// production functions (trash/address_keyed_census.py's rule): byte `byte`
+// production functions: byte `byte`
 // of row `row` of a tile at `base` (a multiple of the spacing and of 64)
 // whose rows are `spacing` bytes apart. The row stays whole at base + row x
 // spacing; the row number that shuffles it is the unshuffled address's own,
@@ -133,13 +132,13 @@ inline const nanosm::DeviceProfile& canonical_profile() {
     return profile;
 }
 
-// I2 / I2.1 / I3 (rfc12 sections 2 and 6): an RMW's write is granted D + Lb
+// An RMW's write is granted D + Lb
 // + C cycles after its read (the read's words reach the port output, then the
 // update crosses the C ALU stages). Its "mbar RMW" slice runs from its START
-// (I3: the store pause begins) to its write grant; uncontended -- no store or
+// (the store pause begins) to its write grant; uncontended -- no store or
 // A-read transaction under way -- the read is granted in the start cycle, so
-// the engine is busy D + Lb + C + 1 cycles (2 before I2; D + Lb + 1 in I2,
-// which had no ALU stage). Back-to-back services are that far apart.
+// the engine is busy D + Lb + C + 1 cycles. Back-to-back services are that
+// far apart.
 inline uint64_t rmw_busy_cycles(const nanosm::DeviceProfile& profile = canonical_profile()) {
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + profile.shmem_rmw_compute_cycles + 1;
 }
@@ -234,17 +233,16 @@ inline std::string i1_asm(const nanosm::DeviceProfile& profile, const std::strin
 }
 
 // Hand assembly with the fixed-latency stalls its register and predicate
-// dependencies need under `profile` (src/rf.hpp, the distances qtxc
+// dependencies need under `profile` (src/timing.hpp, the distances qtxc
 // schedules with): every authored stall is kept when it is at least that,
-// raised when not; depbars and waits stay as written (I6a).
+// raised when not; depbars and waits stay as written.
 inline nanosm::Kernel hand_assemble(const std::string& text, const nanosm::DeviceProfile& profile) {
     return nanosm::schedule_fixed_stalls(nanosm::assemble_asm(text, profile), profile);
 }
 
 // ---------------------------------------------------------------------------
-// LSU (rfc09 B2): interleaved v8, scalar gather/scatter, ldg.uni, the staging
-// pool, the backpressure chain, TMA port-A priority, read-stream separation.
-// trash/lsu-b2-2026-10-04.md lists which tests replaced which.
+// LSU: per-lane v8, scalar gather / scatter, ldg.uni, the load and store
+// buffers, the backpressure chain, TMA port-A priority, read-stream separation.
 // ---------------------------------------------------------------------------
 
 // Coprime periods (31, 29): unique for 899 consecutive words, so a word in
@@ -257,7 +255,7 @@ inline void fill_pattern(std::vector<uint8_t>& image, uint32_t byte_address, uin
     for (uint32_t i = 0; i < words; ++i) write_u32(image, byte_address + 4 * i, pattern_word(first_index + i));
 }
 
-// A divergent region (trash/divergence-2026-11-21.md): `body` runs with only
+// A divergent region: `body` runs with only
 // the lanes of `mask` active; the others wait on the divergence stack. An
 // if with an empty other arm: the body's sync pops the waiting lanes, whose
 // arm is the second sync alone, which pops the ssy's entry (both pcs are the
@@ -290,14 +288,14 @@ inline void expect_sim_panic(nanosm::Machine& machine, const std::string& needle
     throw std::runtime_error(what + " did not panic");
 }
 
-// The RF-starvation setup of the LSU backpressure tests. Before I1 a stream
-// of movs (latency 1) booked an async writer's bank every cycle and starved
-// it indefinitely. Since I1 (trash/rfc10.md section 3) one denial with service
+// The RF-starvation setup of the LSU backpressure tests. A stream of movs
+// (latency 1) cannot starve an async writer by booking its bank every cycle:
+// one denial with service
 // owed inhibits new bookings to the bank, so a ready async writer waits at
 // most for the bookings already made. To hold one for a while, the stream
 // books booking_horizon cycles ahead: fadds whose result reaches the write
-// port that far after their issue (I6a: the issue register, Lr and the fadd
-// latency set by with_long_bookings, src/rf.hpp), one per cycle, rotating
+// port that far after their issue (the issue register, Lr and the fadd
+// latency set by with_long_bookings, src/timing.hpp), one per cycle, rotating
 // over booking_horizon destination registers of `bank`. booking_latency is
 // as long as the five-bit stall field allows at canonical RF depths (window
 // 1, Lr 2, Wd 2: 31 - 2 - 2 - 1 = 26), less a margin.
@@ -332,12 +330,11 @@ inline void write_rank1_load(std::vector<uint8_t>& shmem, uint32_t descriptor_ad
 }
 
 // ---------------------------------------------------------------------------
-// B2.1 (rfc09 section 3a): the handoff table edge by edge. Every edge has a
+// The handoff table edge by edge. Every edge has a
 // declared width per cycle; every named stage is a register stage (BRAM
 // FIFOs: + their declared latency); no datum crosses two stages in a cycle;
 // one write contract; generalized read streams. Observed through the
 // machine's edge probe (a test hook, never consulted by the machine).
-// trash/lsu-b21-2026-10-04.md.
 // ---------------------------------------------------------------------------
 
 using nanosm::LsuEdge;
@@ -391,7 +388,7 @@ inline std::string issue_log(const nanosm::Machine& machine) {
     return text;
 }
 
-// ---- Per-engine mbar event registers (design.md Mbar; 2026-10-07) ----
+// ---- Per-engine mbar event registers ----
 
 using RmwService = std::pair<uint64_t, std::string>; // start cycle, trace detail
 
@@ -435,7 +432,6 @@ inline nanosm::DeviceProfile dense_one_bank_profile(uint32_t result_latency) {
 }
 
 // ---- Race sanitizer: shmem range ownership and tmem ownership ----
-// (trash/shmem-ownership-sanitizer-2026-10-03.md)
 
 // Runs the machine and returns its PANIC text; a clean run is a test failure.
 inline std::string run_expecting_panic(
@@ -540,14 +536,12 @@ inline std::string describe(const std::vector<std::pair<uint64_t, uint64_t>>& sl
 }
 
 // ---------------------------------------------------------------------------
-// I2: shmem services and service slots (trash/rfc12.md sections 1-5 and 13;
-// trash/i2-portA-slots-2026-10-11.md). Exact timelines are hand assembly
+// Shmem services and service slots. Exact timelines are hand assembly
 // (i1_asm) under a debug trace, where every granted round is an instant
 // "<service> grant" (detail = client, value = slot). Several timelines use an
 // engine event the host places into the TMA's event register
-// (host_rmw_event). I3 re-derived every one of them: in I2 that RMW held
-// A-read AND A-write from its read to its write; since I3 (rfc12 section 6)
-// it pauses only new STORE transactions, from its start to its write grant,
+// (host_rmw_event). That RMW
+// pauses only new STORE transactions, from its start to its write grant,
 // and holds A-read only while it waits for its read (i3_with_blocker below).
 // ---------------------------------------------------------------------------
 
@@ -556,9 +550,9 @@ inline uint32_t i2_return(const nanosm::DeviceProfile& profile) {
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
 }
 
-// I6a: issue to dependent issue behind a one-cycle ALU result (mov, sread,
+// Issue to dependent issue behind a one-cycle ALU result (mov, sread,
 // shli, ...): visible issue_to_visible after its producer's issue, sampled
-// issue_register_stages after the consumer's (src/rf.hpp; 6 at canonical).
+// issue_register_stages after the consumer's (src/timing.hpp; 6 at canonical).
 // The hand-assembled timelines below are built from it and from
 // issue_to_dispatch (an lds / sts / mbar operation reaches its slot or
 // register that long after its issue, and is served from the next cycle).
@@ -621,7 +615,7 @@ inline std::unique_ptr<nanosm::Machine> i2_machine(const nanosm::DeviceProfile& 
 
 // The host's event (call between ticks): a complete_tx of 64 bytes into the
 // TMA's event register, held from the next cycle; it completes
-// i2_event_mbar's phase. (Was i2_only_hold_both_a_services.) Since I3 an RMW
+// i2_event_mbar's phase. An RMW
 // STARTS as soon as the engine is idle and A-write's alternation lets it (no
 // store waiting for its turn): from that cycle to its write grant the store
 // pause holds every new store transaction; A-read is held only while the RMW
@@ -637,13 +631,12 @@ inline void i2_run_until(nanosm::Machine& machine, uint64_t cycle) {
 }
 
 // ---------------------------------------------------------------------------
-// I2.1: follow-ups to the port-A slice (trash/i2-1-followups-2026-10-11.md;
-// Fable's review trash/i1-i2-review-fable-2026-10-11.md F1-F8, and the TMA
-// store-register derivation in trash/chan.txt). Timelines are hand assembly
-// under a debug trace, as in the I2 section.
+// Port A in more detail: the RMW compute stage, registered admission, order
+// behind a warp's own accesses, the TMA store registers. Timelines are hand
+// assembly under a debug trace, as in the section above.
 // ---------------------------------------------------------------------------
 
-// An I2-style machine (shmem words 0..2047 hold 0x100 + word) whose image
+// A machine like i2_machine (shmem words 0..2047 hold 0x100 + word) whose image
 // also holds the given mbars.
 inline std::unique_ptr<nanosm::Machine> i21_machine(const nanosm::DeviceProfile& profile, const std::string& program,
     const std::vector<std::pair<uint32_t, nanosm::MbarState>>& mbars, uint32_t warps = 1) {
@@ -666,7 +659,7 @@ inline nanosm::MbarState i21_mbar(uint16_t expected, uint16_t remaining, int32_t
     return state;
 }
 
-// An optional profile field, I2 style: the canonical JSON declares
+// An optional profile field: the canonical JSON declares
 // `canonical`; absent, it defaults to the same value (same fingerprint); 0,
 // negative, fractional and 65 are rejected by parsing and 0 by validation;
 // another value changes the fingerprint.
@@ -704,11 +697,10 @@ inline void i21_check_optional_field(const char* section, const char* field, uin
 }
 
 // ---------------------------------------------------------------------------
-// I3: the RMW engine's global store pause, the RMW / store alternation bit,
+// The RMW engine's global store pause, the RMW / store alternation bit,
 // fair admission between SIMT RMWs and engine events, and the signed mbar tx
-// count (trash/rfc12.md sections 5, 6 and 8;
-// trash/i3-rmw-pause-signed-tx-2026-10-11.md). Hand assembly under a debug
-// trace, as in the I2 sections. An RMW's START is its "mbar RMW" slice's
+// count. Hand assembly under a debug
+// trace, as in the sections above. An RMW's START is its "mbar RMW" slice's
 // start (the store pause begins at that cycle's edge); its read and write are
 // the "rmw" grants on A-read and A-write.
 // ---------------------------------------------------------------------------
@@ -757,11 +749,11 @@ inline std::string i4_panic(nanosm::Machine& machine, const std::string& what) {
 }
 
 // ---------------------------------------------------------------------------
-// I5: uniform shared atomics (trash/rfc13.md; trash/i5r-uniform-atomics-
-// 2026-10-12.md), backlog D12 (machine quiet, sanitizer PANIC) and the C10
-// follow-up (launch-declared mbars are live; C11: their addresses are checked
-// before narrowing). Hand assembly under a debug trace, as in the I2 - I4
-// sections. An atomic is an RMW-engine operation: its "atomic RMW" slice runs
+// Uniform shared atomics, undefined behaviour the machine is quiet about
+// and the sanitizer PANICs on, and launch-declared mbars (live from launch;
+// their addresses are checked before narrowing). Hand assembly under a debug
+// trace, as in the sections above. An atomic is an RMW-engine operation: its
+// "atomic RMW" slice runs
 // from its START (the store pause begins) to its write grant + 1; inside it,
 // its read and its write are the "rmw" grants on A-read and A-write.
 // ---------------------------------------------------------------------------
@@ -783,7 +775,7 @@ inline std::string describe(const I5Atomic& atomic) {
     return text + "}";
 }
 
-// I2-style shmem (word w holds 0x100 + w), a debug trace.
+// Shmem as in i2_machine (word w holds 0x100 + w), a debug trace.
 inline std::unique_ptr<nanosm::Machine> i6a_machine(
     const nanosm::DeviceProfile& profile, const nanosm::Kernel& kernel, uint32_t warps = 1) {
     nanosm::Launch launch;

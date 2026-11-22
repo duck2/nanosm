@@ -1,6 +1,5 @@
-// The LSU (rfc09): vector and scalar gmem access, the staging pool, the handoff edges.
-// Moved from the original tests/tests.cpp (trash/test-setup-2026-10-22.md);
-// each test's body is unchanged, its TEST wrapper is at the end.
+// The LSU: vector and scalar gmem access, the load and store buffers, the
+// handoff edges. Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
 namespace {
@@ -99,9 +98,9 @@ void test_lsu_scalar_ldg_is_one_request_per_lane() {
         "scalar ldg useful/sector byte accounting is wrong");
 }
 
-// (a) ldg.v8 / stg.v8 are per lane (2026-11-21): each ACTIVE lane moves the
+// (a) ldg.v8 / stg.v8 are per lane: each ACTIVE lane moves the
 // sector at ITS OWN address, and the sector's word j is rD + j (rS + j) at
-// that lane. Astra's check first: memory holds word indices and lane l names
+// that lane. The reversed-lane check first: memory holds word indices and lane l names
 // the sector at 32 x (15 - l), so r(D + 3) must hold 123, 115, ..., 3 -- a
 // load and a store that shared one wrong lane permutation could not pass it.
 // Then a store to per-lane sectors with guard bytes, and both under a write
@@ -230,8 +229,8 @@ void test_lsu_contract_panics() {
     run("mov r0, 1024\nldg.v8 r8, [r0]\nhalt\n", 1024, "out of bounds", "out-of-bounds ldg.v8 sector");
 }
 
-// Replaces "gmem command capacity" (a footprint larger than the controller
-// queue used to PANIC): commands now stream through any queue >= 1 entry.
+// A footprint larger than the controller queue is no error: commands stream
+// through any queue >= 1 entry.
 void test_lsu_commands_stream_through_small_queue() {
     auto config = canonical_profile();
     config.tma_queue_commands = 0;
@@ -276,7 +275,7 @@ void test_lsu_command_slot_structurally_stalls() {
     )", config), std::move(launch));
     machine.run();
     const auto& summary = machine.trace().summary();
-    require(summary.lsu_no_slot_cycles != 0 && summary.lsu_no_staging_cycles == 0,
+    require(summary.lsu_no_slot_cycles != 0 && summary.lsu_store_buffer_wait_cycles == 0,
         "one command slot never made the second ldg ineligible");
     require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::structural)] >=
             summary.lsu_no_slot_cycles,
@@ -325,9 +324,8 @@ void test_lsu_gather_requests() {
     const auto in_order = gather(distinct, 16, distinct_word);
     require(std::is_sorted(in_order.begin(), in_order.end()),
         "the placeholder FIFO controller reordered gather returns");
-    // (A gather rides the one ordered LSU read stream since 2026-11-21: one
-    // load buffer, so every load returns in request order. The free-ID
-    // reorder hook that used to shuffle its returns is gone.)
+    // (A gather rides the one ordered LSU read stream: one load buffer, so
+    // every load returns in request order.)
     // Two lanes per sector (lanes 2k, 2k+1): still sixteen requests.
     gather(R"(
         shli r7, r1, 2
@@ -386,8 +384,8 @@ void test_lsu_scatter_byte_enables() {
         "each scatter is not sixteen masked sector writes");
 }
 
-// (f) The backpressure chain: RF write port blocked -> assembly register full
-// -> (B2.1: no vector sector register) ingress FIFO head blocked -> FIFO full
+// (f) The backpressure chain: RF write port blocked -> load buffer full
+// -> (no vector sector register) ingress FIFO head blocked -> FIFO full
 // -> return-ready low ->
 // the controller holds beats -> queue full -> request-ready low -> both
 // command slots held -> the next ldg is ineligible. Nothing is lost.
@@ -406,8 +404,8 @@ void test_lsu_backpressure_chain() {
         auto& gmem = image_bytes(launch.gmem_image, 4096);
         fill_pattern(gmem, 0, 1024, 0);
         // Warp 1 books RF bank 0 every cycle, booking_horizon cycles ahead
-        // (I1: a ready assembly then waits out up to that many old bookings
-        // per denial; a mov storm no longer starves it).
+        // (a ready load buffer then waits out up to that many old bookings
+        // per denial; a mov storm cannot starve it).
         std::string text = R"(
             usread ur0, WARP_ID
             ur2r r29, ur0
@@ -445,7 +443,7 @@ void test_lsu_backpressure_chain() {
         return std::make_tuple(linked, machine.trace().summary());
     };
     const auto [linked, summary] = run(true);
-    // I1: each write bound for bank 0 (r0, r3, r6, r9, r12, r15, per group)
+    // Each write bound for bank 0 (r0, r3, r6, r9, r12, r15, per group)
     // waits out at most the bookings already made when it was denied (the
     // owed bit then inhibits warp 1): blocked, but never starved.
     // A group's eight writes follow each other, so only a group's first
@@ -512,7 +510,7 @@ void test_lsu_controller_contract_tripwire() {
     machine.set_controller_test_order(nanosm::ControllerTestOrder::illegal_ordered_reorder);
     expect_sim_panic(machine, "contract violation: read stream 1 (vector) returned request",
         "an out-of-order vector stream");
-    // Review (Astra, 2026-11-21): with both clocks at 1 GHz request 2 comes
+    // With both clocks at 1 GHz request 2 comes
     // back ahead of request 1. At two lanes a group that is another group's
     // sector, which the load buffer refuses while group 0 waits for the
     // sector that was skipped: the order is checked before the buffer is
@@ -540,12 +538,12 @@ void test_lsu_controller_contract_tripwire() {
     }
 }
 
-// Review (Astra, 2026-11-21): a gather writes the RF, and frees its command
+// A gather writes the RF, and frees its command
 // slot, when its last word is in; the rest of that word's sector is still
 // arriving and its read ID table entry lives until the sector's last byte.
 // With a slow DRAM clock the next gather puts sixteen reads in flight from
 // that slot meanwhile: two slots' reads plus that one tail. The table holds
-// the tail (lsu.active_commands x lanes + 1); it used to trip its own limit.
+// the tail (lsu.active_commands x lanes + 1).
 void test_lsu_gather_tail_after_retirement() {
     auto config = canonical_profile();
     config.dram_clock_hz = 125000000;
@@ -562,7 +560,7 @@ void test_lsu_gather_tail_after_retirement() {
                 "gather " + std::to_string(reg) + " read the wrong word in lane " + std::to_string(lane));
 }
 
-// Review (Astra, 2026-11-21): ldg.v8 / stg.v8 need 32-byte sectors (a lane's
+// ldg.v8 / stg.v8 need 32-byte sectors (a lane's
 // eight words are one sector). On a profile with other sectors they are
 // refused when compiled and at kernel load, not at dispatch; scalar ldg / stg
 // work there.
@@ -641,13 +639,13 @@ void test_lsu_profile_and_encoding() {
     };
     rejects([](auto& j) { j.erase("lsu"); }, "missing 'lsu'");
     // Two ordered read streams exist, the TMA's and the load / store unit's
-    // (every load on one, since 2026-11-21): the field is 2.
+    // (every load on one): the field is 2.
     rejects([](auto& j) { j["lsu"]["read_streams"] = 1; }, "read_streams must be 2");
     rejects([](auto& j) { j["lsu"]["read_streams"] = 3; }, "read_streams must be 2");
     rejects([](auto& j) { j["lsu"]["ingress_sectors"] = 1; }, "at least two sectors");
     rejects([](auto& j) { j["lsu"]["egress_sectors"] = 1; }, "at least two sectors");
     rejects([](auto& j) { j["lsu"]["active_commands"] = 0; }, "must be nonzero");
-    // B2.1: a BRAM FIFO is never fall-through; latency 0 is rejected.
+    // A BRAM FIFO is never fall-through; latency 0 is rejected.
     rejects([](auto& j) { j["lsu"]["ingress_latency_cycles"] = 0; }, "latency must be in 1..64");
     rejects([](auto& j) { j["lsu"]["egress_latency_cycles"] = 0; }, "latency must be in 1..64");
     rejects([](auto& j) { j["lsu"].erase("egress_latency_cycles"); }, "egress_latency_cycles");
@@ -724,8 +722,8 @@ void check_edge_widths(const nanosm::Machine& machine, const nanosm::DeviceProfi
             require(entry.bytes <= pluck, at + "TMA sector register filled with " +
                 std::to_string(entry.bytes) + " B, over the pluck width");
             break;
-        case LsuEdge::assembly_write:
-            require(entry.bytes <= pluck, at + "assembly register filled with " +
+        case LsuEdge::buffer_write:
+            require(entry.bytes <= pluck, at + "load buffer filled with " +
                 std::to_string(entry.bytes) + " B, over the pluck width");
             break;
         case LsuEdge::egress_write:
@@ -777,7 +775,7 @@ void test_lsu_edge_widths() {
             require(machine.read_gmem_u32(2048 + 4 * word) == pattern_word(word), "vector copy mismatch");
         const auto what = "vector path, pluck " + std::to_string(pluck);
         check_edge_widths(machine, config, what);
-        require(max_bytes_per_cycle(machine, LsuEdge::assembly_write) == pluck * 4 &&
+        require(max_bytes_per_cycle(machine, LsuEdge::buffer_write) == pluck * 4 &&
                 max_bytes_per_cycle(machine, LsuEdge::ingress_read) == pluck * 4 &&
                 max_bytes_per_cycle(machine, LsuEdge::egress_write) == pluck * 4,
             what + ": the pluck width was never reached; the test proves nothing");
@@ -826,9 +824,8 @@ void test_lsu_edge_widths() {
     }
 }
 
-// Codex's B2 probe (chan 2026-10-04, finding 3): a 16 KiB one-dimensional
-// plain TMA store, DRAM = core clock, 32 B per tick, latency 0, egress_sectors 2. B2
-// took 520 cycles at pluck 1, 2 and 8 (the store bypassed egress). Now every
+// A 16 KiB one-dimensional
+// plain TMA store, DRAM = core clock, 32 B per tick, latency 0, egress_sectors 2. Every
 // TMA store sector crosses the shared egress write port, so the run is
 // pluck-bound: 16384 / (4 x pluck) cycles plus a short tail.
 void test_tma_store_egress_is_pluck_bound() {
@@ -845,11 +842,11 @@ void test_tma_store_egress_is_pluck_bound() {
         machine.run();
         for (uint32_t i = 0; i < 4096; ++i)
             require(machine.read_gmem_u32(4 * i) == pattern_word(i), "16 KiB TMA store data mismatch");
-        // I2 (rfc12 section 2): a sector's source read reaches the one TMA
+        // A sector's source read reaches the one TMA
         // store sector register D + Lb cycles after its grant, and the
         // register holds the sector until its last word is in the egress
         // FIFO, so each of the 512 sectors costs D + Lb plus its 8 / pluck
-        // drain cycles (before I2: the drain alone, 16384 / (4 * pluck)).
+        // drain cycles.
         const uint64_t bound = 512 * (config.shmem_port_a_depth + config.shmem_read_latency_cycles + 8 / pluck);
         require(machine.cycle() >= bound && machine.cycle() <= bound + 100,
             "16 KiB TMA store at pluck " + std::to_string(pluck) + " took " + std::to_string(machine.cycle()) +
@@ -922,13 +919,13 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
     { // vector load: bus -> ingress FIFO -> assembly -> RF
         const auto machine = run("mov r0, 0\nldg.v8 r8, [r0]\nhalt\n", false, 0);
         std::map<uint64_t, uint64_t> last_word; // request -> cycle of its last assembly write
-        for (const auto& event : of(*machine, LsuEdge::assembly_write)) last_word[event.aux] = event.cycle;
+        for (const auto& event : of(*machine, LsuEdge::buffer_write)) last_word[event.aux] = event.cycle;
         for (const auto& beat : of(*machine, LsuEdge::bus_read_beat)) {
             const auto read = read_cycle(*machine, beat.id, beat.aux);
             bool assembled = false;
-            for (const auto& event : of(*machine, LsuEdge::assembly_write))
+            for (const auto& event : of(*machine, LsuEdge::buffer_write))
                 assembled |= event.aux == beat.id && event.cycle == read;
-            require(assembled, "a vector beat read from the FIFO did not land in the assembly register that cycle");
+            require(assembled, "a vector beat read from the FIFO did not land in the load buffer that cycle");
             t.vector_bus_to_assembly.push_back(static_cast<int64_t>(read) - static_cast<int64_t>(beat.cycle));
         }
         std::vector<uint64_t> requests;
@@ -964,7 +961,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
     }
     { // ldg.uni of word 5 (byte 20, in the beat at offset 16)
         const auto machine = run("umov ur0, 0\nldg.uni r1, [ur0 + 20]\nhalt\n", false, 2);
-        const auto words = of(*machine, LsuEdge::assembly_write);
+        const auto words = of(*machine, LsuEdge::buffer_write);
         const auto writes = of(*machine, LsuEdge::rf_write_beat);
         require(words.size() == 1 && writes.size() == 1, "ldg.uni: one word, one RF beat");
         for (const auto& beat : of(*machine, LsuEdge::bus_read_beat))
@@ -979,7 +976,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
             t.gather_bus_to_read.push_back(
                 static_cast<int64_t>(read_cycle(*machine, beat.id, beat.aux)) - static_cast<int64_t>(beat.cycle));
         uint64_t last = 0;
-        for (const auto& event : of(*machine, LsuEdge::assembly_write)) last = std::max(last, event.cycle);
+        for (const auto& event : of(*machine, LsuEdge::buffer_write)) last = std::max(last, event.cycle);
         const auto writes = of(*machine, LsuEdge::rf_write_beat);
         require(writes.size() == 1, "gather: one RF beat");
         t.gather_assembly_to_rf = static_cast<int64_t>(writes[0].cycle) - static_cast<int64_t>(last);
@@ -1051,7 +1048,7 @@ bool all_equal(const std::vector<int64_t>& values, int64_t expected) {
 void test_lsu_no_fall_through_timelines() {
     const auto t = lsu_timelines(1, 1);
     require(all_equal(t.vector_bus_to_assembly, 1),
-        "vector: bus beat -> assembly register is not exactly the ingress FIFO latency (1)");
+        "vector: bus beat -> load buffer is not exactly the ingress FIFO latency (1)");
     require(all_equal(t.vector_assembly_to_rf, 1),
         "vector: the group's RF writes are not one a cycle from the cycle after its last word lands");
     require(all_equal(t.tma_bus_to_register, 1), "TMA: bus beat -> TMA sector register is not 1 cycle");
@@ -1059,11 +1056,11 @@ void test_lsu_no_fall_through_timelines() {
     require(t.uni_bus_to_assembly == 1 && t.uni_assembly_to_rf == 1, "ldg.uni: bus -> assembly -> RF is not 1 + 1");
     require(all_equal(t.gather_bus_to_read, 1) && t.gather_assembly_to_rf == 1,
         "gather: bus -> FIFO read -> RF is not 1 + 1");
-    // I6a: the beat sampled at t is at the RF output, filling the assembly
+    // The beat sampled at t is at the RF output, filling the assembly
     // register, at t + Lr; the egress port reads it (Q) one cycle later.
     require(all_equal(t.store_rf_to_egress, canonical_profile().rf_read_latency_cycles + 1),
         "stg.v8: a group's eighth RF read beat -> its first egress word is not Lr + 1 cycles");
-    // The assembly register is refilled in the cycle its last word drained
+    // The store buffer is refilled in the cycle its last word drained
     // (its consumer runs first in the tick): a handoff, not a read-through.
     require(all_equal(t.store_drain_to_next_rf, 0),
         "stg.v8: the next group's first read beat is not in the cycle the store buffer drained");
@@ -1162,7 +1159,7 @@ void test_lsu_one_write_contract() {
         "TMA store and stg.v8 acks are not both gmem.latency_dram_ticks after the last beat");
 }
 
-// E4, since 2026-11-21: every LSU read rides ONE ordered stream (stream 1;
+// Every LSU read rides ONE ordered stream (stream 1;
 // lsu.read_streams is 2, the TMA's and this one), because the one load
 // buffer takes data in request order. Two ldg.v8 commands are never
 // interleaved by the legal interleave hook; the illegal reorder still panics.
@@ -1317,32 +1314,32 @@ TEST(Lsu, lsu_profile_and_encoding) {
     test_lsu_profile_and_encoding();
 }
 
-// lsu B2.1: per-edge widths
+// lsu: per-edge widths
 TEST(Lsu, lsu_edge_widths) {
     test_lsu_edge_widths();
 }
 
-// lsu B2.1: TMA store egress is pluck-bound
+// lsu: TMA store egress is pluck-bound
 TEST(LsuSlow, tma_store_egress_is_pluck_bound) {
     test_tma_store_egress_is_pluck_bound();
 }
 
-// lsu B2.1: no fall-through timelines
+// lsu: no fall-through timelines
 TEST(Lsu, lsu_no_fall_through_timelines) {
     test_lsu_no_fall_through_timelines();
 }
 
-// lsu B2.1: FIFO latency fields
+// lsu: FIFO latency fields
 TEST(Lsu, lsu_fifo_latency_fields) {
     test_lsu_fifo_latency_fields();
 }
 
-// lsu B2.1: one write contract
+// lsu: one write contract
 TEST(Lsu, lsu_one_write_contract) {
     test_lsu_one_write_contract();
 }
 
-// lsu B2.1: read_streams generalized
+// lsu: read_streams generalized
 TEST(Lsu, lsu_read_streams_generalized) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_lsu_read_streams_generalized();
