@@ -84,7 +84,7 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
     # Poison outputs / P so unwritten entries cannot pass as launch-zero values
     # (P's address is the kernel's; a test's look inside, not part of launching).
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
-    launch.test_shmem.write(launch.symbol("PBUF0"), struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
+    launch.test_shmem.write(launch.symbol("PBUF"), struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
 
@@ -217,7 +217,7 @@ def run_case(case: str, trace: Path | None) -> None:
     else:
         assert all(alpha == 1 for alpha in second_alpha), "stable-max control is not stable"
     launch = make_launch(q, k, v)
-    STATS, P_SHARED, O_SHARED = launch.symbol("STATS"), launch.symbol("PBUF0"), launch.symbol("OSTAGE0")
+    STATS, P_SHARED, O_SHARED = launch.symbol("STATS"), launch.symbol("PBUF"), launch.symbol("OSTAGE")
     with launch.run(trace=trace, max_trace_events=1_000_000, cycle_limit=1_000_000) as result:
         output = result.gmem_f32(O_GLOBAL, ROWS * WIDTH)
         model_error = check_close(output, ref["model"], 2e-6, "quantized online reference")

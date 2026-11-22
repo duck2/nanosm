@@ -15,37 +15,39 @@
 ; slot XOR r & 3, the word's XOR (r / 4) & 3. One constant per row serves
 ; both tiles (rows of 64 bytes or more). The rule takes the row number from
 ; the address (base / spacing + r); counting r from the tile agrees because
-; PBUF0 and OSTAGE0 are multiples of 16 rows (2048 and 4096 bytes).
+; PBUF and OSTAGE are declared on 16-row multiples (their align=).
 ; A worker's tmem pointers (src/layout.hpp): %s_rows its 16 score rows
-; (S_TMEM + 64 x its first query row), %o_rows the same rows of O; %walk
+; (S + S.row_words x its first query row), %o_rows the same rows of O; %walk
 ; walks one of them eight columns at a time and stops at %s_end / %o_end
 ; (the row's end). The upper query tile's workers use the next barrier in
 ; each pair. %block is the key block and the parity of its score, work and
 ; PV barriers.
 
-; tmem, in words: the scores of all 64 query rows at S_TMEM and the output
-; numerator at O_TMEM, rows of 64 words. Each 32-row tile is one matmul's
-; m32n64 result: S0 = S_TMEM, S1 = S1_TMEM (query rows 32..63), O0, O1 the
-; same. A worker points at its own rows, so both tiles share the worker code.
-.equ S_TMEM,     0
-.equ S1_TMEM,    2048
-.equ O_TMEM,     4096
-.equ O1_TMEM,    6144
+; The kernel's own memory, by name (README "Memory"): qtxc places each object,
+; one after another from address 0; the code uses the names, their elements
+; (QBUF[1]) and their properties (.row_bytes, .stride, .bytes).
+;
+; tmem, in words: the scores S and the output numerator O, each two tiles of
+; 32 rows of 64 words (one matmul's m32n64 result per query tile). A worker
+; points at its own rows, so both tiles share the worker code: query row r's
+; scores are at S + r x S.row_words, tile 1's rows following tile 0's.
+.tmem  S[2],      rows=32, cols=64
+.tmem  O[2],      rows=32, cols=64
 ; Double-buffered K/V stage sets (roofline E3): TMA fills set 1 on port A
-; while MMA reads set 0 on port B — the two async engines finally overlap.
-.equ QBUF0,      0
-.equ QBUF1,      4096
-.equ KBUF0,      8192
-.equ VBUF0,      16384
-.equ KBUF1,      24576
-.equ VBUF1,      32768
-.equ PBUF0,      40960
-.equ PBUF1,      45056
+; while MMA reads set 0 on port B -- the two async engines finally overlap.
+.shmem QBUF[2],   rows=32, cols=64, elem=2   ; Q, query tile t
+.shmem KBUF[2],   rows=64, cols=64, elem=2   ; K, stage set (key block) b
+.shmem VBUF[2],   rows=64, cols=64, elem=2   ; V, the same, transposed
+; P, query tile t (both key blocks use it in turn). The workers shuffle a
+; row's bytes themselves with one constant per row; that needs a base on a
+; multiple of 16 rows, which these tiles ask for.
+.shmem PBUF[2],   rows=32, cols=64, elem=2, align=16 * PBUF.row_bytes
 ; The last QK for both tiles precedes the last PV for either. After its PV
-; commit each worker pair can stage 32 fp32 rows over the dead Q or K0.
-.equ OSTAGE0,    0
-.equ OSTAGE1,    8192
-.equ STATS,      50176
+; commit each worker pair can stage 32 fp32 rows OVER the dead Q or K0.
+.shmem OSTAGE[2], rows=32, cols=64, elem=4, align=16 * OSTAGE.row_bytes, over=QBUF, KBUF[0]
+; Per key block: three fields (row max, denominator, alpha) of 64 query rows.
+.shmem STATS[2],  bytes=1024, align=4
+.equ   STAT_FIELD, 64 * 4            ; one field: a fp32 per query row
 
 ; What the launch gives: one TMA descriptor per tensor (Q and O move 32 rows
 ; at a time, K and V a 64-key block; V transposed): the four .param lines, in
@@ -83,7 +85,8 @@
         ushli %first_row, %w, 4   ; global row group: 0, 16, 32 or 48
         sread %lane, LANE_ID
         ur2r  %row, %first_row
-        ushli %s_rows, %first_row, 6 ; this row group's scores: S_TMEM (0) + 64 x row group
+        ushli %rows_at, %first_row, log2(S.row_words) ; this row group, as a word offset into S or O
+        uaddi %s_rows, %rows_at, S ; this row group's scores
         add   %row, %lane, %row   ; global row for P, statistics and staged O
         shli  %stats, %row, 2
         addi  %stats, %stats, STATS
@@ -97,12 +100,12 @@
         uaddi %work_bar, %tile8, WORK
         uaddi %output_bar, %tile8, OUTPUT
         uaddi %staged_bar, %tile8, STAGED
-        uaddi %s_end, %s_rows, 64 ; the end of the score rows' columns
-        uaddi %o_rows, %s_rows, O_TMEM ; the same rows of O
-        uaddi %o_end, %o_rows, 64
+        uaddi %s_end, %s_rows, S.row_words ; the end of the score rows' columns
+        uaddi %o_rows, %rows_at, O ; the same rows of O
+        uaddi %o_end, %o_rows, O.row_words
 ; This row's P base and its shuffle constant (r & 3) << 4 | (r & 12).
-        shli  %p_row, %row, 7
-        addi  %p_row, %p_row, PBUF0
+        shli  %p_row, %row, log2(PBUF.row_bytes)
+        addi  %p_row, %p_row, PBUF
         andi  %shuffle, %row, 3
         shli  %shuffle, %shuffle, 4
         andi  %tmp, %row, 12
@@ -117,7 +120,7 @@ S_READY:
         ur2r  %new_max, %neg_inf_bits ; -infinity
         umov  %walk, %s_rows
 ROW_MAX:
-        acc.ld.v8 %col0, [%walk, 64]
+        acc.ld.v8 %col0, [%walk, S.row_words]
         fmax  %t0, %col0, %col1
         fmax  %t1, %col2, %col3
         fmax  %t2, %col4, %col5
@@ -143,7 +146,7 @@ ROW_MAX:
 ; Pass 2: exp(score - max), FP32 row sum, packed-half P in the swizzle64
 ; layout the MMA reads (one 16-byte piece per chunk of eight columns).
 MAKE_P:
-        acc.ld.v8 %col0, [%walk, 64]
+        acc.ld.v8 %col0, [%walk, S.row_words]
         addi  %scale_a, %scale, 0
         addi  %scale_b, %scale, 0
         fmul  %col0, %col0, %scale_a
@@ -200,9 +203,9 @@ MAKE_P:
         fmul  %denom, %denom, %alpha
         fadd  %denom, %denom, %block_sum
         sts   [%stats], %max      ; per-block diagnostic row max
-        sts   [%stats+256], %denom ; denominator before final normalization
-        sts   [%stats+512], %alpha ; alpha (zero for first block)
-        addi  %stats, %stats, 1024
+        sts   [%stats + STAT_FIELD], %denom ; denominator before final normalization
+        sts   [%stats + 2 * STAT_FIELD], %alpha ; alpha (zero for first block)
+        addi  %stats, %stats, STATS.stride
         usetp.eq.u32 p2, %block, 0
 @p2     bra.uni P_READY           ; first PV uses init; never read uninitialized O
 
@@ -211,7 +214,7 @@ MAKE_P:
         addi  %alpha_a, %alpha, 0
         addi  %alpha_b, %alpha, 0
 CORRECT_O:
-        acc.ld.v8 %col0, [%walk, 64]
+        acc.ld.v8 %col0, [%walk, O.row_words]
         fmul  %col0, %col0, %alpha_a
         fmul  %col1, %col1, %alpha_a
         fmul  %col2, %col2, %alpha_b
@@ -220,7 +223,7 @@ CORRECT_O:
         fmul  %col5, %col5, %alpha_b
         fmul  %col6, %col6, %alpha_a
         fmul  %col7, %col7, %alpha_a
-        acc.st.v8 [%walk, 64], %col0
+        acc.st.v8 [%walk, O.row_words], %col0
         uaddi %walk, %walk, 8
         usetp.lt.u32 p2, %walk, %o_end
 @p2     bra.uni CORRECT_O
@@ -236,8 +239,8 @@ PV_READY:
 
 ; Final normalization, one row per lane, staged in shmem as an fp32
 ; swizzle64 tile (256-byte rows) for one TMA store per worker pair:
-;   addr(row, col) = OSTAGE0 + 256*row + ((4*col) XOR %shuffle)
-; A chunk of eight columns is 32 unshuffled bytes at %out_chunk (OSTAGE0 + 256*row +
+;   addr(row, col) = OSTAGE + OSTAGE.row_bytes*row + ((4*col) XOR %shuffle)
+; A chunk of eight columns is 32 unshuffled bytes at %out_chunk (OSTAGE + OSTAGE.row_bytes*row +
 ; 32*chunk); its column j is at (%out_chunk XOR %shuffle) XOR 4j. A column sts over 16 rows
 ; takes one bank round. Columns c+2 and c+3 are scaled into registers of
 ; their own (%n2, %n3).
@@ -245,10 +248,10 @@ PV_READY:
         addi  %inv_a, %inv, 0
         addi  %inv_b, %inv, 0
         umov  %walk, %o_rows
-        shli  %out_chunk, %row, 8
-        addi  %out_chunk, %out_chunk, OSTAGE0 ; chunk zero of this row, unshuffled
+        shli  %out_chunk, %row, log2(OSTAGE.row_bytes)
+        addi  %out_chunk, %out_chunk, OSTAGE ; chunk zero of this row, unshuffled
 NORMALIZE:
-        acc.ld.v8 %col0, [%walk, 64]
+        acc.ld.v8 %col0, [%walk, O.row_words]
         fmul  %col0, %col0, %inv_a
         fmul  %col1, %col1, %inv_a
         fmul  %n2, %col2, %inv_b
@@ -286,12 +289,12 @@ ISSUER:
         umov  %input_done, INPUT_DONE
         umov  %coord0, 0          ; TMA coordinates (channel, row)
         umov  %coord1, 0
-        umov  %qbuf, QBUF0
-        umov  %kbuf, KBUF0        ; current K and V for both query tiles
-        umov  %vbuf, VBUF0
-        mbar.arrive.expect_tx [%input_done], 24576
+        umov  %qbuf, QBUF[0]
+        umov  %kbuf, KBUF[0]      ; current K and V for both query tiles
+        umov  %vbuf, VBUF[0]
+        mbar.arrive.expect_tx [%input_done], QBUF.bytes + KBUF[0].bytes + VBUF[0].bytes
         tma.load.2d [%qbuf], [QDESC, %coord0], [%input_done]
-        umov  %qbuf, QBUF1
+        umov  %qbuf, QBUF[1]
         umov  %coord1, 32
         tma.load.2d [%qbuf], [QDESC, %coord0], [%input_done]
         umov  %coord1, 0
@@ -305,18 +308,18 @@ ISSUER:
         umov  %output0, OUTPUT
         umov  %output1, OUTPUT[1]
         umov  %block, 0           ; key block, also the workers' barrier parity
-        umov  %kbuf_next, KBUF1
-        umov  %vbuf_next, VBUF1
-        umov  %acc_s0, S_TMEM     ; the four 32x64 results: S0, S1, O0, O1
-        umov  %acc_s1, S1_TMEM
-        umov  %acc_o0, O_TMEM
-        umov  %acc_o1, O1_TMEM
+        umov  %kbuf_next, KBUF[1]
+        umov  %vbuf_next, VBUF[1]
+        umov  %acc_s0, S[0]       ; the four 32x64 results: S0, S1, O0, O1
+        umov  %acc_s1, S[1]
+        umov  %acc_o0, O[0]
+        umov  %acc_o1, O[1]
 IN0:
         mbar.try_wait p1, [%input_done], 0
 @!p1    bra.uni IN0
 ; Prefetch the second K/V stage while MMA and the workers use the first.
         umov  %coord1, 64
-        mbar.arrive.expect_tx [%input_done], 16384
+        mbar.arrive.expect_tx [%input_done], KBUF[1].bytes + VBUF[1].bytes
         tma.load.2d [%kbuf_next], [KDESC, %coord0], [%input_done]
         tma.load.2d [%vbuf_next], [VDESC, %coord0], [%input_done]
 
@@ -325,56 +328,56 @@ KEY_BLOCK:
 ; Each command consumes eight fp16 values per row. The next K slice is
 ; 16 bytes farther along each 128-byte row. Commit S0 as soon as it is ready:
 ; warps 1/2 can run softmax while the tensor core computes S1.
-        umov  %a_op, QBUF0
+        umov  %a_op, QBUF[0]
         umov  %b_op, %kbuf
-        mma.async.init.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.init.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s0], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         mma.commit [%score0]
 
-        umov  %a_op, QBUF1
+        umov  %a_op, QBUF[1]
         umov  %b_op, %kbuf
-        mma.async.init.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.init.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_s1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_s1], [%a_op, QBUF.row_bytes], [%b_op, KBUF.row_bytes]
         mma.commit [%score1]
 
 ; Each pair publishes its P and corrected O independently. Block 0 initializes
@@ -382,67 +385,67 @@ KEY_BLOCK:
 P0_READY:
         mbar.try_wait p1, [%work0], %block
 @!p1    bra.uni P0_READY
-        umov  %a_op, PBUF0
+        umov  %a_op, PBUF[0]
         umov  %b_op, %vbuf
 @!p2    bra.uni ADD_O0
-        mma.async.init.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.init.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         bra   MORE_O0
-ADD_O0: mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+ADD_O0: mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
 MORE_O0:
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o0], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o0], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         mma.commit [%output0]
 
 P1_READY:
         mbar.try_wait p1, [%work1], %block
 @!p1    bra.uni P1_READY
-        umov  %a_op, PBUF1
+        umov  %a_op, PBUF[1]
         umov  %b_op, %vbuf
 @!p2    bra.uni ADD_O1
-        mma.async.init.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.init.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         bra   MORE_O1
-ADD_O1: mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+ADD_O1: mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
 MORE_O1:
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         uaddi %a_op, %a_op, 16
         uaddi %b_op, %b_op, 16
-        mma.async.m32n64k8 [%acc_o1], [%a_op, 128], [%b_op, 128]
+        mma.async.m32n64k8 [%acc_o1], [%a_op, PBUF.row_bytes], [%b_op, VBUF.row_bytes]
         mma.commit [%output1]
 
 @!p2    bra.uni WRITE_OUTPUT
@@ -460,10 +463,10 @@ WRITE_OUTPUT:
         umov  %staged0, STAGED
         umov  %staged1, STAGED[1]
         umov  %stored, OSTORE_DONE
-        umov  %ostage0, OSTAGE0
-        umov  %ostage1, OSTAGE1
+        umov  %ostage0, OSTAGE[0]
+        umov  %ostage1, OSTAGE[1]
         umov  %coord1, 0
-        mbar.arrive.expect_tx [%stored], 16384
+        mbar.arrive.expect_tx [%stored], OSTAGE.bytes
 WAIT_STAGE0:
         mbar.try_wait p1, [%staged0], 0
 @!p1    bra.uni WAIT_STAGE0

@@ -86,7 +86,11 @@ Launch bind_launch(const Kernel& kernel, Launch launch, const DeviceProfile& pro
 //    "sections": [{"name", "kind", "address", "bytes", "flag"}, ...],  the launch block, in order
 //    "block": {"address", "bytes"},    where the block sits in shared memory
 //    "flags": [{"bar", "bytes"}, ...], the launch flags
-//    "symbols": {"NAME": value, ...},  .equ constants and section addresses
+//    "symbols": {"NAME": value, ...},  .equ constants, section and object addresses
+//    "objects": [{"name", "memory" ("shmem" | "tmem"), "address", "count",
+//                 "size", "stride", "alignment", "rows", "cols", "elem",
+//                 "over"}, ...],       the .shmem / .tmem objects: element i
+//                                      is at address + i x stride
 //    "registers": {"%x": "r5", ...},   the qtx's register names and qtxc's numbers
 //    "warnings": ["line 12: ...", ...]} what qtxc said (a copy it inserted)
 std::string emit_kernel_info(const Kernel& kernel);

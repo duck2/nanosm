@@ -20,10 +20,8 @@
         sread  %lane, LANE_ID
         shli   %lane, %lane, 2
         add    %offset, %offset, %lane ; this lane's byte offset
-        umov   %in_arg, IN
-        umov   %out_arg, OUT
-        lds.uni %in_base, [%in_arg]   ; the pointers' low words (an ldg / stg
-        lds.uni %out_base, [%out_arg] ; address is one 32-bit register)
+        ld.param.u32 %in_base, [IN]   ; the pointers' low words (an ldg / stg
+        ld.param.u32 %out_base, [OUT] ; address is one 32-bit register)
         add    %in_ptr, %offset, %in_base ; this lane's input address
         add    %out_ptr, %offset, %out_base ; and its output address
         ldg    %n, [%in_ptr]          ; n

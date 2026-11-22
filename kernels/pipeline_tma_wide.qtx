@@ -13,10 +13,8 @@
 .param  desc ADESC      ; A and B: dense one-dimensional tensors, one tile per load
 .param  desc BDESC
 .param  ptr  C          ; the output's global address
-.equ SA0,    0
-.equ SB0,    256
-.equ SA1,    512
-.equ SB1,    768
+.shmem A_TILE[2], bytes=256    ; the two stages' buffers; qtxc places them
+.shmem B_TILE[2], bytes=256
 .mbar FULL[2],  expect 1    ; a pair is an array: FULL[1] is 8 bytes after FULL[0]
 .mbar EMPTY[2], expect 1
 
@@ -27,12 +25,7 @@
 ; ---- consumer: warp 1 ----
         sread %lane, LANE_ID
         shli  %lane, %lane, 2
-        addi  %sa0, %lane, SA0
-        addi  %sb0, %lane, SB0
-        addi  %sa1, %lane, SA1
-        addi  %sb1, %lane, SB1
-        umov  %c_arg, C
-        lds.uni %c_base, [%c_arg] ; C's low word (an stg address is one 32-bit register)
+        ld.param.u32 %c_base, [C]  ; C's low word (an stg address is one 32-bit register)
         add   %c_ptr, %lane, %c_base
         umov  %full0, FULL[0]
         umov  %full1, FULL[1]
@@ -46,23 +39,23 @@ CLOOP:  usetp.le.s32 p1, %left, 0
 CF0:    mbar.try_wait p3, [%full0], %parity0
 @!p3    bra.uni CF0
         uxori %parity0, %parity0, 1
-        lds   %x0, [%sa0]
-        lds   %y0, [%sb0]
+        lds   %x0, [%lane + A_TILE[0]]
+        lds   %y0, [%lane + B_TILE[0]]
         fadd  %x0, %x0, %y0
         stg   [%c_ptr], %x0
         addi  %c_ptr, %c_ptr, 64
-        lds   %x1, [%sa0 + 64]
-        lds   %y1, [%sb0 + 64]
+        lds   %x1, [%lane + A_TILE[0] + 64]
+        lds   %y1, [%lane + B_TILE[0] + 64]
         fadd  %x1, %x1, %y1
         stg   [%c_ptr], %x1
         addi  %c_ptr, %c_ptr, 64
-        lds   %x2, [%sa0 + 128]
-        lds   %y2, [%sb0 + 128]
+        lds   %x2, [%lane + A_TILE[0] + 128]
+        lds   %y2, [%lane + B_TILE[0] + 128]
         fadd  %x2, %x2, %y2
         stg   [%c_ptr], %x2
         addi  %c_ptr, %c_ptr, 64
-        lds   %x3, [%sa0 + 192]
-        lds   %y3, [%sb0 + 192]
+        lds   %x3, [%lane + A_TILE[0] + 192]
+        lds   %y3, [%lane + B_TILE[0] + 192]
         fadd  %x3, %x3, %y3
         mbar.arrive [%empty0]
         stg   [%c_ptr], %x3
@@ -70,23 +63,23 @@ CF0:    mbar.try_wait p3, [%full0], %parity0
 CF1:    mbar.try_wait p3, [%full1], %parity1
 @!p3    bra.uni CF1
         uxori %parity1, %parity1, 1
-        lds   %x0, [%sa1]
-        lds   %y0, [%sb1]
+        lds   %x0, [%lane + A_TILE[1]]
+        lds   %y0, [%lane + B_TILE[1]]
         fadd  %x0, %x0, %y0
         stg   [%c_ptr], %x0
         addi  %c_ptr, %c_ptr, 64
-        lds   %x1, [%sa1 + 64]
-        lds   %y1, [%sb1 + 64]
+        lds   %x1, [%lane + A_TILE[1] + 64]
+        lds   %y1, [%lane + B_TILE[1] + 64]
         fadd  %x1, %x1, %y1
         stg   [%c_ptr], %x1
         addi  %c_ptr, %c_ptr, 64
-        lds   %x2, [%sa1 + 128]
-        lds   %y2, [%sb1 + 128]
+        lds   %x2, [%lane + A_TILE[1] + 128]
+        lds   %y2, [%lane + B_TILE[1] + 128]
         fadd  %x2, %x2, %y2
         stg   [%c_ptr], %x2
         addi  %c_ptr, %c_ptr, 64
-        lds   %x3, [%sa1 + 192]
-        lds   %y3, [%sb1 + 192]
+        lds   %x3, [%lane + A_TILE[1] + 192]
+        lds   %y3, [%lane + B_TILE[1] + 192]
         fadd  %x3, %x3, %y3
         mbar.arrive [%empty1]
         stg   [%c_ptr], %x3
@@ -106,10 +99,10 @@ PRODUCER:
 ; The stage buffers (%buf_a0 .. %buf_b1) and the tile's coordinate (%tile, c0 in
 ; elements) are uniform registers beside the barriers; the coordinate moves
 ; on by one 64-element tile after each stage's pair of loads.
-        umov  %buf_a0, SA0
-        umov  %buf_b0, SB0
-        umov  %buf_a1, SA1
-        umov  %buf_b1, SB1
+        umov  %buf_a0, A_TILE[0]
+        umov  %buf_b0, B_TILE[0]
+        umov  %buf_a1, A_TILE[1]
+        umov  %buf_b1, B_TILE[1]
         umov  %tile, 0
 
         mbar.arrive.expect_tx [%full0], 512

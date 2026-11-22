@@ -74,8 +74,7 @@ hand-writable.
 ```
         sread   %lane, LANE_ID
         shli    %offset, %lane, 2
-        umov    %arg, IN               ; IN: a .param (Launch, below)
-        lds.uni %base, [%arg]
+        ld.param.u32 %base, [IN]       ; IN: a .param (Launch, below)
         add     %ptr, %offset, %base
         ldg     %n, [%ptr]
 ```
@@ -83,8 +82,10 @@ hand-writable.
 A kernel declares registers only where the machine needs neighbours: `.reg %a<8>` is `%a0`..`%a7`,
 eight adjacent vector registers, for `ldg.v8` / `stg.v8` / `acc.ld.v8` / `acc.st.v8`, which name the
 first of eight; `.ureg %c<2>` is adjacent uniform registers, for a TMA's coordinates. The line may
-stand anywhere in the file. An instruction that needs a group and is given a lone name is refused
-with the line to add.
+stand anywhere in the file, and the count may be a constant expression (`.reg %a<4 * STAGES>`, with
+the `.equ` above it). An instruction that needs a group and is given a lone name is refused with the
+line to add. Names beginning `%qtxc_` are the compiler's own (the register an `ld.param` reads
+through, the copies it inserts) and are refused where a kernel writes one.
 
 - **Banks are qtxc's business.** An instruction's issue reads at most `rf.read_ports_per_bank`
   different registers from one bank (register number mod `rf.banks`: three banks, one port each, at
@@ -112,6 +113,70 @@ tests' kernels are still written in numbers, because they pin cycles that depend
 bank: `tests/test_support.hpp` renames them on the way in (`r5` becomes `%r5`, a member of one group,
 which keeps its number).
 
+**Memory.** A kernel names its own memory and qtxc places it (src/qtxc/objects.cpp,
+expressions.cpp; trash/qtxc-memory-2026-11-21.md). Names are bare (`%` is for registers):
+
+```
+.shmem QBUF[2],   rows=32, cols=64, elem=2        ; a tile: rows back to back, a row is cols x elem bytes
+.shmem STATS[2],  bytes=1024, align=4             ; a plain buffer
+.shmem PBUF[4],   rows=32, cols=64, elem=2, align=16 * PBUF.row_bytes
+.shmem OSTAGE[2], rows=32, cols=64, elem=4, over=QBUF, KBUF[0]
+.tmem  S[2],      rows=32, cols=64                ; tensor memory, in words
+
+        umov  %kbuf, KBUF[0]
+        uaddi %kbuf, %kbuf, KBUF.stride           ; the next element
+        shli  %p_row, %row, log2(PBUF.row_bytes)  ; a row's address
+        addi  %p_row, %p_row, PBUF
+        lds   %a, [%byte + A_TILE[1]]             ; an object read where it is used
+        acc.ld.v8 %col0, [%walk, S.row_words]
+```
+
+An object is the author's bookkeeping: the machine never sees one, only the addresses the
+instructions carry. So a line says nothing about a layout (a tile's layout is its TMA descriptor's
+and the tensor core's, both keyed by the address), and nothing ties a tile to a descriptor; a
+`.shmem` tile that the host's descriptor does not match is still wrong.
+
+- **Placement.** Objects go one after another from address 0 in the order they are declared, each
+  on its alignment; shared memory in bytes, tmem in words from word 0. The launch block (`.param`,
+  `.mbar`, `.data`: below) stays at the top of shared memory. An object that does not fit is named.
+  An array `NAME[N]` is N elements side by side: element i is at `NAME + i x stride`, the stride
+  being one element rounded up to the alignment.
+- **Alignment is its own statement.** `align=` (bytes; words for tmem) replaces the default, and
+  the defaults are only what the machine needs: a shared tile on a multiple of its row and of 64
+  bytes (the swizzle's base rule, and what a TMA buffer needs), a plain buffer on 64, a tmem tile
+  on four of its rows (the pointer rule of a matmul result and of `acc.ld`; its row, `cols`, is a
+  power of two from 4, and its stride is padded to whole bands of four rows). A kernel that needs
+  more says so: fa / fa32 shuffle a row's bytes themselves with one constant per row, which needs a
+  base on a multiple of 16 rows, hence `align=16 * PBUF.row_bytes`.
+- **`over=` is the only overlap.** An object with `over=A, B[0]` is not placed: it lies on the
+  objects it lists (a bare array name is all its elements), which must follow one another in that
+  order and be large enough; the first of them takes the overlay's alignment before anything is
+  placed. What it may use ends at the last listed element's own size: the padding after an object
+  (its stride minus its size) is not the object's, and the next declaration may sit in it. Objects
+  never overlap otherwise. Whether the memory is free when the overlay is written
+  is the kernel's argument (its barriers), which the sanitizer's ownership checks test at run time.
+- **Names, elements, properties.** `NAME` is the object's address (its element 0) and `NAME[i]`
+  element i's; an index past the end is refused. `NAME.bytes` is the whole object and
+  `NAME[i].bytes` one element (`.words` for a tmem object); `NAME.stride` the step between
+  elements; `NAME.row_bytes` a shared tile's row and `NAME.row_words` a tmem tile's.
+- **Constant expressions.** Wherever qtx or assembly takes a constant (an immediate, an address
+  offset `[%r + ...]`, an `.equ`, a directive's argument) it may be an expression: `+ - * / << >>`,
+  unary minus, parentheses, and `log2(x)`, which refuses an argument that is not a power of two.
+  Nothing wraps: a value past 2^40 anywhere in an expression is refused. Whoever uses the value
+  checks that it fits its field. An expression that names a launch section
+  (`.param`, `.mbar`, `.data`) keeps that section's launch-flag wait (Launch, below), through any
+  `.equ`; an object's name never has one.
+- **`ld.param.u32 %x, [NAME]`** (and `.f32`) reads a parameter into every lane of a vector
+  register. It is written for the reader and stands for the two instructions a parameter read is:
+  `umov` of the parameter's shared address into a uniform register qtxc names, then `lds.uni`. Of a
+  `ptr` parameter it reads the low 32 bits. No hardware and no opcode comes with it.
+- **Looking inside.** `launch.symbol("PBUF")` and `launch.symbol("PBUF[1]")` give an object's and
+  an element's address (an `.mbar` array's barrier too); `launch.memory_object("PBUF")` and the C
+  API's kernel info (`"objects"`) give its size, stride and shape. Assembly carries each object's
+  line with the address qtxc chose (`at=ADDRESS`, assembly only); hex and a saved image carry none.
+  An address written by hand gets the checks placement gives: on its alignment, inside its memory,
+  apart from the other objects unless it says `over=`, and then inside what it names.
+
 **Launch.** A qtx file is self-contained: it declares everything a launch needs to know beside its
 code, and the host knows only the kernel's signature. (v0.1, a first working version: the copy and
 the flags below are expected to change; trash/launch-timed-2026-11-21.md and
@@ -136,12 +201,14 @@ trash/launch-fixes-umov-2026-11-21.md.)
   fixed rule from the sections and the profile: the sections sit in declaration order, each aligned
   to its own size (`ptr` 8, `u32` / `f32` 4, `desc` 64, an mbar 8, data 4); the block starts at the
   top of shared memory (`shmem.bytes`) minus its bytes, rounded down to a multiple of 64. A section's
-  name is its address, an immediate: `umov %arg, OUT` then `lds.uni %out, [%arg]`, or the name as the
-  descriptor operand of `tma.load` / `tma.store`. An `.equ` whose value is a section's name is
-  another name for that section. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
+  name is its address, an immediate: `umov %arg, OUT` then `lds.uni %out, [%arg]` (which
+  `ld.param.u32 %out, [OUT]` writes for you), or the name as the
+  descriptor operand of `tma.load` / `tma.store`. An `.equ` whose expression names a section is
+  an address in that section, and its users wait for it as the section's do. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
   register, so a kernel reads the low word and the launch refuses a pointer that does not fit 32
   bits (a second address register is planned).
-- **Barrier arrays.** `.mbar NAME[C], expect N` is C barriers side by side in ONE section: element
+- **Barrier arrays.** `.mbar NAME[C], expect N` (C a constant expression, so a producer's buffers
+  and their barriers can share one `.equ`) is C barriers side by side in ONE section: element
   i is at `NAME + 8 i` and is written `NAME[i]` (`umov %ready, S_READY[1]`; `NAME` alone is element
   0, and code may reach element t as `NAME + 8 t` in a register). An index past the array's end is
   refused. Because an array is one section it arrives, and is waited for, whole: that is how a
@@ -193,8 +260,8 @@ trash/launch-fixes-umov-2026-11-21.md.)
   (`warps=`). If both say, they must agree.
 - **Looking inside is separate from launching.** `nanosm_qtx_kernel_info` (C API) returns the
   kernel's signature, its sections with their addresses and flags, and its symbols (`.equ` names,
-  section addresses) as JSON; Python has `launch.signature`, `launch.sections` and
-  `launch.symbol("PBUF0")`. A test that checks a tile inside shared memory uses those names with
+  section and object addresses) and memory objects as JSON; Python has `launch.signature`,
+  `launch.sections` and `launch.symbol("PBUF")` (`"PBUF[1]"` for an element). A test that checks a tile inside shared memory uses those names with
   `result.shmem(...)`. A test that poisons a region first uses `launch.test_shmem.write(...)` (C++:
   `Launch::test_shmem`): bytes placed before the first cycle, untimed, which is a TEST's access and
   not part of a launch. It may not touch the launch block, and a run that used it says so in its

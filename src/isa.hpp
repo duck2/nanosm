@@ -391,6 +391,41 @@ struct RegisterName {
     bool predicate = false; // a predicate with a name (pN); then not a register
 };
 
+// A named piece of the kernel's own memory (README "Memory"; qtx `.shmem` /
+// `.tmem`, placed by qtxc: src/qtxc/objects.cpp). It is the author's
+// bookkeeping and nothing else: no hardware reads it, the machine never sees
+// an object, only the addresses the instructions carry. Shared memory is in
+// bytes, tmem in words (`tmem`). An array NAME[N] has `count` elements,
+// `stride` apart; `size` is one element's. A tile has rows x cols (elements
+// of `elem` bytes in shared memory, words in tmem); a plain buffer has rows
+// 0. `over`: the objects it was declared to lie on, as written.
+struct MemoryObject {
+    std::string name;
+    bool tmem = false;
+    uint32_t address = 0;   // element 0
+    uint32_t count = 1;
+    uint32_t size = 0;      // one element
+    uint32_t stride = 0;    // element i is at address + i x stride
+    uint32_t alignment = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t elem = 0;
+    std::vector<std::string> over;
+    bool placed = false;    // its address is known (false only while a source is being read)
+    uint32_t line = 0;
+};
+
+// One element's row in its own unit: cols x elem bytes (shared), cols words (tmem).
+inline uint32_t object_row(const MemoryObject& object) {
+    return object.tmem ? object.cols : object.cols * object.elem;
+}
+
+// From its first unit to its last, all elements. Wider than an address: a
+// large array's extent is found here before anyone has checked that it fits.
+inline uint64_t object_extent(const MemoryObject& object) {
+    return uint64_t{object.count - 1} * object.stride + object.size;
+}
+
 struct Kernel {
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
@@ -402,6 +437,9 @@ struct Kernel {
     std::vector<std::pair<std::string, int32_t>> symbols;
     std::vector<RegisterName> register_names;
     std::vector<std::string> warnings;
+    // The qtx's `.shmem` / `.tmem` objects, for a debugger or a test (a hex
+    // kernel and a saved launch image do not carry them).
+    std::vector<MemoryObject> objects;
 };
 
 namespace encoding {

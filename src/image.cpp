@@ -495,6 +495,27 @@ std::string emit_kernel_info(const Kernel& kernel) {
     for (const auto& flag : kernel.flags) flags.push_back({{"bar", flag.bar}, {"bytes", flag.bytes}});
     auto symbols = json::object();
     for (const auto& [name, value] : kernel.symbols) symbols[name] = value;
+    // The kernel's own memory by name (.shmem / .tmem): where each object is
+    // and how large; element i of an array is at address + i x stride.
+    auto objects = json::array();
+    for (const auto& object : kernel.objects) {
+        json item = {
+            {"name", object.name},
+            {"memory", object.tmem ? "tmem" : "shmem"},
+            {"address", object.address},
+            {"count", object.count},
+            {"size", object.size},
+            {"stride", object.stride},
+            {"alignment", object.alignment},
+        };
+        if (object.rows != 0) {
+            item["rows"] = object.rows;
+            item["cols"] = object.cols;
+            if (!object.tmem) item["elem"] = object.elem;
+        }
+        if (!object.over.empty()) item["over"] = object.over;
+        objects.push_back(std::move(item));
+    }
     // The qtx's register names: "%x" -> "r5" / "ur6".
     auto registers = json::object();
     for (const auto& entry : kernel.register_names) {
@@ -508,6 +529,7 @@ std::string emit_kernel_info(const Kernel& kernel) {
         {"block", {{"address", start}, {"bytes", (end - start + 3) / 4 * 4}}},
         {"flags", std::move(flags)},
         {"symbols", std::move(symbols)},
+        {"objects", std::move(objects)},
         {"registers", std::move(registers)},
         {"warnings", kernel.warnings},
     };

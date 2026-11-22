@@ -9,10 +9,8 @@
 .param  desc ADESC      ; A and B: dense one-dimensional tensors, one tile per load
 .param  desc BDESC
 .param  ptr  C          ; the output's global address
-.equ SA0,    0
-.equ SB0,    64
-.equ SA1,    128
-.equ SB1,    192
+.shmem A_TILE[2], bytes=64    ; the two stages' buffers; qtxc places them
+.shmem B_TILE[2], bytes=64
 .mbar FULL[2],  expect 1    ; a pair is an array: FULL[1] is 8 bytes after FULL[0]
 .mbar EMPTY[2], expect 1
 
@@ -23,12 +21,7 @@
 ; ---- consumer: warp 1 ----
         sread %lane, LANE_ID
         shli  %lane, %lane, 2
-        addi  %sa0, %lane, SA0
-        addi  %sb0, %lane, SB0
-        addi  %sa1, %lane, SA1
-        addi  %sb1, %lane, SB1
-        umov  %c_arg, C
-        lds.uni %c_base, [%c_arg] ; C's low word (an stg address is one 32-bit register)
+        ld.param.u32 %c_base, [C]  ; C's low word (an stg address is one 32-bit register)
         add   %c_ptr, %lane, %c_base
         umov  %full0, FULL[0]
         umov  %full1, FULL[1]
@@ -42,8 +35,8 @@ CLOOP:  usetp.le.s32 p1, %left, 0
 CF0:    mbar.try_wait p3, [%full0], %parity0
 @!p3    bra.uni CF0
         uxori %parity0, %parity0, 1
-        lds   %x, [%sa0]
-        lds   %y, [%sb0]
+        lds   %x, [%lane + A_TILE[0]]
+        lds   %y, [%lane + B_TILE[0]]
         fadd  %x, %x, %y
         mbar.arrive [%empty0]
         stg   [%c_ptr], %x
@@ -51,8 +44,8 @@ CF0:    mbar.try_wait p3, [%full0], %parity0
 CF1:    mbar.try_wait p3, [%full1], %parity1
 @!p3    bra.uni CF1
         uxori %parity1, %parity1, 1
-        lds   %x, [%sa1]
-        lds   %y, [%sb1]
+        lds   %x, [%lane + A_TILE[1]]
+        lds   %y, [%lane + B_TILE[1]]
         fadd  %x, %x, %y
         mbar.arrive [%empty1]
         stg   [%c_ptr], %x
@@ -72,10 +65,10 @@ PRODUCER:
 ; The stage buffers (%buf_a0 .. %buf_b1) and the tile's coordinate (%tile, c0 in
 ; elements) are uniform registers beside the barriers; the coordinate moves
 ; on by one 16-element tile after each stage's pair of loads.
-        umov  %buf_a0, SA0
-        umov  %buf_b0, SB0
-        umov  %buf_a1, SA1
-        umov  %buf_b1, SB1
+        umov  %buf_a0, A_TILE[0]
+        umov  %buf_b0, B_TILE[0]
+        umov  %buf_a1, A_TILE[1]
+        umov  %buf_b1, B_TILE[1]
         umov  %tile, 0
 
         mbar.arrive.expect_tx [%full0], 128

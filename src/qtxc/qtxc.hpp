@@ -84,6 +84,9 @@ struct AssemblyProgram {
     std::vector<std::string> notes;
     std::vector<std::string> warnings;
     uint32_t copies = 0;
+    // The kernel's own memory by name (`.shmem` / `.tmem`, objects.cpp), in
+    // declaration order, each with its address.
+    std::vector<MemoryObject> objects;
 };
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile);

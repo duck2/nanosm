@@ -254,14 +254,44 @@ class Launch:
             raise KeyError(f"{self.kernel.name} has no register '{name}'") from None
 
     def symbol(self, name: str) -> int:
-        """The value of a name in the kernel's qtx: an .equ constant, or a
+        """The value of a name in the kernel's qtx: an .equ constant, a
         section's (a parameter's, an mbar's, a .data's) address in shared
-        memory. For a test or a debugger that looks inside the kernel's
-        memory; a launch does not need it."""
+        memory, or a memory object's (.shmem: a byte address; .tmem: a word
+        address). "NAME[i]" is element i of an array (an object's, or an
+        .mbar's barrier i). For a test or a debugger that looks inside the
+        kernel's memory; a launch does not need it."""
+        base, bracket, rest = name.partition("[")
+        if bracket:
+            if not rest.endswith("]") or not rest[:-1].strip().isdigit():
+                raise KeyError(f"'{name}': an element is written NAME[i] with a number")
+            index = int(rest[:-1])
+            for item in self._info.get("objects", []):
+                if item["name"] == base:
+                    count, step = int(item["count"]), int(item["stride"])
+                    break
+            else:
+                for item in self._info["sections"]:
+                    if item["name"] == base and item["kind"] == "mbar":
+                        count, step = int(item.get("count", 1)), 8
+                        break
+                else:
+                    raise KeyError(f"{self.kernel.name} has no array '{base}'")
+            if index >= count:
+                raise KeyError(f"{name} is past the end of {base}, which has {count} elements")
+            return int(item["address"]) + index * step
         try:
             return int(self._info["symbols"][name])
         except KeyError:
             raise KeyError(f"{self.kernel.name} has no symbol '{name}'") from None
+
+    def memory_object(self, name: str) -> dict[str, object]:
+        """What the kernel's qtx declares about a `.shmem` / `.tmem` object:
+        its address, count, size (one element), stride, and a tile's rows,
+        cols and elem (src/image.hpp emit_kernel_info)."""
+        for item in self._info.get("objects", []):
+            if item["name"] == name:
+                return dict(item)
+        raise KeyError(f"{self.kernel.name} has no memory object '{name}'")
 
     def _named(self, args: Mapping[str, object] | Sequence[object] | None) -> dict[str, object]:
         if args is None:

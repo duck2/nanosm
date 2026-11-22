@@ -16,10 +16,8 @@
 .param  ptr A
 .param  ptr B
 .param  ptr C
-.equ SA0,    0
-.equ SB0,    64
-.equ SA1,    128
-.equ SB1,    192
+.shmem A_TILE[2], bytes=64    ; the two stages' buffers; qtxc places them
+.shmem B_TILE[2], bytes=64
 .mbar FULL[2],  expect 1    ; a pair is an array: FULL[1] is 8 bytes after FULL[0]
 .mbar EMPTY[2], expect 1
 
@@ -30,12 +28,7 @@
 ; ---- consumer: warp 1 ----
         sread %lane, LANE_ID
         shli  %lane, %lane, 2
-        addi  %sa0, %lane, SA0
-        addi  %sb0, %lane, SB0
-        addi  %sa1, %lane, SA1
-        addi  %sb1, %lane, SB1
-        umov  %c_arg, C
-        lds.uni %c_base, [%c_arg] ; C's low word (an stg address is one 32-bit register)
+        ld.param.u32 %c_base, [C]  ; C's low word (an stg address is one 32-bit register)
         add   %c_ptr, %lane, %c_base
         umov  %full0, FULL[0]
         umov  %full1, FULL[1]
@@ -49,8 +42,8 @@ CLOOP:  usetp.le.s32 p1, %left, 0
 CF0:    mbar.try_wait p3, [%full0], %parity0
 @!p3    bra.uni CF0
         uxori %parity0, %parity0, 1
-        lds   %x, [%sa0]
-        lds   %y, [%sb0]
+        lds   %x, [%lane + A_TILE[0]]
+        lds   %y, [%lane + B_TILE[0]]
         fadd  %x, %x, %y
         mbar.arrive [%empty0]   ; stage 0 values live in RF; hand the buffer back
         stg   [%c_ptr], %x
@@ -58,8 +51,8 @@ CF0:    mbar.try_wait p3, [%full0], %parity0
 CF1:    mbar.try_wait p3, [%full1], %parity1
 @!p3    bra.uni CF1
         uxori %parity1, %parity1, 1
-        lds   %x, [%sa1]
-        lds   %y, [%sb1]
+        lds   %x, [%lane + A_TILE[1]]
+        lds   %y, [%lane + B_TILE[1]]
         fadd  %x, %x, %y
         mbar.arrive [%empty1]
         stg   [%c_ptr], %x
@@ -72,16 +65,10 @@ CDONE:  halt
 PRODUCER:
         sread %lane, LANE_ID
         shli  %lane, %lane, 2
-        umov  %a_arg, A
-        umov  %b_arg, B
-        lds.uni %a_base, [%a_arg] ; the pointers' low words
-        lds.uni %b_base, [%b_arg]
+        ld.param.u32 %a_base, [A]  ; the pointers' low words
+        ld.param.u32 %b_base, [B]
         add   %a_ptr, %lane, %a_base
         add   %b_ptr, %lane, %b_base
-        addi  %sa0, %lane, SA0
-        addi  %sb0, %lane, SB0
-        addi  %sa1, %lane, SA1
-        addi  %sb1, %lane, SB1
         umov  %full0, FULL[0]
         umov  %full1, FULL[1]
         umov  %empty0, EMPTY[0]
@@ -91,15 +78,15 @@ PRODUCER:
         ; cold start is peeled: both stages begin free, no empty wait
         ldg   %x, [%a_ptr]
         ldg   %y, [%b_ptr]
-        sts   [%sa0], %x
-        sts   [%sb0], %y
+        sts   [%lane + A_TILE[0]], %x
+        sts   [%lane + B_TILE[0]], %y
         mbar.arrive [%full0]    ; sts -> arrive order is free: both serialize through port A
         addi  %a_ptr, %a_ptr, 64
         addi  %b_ptr, %b_ptr, 64
         ldg   %x, [%a_ptr]
         ldg   %y, [%b_ptr]
-        sts   [%sa1], %x
-        sts   [%sb1], %y
+        sts   [%lane + A_TILE[1]], %x
+        sts   [%lane + B_TILE[1]], %y
         mbar.arrive [%full1]
         addi  %a_ptr, %a_ptr, 64
         addi  %b_ptr, %b_ptr, 64
@@ -111,8 +98,8 @@ PE0:    mbar.try_wait p3, [%empty0], %parity0
         uxori %parity0, %parity0, 1
         ldg   %x, [%a_ptr]
         ldg   %y, [%b_ptr]
-        sts   [%sa0], %x
-        sts   [%sb0], %y
+        sts   [%lane + A_TILE[0]], %x
+        sts   [%lane + B_TILE[0]], %y
         mbar.arrive [%full0]
         addi  %a_ptr, %a_ptr, 64
         addi  %b_ptr, %b_ptr, 64
@@ -124,8 +111,8 @@ PE1:    mbar.try_wait p3, [%empty1], %parity1
         uxori %parity1, %parity1, 1
         ldg   %x, [%a_ptr]
         ldg   %y, [%b_ptr]
-        sts   [%sa1], %x
-        sts   [%sb1], %y
+        sts   [%lane + A_TILE[1]], %x
+        sts   [%lane + B_TILE[1]], %y
         mbar.arrive [%full1]
         addi  %a_ptr, %a_ptr, 64
         addi  %b_ptr, %b_ptr, 64

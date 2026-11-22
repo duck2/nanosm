@@ -23,12 +23,9 @@
         ushli  %first, %first, 9      ; 512 * warp: this warp's first block
         usread %stride, N_WARPS
         ushli  %stride, %stride, 9    ; 512 * warps: to this warp's next block
-        umov   %a_arg, A
-        umov   %b_arg, B
-        umov   %c_arg, C
-        lds.uni %a_ptr, [%a_arg]      ; the pointers' low words (an ldg.v8 /
-        lds.uni %b_ptr, [%b_arg]      ; stg.v8 address is one 32-bit register)
-        lds.uni %c_ptr, [%c_arg]
+        ld.param.u32 %a_ptr, [A]      ; the pointers' low words (an ldg.v8 /
+        ld.param.u32 %b_ptr, [B]      ; stg.v8 address is one 32-bit register)
+        ld.param.u32 %c_ptr, [C]
         ur2r   %offset, %first
         ur2r   %step, %stride
         sread  %lane, LANE_ID

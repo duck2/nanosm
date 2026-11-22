@@ -22,10 +22,14 @@ std::string emit_asm(const AssemblyProgram& program) {
     if (program.warps != 0) out << ".warps " << program.warps << '\n';
     for (const auto& section : program.sections) out << format_section_directive(section, false) << '\n';
     for (const auto& flag : program.flags) out << format_flag_directive(flag) << '\n';
+    // The kernel's own memory by name, each object where qtxc put it (objects.cpp).
+    for (const auto& object : program.objects) out << format_object_directive(object) << '\n';
     for (const auto& [name, value] : program.constants) {
         out << ".equ " << name << ", " << value << '\n';
     }
-    if (program.warps != 0 || !program.sections.empty() || !program.constants.empty()) out << '\n';
+    if (program.warps != 0 || !program.sections.empty() || !program.constants.empty() || !program.objects.empty()) {
+        out << '\n';
+    }
     // The qtx's register names and the numbers qtxc gave them (registers.cpp).
     for (const auto& entry : program.register_names) out << format_name_directive(entry) << '\n';
     if (!program.register_names.empty()) out << '\n';
@@ -65,6 +69,12 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     for (const auto& section : program.sections) {
         kernel.symbols.emplace_back(section.name, static_cast<int32_t>(section.address));
     }
+    // ... and each memory object's address (its elements and sizes are in
+    // kernel.objects).
+    for (const auto& object : program.objects) {
+        kernel.symbols.emplace_back(object.name, static_cast<int32_t>(object.address));
+    }
+    kernel.objects = program.objects;
     kernel.register_names = program.register_names;
     check_kernel_image(kernel, profile);
     kernel.words.reserve(program.instructions.size());

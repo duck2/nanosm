@@ -55,10 +55,11 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
         launch.gmem.write(base, struct.pack(f"<{len(values)}e", *values))
     # Poison the output and P so unwritten entries cannot pass as launch zeros
     # (P's addresses are the kernel's; a test's look inside, not part of
-    # launching). Block b's P: 64 rows of 128 bytes from PBUF0 + P_BLOCK_STEP b.
+    # launching). Block b's P is the two tiles PBUF[2 b] and PBUF[2 b + 1],
+    # side by side: 64 rows of 128 bytes.
     launch.gmem.f32(O_GLOBAL, [math.nan] * (ROWS * WIDTH))
     for block in range(2):
-        launch.test_shmem.write(launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP") * block,
+        launch.test_shmem.write(launch.symbol(f"PBUF[{2 * block}]"),
                            struct.pack("<H", 0x7e00) * (ROWS * BLOCK))
     return launch
 
@@ -139,14 +140,14 @@ def run_case(case: str, trace: Path | None) -> None:
     else:
         assert all(alpha == 1 for alpha in second_alpha), "stable-max control is not stable"
     launch = make_launch(q, k, v)
-    # Where the kernel keeps what the checks look at (its .equ names).
-    STATS = launch.symbol("STATS")
-    K_SHARED = [launch.symbol("KBUF0"), launch.symbol("KBUF1")]     # key block b: 64 rows of 128 bytes
-    V_SHARED = [launch.symbol("VBUF0"), launch.symbol("VBUF1")]     # transposed: 64 channel rows of 64 keys
-    P_BLOCK1 = launch.symbol("PBUF0") + launch.symbol("P_BLOCK_STEP")
-    P_SHARED = [[launch.symbol("PBUF0"), launch.symbol("PBUF1")],   # [key block][query tile]: 32 rows of 128 bytes
-                [P_BLOCK1, P_BLOCK1 + launch.symbol("PBUF1") - launch.symbol("PBUF0")]]
-    O_STAGED = [launch.symbol("OSTAGE") + launch.symbol("OSTAGE_STEP") * t for t in range(2)]  # 32 rows of 256 bytes
+    # Where the kernel keeps what the checks look at (its .shmem objects; qtxc
+    # placed them).
+    STATS = [launch.symbol(f"STATS[{block}]") for block in range(2)]
+    K_SHARED = [launch.symbol("KBUF[0]"), launch.symbol("KBUF[1]")]     # key block b: 64 rows of 128 bytes
+    V_SHARED = [launch.symbol("VBUF[0]"), launch.symbol("VBUF[1]")]     # transposed: 64 channel rows of 64 keys
+    # [key block][query tile]: 32 rows of 128 bytes
+    P_SHARED = [[launch.symbol(f"PBUF[{2 * block + t}]") for t in range(2)] for block in range(2)]
+    O_STAGED = [launch.symbol(f"OSTAGE[{t}]") for t in range(2)]        # 32 rows of 256 bytes
     with launch.run(trace=trace, max_trace_events=1_000_000, cycle_limit=1_000_000) as result:
         output = result.gmem_f32(O_GLOBAL, ROWS * WIDTH)
         model_error = fa.check_close(output, ref["model"], 2e-6, "quantized online reference")
@@ -157,7 +158,7 @@ def run_case(case: str, trace: Path | None) -> None:
                                  f"places, first index {mismatches[0]}")
         for block in range(2):
             for field, values in enumerate(ref["stats"][block]):
-                actual = list(struct.unpack("<64f", result.shmem(STATS + block * 1024 + field * 256, 256)))
+                actual = list(struct.unpack("<64f", result.shmem(STATS[block] + field * 256, 256)))
                 fa.check_close(actual, values, 1e-5, f"block {block} row statistic {field}")
         # The new arrangement, tile by tile. Query tile t's P rows (block 1's
         # buffer, the one the check reads) and staged output rows are its own

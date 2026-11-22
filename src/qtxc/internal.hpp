@@ -48,7 +48,8 @@ std::vector<uint8_t> issue_sources(const Instruction& inst);
 // section's address.
 bool is_directive(const std::string& clean, std::string_view name);
 std::string section_name(const std::string& name, uint32_t line, const char* what);
-std::pair<std::string, uint32_t> mbar_name_and_count(const std::string& text, uint32_t line);
+std::pair<std::string, uint32_t> mbar_name_and_count(
+    const std::string& text, const std::unordered_map<std::string, int32_t>& constants, uint32_t line);
 uint32_t parse_warps_directive(const std::string& tail, uint32_t line);
 KernelSection parse_param_directive(const std::string& tail, uint32_t line, bool with_address);
 KernelSection parse_mbar_directive(
@@ -63,6 +64,37 @@ std::string format_flag_directive(const LaunchFlag& flag);
 // `.name %x, r5` (assembly, hex): a qtx register's name and its number.
 RegisterName parse_name_directive(const std::string& tail, uint32_t line);
 std::string format_name_directive(const RegisterName& entry);
+
+// Constant expressions (expressions.cpp): + - * / << >>, unary minus,
+// parentheses, log2(x), over numbers, `.equ` constants (`constants`) and the
+// names of whoever is parsing: memory objects (NAME, NAME[i], NAME.bytes,
+// .stride, .row_bytes, .row_words) and `.mbar` arrays (NAME[i]). The value,
+// or nullopt with `problem` saying why; the caller checks its range.
+struct ExpressionNames {
+    const std::vector<MemoryObject>* objects = nullptr;
+    const std::vector<KernelSection>* sections = nullptr;
+    bool addresses_known = false; // the sections have their addresses
+};
+class ExpressionScope { // while it lives, expressions see these names
+public:
+    explicit ExpressionScope(const ExpressionNames* names);
+    ~ExpressionScope();
+    ExpressionScope(const ExpressionScope&) = delete;
+    ExpressionScope& operator=(const ExpressionScope&) = delete;
+private:
+    const ExpressionNames* previous_;
+};
+std::optional<int64_t> evaluate_expression(
+    const std::string& text, const std::unordered_map<std::string, int32_t>& constants, std::string& problem);
+
+// The kernel's own memory by name (objects.cpp): a `.shmem` / `.tmem` line
+// (appended to `objects`; allow_at: assembly, which carries each address),
+// where qtxc puts the objects, and the line as assembly carries it.
+void parse_object_directive(
+    const std::string& tail, bool tmem, const std::unordered_map<std::string, int32_t>& constants, uint32_t line,
+    bool allow_at, std::vector<MemoryObject>& objects);
+void place_objects(std::vector<MemoryObject>& objects, uint32_t shmem_limit, uint64_t tmem_words);
+std::string format_object_directive(const MemoryObject& object);
 
 // qtx's registers (registers.cpp): every %name of a parsed qtx program gets
 // its number (banks, copies where the banks cannot fit, who may share); the

@@ -96,6 +96,7 @@ struct Names {
     // name -> (kind: 0 vector register, 1 uniform register, 2 predicate; place)
     std::unordered_map<std::string, std::pair<int, uint32_t>> index;
     std::string text; // the instruction being read, for a later message
+    bool own = false; // qtxc is naming a register of its own (ld.param's), not reading the writer's
 };
 
 const char* kind_name(int kind) {
@@ -118,6 +119,18 @@ thread_local Names* names = nullptr;
 
 const char* file_name(bool uniform) { return uniform ? "uniform" : "vector"; }
 
+// Names beginning qtxc_ are the compiler's own: the uniform register an
+// ld.param reads through (%qtxc_param) and the copies it inserts
+// (%qtxc_copyN, registers.cpp). A writer who used one would share a register
+// with the compiler and see its value change, so the name is refused where
+// the writer writes it.
+bool reserved_name(const std::string& name) { return name.rfind("qtxc_", 0) == 0; }
+void refuse_reserved(const std::string& name, const std::string& where) {
+    if (!reserved_name(name) || (names != nullptr && names->own)) return;
+    throw SimError(where + "%" + name + ": names beginning %qtxc_ are qtxc's own (the register an ld.param reads "
+        "through, the copies it inserts); choose another name");
+}
+
 uint8_t named_register(const std::string& text, bool uniform, uint32_t line) {
     static const std::regex raw(R"(^[uU]?[rR][0-9]+$)");
     static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)$)");
@@ -135,6 +148,7 @@ uint8_t named_register(const std::string& text, bool uniform, uint32_t line) {
     if (name.size() == 2 && name[0] == 'p' && name[1] >= '0' && name[1] <= '6') {
         throw SimError(where + "%" + name + " is the predicate " + name + ", not a register");
     }
+    refuse_reserved(name, where);
     auto& list = uniform ? names->program->uniform_registers : names->program->vector_registers;
     const int kind = uniform ? 1 : 0;
     if (const auto found = names->index.find(name); found != names->index.end()) {
@@ -272,6 +286,7 @@ std::pair<uint8_t, bool> parse_predicate(const std::string& text, uint32_t line)
         if (name.size() == 2 && name[0] == 'p' && name[1] >= '0' && name[1] <= '6') {
             return {static_cast<uint8_t>(name[1] - '0'), invert};
         }
+        refuse_reserved(name, where);
         auto& list = names->program->predicate_names;
         if (const auto found = names->index.find(name); found != names->index.end()) {
             if (found->second.first != 2) throw kind_conflict(*names->program, where, name, 2, found->second);
@@ -340,22 +355,24 @@ Opcode parse_setp_opcode(const std::string& written, bool uniform, bool immediat
     return static_cast<Opcode>(static_cast<uint8_t>(first) + i);
 }
 
+// A constant where an instruction or a directive takes one: a constant
+// expression (expressions.cpp) whose value fits the immediate field.
 int32_t parse_value(
     const std::string& text,
     const std::unordered_map<std::string, int32_t>& constants,
     uint32_t line) {
-    const auto found = constants.find(text);
-    if (found != constants.end()) return found->second;
-    std::size_t consumed = 0;
-    try {
-        const auto value = std::stoll(text, &consumed, 0);
-        if (consumed != text.size() || value < encoding::immediate_min || value > encoding::immediate_max) {
-            throw std::invalid_argument("range or suffix");
-        }
-        return static_cast<int32_t>(value);
-    } catch (const std::exception&) {
-        throw SimError("line " + std::to_string(line) + ": bad or unknown immediate '" + text + "'");
+    std::string problem;
+    const auto value = evaluate_expression(text, constants, problem);
+    if (!value.has_value()) {
+        throw SimError("line " + std::to_string(line) + ": bad or unknown immediate '" + text + "'" +
+            (problem.empty() ? std::string() : " (" + problem + ")"));
     }
+    if (*value < encoding::immediate_min || *value > encoding::immediate_max) {
+        throw SimError("line " + std::to_string(line) + ": bad or unknown immediate '" + text + "' (its value " +
+            std::to_string(*value) + " does not fit the immediate field, " + std::to_string(encoding::immediate_min) +
+            " .. " + std::to_string(encoding::immediate_max) + ")");
+    }
+    return static_cast<int32_t>(*value);
 }
 
 // umov's immediate: any 32-bit word (src/isa.hpp, the umovi payload). A name;
@@ -366,35 +383,30 @@ int32_t parse_word(
     const std::string& text,
     const std::unordered_map<std::string, int32_t>& constants,
     uint32_t line) {
-    if (const auto found = constants.find(text); found != constants.end()) return found->second;
-    const auto bad = [&]() -> SimError {
+    const auto bad = [&](const std::string& why) -> SimError {
         return SimError("line " + std::to_string(line) + ": bad or unknown 32-bit immediate '" + text +
-            "' (a name, an integer from -2147483648 to 4294967295, or a float such as 1.5, -inf)");
+            "' (a constant expression from -2147483648 to 4294967295, or a float such as 1.5, -inf)" +
+            (why.empty() ? std::string() : ": " + why));
     };
-    if (text.empty()) throw bad();
-    std::size_t consumed = 0;
-    try {
-        const auto value = std::stoll(text, &consumed, 0);
-        if (consumed == text.size()) {
-            if (value < -(int64_t{1} << 31) || value > (int64_t{1} << 32) - 1) throw bad();
-            return static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(value)));
-        }
-    } catch (const SimError&) {
-        throw;
-    } catch (const std::exception&) {
-        // not an integer: a float, below
-    }
+    if (text.empty()) throw bad("");
     // A float literal: digits with a point or an exponent, or inf / nan, with
-    // an optional sign. (Hex floats and suffixes are not accepted.)
+    // an optional sign. (Hex floats and suffixes are not accepted.) A plain
+    // integer is an expression, below.
     static const std::regex float_literal(
-        R"(^[+-]?(([0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)([eE][+-]?[0-9]+)?|inf|nan)$)");
-    if (!std::regex_match(text, float_literal)) throw bad();
-    char* end = nullptr;
-    const float value = std::strtof(text.c_str(), &end);
-    if (end != text.c_str() + text.size()) throw bad();
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return static_cast<int32_t>(bits);
+        R"(^[+-]?(([0-9]+\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+|inf|nan)$)");
+    if (std::regex_match(text, float_literal) && !constants.contains(text)) {
+        char* end = nullptr;
+        const float value = std::strtof(text.c_str(), &end);
+        if (end != text.c_str() + text.size()) throw bad("");
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return static_cast<int32_t>(bits);
+    }
+    std::string problem;
+    const auto value = evaluate_expression(text.front() == '+' ? text.substr(1) : text, constants, problem);
+    if (!value.has_value()) throw bad(problem);
+    if (*value < -(int64_t{1} << 31) || *value > (int64_t{1} << 32) - 1) throw bad("the value is out of range");
+    return static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(*value)));
 }
 
 struct Address {
@@ -402,22 +414,40 @@ struct Address {
     int32_t offset = 0;
 };
 
+// "[REG]" or "[REG + / - expression]" -> the register's text and the offset,
+// a constant expression (so a named object reads where it is used: lds %a,
+// [%byte + A_TILE[1]]). nullopt when the text is not that shape.
+std::optional<std::pair<std::string, int32_t>> split_address(
+    const std::string& text,
+    const std::unordered_map<std::string, int32_t>& constants,
+    uint32_t line) {
+    if (text.size() < 2 || text.front() != '[' || text.back() != ']') return std::nullopt;
+    const auto inner = trim(text.substr(1, text.size() - 2));
+    std::size_t end = 0;
+    while (end < inner.size() &&
+           (std::isalnum(static_cast<unsigned char>(inner[end])) != 0 || inner[end] == '_' || inner[end] == '%')) {
+        ++end;
+    }
+    if (end == 0) return std::nullopt;
+    const auto rest = trim(inner.substr(end));
+    if (rest.empty()) return std::pair<std::string, int32_t>{inner.substr(0, end), 0};
+    if (rest.front() != '+' && rest.front() != '-') return std::nullopt;
+    // "0 + rest": the sign in front belongs to the offset.
+    return std::pair<std::string, int32_t>{inner.substr(0, end), parse_value("0 " + rest, constants, line)};
+}
+
 Address parse_address(
     const std::string& text,
     const std::unordered_map<std::string, int32_t>& constants,
     uint32_t line) {
-    static const std::regex pattern(
-        R"(^\[\s*([rR][0-9]+|%[A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
-    std::smatch match;
-    if (!std::regex_match(text, match, pattern)) {
+    const auto parts = split_address(text, constants, line);
+    static const std::regex base_pattern(R"(^([rR][0-9]+|%[A-Za-z_][A-Za-z0-9_]*)$)");
+    if (!parts.has_value() || !std::regex_match(parts->first, base_pattern)) {
         throw SimError("line " + std::to_string(line) + ": bad address '" + text + "'");
     }
     Address result;
-    result.base = parse_reg(match[1].str(), line);
-    if (match[3].matched) {
-        result.offset = parse_value(match[3].str(), constants, line);
-        if (match[2].str() == "-") result.offset = -result.offset;
-    }
+    result.base = parse_reg(parts->first, line);
+    result.offset = parts->second;
     return result;
 }
 
@@ -427,18 +457,14 @@ Address parse_uniform_address(
     const std::unordered_map<std::string, int32_t>& constants,
     uint32_t line,
     const DeviceProfile& profile) {
-    static const std::regex pattern(
-        R"(^\[\s*([A-Za-z]+[0-9]+|%[A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
-    std::smatch match;
-    if (!std::regex_match(text, match, pattern)) {
+    const auto parts = split_address(text, constants, line);
+    static const std::regex base_pattern(R"(^([A-Za-z]+[0-9]+|%[A-Za-z_][A-Za-z0-9_]*)$)");
+    if (!parts.has_value() || !std::regex_match(parts->first, base_pattern)) {
         throw SimError("line " + std::to_string(line) + ": bad address '" + text + "'");
     }
     Address result;
-    result.base = parse_ureg(match[1].str(), line, profile);
-    if (match[3].matched) {
-        result.offset = parse_value(match[3].str(), constants, line);
-        if (match[2].str() == "-") result.offset = -result.offset;
-    }
+    result.base = parse_ureg(parts->first, line, profile);
+    result.offset = parts->second;
     return result;
 }
 
@@ -602,8 +628,11 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     // `.reg %a<8>` / `.ureg %c<2>` (qtx): N neighbouring registers, %a0 ..
     // %a7. Read before the first line, like the sections, so a group may be
     // declared anywhere in the file.
-    const auto declare_groups = [&](const std::string& tail, bool uniform, uint32_t line) {
-        static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)<([0-9]+)>$)");
+    const auto declare_groups = [&](
+        const std::string& tail, bool uniform, uint32_t line,
+        const std::unordered_map<std::string, int32_t>& known_constants) {
+        // The count is a constant expression (a number, an `.equ` declared above).
+        static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)<(.+)>$)");
         const std::string directive = uniform ? ".ureg" : ".reg";
         const auto where = "line " + std::to_string(line) + ": ";
         if (tail.empty()) throw SimError(where + directive + " needs a group: " + directive + " %name<count>");
@@ -614,8 +643,14 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                     file_name(uniform) + " registers, %name0 .. ), got '" + item + "'");
             }
             const auto stem = match[1].str();
-            const auto digits = match[2].str();
-            const auto count = digits.size() > 4 ? 0u : static_cast<uint32_t>(std::stoul(digits));
+            const auto digits = trim(match[2].str());
+            refuse_reserved(stem, where + directive + " " + item + ": ");
+            std::string problem;
+            const auto wide = evaluate_expression(digits, known_constants, problem);
+            if (!wide.has_value()) {
+                throw SimError(where + directive + " %" + stem + "<" + digits + ">: bad count (" + problem + ")");
+            }
+            const auto count = *wide < 0 || *wide > 256 ? 0u : static_cast<uint32_t>(*wide);
             auto& list = uniform ? program.uniform_registers : program.vector_registers;
             if (count < 2 || list.size() + count > 256) {
                 throw SimError(where + directive + " %" + stem + "<" + digits + ">: a group has 2 or more registers, " +
@@ -652,33 +687,62 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     // are read in full below, in order, where their values may use `.equ`
     // names. A `.data` line's size is its value count.
     std::unordered_map<std::string, uint8_t> section_flags; // qtx: name -> its launch flag's depbar bit
-    std::unordered_map<std::string, uint32_t> mbar_arrays;  // an .mbar's name -> how many barriers it has
-    // NAME[i] past the end of the array NAME: refused wherever it is written.
-    const auto check_elements = [&](const std::string& text, uint32_t line) {
-        static const std::regex element(R"(([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+)\])");
-        for (std::sregex_iterator it(text.begin(), text.end(), element), end; it != end; ++it) {
-            const auto found = mbar_arrays.find((*it)[1].str());
-            if (found == mbar_arrays.end()) continue;
-            const auto digits = (*it)[2].str();
-            if (digits.size() > 6 || std::stoul(digits) >= found->second) {
-                throw SimError("line " + std::to_string(line) + ": " + it->str() + " is past the end of .mbar " +
-                    found->first + ", which has " + std::to_string(found->second) +
-                    (found->second == 1 ? " barrier" : " barriers"));
+    // The launch flags of the sections a text names (their aliases too): an
+    // instruction whose operands, or an `.equ` whose expression, mentions a
+    // section waits for it. A %register or an object's .property is not a name.
+    const auto flags_named = [&](const std::string& text) {
+        uint8_t named = 0;
+        if (section_flags.empty()) return named;
+        static const std::regex word(R"([A-Za-z_][A-Za-z0-9_]*)");
+        for (std::sregex_iterator it(text.begin(), text.end(), word), end; it != end; ++it) {
+            const auto before = it->position() > 0 ? text[static_cast<std::size_t>(it->position()) - 1] : ' ';
+            if (before == '%' || before == '.') continue;
+            if (const auto found = section_flags.find(it->str()); found != section_flags.end()) {
+                named |= found->second;
             }
         }
+        return named;
     };
+    // What a constant expression may name beyond the `.equ` constants: the
+    // kernel's memory objects and its `.mbar` arrays (expressions.cpp).
+    ExpressionNames expression_names;
+    expression_names.objects = &program.objects;
+    expression_names.sections = &program.sections;
+    ExpressionScope expression_scope(&expression_names);
     std::size_t next_section = 0;
     {
         std::istringstream scan{std::string(source)};
         uint32_t scan_line = 0;
         uint32_t last_section_line = 0;
+        // The `.equ` lines that need no address (numbers and other such
+        // constants) are worked out here too, in order, so that an object's
+        // size or count may be a constant declared above it. They are read
+        // again, like every `.equ`, in the pass below.
+        std::unordered_map<std::string, int32_t> early_constants;
         while (std::getline(scan, raw)) {
             ++scan_line;
-            const auto clean = trim(raw.substr(0, raw.find(';')));
+            auto clean = trim(raw.substr(0, raw.find(';')));
             KernelSection section;
             if (!allow_control && (is_directive(clean, ".reg") || is_directive(clean, ".ureg"))) {
                 const bool uniform = is_directive(clean, ".ureg");
-                declare_groups(trim(clean.substr(uniform ? 5 : 4)), uniform, scan_line);
+                declare_groups(trim(clean.substr(uniform ? 5 : 4)), uniform, scan_line, early_constants);
+                continue;
+            }
+            if (is_directive(clean, ".equ")) {
+                const auto args = operands(trim(clean.substr(4)));
+                std::string problem;
+                if (args.size() == 2) {
+                    if (const auto value = evaluate_expression(args[1], early_constants, problem);
+                        value.has_value() && *value >= -(int64_t{1} << 31) && *value < (int64_t{1} << 31)) {
+                        early_constants.emplace(args[0], static_cast<int32_t>(*value));
+                    }
+                }
+                continue;
+            }
+            if (is_directive(clean, ".shmem") || is_directive(clean, ".tmem")) {
+                const bool tmem = is_directive(clean, ".tmem");
+                parse_object_directive(
+                    trim(clean.substr(tmem ? 5 : 6)), tmem, early_constants, scan_line, allow_control, program.objects);
                 continue;
             }
             if (is_directive(clean, ".param")) {
@@ -688,7 +752,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 const auto args = operands(trim(clean.substr(5)));
                 section.kind = SectionKind::mbar;
                 std::tie(section.name, section.count) =
-                    mbar_name_and_count(args.empty() ? std::string() : args[0], scan_line);
+                    mbar_name_and_count(args.empty() ? std::string() : args[0], early_constants, scan_line);
             } else if (is_directive(clean, ".data")) {
                 const auto args = operands(trim(clean.substr(5)));
                 section.kind = SectionKind::data;
@@ -715,14 +779,18 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             auto& section = program.sections[index];
             section.address = block->addresses[index];
             constants[section.name] = static_cast<int32_t>(section.address);
-            // A barrier of an array by its index: NAME[i] is NAME + 8 i.
-            if (section.kind == SectionKind::mbar) {
-                mbar_arrays[section.name] = section.count;
-                for (uint32_t element = 0; element < section.count; ++element) {
-                    constants[section.name + "[" + std::to_string(element) + "]"] =
-                        static_cast<int32_t>(section.address + 8 * element);
-                }
+        }
+        expression_names.addresses_known = true;
+        // The kernel's own memory (objects.cpp): below the launch block, from
+        // address 0 up; tmem from word 0. An object's name is its address.
+        place_objects(
+            program.objects, program.sections.empty() ? profile.shmem_bytes : block->start,
+            uint64_t{profile.tmem_fine_banks} * profile.tmem_words_per_fine_bank);
+        for (const auto& object : program.objects) {
+            if (constants.contains(object.name)) {
+                throw SimError("line " + std::to_string(object.line) + ": duplicate symbol '" + object.name + "'");
             }
+            constants[object.name] = static_cast<int32_t>(object.address);
         }
         // qtx: the launch flags are the compiler's (the policy: src/isa.hpp
         // default_launch_flags); assembly states its own (`.flag`).
@@ -732,12 +800,6 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 const auto end = section.address - block->start + section_bytes(section);
                 if (const auto bar = launch_flag_covering(program.flags, end); bar.has_value()) {
                     section_flags[section.name] = static_cast<uint8_t>(1u << *bar);
-                    if (section.kind == SectionKind::mbar) {
-                        for (uint32_t element = 0; element < section.count; ++element) {
-                            section_flags[section.name + "[" + std::to_string(element) + "]"] =
-                                static_cast<uint8_t>(1u << *bar);
-                        }
-                    }
                 }
             }
         }
@@ -763,23 +825,28 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
         if (clean.empty()) continue;
 
-        if (clean.starts_with(".equ")) {
+        if (is_directive(clean, ".equ")) {
             auto args = operands(trim(clean.substr(4)));
             expect_count(args, 2, line_number);
-            check_elements(args[1], line_number);
-            const auto value = parse_value(args[1], constants, line_number);
+            // A constant expression; any 32-bit value (where it is used
+            // decides whether it fits).
+            std::string problem;
+            const auto wide = evaluate_expression(args[1], constants, problem);
+            if (!wide.has_value() || *wide < -(int64_t{1} << 31) || *wide >= (int64_t{1} << 31)) {
+                throw SimError("line " + std::to_string(line_number) + ": bad or unknown immediate '" + args[1] + "'" +
+                    (problem.empty() ? std::string(wide.has_value() ? " (out of range)" : "") : " (" + problem + ")"));
+            }
+            const auto value = static_cast<int32_t>(*wide);
             if (constants.contains(args[0]) || labels.contains(args[0])) {
                 throw SimError("line " + std::to_string(line_number) + ": duplicate constant '" + args[0] + "'");
             }
             constants[args[0]] = value;
             program.constants.emplace_back(args[0], value);
-            // Another name for a section (`.equ XX, X`, through any number
-            // of such lines) is that section: an instruction naming it waits
-            // on the same launch flag.
-            if (const auto section = section_flags.find(args[1]); section != section_flags.end()) {
-                const uint8_t flag = section->second;
-                section_flags[args[0]] = flag;
-            }
+            // A constant whose expression names a section (`.equ XX, X`,
+            // `.equ SECOND, FULL[1]`, through any number of such lines) is an
+            // address in that section: an instruction naming it waits on the
+            // same launch flag.
+            if (const auto flags = flags_named(args[1]); flags != 0) section_flags[args[0]] = flags;
             continue;
         }
         if (clean.starts_with(".profile")) {
@@ -815,6 +882,9 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
         if (!allow_control && (is_directive(clean, ".reg") || is_directive(clean, ".ureg"))) {
             continue; // read above, before the first line
+        }
+        if (is_directive(clean, ".shmem") || is_directive(clean, ".tmem")) {
+            continue; // read and placed above, before the first line
         }
         if (is_directive(clean, ".name")) {
             // Assembly: a qtx register's name and its number, for the reader
@@ -883,8 +953,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         const auto op = clean.substr(0, space);
         const auto tail = space == std::string::npos ? std::string{} : trim(clean.substr(space + 1));
         const auto args = tail.empty() ? std::vector<std::string>{} : operands(tail);
-        check_elements(tail, line_number);
         Instruction inst;
+        std::string names_text = tail; // what the launch-flag scan below reads
         inst.line = line_number;
         inst.text = clean;
         name_table.text = clean;
@@ -1064,6 +1134,60 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = parse_reg(args[1], line_number);
             inst.imm = parse_value(args[2], constants, line_number);
+        } else if (op == "ld.param.u32" || op == "ld.param.f32") {
+            // ld.param.u32 %x, [NAME] (qtx; README "Memory"): a parameter's
+            // value into every lane of a vector register. It is written for
+            // the reader and stands for the two instructions a parameter read
+            // is: umov of the parameter's shared address into a uniform
+            // register qtxc names (%qtxc_param), then lds.uni through it. The
+            // umov names the parameter, so it waits for the launch's bytes.
+            if (allow_control) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": ld.param is qtx; assembly writes the umov and the lds.uni it stands for");
+            }
+            expect_count(args, 2, line_number);
+            if (prefix_predicate.has_value()) {
+                throw SimError("line " + std::to_string(line_number) + ": ld.param cannot be masked (@p)");
+            }
+            static const std::regex operand(R"(^\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]$)");
+            std::smatch match;
+            const KernelSection* param = nullptr;
+            if (std::regex_match(args[1], match, operand)) {
+                for (const auto& section : program.sections) {
+                    if (section.name == match[1].str() && section.kind == SectionKind::param) param = &section;
+                }
+            }
+            if (param == nullptr) {
+                throw SimError("line " + std::to_string(line_number) + ": " + op + " reads a parameter: expected " + op +
+                    " %x, [NAME] with NAME a .param of this kernel, got '" + args[1] + "'");
+            }
+            const bool wants_float = op == "ld.param.f32";
+            if (param->type == ParamType::desc || (param->type == ParamType::f32) != wants_float) {
+                throw SimError("line " + std::to_string(line_number) + ": " + op + " [" + param->name + "]: " +
+                    param->name + " is a .param " + param_type_name(param->type) +
+                    (param->type == ParamType::desc
+                        ? " (a descriptor is named in a tma instruction's tile operand, not read)"
+                        : param->type == ParamType::f32 ? " (read it with ld.param.f32)"
+                        : " (read it with ld.param.u32; of a ptr that is its low 32 bits)"));
+            }
+            Instruction address;
+            address.line = line_number;
+            address.opcode = Opcode::umovi;
+            name_table.own = true;
+            address.dst = parse_ureg("%qtxc_param", line_number, profile);
+            name_table.own = false;
+            address.imm = static_cast<int32_t>(param->address);
+            address.text = "umov %qtxc_param, " + param->name;
+            program.named_flags.push_back(flags_named(param->name));
+            program.instructions.push_back(std::move(address));
+            inst.opcode = Opcode::lds_uni;
+            inst.dst = parse_reg(args[0], line_number);
+            name_table.own = true;
+            inst.src0 = parse_ureg("%qtxc_param", line_number, profile);
+            name_table.own = false;
+            inst.imm = 0;
+            inst.text = "lds.uni " + args[0] + ", [%qtxc_param]";
+            names_text.clear();
         } else if (op == "lds" || op == "lds.uni" || op == "ldg" || op == "ldg.v8" || op == "ldg.uni") {
             expect_count(args, 2, line_number);
             inst.opcode = op == "lds" ? Opcode::lds
@@ -1278,17 +1402,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
         // The sections this instruction's operands name (qtx): their launch
         // flags, for the scheduler.
-        uint8_t named = 0;
-        if (!section_flags.empty()) {
-            static const std::regex word(R"([A-Za-z_][A-Za-z0-9_]*)");
-            for (std::sregex_iterator it(tail.begin(), tail.end(), word), end; it != end; ++it) {
-                // %IN is a register that happens to share a section's name.
-                if (it->position() > 0 && tail[static_cast<std::size_t>(it->position()) - 1] == '%') continue;
-                if (const auto found = section_flags.find(it->str()); found != section_flags.end()) {
-                    named |= found->second;
-                }
-            }
-        }
+        const uint8_t named = flags_named(names_text);
         program.named_flags.push_back(named);
         program.instructions.push_back(std::move(inst));
     }

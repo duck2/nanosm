@@ -34,28 +34,26 @@ std::pair<std::string, std::string> first_word(const std::string& text) {
     return {std::string(text.begin(), end), trim(std::string(end, text.end()))};
 }
 
-// A constant's name or an unsigned number (decimal or 0x), at most `maximum`.
+// A directive's argument: a constant expression (expressions.cpp) from 0 to
+// `maximum`.
 uint64_t unsigned_value(
     const std::string& text,
     const std::unordered_map<std::string, int32_t>& constants,
     uint64_t maximum,
     uint32_t line,
     const char* what) {
-    if (const auto found = constants.find(text); found != constants.end()) {
-        if (found->second < 0 || static_cast<uint64_t>(found->second) > maximum) {
-            throw SimError(at(line) + what + " '" + text + "' is out of range");
-        }
-        return static_cast<uint64_t>(found->second);
+    std::string problem;
+    const auto value = evaluate_expression(text, constants, problem);
+    if (!value.has_value()) {
+        throw SimError(at(line) + "bad or unknown " + what + " '" + text + "'" +
+            (problem.empty() ? std::string() : " (" + problem + ")"));
     }
-    std::size_t consumed = 0;
-    try {
-        if (text.empty() || text.front() == '-') throw std::invalid_argument("sign");
-        const auto value = std::stoull(text, &consumed, 0);
-        if (consumed != text.size() || value > maximum) throw std::invalid_argument("range or suffix");
-        return value;
-    } catch (const std::exception&) {
-        throw SimError(at(line) + "bad or unknown " + what + " '" + text + "'");
+    // A constant holds its 32 bits signed: 0xffffffff written as a name reads -1.
+    const auto wide = *value < 0 && maximum == 0xffffffffu ? *value + (int64_t{1} << 32) : *value;
+    if (wide < 0 || static_cast<uint64_t>(wide) > maximum) {
+        throw SimError(at(line) + what + " '" + text + "' is out of range");
     }
+    return static_cast<uint64_t>(wide);
 }
 
 void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
@@ -77,17 +75,25 @@ std::string section_name(const std::string& name, uint32_t line, const char* wha
 }
 
 // An mbar's name with its optional element count: "NAME" (1) or "NAME[C]".
-std::pair<std::string, uint32_t> mbar_name_and_count(const std::string& text, uint32_t line) {
-    static const std::regex array(R"(^([^\[\]\s]+)\s*\[\s*([0-9]+)\s*\]$)");
+std::pair<std::string, uint32_t> mbar_name_and_count(
+    const std::string& text, const std::unordered_map<std::string, int32_t>& constants, uint32_t line) {
+    // NAME[COUNT]: the count is a constant expression (a number, an `.equ`
+    // declared above the line), as a .shmem array's is.
+    static const std::regex array(R"(^([^\[\]\s]+)\s*\[(.+)\]$)");
     std::smatch match;
     if (!std::regex_match(text, match, array)) return {section_name(text, line, "mbar"), 1};
     const auto name = section_name(match[1].str(), line, "mbar");
-    const auto count = match[2].str().size() > 6 ? 0ul : std::stoul(match[2].str());
-    if (count == 0 || count > max_mbar_array) {
-        throw SimError(at(line) + ".mbar " + name + "[" + match[2].str() + "]: an array has 1.." +
+    const auto written = trim(match[2].str());
+    std::string problem;
+    const auto count = evaluate_expression(written, constants, problem);
+    if (!count.has_value()) {
+        throw SimError(at(line) + ".mbar " + name + "[" + written + "]: bad barrier count (" + problem + ")");
+    }
+    if (*count < 1 || *count > max_mbar_array) {
+        throw SimError(at(line) + ".mbar " + name + "[" + written + "]: an array has 1.." +
             std::to_string(max_mbar_array) + " barriers");
     }
-    return {name, static_cast<uint32_t>(count)};
+    return {name, static_cast<uint32_t>(*count)};
 }
 
 bool is_directive(const std::string& clean, std::string_view name) {
@@ -145,7 +151,7 @@ KernelSection parse_mbar_directive(
     }
     KernelSection mbar;
     mbar.kind = SectionKind::mbar;
-    std::tie(mbar.name, mbar.count) = mbar_name_and_count(args[0], line);
+    std::tie(mbar.name, mbar.count) = mbar_name_and_count(args[0], constants, line);
     if (with_address) mbar.address = static_cast<uint32_t>(unsigned_value(args[1], {}, 0xffffffffu, line, "address"));
     const auto expected = unsigned_value(last.second, constants, mbar_encoding::max_count, line, "expected count");
     if (expected == 0) throw SimError(at(line) + "an mbar's expected count must be 1..32767");
