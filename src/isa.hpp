@@ -379,6 +379,18 @@ inline std::optional<uint8_t> launch_flag_covering(const std::vector<LaunchFlag>
 // `symbols` are the qtx's names (.equ constants and section addresses) for
 // a debugger or a test that looks inside; a hex kernel and a saved launch
 // image do not carry them.
+// `register_names`: the qtx's register names (written %name there) and the
+// number qtxc gave each, for a reader, a debugger or a test; `warnings`: what
+// qtxc said while compiling (a copy it inserted, say). Assembly and hex carry
+// the names (`.name %x, r5` lines); a saved launch image does not, and
+// nothing but the compile itself carries the warnings.
+struct RegisterName {
+    std::string name;       // without the %
+    bool uniform = false;   // a uniform register (urN) or a vector register (rN)
+    uint8_t number = 0;
+    bool predicate = false; // a predicate with a name (pN); then not a register
+};
+
 struct Kernel {
     std::string profile_name;
     uint64_t profile_fingerprint = 0;
@@ -388,6 +400,8 @@ struct Kernel {
     std::vector<KernelSection> sections;
     std::vector<LaunchFlag> flags;
     std::vector<std::pair<std::string, int32_t>> symbols;
+    std::vector<RegisterName> register_names;
+    std::vector<std::string> warnings;
 };
 
 namespace encoding {

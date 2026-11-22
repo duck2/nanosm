@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 import struct
 from typing import Iterable, Mapping, Sequence
@@ -201,6 +202,9 @@ class Launch:
         self.kernel = Path(kernel)
         self.profile = Path(profile)
         self._info = json.loads(kernel_info(self.profile.read_bytes(), self.kernel.read_bytes()))
+        # What qtxc has to tell the kernel's author (a copy it inserted).
+        for warning in self._info.get("warnings", []):
+            print(f"qtxc: warning: {self.kernel.name}: {warning}", file=sys.stderr)
         self._warps = warps
         self.args = self._named(args)
         # A TEST's access: bytes placed in shared memory before the first
@@ -233,6 +237,21 @@ class Launch:
         sections. The copy is one more TMA command of whole sectors; a script
         that pins counters adds its part (launch_copy_counters)."""
         return int(self._info["block"]["bytes"]) if self._info["flags"] else 0
+
+    @property
+    def warnings(self) -> list[str]:
+        """What qtxc said while compiling the kernel (a copy it inserted where
+        two sources share a register-file bank)."""
+        return list(self._info.get("warnings", []))
+
+    def register(self, name: str) -> str:
+        """The register qtxc gave a name of the kernel's qtx: "%row" ->
+        "r5", "%block" -> "ur6". For a test or a debugger that looks at
+        registers."""
+        try:
+            return str(self._info["registers"][name])
+        except KeyError:
+            raise KeyError(f"{self.kernel.name} has no register '{name}'") from None
 
     def symbol(self, name: str) -> int:
         """The value of a name in the kernel's qtx: an .equ constant, or a

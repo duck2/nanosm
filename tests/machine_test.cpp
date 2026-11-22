@@ -42,7 +42,7 @@ void test_lds_is_nonblocking_and_depbar_waits() {
     // rounds (sixteen lanes on bank 0), which holds port A and would block the
     // second lds structurally. Lane-strided addresses keep each lds at one
     // round (one lane per bank), the premise of this test.
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         sread r0, LANE_ID
         shli r0, r0, 2
         lds  r1, [r0]

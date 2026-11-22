@@ -60,6 +60,15 @@ KernelSection parse_data_directive(
 LaunchFlag parse_flag_directive(const std::string& tail, uint32_t line);
 std::string format_section_directive(const KernelSection& section, bool with_address);
 std::string format_flag_directive(const LaunchFlag& flag);
+// `.name %x, r5` (assembly, hex): a qtx register's name and its number.
+RegisterName parse_name_directive(const std::string& tail, uint32_t line);
+std::string format_name_directive(const RegisterName& entry);
+
+// qtx's registers (registers.cpp): every %name of a parsed qtx program gets
+// its number (banks, copies where the banks cannot fit, who may share); the
+// program then holds physical registers, as the scheduler expects.
+void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile);
+const char* file_kind_name(bool uniform);
 
 // The per-instruction rules (checks.cpp).
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);

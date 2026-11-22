@@ -35,7 +35,7 @@ std::string encode_error(const nanosm::TmaDescriptor& descriptor) {
 void test_tma_direction_is_the_opcode() {
     const auto& profile = canonical_profile();
     for (const std::string text : {"tma.load.1d [ur4], [64, ur8], [ur5]", "tma.store.1d [64, ur8], [ur4], [ur5]"}) {
-        const auto program = nanosm::compile_qtx(text + "\nhalt\n", profile);
+        const auto program = qtx_program(text + "\nhalt\n", profile);
         require(nanosm::format_instruction(nanosm::decode(nanosm::encode(program.instructions.at(0))), false) == text,
             "'" + text + "' did not survive encode / decode / print");
     }
@@ -1166,7 +1166,7 @@ void test_tma_rank2_strides_planes_in_software() {
 
 void test_profile_stamp_rejects_mismatch() {
     const auto profile = nanosm::load_device_profile("profiles/nanosm-v0.json");
-    const auto program = nanosm::compile_qtx("mov r0, 1\nhalt", profile);
+    const auto program = qtx_program("mov r0, 1\nhalt", profile);
     const auto assembly = nanosm::emit_asm(program);
     const auto kernel = nanosm::assemble_asm(assembly, profile);
     require(kernel.profile_name == profile.name, "profile name was not stamped into kernel");

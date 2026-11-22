@@ -48,6 +48,42 @@ struct AssemblyProgram {
     // sections the instruction's text names. The scheduler turns them into
     // waits (schedule.cpp); assembly's waits are the author's.
     std::vector<uint8_t> named_flags;
+    // qtx's registers (registers.cpp). A qtx register is a name, %x; the
+    // parser gives each a place in its file's list (vector or uniform) and
+    // the instructions hold those places until allocate_registers turns
+    // them into numbers. `group`: the `.reg %a<8>` / `.ureg %c<2>` it is a
+    // member of (neighbouring registers), or none. `scratch`: one qtxc made
+    // for a copy.
+    struct QtxRegister {
+        std::string name; // without the %
+        uint32_t line = 0;
+        std::string where; // the instruction or directive that first named it
+        int32_t group = -1;
+        uint32_t member = 0;
+        bool scratch = false;
+    };
+    struct QtxGroup {
+        std::string stem;
+        bool uniform = false;
+        uint32_t first = 0; // the place of its member 0 in its file's list
+        uint32_t size = 0;
+        uint32_t line = 0;
+    };
+    std::vector<QtxRegister> vector_registers;
+    std::vector<QtxRegister> uniform_registers;
+    // Predicates with a name (%odd): an instruction's predicate field holds
+    // 8 + the name's place here until allocation; p0 .. p6 (and %p0 .. %p6)
+    // are themselves.
+    std::vector<QtxRegister> predicate_names;
+    std::vector<QtxGroup> register_groups;
+    // After allocation (qtx), or as an assembly's `.name` lines say: each
+    // name and its number. `notes`: one per instruction, a comment the
+    // assembly carries (a copy qtxc inserted); `warnings`: what the compiler
+    // has to tell the author; `copies`: the copies it inserted.
+    std::vector<RegisterName> register_names;
+    std::vector<std::string> notes;
+    std::vector<std::string> warnings;
+    uint32_t copies = 0;
 };
 
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile);

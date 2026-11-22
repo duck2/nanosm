@@ -87,7 +87,7 @@ void test_rf_capacity_determines_residency() {
 }
 
 void test_compiler_controls() {
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         mov  r0, 0
         lds  r1, [r0]
         lds  r2, [r0 + 64]
@@ -117,7 +117,7 @@ void test_compiler_controls() {
 // With all six depbars live, the instruction that needs a seventh waits for
 // the oldest live one and reuses it (it used to be an error).
 void test_seventh_depbar_reuses_the_oldest() {
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         mov r0, 0
         lds r1, [r0]
         lds r2, [r0+4]
@@ -143,7 +143,7 @@ void test_stalls_track_consumer_distance() {
     // exceeds those three issues is bought with a stall, and it lands just
     // before the consumer. The mov feeding the fadd stalls the full distance.
     const auto& profile = canonical_profile();
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         mov  r0, 1
         fadd r1, r0, r0
         mov  r2, 5
@@ -170,7 +170,7 @@ void test_stalls_track_consumer_distance() {
 }
 
 void test_counted_loop_and_label_relocation() {
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         mov r0, 0
         mov r1, 4
     loop:
@@ -240,7 +240,7 @@ void test_nonuniform_bra_uni_panics() {
 }
 
 void test_branch_boundary_drains_async_work() {
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         mov r0, 0
         ldg r1, [r0]
         bra done
@@ -249,7 +249,7 @@ void test_branch_boundary_drains_async_work() {
     )", canonical_profile());
     require(program.instructions[2].control.wait_mask == 1, "branch did not drain its live load depbar");
 
-    const auto fixed = nanosm::compile_qtx(R"(
+    const auto fixed = qtx_program(R"(
         mov r0, 1
         fadd r1, r0, r0
         bra done
@@ -286,7 +286,7 @@ void test_wait_on_matmul_operands() {
         sts [r20], r21
         halt
     )";
-    const auto program = nanosm::compile_qtx(source, profile);
+    const auto program = qtx_program(source, profile);
     const auto& matmul = program.instructions.at(4);
     const auto& wait = program.instructions.at(6);
     require(wait.opcode == nanosm::Opcode::nop && wait.text == "nop", "wait was not emitted as a nop");
@@ -317,7 +317,7 @@ void test_wait_on_load_then_use() {
         add r3, r1, r1
         halt
     )";
-    const auto program = nanosm::compile_qtx(source, profile);
+    const auto program = qtx_program(source, profile);
     const auto& load = program.instructions.at(1);
     const auto& wait = program.instructions.at(3);
     const auto& use = program.instructions.at(4);
@@ -380,7 +380,7 @@ void test_nop_in_hand_assembly() {
     refused([&] { nanosm::assemble_asm(i1_asm(profile, "nop {pred=PT, stall=0, set=sb0, wait=-}\nhalt"), profile); },
         "cannot set a depbar", "nop setting a depbar");
     refused([&] { nanosm::assemble_asm(i1_asm(profile, "wait\nhalt"), profile); }, "nop {wait=", "wait in assembly");
-    refused([&] { nanosm::compile_qtx("nop\nhalt\n", profile); }, "qtx has no nop", "nop in qtx");
+    refused([&] { qtx_program("nop\nhalt\n", profile); }, "qtx has no nop", "nop in qtx");
 }
 
 void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
@@ -778,7 +778,7 @@ void test_launch_arguments_reach_the_kernel() {
                     other.flags[index].bytes == kernel.flags[index].bytes, what + " changed a launch flag");
         }
     };
-    same_block(nanosm::assemble_asm(nanosm::emit_asm(nanosm::compile_qtx(argument_kernel, profile)), profile),
+    same_block(nanosm::assemble_asm(nanosm::emit_asm(qtx_program(argument_kernel, profile)), profile),
         "scheduled assembly");
     same_block(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
     same_block(nanosm::load_launch_image(serialized).kernel, "a saved image");
@@ -803,7 +803,7 @@ void test_section_alias_waits_on_its_flag() {
     for (const std::string name : {"X", "XX", "XXX"}) {
         require(run(name) == 0x12345678u, "umov ur1, " + name + " read its parameter before it landed");
     }
-    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx(
+    const auto scheduled = nanosm::emit_asm(qtx_program(
         ".param u32 X\n.equ XX, X\n.equ XXX, XX\numov ur1, XXX\nhalt\n", canonical_profile()));
     require(scheduled.find("wait=sb5") != std::string::npos, "an alias of a section got no launch-flag wait");
 }
@@ -889,7 +889,7 @@ void test_umov_takes_a_32_bit_word() {
     };
     const auto kernel = compile(source);
     check(kernel, "qtx");
-    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx(source, profile));
+    const auto scheduled = nanosm::emit_asm(qtx_program(source, profile));
     check(nanosm::assemble_asm(scheduled, profile), "scheduled assembly");
     check(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
     // A word outside the old 22-bit immediate prints as its 32 bits in hex; a
@@ -1078,7 +1078,7 @@ void test_profile_can_disable_mbar_try_wait() {
     profile.mbar_try_wait_timeout_cycles = 0;
     nanosm::validate_device_profile(profile);
     try {
-        nanosm::compile_qtx("umov ur0, 64\nmbar.try_wait p0, [ur0], 0\nhalt", profile);
+        qtx_program("umov ur0, 64\nmbar.try_wait p0, [ur0], 0\nhalt", profile);
         throw std::runtime_error("qtxc accepted try_wait with no wait slots");
     } catch (const nanosm::SimError& error) {
         require(

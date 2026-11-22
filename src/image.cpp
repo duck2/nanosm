@@ -495,6 +495,12 @@ std::string emit_kernel_info(const Kernel& kernel) {
     for (const auto& flag : kernel.flags) flags.push_back({{"bar", flag.bar}, {"bytes", flag.bytes}});
     auto symbols = json::object();
     for (const auto& [name, value] : kernel.symbols) symbols[name] = value;
+    // The qtx's register names: "%x" -> "r5" / "ur6".
+    auto registers = json::object();
+    for (const auto& entry : kernel.register_names) {
+        registers["%" + entry.name] =
+            (entry.predicate ? "p" : entry.uniform ? "ur" : "r") + std::to_string(entry.number);
+    }
     json document = {
         {"warps", kernel.warps},
         {"params", std::move(params)},
@@ -502,6 +508,8 @@ std::string emit_kernel_info(const Kernel& kernel) {
         {"block", {{"address", start}, {"bytes", (end - start + 3) / 4 * 4}}},
         {"flags", std::move(flags)},
         {"symbols", std::move(symbols)},
+        {"registers", std::move(registers)},
+        {"warnings", kernel.warnings},
     };
     return document.dump(2) + '\n';
 }

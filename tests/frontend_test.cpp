@@ -454,7 +454,7 @@ void test_i6b2_setp_to_branch_distance() {
     const auto distance = nanosm::issue_to_predicate_visible(setp, profile) - nanosm::issue_to_predicate_sample;
     require(distance == 1 + profile.rf_read_latency_cycles + profile.timing.alu + 1 - 1 && distance == 4,
         "the canonical setp -> bra.uni distance is not 4");
-    const auto qtx = nanosm::compile_qtx("setp.eq.u32 p0, r0, r0\n@p0 bra.uni target\nmov r5, 1\ntarget: halt\n", profile);
+    const auto qtx = qtx_program("setp.eq.u32 p0, r0, r0\n@p0 bra.uni target\nmov r5, 1\ntarget: halt\n", profile);
     require(qtx.instructions[0].control.stall == distance, "qtxc did not place the bra.uni at the distance");
     const auto program = [&](uint32_t stall) {
         return "setp.eq.u32 p0, r0, r0 {pred=PT, stall=" + std::to_string(stall) + R"(, set=-, wait=-}
@@ -501,7 +501,7 @@ void test_loop_head_pays_the_entry_once() {
         @p2 bra.uni LOOP
             halt
     )";
-    const auto qtx = nanosm::compile_qtx(source, profile);
+    const auto qtx = qtx_program(source, profile);
     require(qtx.instructions[1].control.stall > 1, "qtxc did not pay the ex2 before the loop head");
     require(qtx.instructions[2].control.stall == 0, "qtxc's branch at the loop head still carries the ex2");
     const auto hand = hand_assemble(i1_asm(profile, R"(

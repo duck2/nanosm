@@ -60,6 +60,58 @@ also call `write_image(path)` to produce a self-contained `.launch.json` replay 
 `nanosm_run`. The Python file is the authoring interface; JSON is transport, not another source of
 truth.
 
+**Registers.** In qtx a register is a name, `%x`. It exists from its first use and qtxc picks its
+number (src/qtxc/registers.cpp; trash/qtxc-registers-2026-11-21.md). The instruction decides the
+file: an operand position takes a vector register (sixteen lanes) or a uniform one (one value per
+warp), and a name used as both is refused (`ur2r` and `r2ur` carry a value from one file to the
+other). Predicates are `p0`..`p6` and a mask is `@p0`; a predicate may have a name too: `%odd` in a
+predicate position (`setp.ne.u32 %odd, %bit, 0`, then `@%odd add ...`) gets one of the predicates
+the kernel does not name by number, `%p0` there is `p0` itself, and a name is a register or a
+predicate, not both. Numbers (`r5`, `ur5`) are assembly's: the
+scheduled assembly qtxc writes holds them, says which name got which (`.name %row, r4`) and stays
+hand-writable.
+
+```
+        sread   %lane, LANE_ID
+        shli    %offset, %lane, 2
+        umov    %arg, IN               ; IN: a .param (Launch, below)
+        lds.uni %base, [%arg]
+        add     %ptr, %offset, %base
+        ldg     %n, [%ptr]
+```
+
+A kernel declares registers only where the machine needs neighbours: `.reg %a<8>` is `%a0`..`%a7`,
+eight adjacent vector registers, for `ldg.v8` / `stg.v8` / `acc.ld.v8` / `acc.st.v8`, which name the
+first of eight; `.ureg %c<2>` is adjacent uniform registers, for a TMA's coordinates. The line may
+stand anywhere in the file. An instruction that needs a group and is given a lone name is refused
+with the line to add.
+
+- **Banks are qtxc's business.** An instruction's issue reads at most `rf.read_ports_per_bank`
+  different registers from one bank (register number mod `rf.banks`: three banks, one port each, at
+  the canonical profile). qtxc gives the names numbers that keep every instruction's sources apart; a
+  group has one choice, its base, for all its members. A register named twice by one instruction is
+  one read.
+- **A copy where no number fits.** A value read beside registers of every bank has no bank left.
+  qtxc then copies one source into a scratch register immediately before the instruction that needs
+  it (a label on the instruction moves to the copy) and warns: `line 12: 'add %r, %v, %x' reads %x
+  and %v from one register-file bank; qtxc inserted a copy of %x before it (one more instruction each
+  time it runs)`. The copy is in the assembly, marked. Inside a loop the warning says so; a second
+  name made before the loop (`mov %v2, %v`) and read there removes it (fa32's `%scale_b` and
+  `%max_b` are such names). No kernel in `kernels/` needs a copy.
+- **Sharing.** A name holds its value from a write to the last read that needs it. Every name gets
+  a number of its own while its file has room -- the uniform file's `urf.registers`; for the vector
+  file what each warp can have when the kernel's warps (`.warps`, else every warp slot) share
+  `rf.rows_per_bank` -- and only beyond that do two names that never hold a value at the same time
+  (two warps' roles, say) get one number. A write under a mask keeps the old value alive in the
+  lanes it skips, and in a kernel that uses the divergence stack every vector write counts as such
+  a write. A kernel that holds more values at once than a file has registers is refused.
+
+`launch.register("%row")` (Python) and the C API's kernel info (`registers`, `warnings`) give a
+test or a debugger the numbers; the Python launch and the `qtxc` tool print the warnings. Most unit
+tests' kernels are still written in numbers, because they pin cycles that depend on a register's
+bank: `tests/test_support.hpp` renames them on the way in (`r5` becomes `%r5`, a member of one group,
+which keeps its number).
+
 **Launch.** A qtx file is self-contained: it declares everything a launch needs to know beside its
 code, and the host knows only the kernel's signature. (v0.1, a first working version: the copy and
 the flags below are expected to change; trash/launch-timed-2026-11-21.md and
@@ -84,13 +136,13 @@ trash/launch-fixes-umov-2026-11-21.md.)
   fixed rule from the sections and the profile: the sections sit in declaration order, each aligned
   to its own size (`ptr` 8, `u32` / `f32` 4, `desc` 64, an mbar 8, data 4); the block starts at the
   top of shared memory (`shmem.bytes`) minus its bytes, rounded down to a multiple of 64. A section's
-  name is its address, an immediate: `umov ur1, OUT` then `lds.uni r4, [ur1]`, or the name as the
+  name is its address, an immediate: `umov %arg, OUT` then `lds.uni %out, [%arg]`, or the name as the
   descriptor operand of `tma.load` / `tma.store`. An `.equ` whose value is a section's name is
   another name for that section. A `ptr` is 8 bytes, but `ldg` / `stg` still take their whole address from one 32-bit
   register, so a kernel reads the low word and the launch refuses a pointer that does not fit 32
   bits (a second address register is planned).
 - **Barrier arrays.** `.mbar NAME[C], expect N` is C barriers side by side in ONE section: element
-  i is at `NAME + 8 i` and is written `NAME[i]` (`umov ur11, S_READY[1]`; `NAME` alone is element
+  i is at `NAME + 8 i` and is written `NAME[i]` (`umov %ready, S_READY[1]`; `NAME` alone is element
   0, and code may reach element t as `NAME + 8 t` in a register). An index past the array's end is
   refused. Because an array is one section it arrives, and is waited for, whole: that is how a
   kernel says "these belong together", so the ORDER of the declarations is free to mean only
@@ -133,7 +185,7 @@ trash/launch-fixes-umov-2026-11-21.md.)
   code is the one thing still in place before the first cycle without being timed (the instruction
   memory is loaded by the launch; HUMAN 2026-11-21: "can be skipped for now").
 - **Float constants need no memory.** `umov urD, imm` takes any 32-bit word, so a constant is one
-  instruction (`umov ur2, 0.180336878`, then `ur2r r9, ur2` if every lane needs it). `.data` is for
+  instruction (`umov %bits, 0.180336878`, then `ur2r %scale, %bits` if every lane needs it). `.data` is for
   tables.
 - **A barrier is initialized by its `.mbar` line** and not by `mbar.init` at run time: the warps
   start together and nothing would hold the others until one had initialized it.
@@ -168,8 +220,9 @@ is checked against the profile's warp slots (`core.warps`, 16) and its physical 
 it names at issue in one RF round (the data of `acc.st` and `stg.v8` is read later, beat by beat,
 and is not part of that round). An instruction whose distinct issue-time sources need more reads of
 one bank (register mod `rf.banks`) than `rf.read_ports_per_bank` allows -- at the canonical one port,
-two distinct sources in one bank -- is malformed: qtxc, qtxas and kernel load reject it with the
-registers named.
+two distinct sources in one bank -- is malformed: qtxas and kernel load reject it with the
+registers named. qtxc never writes one: it picks the numbers, and inserts a copy where none fit
+(Registers, above).
 
 Each warp also has a uniform register file (the profile's `urf` section; trash/rfc16.md and
 trash/urf-slice-2026-11-08.md): `urf.registers` 32-bit registers (32 in the canonical profile,
@@ -243,7 +296,7 @@ instruction refuses to be masked at qtxc, the assembler and kernel load (`uadd c
 masked (@p)`): uniform arithmetic, `usetp`, `r2ur`, the warp-wide memory and engine operations
 listed above, `mbar.*`, `atom.*`, `fence.sh`, `nop`, `halt`, `ssy` and `sync`. `bra` and
 `bra.uni` keep their own meaning of the predicate. In qtx `mov rD, rS` is `addi rD, rS, 0` (and
-disassembles as that), so a register move can be masked: `@p0 mov r1, r2`.
+disassembles as that), so a register move can be masked: `@p0 mov %x, %y`.
 `kernels/diverge_masked.launch.py` is the Collatz count with each step's odd / even choice
 made by two masked arms instead of an if / else on the stack.
 

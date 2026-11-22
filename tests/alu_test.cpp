@@ -9,7 +9,7 @@ using namespace nanosm_test;
 
 void test_integer_alu_menu() {
     // Toolchain round trip for the eight integer ALU ops.
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         sread r0, LANE_ID
         lds r1, [r0]
         lds r2, [r0+64]
@@ -124,12 +124,13 @@ void test_integer_alu_menu() {
     }
 
     // Two distinct sources in one bank are a malformed instruction (one read
-    // round, one read port per bank: src/rf.hpp).
+    // round, one read port per bank: src/rf.hpp): the assembler refuses it.
+    // (qtxc repairs it with a copy: Rf.i6b1_same_bank_sources_are_malformed.)
     try {
-        (void)nanosm::compile_qtx("and r2, r0, r3\nhalt", canonical_profile());
+        (void)nanosm::assemble_asm(i1_asm(canonical_profile(), "and r2, r0, r3\nhalt"), canonical_profile());
         throw std::runtime_error("same-bank and sources were accepted");
     } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("line 1: malformed instruction 'and r2, r0, r3'") != std::string::npos,
+        require(std::string(error.what()).find("line 2: malformed instruction 'and r2, r0, r3'") != std::string::npos,
             std::string("same-bank and: ") + error.what());
     }
 }
@@ -154,7 +155,7 @@ void test_fa_menu_encoding_round_trips() {
     require(unary_decoded.opcode == nanosm::Opcode::ex2 && unary_decoded.dst == 100 &&
             unary_decoded.src0 == 55, "ex2 encoding mismatch");
 
-    const auto program = nanosm::compile_qtx(R"(
+    const auto program = qtx_program(R"(
         sread r0, LANE_ID
         lds r1, [r0]
         lds r2, [r0+64]
@@ -304,7 +305,7 @@ void test_fa_menu_numeric_vectors() {
 void test_sfu_unit_timing() {
     const auto& profile = canonical_profile();
     require(profile.timing.sfu == 11, "canonical effective SFU latency is not 3 + 8");
-    const auto scheduled = nanosm::compile_qtx(R"(
+    const auto scheduled = qtx_program(R"(
         sread r1, LANE_ID
         ex2 r2, r1
         fadd r4, r2, r2
@@ -356,7 +357,7 @@ void test_sfu_unit_timing() {
 
 void test_fma_bank_discipline() {
     try {
-        (void)nanosm::compile_qtx("fma r2, r0, r3, r1\nhalt", canonical_profile());
+        (void)nanosm::assemble_asm(i1_asm(canonical_profile(), "fma r2, r0, r3, r1\nhalt"), canonical_profile());
         throw std::runtime_error("same-bank fma sources were accepted");
     } catch (const nanosm::SimError& error) {
         require(std::string(error.what()).find("its distinct sources r0 and r3 are in one RF bank (0)") !=

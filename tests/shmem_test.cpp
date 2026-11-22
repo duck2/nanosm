@@ -247,8 +247,8 @@ void test_b3_lds_uni_composes_like_lds() {
     {
         const std::string what = "canonical";
         const auto& profile = canonical_profile();
-        const auto plain_asm = nanosm::compile_qtx(plain, profile);
-        const auto uniform_asm = nanosm::compile_qtx(uniform, profile);
+        const auto plain_asm = qtx_program(plain, profile);
+        const auto uniform_asm = qtx_program(uniform, profile);
         require(plain_asm.instructions.size() == uniform_asm.instructions.size(), what + ": instruction counts differ");
         for (std::size_t i = load_pc / 8; i < plain_asm.instructions.size(); ++i) {
             const auto& a = plain_asm.instructions[i].control;
@@ -1821,7 +1821,7 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
     require(nanosm::fixed_latency(decoded, canonical_profile().timing) == 0, "fence.sh has a fixed latency");
 
     const auto& profile = canonical_profile();
-    const auto program = nanosm::compile_qtx("mov r0, 0\nsts [r0], r0\nfence.sh\nhalt\n", profile);
+    const auto program = qtx_program("mov r0, 0\nsts [r0], r0\nfence.sh\nhalt\n", profile);
     require(program.instructions.size() == 4 && program.instructions[2].opcode == nanosm::Opcode::fence_sh &&
             program.instructions[2].control.set_depbar == 7,
         "qtxc did not schedule the written fence.sh in place");
@@ -1829,7 +1829,7 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
     require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "fence.sh did not survive hex");
     for (const auto* bad : {"fence.sh r1\nhalt\n", "fence.sh [r0]\nhalt\n"}) {
         try {
-            (void)nanosm::compile_qtx(bad, profile);
+            (void)qtx_program(bad, profile);
             throw std::runtime_error(std::string("qtxc accepted '") + bad + "'");
         } catch (const nanosm::SimError& error) {
             require(std::string(error.what()).find("expected 0 operands") != std::string::npos,
@@ -1844,7 +1844,7 @@ void test_i4_fence_encoding_qtxc_and_assembly() {
             std::string("fence.sh with a depbar: wrong error: ") + error.what());
     }
     // No auto-insertion: an sts the TMA then stores, with no fence written, gets none.
-    const auto unfenced = nanosm::compile_qtx(
+    const auto unfenced = qtx_program(
         "mov r8, 0\n" + i4_tma_operands(0) + "sts [r8], r8\ntma.store.1d [5120, ur8], [ur10], [ur11]\nhalt\n", profile);
     require(std::none_of(unfenced.instructions.begin(), unfenced.instructions.end(),
                 [](const auto& inst) { return inst.opcode == nanosm::Opcode::fence_sh; }) &&

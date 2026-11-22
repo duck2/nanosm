@@ -26,12 +26,17 @@ std::string emit_asm(const AssemblyProgram& program) {
         out << ".equ " << name << ", " << value << '\n';
     }
     if (program.warps != 0 || !program.sections.empty() || !program.constants.empty()) out << '\n';
+    // The qtx's register names and the numbers qtxc gave them (registers.cpp).
+    for (const auto& entry : program.register_names) out << format_name_directive(entry) << '\n';
+    if (!program.register_names.empty()) out << '\n';
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         for (const auto& label : program.labels) {
             if (label.instruction_index == index) out << label.name << ":\n";
         }
         const auto& inst = program.instructions[index];
-        out << "        " << inst.text << ' ' << format_control(inst.control) << '\n';
+        out << "        " << inst.text << ' ' << format_control(inst.control);
+        if (index < program.notes.size() && !program.notes[index].empty()) out << " ; " << program.notes[index];
+        out << '\n';
     }
     return out.str();
 }
@@ -60,6 +65,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     for (const auto& section : program.sections) {
         kernel.symbols.emplace_back(section.name, static_cast<int32_t>(section.address));
     }
+    kernel.register_names = program.register_names;
     check_kernel_image(kernel, profile);
     kernel.words.reserve(program.instructions.size());
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
@@ -141,7 +147,10 @@ Kernel assemble_asm_file(const std::string& path, const DeviceProfile& profile) 
 }
 
 Kernel compile_and_assemble(std::string_view source, const DeviceProfile& profile) {
-    return assemble_asm(emit_asm(compile_qtx(source, profile)), profile);
+    const auto program = compile_qtx(source, profile);
+    auto kernel = assemble_asm(emit_asm(program), profile);
+    kernel.warnings = program.warnings;
+    return kernel;
 }
 
 Kernel compile_and_assemble_file(const std::string& path, const DeviceProfile& profile) {

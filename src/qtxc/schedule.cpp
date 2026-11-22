@@ -193,6 +193,8 @@ struct LoopEntry {
 AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profile) {
     validate_device_profile(profile);
     auto program = parse_program(source, false, profile);
+    // qtx's registers are names; from here on they are numbers (registers.cpp).
+    allocate_registers(program, profile);
     program.register_count = register_count(program);
     program.profile_name = profile.name;
     program.profile_fingerprint = device_profile_fingerprint(profile);

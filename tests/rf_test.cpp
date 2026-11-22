@@ -91,10 +91,10 @@ void test_rf_one_round_fadd_and_halt() {
 void test_rf_one_round_war_and_branch() {
     const auto& profile = canonical_profile();
     require(nanosm::issue_to_sample + 1 < nanosm::earliest_rf_visible(profile), "a younger write could land first");
-    const auto fixed_writer = nanosm::compile_qtx("add r2, r0, r1\nmov r1, 7\nhalt", profile);
+    const auto fixed_writer = qtx_program("add r2, r0, r1\nmov r1, 7\nhalt", profile);
     require(fixed_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall a fixed writer cannot need");
     const auto source = "add r2, r0, r1\nlds r1, [r5]\nhalt";
-    const auto async_writer = nanosm::compile_qtx(source, profile);
+    const auto async_writer = qtx_program(source, profile);
     require(async_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall an async writer cannot need");
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -1180,7 +1180,7 @@ void test_i6a_dependent_add_distance() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
-        const auto scheduled = nanosm::compile_qtx("add r1, r0, r0\nadd r2, r1, r1\nhalt\n", profile);
+        const auto scheduled = qtx_program("add r1, r0, r0\nadd r2, r1, r1\nhalt\n", profile);
         const auto distance = nanosm::issue_to_visible(scheduled.instructions[0], profile) - nanosm::issue_register_stages;
         require(scheduled.instructions[0].control.stall == distance, what + "qtxc's stall is not the helper's distance");
         const auto run = [&](uint64_t stall) {
@@ -1216,7 +1216,7 @@ void test_i6a_waw_order() {
     for (const auto& [lr, wd] : i6a_depths) {
         const auto profile = i6a_profile(lr, wd);
         const auto what = i6a_what(profile);
-        const auto scheduled = nanosm::compile_qtx("fadd r3, r1, r1\nadd r3, r2, r2\nhalt\n", profile);
+        const auto scheduled = qtx_program("fadd r3, r1, r1\nadd r3, r2, r2\nhalt\n", profile);
         const uint64_t stall = profile.timing.fadd - profile.timing.alu + 1;
         require(scheduled.instructions[0].control.stall == stall, what + "qtxc's WAW stall");
         // r1 = 1.0f (0x3f8 << 20), r2 = 3; each mov / shli stalls its full
@@ -1594,17 +1594,26 @@ void test_i6b1_same_bank_sources_are_malformed() {
     for (const auto& c : cases) {
         const auto& profile = *c.profile;
         const auto source = c.line + "\nhalt\n";
-        try {
-            (void)nanosm::compile_qtx(source, profile);
-            throw std::runtime_error("qtxc accepted '" + c.line + "'");
-        } catch (const nanosm::SimError& error) {
-            require(mentions(error.what(), "line 1", c), "qtxc's refusal of '" + c.line + "': " + error.what());
+        // qtxc repairs it: a copy of one source into a register of another
+        // bank just before the instruction, and a warning that says so. The
+        // result passes the assembler.
+        {
+            const auto repaired = qtx_program(source, profile);
+            require(repaired.copies >= 1 && repaired.warnings.size() == repaired.copies &&
+                    repaired.warnings.front().rfind("line 1: '", 0) == 0 &&
+                    repaired.warnings.front().find("from one register-file bank; qtxc inserted a copy of %r") !=
+                        std::string::npos &&
+                    repaired.instructions.size() == 2 + repaired.copies &&
+                    repaired.instructions.front().opcode == nanosm::Opcode::addi,
+                "qtxc's repair of '" + c.line + "': " +
+                    (repaired.warnings.empty() ? std::string("no warning") : repaired.warnings.front()));
+            (void)nanosm::assemble_asm(nanosm::emit_asm(repaired), profile);
         }
         // The same line through a looser profile (one read port per source),
         // emitted as the profile under test's assembly.
         auto loose = profile;
         loose.rf_read_ports_per_bank = 3;
-        auto program = nanosm::compile_qtx(source, loose);
+        auto program = qtx_program(source, loose);
         program.profile_fingerprint = nanosm::device_profile_fingerprint(profile);
         try {
             (void)nanosm::assemble_asm(nanosm::emit_asm(program), profile);
@@ -1612,7 +1621,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
         } catch (const nanosm::SimError& error) {
             require(mentions(error.what(), "line ", c), "the assembler's refusal of '" + c.line + "': " + error.what());
         }
-        auto kernel = nanosm::assemble_asm(nanosm::emit_asm(nanosm::compile_qtx(source, loose)), loose);
+        auto kernel = nanosm::assemble_asm(nanosm::emit_asm(qtx_program(source, loose)), loose);
         kernel.profile_fingerprint = nanosm::device_profile_fingerprint(profile);
         nanosm::Launch launch;
         launch.active_warps = 1;
@@ -1631,7 +1640,7 @@ void test_i6b1_same_bank_sources_are_malformed() {
              "mma.async.m64n64k8 [ur0], [ur3], [ur6]", "acc.st [ur0, 64], r3"}) {
         try {
             const auto source = line + "\nhalt\n";
-            (void)nanosm::assemble_asm(nanosm::emit_asm(nanosm::compile_qtx(source, canonical)), canonical);
+            (void)nanosm::assemble_asm(nanosm::emit_asm(qtx_program(source, canonical)), canonical);
         } catch (const nanosm::SimError& error) {
             throw std::runtime_error("'" + line + "' with uniform operands was refused: " + error.what());
         }

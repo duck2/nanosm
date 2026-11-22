@@ -8,8 +8,9 @@
 ; three arrays' global addresses; the four barriers (.mbar, expect 1) are the kernel's own.
 ; Stages start free, so the producer peels the first two fills.
 ; The barrier addresses, their parities and the loop counters are uniform
-; registers (ur1..ur7; the loops test their counter with usetp); the
-; per-lane addresses stay vector.
+; registers (the loops test their counter with usetp); the per-lane
+; addresses are vector registers. Both warps use the same names for the same
+; things.
 
 .warps  2
 .param  ptr A
@@ -22,112 +23,112 @@
 .mbar FULL[2],  expect 1    ; a pair is an array: FULL[1] is 8 bytes after FULL[0]
 .mbar EMPTY[2], expect 1
 
-        usread ur0, WARP_ID
-        usetp.eq.u32 p0, ur0, 0
+        usread %warp, WARP_ID
+        usetp.eq.u32 p0, %warp, 0
 @p0     bra.uni PRODUCER
 
 ; ---- consumer: warp 1 ----
-        sread r0, LANE_ID
-        shli  r0, r0, 2
-        addi  r10, r0, SA0
-        addi  r11, r0, SB0
-        addi  r12, r0, SA1
-        addi  r13, r0, SB1
-        umov  ur8, C
-        lds.uni r14, [ur8]      ; C's low word (an stg address is one 32-bit register)
-        add   r1, r0, r14
-        umov  ur1, FULL[0]
-        umov  ur2, FULL[1]
-        umov  ur3, EMPTY[0]
-        umov  ur4, EMPTY[1]
-        umov  ur5, 0            ; FULL0 parity
-        umov  ur6, 0            ; FULL1 parity
-        umov  ur7, 4            ; outer iterations, two tiles each
-CLOOP:  usetp.le.s32 p1, ur7, 0
+        sread %lane, LANE_ID
+        shli  %lane, %lane, 2
+        addi  %sa0, %lane, SA0
+        addi  %sb0, %lane, SB0
+        addi  %sa1, %lane, SA1
+        addi  %sb1, %lane, SB1
+        umov  %c_arg, C
+        lds.uni %c_base, [%c_arg] ; C's low word (an stg address is one 32-bit register)
+        add   %c_ptr, %lane, %c_base
+        umov  %full0, FULL[0]
+        umov  %full1, FULL[1]
+        umov  %empty0, EMPTY[0]
+        umov  %empty1, EMPTY[1]
+        umov  %parity0, 0       ; FULL0 parity
+        umov  %parity1, 0       ; FULL1 parity
+        umov  %left, 4          ; outer iterations, two tiles each
+CLOOP:  usetp.le.s32 p1, %left, 0
 @p1     bra.uni CDONE
-CF0:    mbar.try_wait p3, [ur1], ur5
+CF0:    mbar.try_wait p3, [%full0], %parity0
 @!p3    bra.uni CF0
-        uxori ur5, ur5, 1
-        lds   r8, [r10]
-        lds   r9, [r11]
-        fadd  r8, r8, r9
-        mbar.arrive [ur3]       ; stage 0 values live in RF; hand the buffer back
-        stg   [r1], r8
-        addi  r1, r1, 64
-CF1:    mbar.try_wait p3, [ur2], ur6
+        uxori %parity0, %parity0, 1
+        lds   %x, [%sa0]
+        lds   %y, [%sb0]
+        fadd  %x, %x, %y
+        mbar.arrive [%empty0]   ; stage 0 values live in RF; hand the buffer back
+        stg   [%c_ptr], %x
+        addi  %c_ptr, %c_ptr, 64
+CF1:    mbar.try_wait p3, [%full1], %parity1
 @!p3    bra.uni CF1
-        uxori ur6, ur6, 1
-        lds   r8, [r12]
-        lds   r9, [r13]
-        fadd  r8, r8, r9
-        mbar.arrive [ur4]
-        stg   [r1], r8
-        addi  r1, r1, 64
-        uaddi ur7, ur7, -1
+        uxori %parity1, %parity1, 1
+        lds   %x, [%sa1]
+        lds   %y, [%sb1]
+        fadd  %x, %x, %y
+        mbar.arrive [%empty1]
+        stg   [%c_ptr], %x
+        addi  %c_ptr, %c_ptr, 64
+        uaddi %left, %left, -1
         bra.uni CLOOP
 CDONE:  halt
 
 ; ---- producer: warp 0 ----
 PRODUCER:
-        sread r0, LANE_ID
-        shli  r0, r0, 2
-        umov  ur8, A
-        umov  ur9, B
-        lds.uni r14, [ur8]      ; the pointers' low words
-        lds.uni r16, [ur9]
-        add   r1, r0, r14
-        add   r2, r0, r16
-        addi  r10, r0, SA0
-        addi  r11, r0, SB0
-        addi  r12, r0, SA1
-        addi  r13, r0, SB1
-        umov  ur1, FULL[0]
-        umov  ur2, FULL[1]
-        umov  ur3, EMPTY[0]
-        umov  ur4, EMPTY[1]
-        umov  ur5, 0            ; EMPTY0 parity
-        umov  ur6, 0            ; EMPTY1 parity
+        sread %lane, LANE_ID
+        shli  %lane, %lane, 2
+        umov  %a_arg, A
+        umov  %b_arg, B
+        lds.uni %a_base, [%a_arg] ; the pointers' low words
+        lds.uni %b_base, [%b_arg]
+        add   %a_ptr, %lane, %a_base
+        add   %b_ptr, %lane, %b_base
+        addi  %sa0, %lane, SA0
+        addi  %sb0, %lane, SB0
+        addi  %sa1, %lane, SA1
+        addi  %sb1, %lane, SB1
+        umov  %full0, FULL[0]
+        umov  %full1, FULL[1]
+        umov  %empty0, EMPTY[0]
+        umov  %empty1, EMPTY[1]
+        umov  %parity0, 0       ; EMPTY0 parity
+        umov  %parity1, 0       ; EMPTY1 parity
         ; cold start is peeled: both stages begin free, no empty wait
-        ldg   r8, [r1]
-        ldg   r9, [r2]
-        sts   [r10], r8
-        sts   [r11], r9
-        mbar.arrive [ur1]       ; sts -> arrive order is free: both serialize through port A
-        addi  r1, r1, 64
-        addi  r2, r2, 64
-        ldg   r8, [r1]
-        ldg   r9, [r2]
-        sts   [r12], r8
-        sts   [r13], r9
-        mbar.arrive [ur2]
-        addi  r1, r1, 64
-        addi  r2, r2, 64
-        umov  ur7, 6            ; tiles left after the peel
-PLOOP:  usetp.le.s32 p1, ur7, 0
+        ldg   %x, [%a_ptr]
+        ldg   %y, [%b_ptr]
+        sts   [%sa0], %x
+        sts   [%sb0], %y
+        mbar.arrive [%full0]    ; sts -> arrive order is free: both serialize through port A
+        addi  %a_ptr, %a_ptr, 64
+        addi  %b_ptr, %b_ptr, 64
+        ldg   %x, [%a_ptr]
+        ldg   %y, [%b_ptr]
+        sts   [%sa1], %x
+        sts   [%sb1], %y
+        mbar.arrive [%full1]
+        addi  %a_ptr, %a_ptr, 64
+        addi  %b_ptr, %b_ptr, 64
+        umov  %left, 6          ; tiles left after the peel
+PLOOP:  usetp.le.s32 p1, %left, 0
 @p1     bra.uni PDONE
-PE0:    mbar.try_wait p3, [ur3], ur5
+PE0:    mbar.try_wait p3, [%empty0], %parity0
 @!p3    bra.uni PE0
-        uxori ur5, ur5, 1
-        ldg   r8, [r1]
-        ldg   r9, [r2]
-        sts   [r10], r8
-        sts   [r11], r9
-        mbar.arrive [ur1]
-        addi  r1, r1, 64
-        addi  r2, r2, 64
-        uaddi ur7, ur7, -1
-        usetp.le.s32 p1, ur7, 0
+        uxori %parity0, %parity0, 1
+        ldg   %x, [%a_ptr]
+        ldg   %y, [%b_ptr]
+        sts   [%sa0], %x
+        sts   [%sb0], %y
+        mbar.arrive [%full0]
+        addi  %a_ptr, %a_ptr, 64
+        addi  %b_ptr, %b_ptr, 64
+        uaddi %left, %left, -1
+        usetp.le.s32 p1, %left, 0
 @p1     bra.uni PDONE
-PE1:    mbar.try_wait p3, [ur4], ur6
+PE1:    mbar.try_wait p3, [%empty1], %parity1
 @!p3    bra.uni PE1
-        uxori ur6, ur6, 1
-        ldg   r8, [r1]
-        ldg   r9, [r2]
-        sts   [r12], r8
-        sts   [r13], r9
-        mbar.arrive [ur2]
-        addi  r1, r1, 64
-        addi  r2, r2, 64
-        uaddi ur7, ur7, -1
+        uxori %parity1, %parity1, 1
+        ldg   %x, [%a_ptr]
+        ldg   %y, [%b_ptr]
+        sts   [%sa1], %x
+        sts   [%sb1], %y
+        mbar.arrive [%full1]
+        addi  %a_ptr, %a_ptr, 64
+        addi  %b_ptr, %b_ptr, 64
+        uaddi %left, %left, -1
         bra.uni PLOOP
 PDONE:  halt

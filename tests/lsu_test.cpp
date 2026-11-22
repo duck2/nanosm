@@ -183,7 +183,7 @@ void test_lsu_v8_store_source_lifetime() {
         mov r8, 99
         halt
     )";
-    const auto scheduled = nanosm::compile_qtx(text, canonical_profile());
+    const auto scheduled = qtx_program(text, canonical_profile());
     require(scheduled.instructions[11].control.wait_mask != 0,
         "qtxc did not protect the deferred stg.v8 source tuple");
     nanosm::Launch launch;
@@ -203,7 +203,7 @@ void test_lsu_contract_panics() {
     {
         auto profile = canonical_profile();
         profile.timing.alu = 4;
-        const auto scheduled = nanosm::compile_qtx("mov r0, 0\nldg.v8 r8, [r0]\nhalt\n", profile);
+        const auto scheduled = qtx_program("mov r0, 0\nldg.v8 r8, [r0]\nhalt\n", profile);
         require(scheduled.instructions.front().control.stall != 0,
             "qtxc did not schedule the ldg.v8 address RAW dependency");
     }

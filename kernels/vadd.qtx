@@ -1,8 +1,9 @@
 ; Vector add, C = A + B over 8192 fp32 (32 KiB per vector), four warps.
 ; Warp w streams its own 512 B blocks w, w+4, w+8, ... (16 blocks each).
 ; ldg.v8 / stg.v8 are per lane: each lane gives its own 32-byte-aligned
-; address and moves that sector's eight words to or from r(base) .. r(base+7)
-; at that lane. Lane l takes the block's sector l (base + 32 l), so one
+; address and moves that sector's eight words to or from eight neighbouring
+; registers at that lane (`.reg %a<8>` declares %a0 .. %a7; the instruction
+; names the first). Lane l takes the block's sector l (base + 32 l), so one
 ; ldg.v8 is a whole 512 B block, sixteen sector requests in lane order.
 ; Elementwise work does not care which lane holds which element.
 ;
@@ -16,46 +17,46 @@
 .param ptr B
 .param ptr C
 .equ BYTES, 32768             ; per vector: 8192 fp32
+.reg %a<8>, %b<8>
 
-        usread ur0, WARP_ID
-        ushli  ur0, ur0, 9            ; 512 * warp: this warp's first block
-        usread ur1, N_WARPS
-        ushli  ur1, ur1, 9            ; 512 * warps: to this warp's next block
-        umov   ur2, A
-        umov   ur3, B
-        umov   ur4, C
-        lds.uni r20, [ur2]            ; the pointers' low words (an ldg.v8 /
-        lds.uni r23, [ur3]            ; stg.v8 address is one 32-bit register)
-        lds.uni r26, [ur4]
-        ur2r   r16, ur0
-        ur2r   r18, ur1
-        sread  r27, LANE_ID
-        shli   r27, r27, 5            ; 32 bytes per lane: this lane's sector of a block
-        add    r16, r16, r27          ; this lane's offset in the warp's first block
-        ; r20 / r23 / r26 (bank 2) walk A, B and C, one address per lane; the
-        ; step r18 (bank 0) and the end of A at this lane's offset r19 (bank 1)
-        ; sit in the other two banks, so every lane leaves the loop together.
-        addi   r19, r20, BYTES
-        add    r19, r19, r27
-        add    r20, r20, r16
-        add    r23, r23, r16
-        add    r26, r26, r16
+        usread %first, WARP_ID
+        ushli  %first, %first, 9      ; 512 * warp: this warp's first block
+        usread %stride, N_WARPS
+        ushli  %stride, %stride, 9    ; 512 * warps: to this warp's next block
+        umov   %a_arg, A
+        umov   %b_arg, B
+        umov   %c_arg, C
+        lds.uni %a_ptr, [%a_arg]      ; the pointers' low words (an ldg.v8 /
+        lds.uni %b_ptr, [%b_arg]      ; stg.v8 address is one 32-bit register)
+        lds.uni %c_ptr, [%c_arg]
+        ur2r   %offset, %first
+        ur2r   %step, %stride
+        sread  %lane, LANE_ID
+        shli   %lane, %lane, 5        ; 32 bytes per lane: this lane's sector of a block
+        add    %offset, %offset, %lane ; this lane's offset in the warp's first block
+        ; %a_ptr / %b_ptr / %c_ptr walk A, B and C, one address per lane;
+        ; %a_end is the end of A at this lane's offset, so every lane leaves
+        ; the loop together.
+        addi   %a_end, %a_ptr, BYTES
+        add    %a_end, %a_end, %lane
+        add    %a_ptr, %a_ptr, %offset
+        add    %b_ptr, %b_ptr, %offset
+        add    %c_ptr, %c_ptr, %offset
 loop:
-        ldg.v8 r0, [r20]
-        ldg.v8 r8, [r23]
-        ; rj and r(8+j) are always in different RF banks (j vs j+2 mod 3)
-        fadd   r0, r0, r8
-        fadd   r1, r1, r9
-        fadd   r2, r2, r10
-        fadd   r3, r3, r11
-        fadd   r4, r4, r12
-        fadd   r5, r5, r13
-        fadd   r6, r6, r14
-        fadd   r7, r7, r15
-        stg.v8 [r26], r0
-        add    r20, r20, r18
-        add    r23, r23, r18
-        add    r26, r26, r18
-        setp.lt.u32 p0, r20, r19
+        ldg.v8 %a0, [%a_ptr]
+        ldg.v8 %b0, [%b_ptr]
+        fadd   %a0, %a0, %b0
+        fadd   %a1, %a1, %b1
+        fadd   %a2, %a2, %b2
+        fadd   %a3, %a3, %b3
+        fadd   %a4, %a4, %b4
+        fadd   %a5, %a5, %b5
+        fadd   %a6, %a6, %b6
+        fadd   %a7, %a7, %b7
+        stg.v8 [%c_ptr], %a0
+        add    %a_ptr, %a_ptr, %step
+        add    %b_ptr, %b_ptr, %step
+        add    %c_ptr, %c_ptr, %step
+        setp.lt.u32 p0, %a_ptr, %a_end
         @p0 bra.uni loop
         halt

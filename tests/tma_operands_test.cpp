@@ -370,9 +370,20 @@ void test_descriptor_and_toolchain() {
     // pass it by one; one coordinate in the last register fits.
     const auto registers = canonical_profile().urf_registers;
     const auto from = "ur" + std::to_string(registers - 3);
+    // (In qtx the four are members of a group, which ends one short; the
+    // assembler refuses the numbers.)
     require(compile_error("tma.load.4d [ur0], [4096, " + from + "], [ur1]\nhalt\n")
-                    .find("pass this profile's last uniform register") != std::string::npos,
+                    .find("has only 3 from there on") != std::string::npos,
         "coordinates " + from + " .. ur" + std::to_string(registers));
+    try {
+        (void)nanosm::assemble_asm(
+            i1_asm(canonical_profile(), "tma.load.4d [ur0], [4096, " + from + "], [ur1] {set=-}\nhalt"),
+            canonical_profile());
+        throw std::runtime_error("assembly accepted coordinates past the last uniform register");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("pass this profile's last uniform register") != std::string::npos,
+            std::string("assembly's coordinates: wrong error: ") + error.what());
+    }
     require(compile_error("tma.load.1d [ur0], [4096, ur" + std::to_string(registers - 1) + "], [ur1]\nhalt\n").empty(),
         "one coordinate in the last uniform register");
     require(compile_error("tma.load [4096], r0, r1\nhalt\n").find("needs its coordinate count") != std::string::npos,

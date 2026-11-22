@@ -81,7 +81,102 @@ std::vector<std::string> split(const std::string& text, char separator) {
     return result;
 }
 
+// qtx's register names (README "Registers"; registers.cpp). While
+// parse_program reads qtx, `names` points at the program being built: a
+// register operand is then a name, %x, and what the instruction's field
+// holds is the name's place in its file's list -- vector_registers or
+// uniform_registers, whichever the operand position asks for -- until
+// allocate_registers gives it a number. A name used in both files, and a raw
+// r5 / ur5, are refused here. A predicate may be a name too (%odd, in a
+// predicate position; %p0 .. %p6 there are p0 .. p6 themselves): its place
+// is in predicate_names, and the field holds 8 + place until it has a
+// number. Null while assembly is read: registers are numbers there.
+struct Names {
+    AssemblyProgram* program = nullptr;
+    // name -> (kind: 0 vector register, 1 uniform register, 2 predicate; place)
+    std::unordered_map<std::string, std::pair<int, uint32_t>> index;
+    std::string text; // the instruction being read, for a later message
+};
+
+const char* kind_name(int kind) {
+    return kind == 0 ? "vector register" : kind == 1 ? "uniform register" : "predicate";
+}
+
+// The message for a name already used as another kind.
+SimError kind_conflict(
+    const AssemblyProgram& program, const std::string& where, const std::string& name, int here,
+    std::pair<int, uint32_t> there) {
+    const auto& other = (there.first == 0 ? program.vector_registers
+        : there.first == 1 ? program.uniform_registers : program.predicate_names)[there.second];
+    const std::string advice = here == 2 || there.first == 2
+        ? "a name is a register or a predicate, not both"
+        : "a name is one register, in one file (ur2r and r2ur carry a value from one file to the other)";
+    return SimError(where + "%" + name + " is used here as a " + kind_name(here) + " and on line " +
+        std::to_string(other.line) + " as a " + kind_name(there.first) + " ('" + other.where + "'); " + advice);
+}
+thread_local Names* names = nullptr;
+
+const char* file_name(bool uniform) { return uniform ? "uniform" : "vector"; }
+
+uint8_t named_register(const std::string& text, bool uniform, uint32_t line) {
+    static const std::regex raw(R"(^[uU]?[rR][0-9]+$)");
+    static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)$)");
+    const auto where = "line " + std::to_string(line) + ": ";
+    std::smatch match;
+    if (std::regex_match(text, raw)) {
+        throw SimError(where + "qtx names its registers: write a name such as %x instead of '" + text +
+            "' (qtxc picks the number)");
+    }
+    if (!std::regex_match(text, match, pattern)) {
+        throw SimError(where + "expected a " + (uniform ? std::string("uniform ") : std::string()) +
+            "register name (%name), got '" + text + "'");
+    }
+    const auto name = match[1].str();
+    if (name.size() == 2 && name[0] == 'p' && name[1] >= '0' && name[1] <= '6') {
+        throw SimError(where + "%" + name + " is the predicate " + name + ", not a register");
+    }
+    auto& list = uniform ? names->program->uniform_registers : names->program->vector_registers;
+    const int kind = uniform ? 1 : 0;
+    if (const auto found = names->index.find(name); found != names->index.end()) {
+        if (found->second.first != kind) throw kind_conflict(*names->program, where, name, kind, found->second);
+        return static_cast<uint8_t>(found->second.second);
+    }
+    if (list.size() >= 256) {
+        throw SimError(where + "more than 256 " + file_name(uniform) + " register names");
+    }
+    AssemblyProgram::QtxRegister entry;
+    entry.name = name;
+    entry.line = line;
+    entry.where = names->text;
+    list.push_back(std::move(entry));
+    names->index[name] = {kind, static_cast<uint32_t>(list.size() - 1)};
+    return static_cast<uint8_t>(list.size() - 1);
+}
+
+// An instruction that names the first of `count` neighbouring registers
+// (ldg.v8 and its kin: eight; a tma's coordinates): in qtx the name must be
+// a member of a declared group with that many members from it on.
+void require_group(uint8_t place, bool uniform, uint32_t count, uint32_t line, const std::string& what) {
+    if (names == nullptr || count < 2) return;
+    const auto& program = *names->program;
+    const auto& entry = (uniform ? program.uniform_registers : program.vector_registers)[place];
+    const std::string directive = uniform ? ".ureg" : ".reg";
+    const auto where = "line " + std::to_string(line) + ": " + what + " " + std::to_string(count) +
+        " neighbouring registers starting at %" + entry.name;
+    if (entry.group < 0) {
+        throw SimError(where + ", which is a single register: declare a group, `" + directive + " %" + entry.name +
+            "<" + std::to_string(count) + ">`, and name its first member, %" + entry.name + "0");
+    }
+    const auto& group = program.register_groups[static_cast<std::size_t>(entry.group)];
+    if (entry.member + count > group.size) {
+        throw SimError(where + ", and `" + directive + " %" + group.stem + "<" + std::to_string(group.size) +
+            ">` (line " + std::to_string(group.line) + ") has only " + std::to_string(group.size - entry.member) +
+            " from there on");
+    }
+}
+
 uint8_t parse_reg(const std::string& text, uint32_t line) {
+    if (names != nullptr) return named_register(text, false, line);
     static const std::regex pattern(R"(^[rR]([0-9]+)$)");
     std::smatch match;
     if (!std::regex_match(text, match, pattern)) {
@@ -94,13 +189,17 @@ uint8_t parse_reg(const std::string& text, uint32_t line) {
     return static_cast<uint8_t>(value);
 }
 
+// Where an operand may be a register or an immediate (umov, usetp, an mbar's
+// count), is it a register? In qtx any %name is.
 bool is_uniform_register(const std::string& text) {
+    if (names != nullptr && !text.empty() && text.front() == '%') return true;
     static const std::regex pattern(R"(^[uU][rR][0-9]+$)");
     return std::regex_match(text, pattern);
 }
 
 // A uniform register, ur0 .. ur(urf.registers - 1).
 uint8_t parse_ureg(const std::string& text, uint32_t line, const DeviceProfile& profile) {
+    if (names != nullptr) return named_register(text, true, line);
     static const std::regex pattern(R"(^[uU][rR]([0-9]+)$)");
     std::smatch match;
     if (!std::regex_match(text, match, pattern)) {
@@ -145,7 +244,7 @@ uint8_t parse_mma_result(const std::string& text, uint32_t line, const DevicePro
         throw SimError("line " + std::to_string(line) + ": mma.async result '" + text +
             "': its rows are the shape's n words; write [urC] without a row length");
     }
-    if (inner.size() != 1 || is_register(inner[0]) || !is_uniform_register(inner[0])) {
+    if (inner.size() != 1 || (names == nullptr && is_register(inner[0])) || !is_uniform_register(inner[0])) {
         throw SimError("line " + std::to_string(line) + ": bad mma.async result '" + text +
             "' (expected [urC], a uniform register holding its tmem pointer)");
     }
@@ -162,6 +261,30 @@ std::pair<uint8_t, bool> parse_predicate(const std::string& text, uint32_t line)
     if (value == "PT") return {7, invert};
     if (value.size() == 2 && value[0] == 'p' && value[1] >= '0' && value[1] <= '6') {
         return {static_cast<uint8_t>(value[1] - '0'), invert};
+    }
+    // qtx: %p0 .. %p6 are p0 .. p6; any other %name is a predicate qtxc
+    // places (registers.cpp). The field holds 8 + its place meanwhile.
+    static const std::regex name_pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)$)");
+    std::smatch match;
+    if (names != nullptr && std::regex_match(value, match, name_pattern)) {
+        const auto name = match[1].str();
+        const auto where = "line " + std::to_string(line) + ": ";
+        if (name.size() == 2 && name[0] == 'p' && name[1] >= '0' && name[1] <= '6') {
+            return {static_cast<uint8_t>(name[1] - '0'), invert};
+        }
+        auto& list = names->program->predicate_names;
+        if (const auto found = names->index.find(name); found != names->index.end()) {
+            if (found->second.first != 2) throw kind_conflict(*names->program, where, name, 2, found->second);
+            return {static_cast<uint8_t>(8 + found->second.second), invert};
+        }
+        if (list.size() >= 240) throw SimError(where + "more than 240 predicate names");
+        AssemblyProgram::QtxRegister entry;
+        entry.name = name;
+        entry.line = line;
+        entry.where = names->text;
+        list.push_back(std::move(entry));
+        names->index[name] = {2, static_cast<uint32_t>(list.size() - 1)};
+        return {static_cast<uint8_t>(8 + list.size() - 1), invert};
     }
     throw SimError("line " + std::to_string(line) + ": bad predicate '" + text + "'");
 }
@@ -284,7 +407,7 @@ Address parse_address(
     const std::unordered_map<std::string, int32_t>& constants,
     uint32_t line) {
     static const std::regex pattern(
-        R"(^\[\s*([rR][0-9]+)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
+        R"(^\[\s*([rR][0-9]+|%[A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
     std::smatch match;
     if (!std::regex_match(text, match, pattern)) {
         throw SimError("line " + std::to_string(line) + ": bad address '" + text + "'");
@@ -305,7 +428,7 @@ Address parse_uniform_address(
     uint32_t line,
     const DeviceProfile& profile) {
     static const std::regex pattern(
-        R"(^\[\s*([A-Za-z]+[0-9]+)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
+        R"(^\[\s*([A-Za-z]+[0-9]+|%[A-Za-z_][A-Za-z0-9_]*)\s*(?:([+-])\s*([A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|[0-9]+))?\s*\]$)");
     std::smatch match;
     if (!std::regex_match(text, match, pattern)) {
         throw SimError("line " + std::to_string(line) + ": bad address '" + text + "'");
@@ -397,6 +520,7 @@ std::pair<int32_t, uint8_t> parse_tma_tile(
 }
 
 bool is_register(const std::string& text) {
+    if (names != nullptr && !text.empty() && text.front() == '%') return true;
     static const std::regex pattern(R"(^[rR][0-9]+$)");
     return std::regex_match(text, pattern);
 }
@@ -467,6 +591,60 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
     std::string raw;
     uint32_t line_number = 0;
 
+    // qtx: registers are names (see Names). The pointer is cleared however
+    // this function is left.
+    Names name_table;
+    name_table.program = &program;
+    struct NamesScope {
+        explicit NamesScope(Names* table) { names = table; }
+        ~NamesScope() { names = nullptr; }
+    } names_scope(allow_control ? nullptr : &name_table);
+    // `.reg %a<8>` / `.ureg %c<2>` (qtx): N neighbouring registers, %a0 ..
+    // %a7. Read before the first line, like the sections, so a group may be
+    // declared anywhere in the file.
+    const auto declare_groups = [&](const std::string& tail, bool uniform, uint32_t line) {
+        static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)<([0-9]+)>$)");
+        const std::string directive = uniform ? ".ureg" : ".reg";
+        const auto where = "line " + std::to_string(line) + ": ";
+        if (tail.empty()) throw SimError(where + directive + " needs a group: " + directive + " %name<count>");
+        for (const auto& item : operands(tail)) {
+            std::smatch match;
+            if (!std::regex_match(item, match, pattern)) {
+                throw SimError(where + "expected " + directive + " %name<count> (count neighbouring " +
+                    file_name(uniform) + " registers, %name0 .. ), got '" + item + "'");
+            }
+            const auto stem = match[1].str();
+            const auto digits = match[2].str();
+            const auto count = digits.size() > 4 ? 0u : static_cast<uint32_t>(std::stoul(digits));
+            auto& list = uniform ? program.uniform_registers : program.vector_registers;
+            if (count < 2 || list.size() + count > 256) {
+                throw SimError(where + directive + " %" + stem + "<" + digits + ">: a group has 2 or more registers, " +
+                    "and a file at most 256 names");
+            }
+            AssemblyProgram::QtxGroup group;
+            group.stem = stem;
+            group.uniform = uniform;
+            group.first = static_cast<uint32_t>(list.size());
+            group.size = count;
+            group.line = line;
+            for (uint32_t member = 0; member < count; ++member) {
+                AssemblyProgram::QtxRegister entry;
+                entry.name = stem + std::to_string(member);
+                entry.line = line;
+                entry.where = directive + " " + item;
+                entry.group = static_cast<int32_t>(program.register_groups.size());
+                entry.member = member;
+                if (name_table.index.contains(entry.name)) {
+                    throw SimError(where + directive + " " + item + ": %" + entry.name +
+                        " is already a member of another group");
+                }
+                name_table.index[entry.name] = {uniform ? 1 : 0, static_cast<uint32_t>(list.size())};
+                list.push_back(std::move(entry));
+            }
+            program.register_groups.push_back(std::move(group));
+        }
+    };
+
     // The sections first (`.param`, `.mbar`, `.data` lines, README "Launch"):
     // a section's address depends on the whole list (src/isa.hpp
     // launch_block), and its name is a constant, the address, from the first
@@ -498,6 +676,11 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             ++scan_line;
             const auto clean = trim(raw.substr(0, raw.find(';')));
             KernelSection section;
+            if (!allow_control && (is_directive(clean, ".reg") || is_directive(clean, ".ureg"))) {
+                const bool uniform = is_directive(clean, ".ureg");
+                declare_groups(trim(clean.substr(uniform ? 5 : 4)), uniform, scan_line);
+                continue;
+            }
             if (is_directive(clean, ".param")) {
                 section = parse_param_directive(trim(clean.substr(6)), scan_line, false);
             } else if (is_directive(clean, ".mbar")) {
@@ -630,6 +813,19 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             program.flags.push_back(parse_flag_directive(trim(clean.substr(5)), line_number));
             continue;
         }
+        if (!allow_control && (is_directive(clean, ".reg") || is_directive(clean, ".ureg"))) {
+            continue; // read above, before the first line
+        }
+        if (is_directive(clean, ".name")) {
+            // Assembly: a qtx register's name and its number, for the reader
+            // and for whoever asks the kernel (Kernel::register_names).
+            if (!allow_control) {
+                throw SimError("line " + std::to_string(line_number) +
+                    ": qtx has no .name line (a register is a name there already: %x)");
+            }
+            program.register_names.push_back(parse_name_directive(trim(clean.substr(5)), line_number));
+            continue;
+        }
         if (is_directive(clean, ".warps")) {
             if (program.warps != 0) throw SimError("line " + std::to_string(line_number) + ": duplicate .warps");
             program.warps = parse_warps_directive(trim(clean.substr(6)), line_number);
@@ -673,6 +869,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
 
         std::optional<std::pair<uint8_t, bool>> prefix_predicate;
+        name_table.text = clean;
         if (!clean.empty() && clean.front() == '@') {
             const auto end = clean.find_first_of(" \t");
             if (end == std::string::npos) {
@@ -690,6 +887,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         Instruction inst;
         inst.line = line_number;
         inst.text = clean;
+        name_table.text = clean;
         inst.control = parse_control(control_text, line_number);
         if (prefix_predicate.has_value()) {
             if ((inst.control.predicate != 7 || inst.control.predicate_invert) &&
@@ -880,6 +1078,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                                       : parse_address(args[1], constants, line_number);
             inst.src0 = addr.base;
             inst.imm = addr.offset;
+            if (op == "ldg.v8") require_group(inst.dst, false, 8, line_number, "ldg.v8 writes");
             if (op == "ldg.v8" && static_cast<unsigned>(inst.dst) + 8 > 256)
                 throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
         } else if (op == "sts" || op == "stg" || op == "stg.v8") {
@@ -889,6 +1088,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = addr.base;
             inst.imm = addr.offset;
             inst.src1 = parse_reg(args[1], line_number);
+            if (op == "stg.v8") require_group(inst.src1, false, 8, line_number, "stg.v8 stores");
             if (op == "stg.v8" && static_cast<unsigned>(inst.src1) + 8 > 256)
                 throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
         } else if (op == "atom.add.uni" || op == "atom.and.uni" || op == "atom.xor.uni" || op == "atom.exch.uni") {
@@ -981,7 +1181,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src1 = first;
             inst.src0 = parse_tma_address(buffer, "buffer", line_number, profile);
             inst.src2 = parse_tma_address(args[2], "barrier", line_number, profile);
-            if (static_cast<uint32_t>(first) + coordinates > profile.urf_registers) {
+            require_group(first, true, coordinates, line_number, op + " reads its coordinates from");
+            if (names == nullptr && static_cast<uint32_t>(first) + coordinates > profile.urf_registers) {
                 throw SimError("line " + std::to_string(line_number) + ": the coordinates ur" +
                     std::to_string(first) + " .. ur" + std::to_string(first + coordinates - 1) +
                     " pass this profile's last uniform register, ur" + std::to_string(profile.urf_registers - 1));
@@ -997,6 +1198,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = pointer;
             inst.imm = row_words;
             const auto width = op == "acc.ld.v8" ? 8u : 1u;
+            require_group(inst.dst, false, width, line_number, "acc.ld.v8 writes");
             if (static_cast<unsigned>(inst.dst) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
@@ -1009,6 +1211,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.imm = row_words;
             inst.src1 = parse_reg(args[1], line_number);
             const auto width = op == "acc.st.v8" ? 8u : 1u;
+            require_group(inst.src1, false, width, line_number, "acc.st.v8 stores");
             if (static_cast<unsigned>(inst.src1) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
@@ -1079,6 +1282,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         if (!section_flags.empty()) {
             static const std::regex word(R"([A-Za-z_][A-Za-z0-9_]*)");
             for (std::sregex_iterator it(tail.begin(), tail.end(), word), end; it != end; ++it) {
+                // %IN is a register that happens to share a section's name.
+                if (it->position() > 0 && tail[static_cast<std::size_t>(it->position()) - 1] == '%') continue;
                 if (const auto found = section_flags.find(it->str()); found != section_flags.end()) {
                     named |= found->second;
                 }

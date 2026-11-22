@@ -233,6 +233,29 @@ std::string format_section_directive(const KernelSection& section, bool with_add
     return {};
 }
 
+// `.name %x, r5` / `.name %blk, ur6` (assembly, hex): the name a qtx gave a
+// register and the number qtxc gave it (registers.cpp). It changes nothing
+// about the code; a reader, a debugger or a test asks the kernel for it
+// (Kernel::register_names).
+RegisterName parse_name_directive(const std::string& tail, uint32_t line) {
+    const auto args = operands(tail);
+    static const std::regex name_pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)$)");
+    static const std::regex number_pattern(R"(^(ur|r|p)([0-9]+)$)");
+    std::smatch name_match, number_match;
+    if (args.size() != 2 || !std::regex_match(args[0], name_match, name_pattern) ||
+        !std::regex_match(args[1], number_match, number_pattern) || number_match[2].str().size() > 3 ||
+        std::stoul(number_match[2].str()) > 255) {
+        throw SimError("line " + std::to_string(line) + ": expected .name %name, rN (or urN, or pN)");
+    }
+    return {name_match[1].str(), number_match[1].str() == "ur",
+        static_cast<uint8_t>(std::stoul(number_match[2].str())), number_match[1].str() == "p"};
+}
+
+std::string format_name_directive(const RegisterName& entry) {
+    return ".name %" + entry.name + ", " + (entry.predicate ? "p" : entry.uniform ? "ur" : "r") +
+        std::to_string(entry.number);
+}
+
 std::string format_flag_directive(const LaunchFlag& flag) {
     return ".flag sb" + std::to_string(flag.bar) + ", " + std::to_string(flag.bytes);
 }

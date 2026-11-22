@@ -111,7 +111,7 @@ void test_write_and_read_timing() {
     const auto& profile = canonical_profile();
     require(nanosm::issue_to_urf_port(profile) == 3 && nanosm::issue_to_urf_visible(profile) == 5,
         "the canonical URF timing is L 3, visible from issue + 5");
-    const auto scheduled = nanosm::compile_qtx(R"(
+    const auto scheduled = qtx_program(R"(
         umov  ur1, 7
         uaddi ur2, ur1, 1
         ur2r  r1, ur2
@@ -281,15 +281,25 @@ void test_toolchain_forms_and_refusals() {
     const auto past = "ur" + std::to_string(profile.urf_registers);
     const auto last = "ur" + std::to_string(profile.urf_registers - 1);
     refused("usread ur0, LANE_ID\nhalt\n", "sread", "usread of LANE_ID");
-    refused("umov " + past + ", 1\nhalt\n", "outside this profile's " + std::to_string(profile.urf_registers), past);
-    refused("mov r2, 0\nlds.uni r1, [r2]\nhalt\n", "expected uniform register", "a vector lds.uni base");
-    refused("mov r2, 0\nmbar.arrive [r2]\nhalt\n", "expected uniform register", "a vector mbar address");
-    refused("mbar.try_wait p1, [ur0], r3\nhalt\n", "expected uniform register", "a vector mbar parity");
-    refused("acc.ld r1, [" + past + ", 8]\nhalt\n", "outside this profile's", "an acc pointer past " + last);
+    // (A register past the file's end has no name to be written with: the
+    // file just runs out. Assembly's refusal of the number is below.)
+    refused("umov " + past + ", 1\nhalt\n", "this profile's " + std::to_string(profile.urf_registers), past);
+    // A name is one register in one file.
+    refused("mov r2, 0\nlds.uni r1, [r2]\nhalt\n", "is used here as a uniform register", "a vector lds.uni base");
+    refused("mov r2, 0\nmbar.arrive [r2]\nhalt\n", "is used here as a uniform register", "a vector mbar address");
+    refused("mbar.try_wait p1, [ur0], r3\nhalt\n", "is used here as a uniform register", "a vector mbar parity");
+    refused("acc.ld r1, [" + past + ", 8]\nhalt\n", "this profile's", "an acc pointer past " + last);
     refused("acc.ld r1, [ur1, 6]\nhalt\n", "must be a power of two", "an acc row of 6 words");
     refused(".acc T, 0, 16, 8\nhalt\n", "there is no .acc directive", "the .acc directive");
     refused("umov ur1, r2\nhalt\n", "r2ur", "umov from a vector register");
-    refused("usetp.eq.u32 p0, ur1, r2\nhalt\n", "expected uniform register", "usetp of a vector register");
+    refused("usetp.eq.u32 p0, ur1, r2\nhalt\n", "is used here as a uniform register", "usetp of a vector register");
+    try {
+        (void)nanosm::assemble_asm(i1_asm(profile, "umov " + past + ", 1\nlds.uni r1, [r2]\nhalt"), profile);
+        throw std::runtime_error("assembly accepted " + past);
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("outside this profile's " + std::to_string(profile.urf_registers)) !=
+                std::string::npos, std::string("assembly's ") + past + ": wrong error: " + error.what());
+    }
     refused("usetp.eq.u32 PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");
     refused("usetp.lo.u32 p0, ur1, 0\nhalt\n", "unknown usetp comparison", "an unknown usetp comparison");
     // Every compare says its type (trash/typed-compare-and-wait-2026-11-18.md);
@@ -306,7 +316,7 @@ void test_toolchain_forms_and_refusals() {
             std::string("assembly's untyped setp: wrong error: ") + error.what());
     }
     // eq / ne written .s32 is the .u32 opcode and is printed so in scheduled asm.
-    const auto scheduled = nanosm::emit_asm(nanosm::compile_qtx("usetp.ne.s32 p6, ur3, ur4\nhalt\n", profile));
+    const auto scheduled = nanosm::emit_asm(qtx_program("usetp.ne.s32 p6, ur3, ur4\nhalt\n", profile));
     require(scheduled.find("        usetp.ne.u32 p6, ur3, ur4 {") != std::string::npos,
         "scheduled asm does not print usetp.ne.s32 as usetp.ne.u32");
 
@@ -369,7 +379,7 @@ void test_profile_fields() {
     auto padded = canonical;
     padded.urf_issue_to_port_cycles = 4;
     const auto source = std::string("umov ur1, 7\nuaddi ur2, ur1, 1\nhalt\n");
-    require(nanosm::compile_qtx(source, padded).instructions[0].control.stall == 5,
+    require(qtx_program(source, padded).instructions[0].control.stall == 5,
         "L 4: a dependent uniform reader is not 5 cycles later");
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -474,7 +484,7 @@ void test_uniform_compare_loop_and_timing() {
 @p0     bra.uni loop
         halt
     )";
-    const auto scheduled = nanosm::compile_qtx(source, profile);
+    const auto scheduled = qtx_program(source, profile);
     require(scheduled.instructions.at(3).control.stall == 4, "qtxc: uniform write -> usetp is not 4 cycles");
     require(scheduled.instructions.at(4).control.stall == 3, "qtxc: usetp -> bra.uni is not 3 cycles");
     const auto kernel = compile(source);

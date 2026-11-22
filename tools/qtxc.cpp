@@ -11,6 +11,7 @@ int main(int argc, char** argv) {
     return nanosm::run_main([&] {
         const auto profile = nanosm::load_device_profile(argv[1]);
         const auto program = nanosm::compile_qtx_file(argv[2], profile);
+        for (const auto& warning : program.warnings) nanosm::err("qtxc: warning: {}", warning);
         std::ofstream output(argv[3]);
         if (!output) nanosm::die("cannot create output asm '{}'", argv[3]);
         output << nanosm::emit_asm(program);

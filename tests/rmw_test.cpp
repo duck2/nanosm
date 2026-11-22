@@ -701,7 +701,7 @@ void test_i5_atomic_encoding_and_assembly() {
         }
         ++code;
     }
-    const auto program = nanosm::compile_qtx(
+    const auto program = qtx_program(
         "umov ur1, 0\numov ur2, 5\natom.xor.uni r3, [ur1 - 64], ur2\nadd r4, r3, r3\nhalt\n", profile);
     const auto& atom = program.instructions.at(2);
     const auto& consumer = program.instructions.at(3);
@@ -713,7 +713,7 @@ void test_i5_atomic_encoding_and_assembly() {
     const auto rejects = [&](const std::string& source, bool hand, const std::string& needle) {
         try {
             if (hand) (void)hand_assemble(i1_asm(profile, source), profile);
-            else (void)nanosm::compile_qtx(source, profile);
+            else (void)qtx_program(source, profile);
         } catch (const nanosm::SimError& error) {
             require(std::string(error.what()).find(needle) != std::string::npos,
                 "'" + source + "': wrong error: " + error.what());
@@ -726,7 +726,8 @@ void test_i5_atomic_encoding_and_assembly() {
     rejects("atom.add.uni r3, [ur1]\nhalt\n", false, "expected 3 operands");
     rejects("atom.min.uni r3, [ur1], ur2\nhalt\n", false, "unknown opcode 'atom.min.uni'");
     rejects("atom.add r3, [r1], r2\nhalt\n", false, "unknown opcode 'atom.add'");
-    rejects("atom.add.uni r3, [r1], r2\nhalt\n", false,
+    rejects("atom.add.uni r3, [r1], r2\nhalt\n", false, "%r1 is used here as a uniform register");
+    rejects("atom.add.uni r3, [r1], r2\nhalt\n", true,
         "expected uniform register (ur0..ur" + std::to_string(profile.urf_registers - 1) + "), got 'r1'");
     rejects("atom.exch.uni r3, [ur1], ur2\nhalt\n", true, "memory operation requires set=sb0..sb5");
 }

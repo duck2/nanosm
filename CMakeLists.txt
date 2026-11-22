@@ -27,6 +27,7 @@ set(NANOSM_SOURCES
     src/qtxc/parse.cpp
     src/qtxc/directives.cpp
     src/qtxc/metadata.cpp
+    src/qtxc/registers.cpp
     src/qtxc/checks.cpp
     src/qtxc/schedule.cpp
     src/qtxc/assemble.cpp
@@ -143,6 +144,7 @@ set(NANOSM_TEST_SOURCES
     tests/frontend_test.cpp
     tests/urf_test.cpp
     tests/divergence_test.cpp
+    tests/registers_test.cpp
 )
 
 function(add_nanosm_tests NAME LIBRARY)

@@ -2,7 +2,7 @@
 // .registers header, what the kernel declares beside its code (.warps, its
 // sections .param / .mbar / .data each with its address, its launch flags
 // .flag: directives.cpp) and one 64-bit word per line; load_hex reads it back and runs validate_kernel
-// (checks.cpp). The qtx's symbols are not in it. The encoding of a word is
+// (checks.cpp). The qtx's register names are in it (.name lines); its other symbols are not. The encoding of a word is
 // src/isa.cpp's; this is only the text around the words.
 
 #include "qtxc/internal.hpp"
@@ -20,6 +20,8 @@ std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shap
     if (kernel.warps != 0) out << ".warps " << kernel.warps << '\n';
     for (const auto& section : kernel.sections) out << format_section_directive(section, true) << '\n';
     for (const auto& flag : kernel.flags) out << format_flag_directive(flag) << '\n';
+    // The qtx's register names and their numbers, for a reader.
+    for (const auto& entry : kernel.register_names) out << format_name_directive(entry) << '\n';
     for (const auto word : kernel.words) {
         out << std::hex << std::setw(16) << std::setfill('0') << word
             << " ; " << format_instruction(decode(word), true, mma_shapes) << '\n';
@@ -91,6 +93,10 @@ Kernel load_hex(std::string_view source) {
         }
         if (is_directive(clean, ".flag")) {
             kernel.flags.push_back(parse_flag_directive(trim(clean.substr(5)), line));
+            continue;
+        }
+        if (is_directive(clean, ".name")) {
+            kernel.register_names.push_back(parse_name_directive(trim(clean.substr(5)), line));
             continue;
         }
         if (clean.starts_with(".acc")) {

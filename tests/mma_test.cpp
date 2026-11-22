@@ -37,12 +37,12 @@ void test_tmem_profile_metadata_and_round_trip() {
         acc.ld.v8 r40, [ur8, 64]
         halt
     )"; // warp w: rows 16 w .. 16 w + 15 of 64-word rows, pointer 1024 w
-    const auto scheduled = nanosm::compile_qtx(source, profile);
+    const auto scheduled = qtx_program(source, profile);
     require(scheduled.instructions[15].opcode == nanosm::Opcode::add,
         "directed tmem test instruction index changed unexpectedly");
     require(scheduled.instructions[15].control.wait_mask == 0,
         "independent arithmetic was unnecessarily serialized behind acc.st");
-    const auto protected_store = nanosm::compile_qtx(R"(
+    const auto protected_store = qtx_program(R"(
         mov r0, 1
         umov ur8, 0
         umov ur9, 0
@@ -94,7 +94,7 @@ void test_tmem_transfer_ordering_and_store_lifetime() {
         acc.ld r3, [ur9, 16]
         halt
     )";
-    const auto scheduled = nanosm::compile_qtx(source, profile);
+    const auto scheduled = qtx_program(source, profile);
     const auto& first_store = scheduled.instructions[4];
     const auto& second_store = scheduled.instructions[5];
     const auto& overwrite = scheduled.instructions[6];
@@ -107,7 +107,7 @@ void test_tmem_transfer_ordering_and_store_lifetime() {
     require(first_load.control.wait_mask == 0,
         "a wait already paid by the overwrite was redundantly retained on the load");
 
-    const auto ordered = nanosm::compile_qtx(R"(
+    const auto ordered = qtx_program(R"(
         mov r0, 17
         umov ur8, 0
         umov ur9, 0
@@ -251,7 +251,7 @@ void test_mma_fusion_boundaries() {
         auto profile = canonical_profile();
         profile.mma_layout = nanosm::TileLayout::dense;
         profile.mma_core_k = core_k;
-        const auto scheduled = nanosm::compile_qtx(
+        const auto scheduled = qtx_program(
             "umov ur0, 0\numov ur1, 1024\numov ur4, 4096\numov ur8, 0\n"
             "mbar.init [ur4], 1\nmma.async.init.m64n64k8 [ur8], [ur0], [ur1]\nmma.commit [ur4]\n"
             "wait:\nmbar.try_wait p0, [ur4], 0\n@!p0 bra.uni wait\nacc.ld r10, [ur8, 64]\nhalt\n", profile);
@@ -294,7 +294,7 @@ void test_autonomous_mma_gemm_and_commit() {
         << "mbar.try_wait p0, [ur4], 0\n"
         << "@!p0 bra.uni wait_commit\n"
         << "acc.ld r10, [ur8, 64]\nhalt\n";
-    const auto scheduled = nanosm::compile_qtx(qtx.str(), profile);
+    const auto scheduled = qtx_program(qtx.str(), profile);
     require(scheduled.instructions[6].control.set_depbar < 6 &&
             scheduled.instructions[7].control.set_depbar < 6,
         "qtxc did not allocate MMA operand-consumed depbars");
@@ -346,7 +346,7 @@ void test_autonomous_mma_gemm_and_commit() {
 
 void test_worker_acc_store_mbar_handoff() {
     const auto& profile = canonical_profile();
-    const auto scheduled = nanosm::compile_qtx(R"(
+    const auto scheduled = qtx_program(R"(
         sread r0, THREAD_ID
         usread ur8, WARP_ID
         ushli ur8, ur8, 10
@@ -771,7 +771,7 @@ void test_mma_multi_round_fetch_timing() {
         acc.ld r10, [ur8, 64]
         halt
     )";
-    const auto scheduled = nanosm::compile_qtx(source, profile);
+    const auto scheduled = qtx_program(source, profile);
     require(scheduled.instructions[6].opcode == nanosm::mma_opcode(0, true), // m32n64k8 (its only shape), init
         "multi-round timing test instruction index changed unexpectedly");
     const auto bar = scheduled.instructions[6].control.set_depbar;
@@ -1119,7 +1119,7 @@ void test_i9_mma_opcodes() {
     // spacing that is not a multiple of 16 or past the field is refused at
     // assembly; one the layout does not take (or shorter than the row a
     // shape reads) at assembly and kernel load (check_mma_shape).
-    const auto parsed = nanosm::compile_qtx("mma.async.m64n64k8 [ur8], [ur0, 128], [ur1]\nhalt\n",
+    const auto parsed = qtx_program("mma.async.m64n64k8 [ur8], [ur0, 128], [ur1]\nhalt\n",
         profile);
     require(nanosm::mma_row_spacing(parsed.instructions.at(0), true) == 128 &&
             nanosm::mma_row_spacing(parsed.instructions.at(0), false) == 16,
@@ -1128,7 +1128,7 @@ void test_i9_mma_opcodes() {
              std::pair{"[ur0, 2048]", "multiple of 16"}, std::pair{"[ur0, 48]", "a power of two"},
              std::pair{"[ur0, 192]", "a power of two"}, std::pair{"[ur0, 1, 2]", "bad mma operand"}}) {
         try {
-            (void)nanosm::compile_qtx(std::string("mma.async.m64n64k8 [ur8], ") + operand +
+            (void)qtx_program(std::string("mma.async.m64n64k8 [ur8], ") + operand +
                 ", [ur1]\nhalt\n", profile);
             throw std::runtime_error(std::string("the mma operand ") + operand + " was accepted");
         } catch (const nanosm::SimError& error) {
@@ -1155,7 +1155,7 @@ void test_i9_mma_opcodes() {
         const auto rows = e.shape.m;
         const auto source = "umov ur0, 0\numov ur1, 2048\numov ur2, " + std::to_string(64 * (64 - rows)) + "\n" +
             std::string(e.name) + " [ur2], [ur0], [ur1]\nhalt\n";
-        const auto scheduled = nanosm::compile_qtx(source, profile);
+        const auto scheduled = qtx_program(source, profile);
         const auto kernel = nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile);
         require(nanosm::decode(kernel.words.at(3)).opcode == nanosm::mma_opcode(e.index, e.init),
             std::string(e.name) + ": qtxc and the hand assembler did not produce the opcode");
@@ -1165,7 +1165,7 @@ void test_i9_mma_opcodes() {
     }
     for (const auto* old : {"mma.async C, [ur0], [ur1]", "mma.async.init C, [ur0], [ur1]"}) {
         try {
-            (void)nanosm::compile_qtx(std::string("umov ur0, 0\numov ur1, 2048\n") + old + "\nhalt\n",
+            (void)qtx_program(std::string("umov ur0, 0\numov ur1, 2048\n") + old + "\nhalt\n",
                 profile);
             throw std::runtime_error(std::string("the shape-less '") + old + "' was accepted");
         } catch (const nanosm::SimError&) {}
@@ -1263,7 +1263,7 @@ void test_i9_profile_shapes_and_refusals() {
         "umov ur0, 0\numov ur1, 2048\numov ur2, 4096\nmma.async.init.m32n64k8 [ur2], [ur0], [ur1]\nhalt\n";
     // qtxc: the profile does not list m32n64k8.
     try {
-        (void)nanosm::compile_qtx(m32, restricted);
+        (void)qtx_program(m32, restricted);
         throw std::runtime_error("qtxc accepted an unsupported shape");
     } catch (const nanosm::SimError& error) {
         require_mentions(error.what(), {"line 4", "mma.async.init.m32n64k8: shape m32n64k8 is not one of this "
@@ -1271,7 +1271,7 @@ void test_i9_profile_shapes_and_refusals() {
     }
     // The hand assembler: an m64 kernel assembled for the restricted profile,
     // its mnemonic changed to m32 in the text.
-    auto text = nanosm::emit_asm(nanosm::compile_qtx(
+    auto text = nanosm::emit_asm(qtx_program(
         "umov ur0, 0\numov ur1, 2048\nmma.async.init.m64n64k8 [ur8], [ur0], [ur1]\nhalt\n", restricted));
     text.replace(text.find("mma.async.init.m64n64k8"), 23, "mma.async.init.m32n64k8");
     try {
@@ -1313,10 +1313,10 @@ void test_i9_profile_shapes_and_refusals() {
     // words): a row length, a vector register or a name is refused. There is
     // no accumulator to compare a shape with (2026-11-19).
     for (const auto& [result, needle] : {std::pair{"[ur2, 64]", "without a row length"},
-             std::pair{"[r2]", "a uniform register holding its tmem pointer"},
+             std::pair{"[r2]", "%r2 is used here as a uniform register"},
              std::pair{"T", "a uniform register holding its tmem pointer"}}) {
         try {
-            (void)nanosm::compile_qtx(std::string("mma.async.init.m32n64k8 ") + result + ", [ur0], [ur1]\nhalt\n",
+            (void)qtx_program(std::string("mma.async.init.m32n64k8 ") + result + ", [ur0], [ur1]\nhalt\n",
                 profile);
             throw std::runtime_error(std::string("the mma result ") + result + " was accepted");
         } catch (const nanosm::SimError& error) {

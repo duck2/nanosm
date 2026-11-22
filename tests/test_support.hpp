@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -143,9 +144,77 @@ inline uint64_t rmw_busy_cycles(const nanosm::DeviceProfile& profile = canonical
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + profile.shmem_rmw_compute_cycles + 1;
 }
 
+// Most test kernels are written at the level of physical registers (r5,
+// ur3): they pin cycle counts that depend on which bank a register is in.
+// qtx takes names only, so a kernel written that way is renamed here, r5 ->
+// %r5 and ur3 -> %ur3, with one group declared for each file (`.reg %r<N>`,
+// `.ureg %ur<M>`, appended, so line numbers stay). A group's members keep
+// their distances and a lone group starts at number 0, so %r5 is r5 again;
+// compile() checks that it is. A kernel written with %names passes through
+// unchanged. renamed: whether anything was.
+inline std::string name_raw_registers(
+    std::string_view source, const nanosm::DeviceProfile& profile, bool* renamed = nullptr) {
+    static const std::regex raw(R"(\b([uU]?)[rR]([0-9]+)\b)");
+    const std::string text(source);
+    std::string result;
+    int max_vector = -1;
+    int max_uniform = -1;
+    auto begin = text.cbegin();
+    for (std::sregex_iterator it(text.begin(), text.end(), raw), end; it != end; ++it) {
+        const auto at = text.cbegin() + it->position();
+        if (at != text.cbegin() && *(at - 1) == '%') continue; // a name already
+        const bool uniform = (*it)[1].length() != 0;
+        const int index = std::stoi((*it)[2].str().substr(0, 6));
+        (uniform ? max_uniform : max_vector) = std::max(uniform ? max_uniform : max_vector, index);
+        result.append(begin, at);
+        result += (uniform ? "%ur" : "%r") + (*it)[2].str();
+        begin = at + it->length();
+    }
+    result.append(begin, text.cend());
+    if (renamed != nullptr) *renamed = max_vector >= 0 || max_uniform >= 0;
+    if (max_vector < 0 && max_uniform < 0) return text;
+    if (result.empty() || result.back() != '\n') result += '\n';
+    // Room for a v8's eight registers and a tma's four coordinates after the
+    // highest one named.
+    if (max_vector >= 0) {
+        result += ".reg %r<" + std::to_string(std::max(max_vector + 1, std::min(max_vector + 8, 256))) + ">\n";
+    }
+    if (max_uniform >= 0) {
+        const int room = std::max(max_uniform + 1, std::min<int>(max_uniform + 4, static_cast<int>(profile.urf_registers)));
+        result += ".ureg %ur<" + std::to_string(std::max(room, 2)) + ">\n";
+    }
+    return result;
+}
+
+inline void check_raw_registers_kept(const std::vector<nanosm::RegisterName>& names) {
+    for (const auto& entry : names) {
+        const auto expected = (entry.uniform ? "ur" : "r") + std::to_string(entry.number);
+        if (entry.name.rfind("qtxc_copy", 0) == 0 || entry.predicate) continue; // a scratch qtxc made; a predicate
+        if (entry.name != expected) {
+            throw std::runtime_error("test kernel: %" + entry.name + " was given " + expected +
+                "; this test's kernel is written in physical registers and needs them kept");
+        }
+    }
+}
+
 inline nanosm::Kernel compile(
     std::string_view source, const nanosm::DeviceProfile& profile = canonical_profile()) {
-    return nanosm::compile_and_assemble(source, profile);
+    bool renamed = false;
+    const auto text = name_raw_registers(source, profile, &renamed);
+    auto kernel = nanosm::compile_and_assemble(text, profile);
+    if (renamed) check_raw_registers_kept(kernel.register_names);
+    return kernel;
+}
+
+// nanosm::compile_qtx for a test kernel (renamed as above): the scheduled
+// program, for a test that looks at stalls, depbars and waits.
+inline nanosm::AssemblyProgram qtx_program(
+    std::string_view source, const nanosm::DeviceProfile& profile = canonical_profile()) {
+    bool renamed = false;
+    const auto text = name_raw_registers(source, profile, &renamed);
+    auto program = nanosm::compile_qtx(text, profile);
+    if (renamed) check_raw_registers_kept(program.register_names);
+    return program;
 }
 
 // Hand assembly: lines without a {...} control block get the default one.
