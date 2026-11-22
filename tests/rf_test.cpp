@@ -993,144 +993,6 @@ void test_i1_load_slots_profile_field() {
     require(machine->read_reg(0, 0, 6) == 0x101, "the second load's word");
 }
 
-// I1.1: the LSU has one RF write path (rfc09 section 3a: one lane-wide vector
-// per cycle), so its output mux presents ONE assembly register per cycle to the
-// RF write decision, round-robin from the LSU cursor. Warp 0 issues two ldg.uni:
-// r9 (bank 0) then r10 (bank 1). Warp 1 keeps bank 0 booked with fadds, so the
-// first load waits for its bank while the second completes: both assembly
-// registers hold complete vectors at once, with bank 1 free. The LSU still
-// writes only the register at its cursor (the bank-0 load, when bank 0 opens)
-// and the other one afterwards -- never the second one past the first, and
-// never two in one cycle.
-void test_i1_lsu_one_rf_write_per_cycle() {
-    auto config = canonical_profile();
-    config.gmem_latency_dram_ticks = 64 * 25; // the loads return while warp 1's fadds book bank 0 every cycle
-    config.gmem_bus_bytes_per_dram_tick = config.gmem_sector_bytes;
-    config.dram_clock_hz = config.core_clock_hz * 64;
-    config.lsu_pluck_words_per_cycle = 64; // a load completes as soon as its sector arrives
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& image = image_bytes(launch.gmem_image, 1024);
-    fill_pattern(image, 0, 256, 0);
-    nanosm::Machine machine(config, compile(R"(
-        usread ur2, WARP_ID
-        ur2r r2, ur2
-        setp.ne.u32 p0, r2, 0
-@p0     bra.uni ARITH
-        umov ur0, 0
-        umov ur1, 512
-        ldg.uni r9, [ur0]
-        ldg.uni r10, [ur1]
-        halt
-ARITH:
-        mov r4, 1
-        mov r5, 2
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        fadd r3, r4, r5
-        fadd r6, r4, r5
-        fadd r24, r4, r5
-        fadd r27, r4, r5
-        fadd r30, r4, r5
-        fadd r33, r4, r5
-        fadd r36, r4, r5
-        fadd r39, r4, r5
-        halt
-    )", config), std::move(launch));
-    machine.enable_edge_probe();
-    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, uint32_t>> both_ready; // (cycle, owner 0, owner 1, cursor)
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        if (machine.assembly_valid_count(0) == 16 && machine.assembly_valid_count(1) == 16 &&
-            machine.assembly_owner(0).has_value() && machine.assembly_owner(1).has_value()) {
-            both_ready.emplace_back(cycle, *machine.assembly_owner(0), *machine.assembly_owner(1),
-                machine.rf_write_lsu_cursor());
-        }
-        tick_capped(machine);
-    }
-    std::map<uint64_t, std::vector<uint64_t>> writes_at; // cycle -> command ids written
-    std::map<uint64_t, uint64_t> write_cycle;            // command id -> its RF write cycle
-    for (const auto& event : machine.edge_events()) {
-        if (event.edge != LsuEdge::rf_write_beat) continue;
-        writes_at[event.cycle].push_back(event.id);
-        write_cycle[event.id] = event.cycle;
-    }
-    for (const auto& [cycle, ids] : writes_at) {
-        require(ids.size() == 1, "the LSU wrote " + std::to_string(ids.size()) + " RF beats in cycle " +
-            std::to_string(cycle));
-    }
-    require(write_cycle.size() == 2, "two ldg.uni did not make two LSU RF writes");
-    require(!both_ready.empty(), "the two assembly registers were never ready together (the test is vacuous)");
-    for (const auto& [cycle, owner0, owner1, cursor] : both_ready) {
-        const auto presented = cursor == 0 ? owner0 : owner1;
-        const auto other = cursor == 0 ? owner1 : owner0;
-        if (writes_at.count(cycle) == 1) {
-            require(writes_at.at(cycle).front() == presented,
-                "cycle " + std::to_string(cycle) + ": a register other than the one at the LSU cursor was written");
-        }
-        require(write_cycle.at(other) > write_cycle.at(presented),
-            "the register behind the LSU cursor was written before the one at the cursor");
-    }
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 9) == pattern_word(0), "the first ldg.uni's word");
-        require(machine.read_reg(0, lane, 10) == pattern_word(128), "the second ldg.uni's word");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // I6a: the RF's read latency Lr and write depth Wd, the issue register, and
 // src/rf.hpp as the ONE timing helper of qtxc, the simulator and the
@@ -1883,13 +1745,15 @@ void test_i6b1_async_reader_gets_the_hole() {
 // hole. The LSU's later beats in bank 0 (r21, r24) wait at most one cycle
 // each. Data: tmem (read back) and gmem.
 void test_i6b1_async_readers_round_robin() {
-    const auto& profile = canonical_profile();
+    // One lane group per stg.v8: it reads each of r18 .. r25 once.
+    auto profile = canonical_profile();
+    profile.lsu_store_group_lanes = 16;
     std::string setup = "sread r0, LANE_ID\naddi r9, r0, 100\n";
     for (uint32_t j = 0; j < 8; ++j) setup += "addi r" + std::to_string(18 + j) + ", r0, " + std::to_string(200 + 10 * j) + "\n";
+    setup += "shli r40, r0, 5\n"; // the stg.v8's per-lane sectors: 32 x lane
     auto machine = i6a_machine(profile, hand_assemble(i1_asm(profile, R"(
         umov ur2, 0
         umov ur3, 0
-        mov r40, 0
     )" + setup + R"(
         mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
         acc.st [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
@@ -1944,7 +1808,7 @@ void test_i6b1_async_readers_round_robin() {
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_reg(0, lane, 50) == lane, "tmem data (acc.st -> acc.ld)");
         for (uint32_t j = 0; j < 8; ++j) {
-            require(machine->read_gmem_u32(4 * (16 * j + lane)) == lane + 200 + 10 * j, "stg.v8 data");
+            require(machine->read_gmem_u32(32 * lane + 4 * j) == lane + 200 + 10 * j, "stg.v8 data");
         }
     }
     check_read_capacity(*machine, profile);
@@ -1965,12 +1829,12 @@ void test_i6b1_persistent_readers_under_pressure() {
     for (uint32_t j = 1; j < 8; ++j) setup += "addi r" + std::to_string(j) + ", r0, " + std::to_string(10 * j) + "\n";
     for (uint32_t j = 0; j < 8; ++j) setup += "addi r" + std::to_string(9 + j) + ", r0, " + std::to_string(100 + 10 * j) + "\n";
     for (uint32_t j = 0; j < 8; ++j) setup += "addi r" + std::to_string(18 + j) + ", r0, " + std::to_string(200 + 10 * j) + "\n";
+    setup += "shli r40, r0, 5\n"; // the stg.v8's per-lane sectors: 32 x lane
     std::string pressure;
     for (uint32_t i = 0; i < 60; ++i) pressure += "addi r41, r27, " + std::to_string(i) + "\n";
     const auto body = R"(
         umov ur2, 0
         umov ur3, 0
-        mov r40, 0
     )" + setup + R"(
         mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
         acc.st.v8 [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
@@ -2017,7 +1881,7 @@ void test_i6b1_persistent_readers_under_pressure() {
     for (uint32_t lane = 0; lane < 16; ++lane) {
         for (uint32_t j = 0; j < 8; ++j) {
             require(machine->read_reg(0, lane, 50 + j) == lane + 10 * j, "tmem data (acc.st.v8 -> acc.ld.v8)");
-            require(machine->read_gmem_u32(4 * (16 * j + lane)) == lane + 200 + 10 * j, "stg.v8 data");
+            require(machine->read_gmem_u32(32 * lane + 4 * j) == lane + 200 + 10 * j, "stg.v8 data");
         }
     }
     check_read_capacity(*machine, profile);
@@ -2267,11 +2131,6 @@ TEST(Rf, i1_load_slots) {
 // I1: load slots profile field
 TEST(Rf, i1_load_slots_profile_field) {
     test_i1_load_slots_profile_field();
-}
-
-// I1.1: one LSU RF write per cycle
-TEST(Rf, i1_lsu_one_rf_write_per_cycle) {
-    test_i1_lsu_one_rf_write_per_cycle();
 }
 
 // I6a: the RF timing helper is the trace's (Lr/Wd 1/1, 2/2, 3/1)

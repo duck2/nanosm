@@ -193,7 +193,7 @@ operand, `acc.ld`/`acc.st` tmem pointers, mbar addresses and values, MMA operand
 result pointer, and `mma.commit`'s mbar. Two instructions read more than the two read ports give
 one round: a TMA command (below) and `mma.async` (urA and urB at issue + 1, its result pointer urC at
 issue + 2); while either has a round left, an instruction that reads a uniform register waits a
-cycle. The TMA's operands are uniform registers too (below). The `ldg.v8`/`stg.v8` base still comes from lane 0 of a vector register. `sread` reads only
+cycle. The TMA's operands are uniform registers too (below). `ldg.v8`/`stg.v8` take a per-lane address from a vector register, as `ldg`/`stg` do. `sread` reads only
 the per-lane `LANE_ID` / `THREAD_ID`.
 
 The current control-flow slice supports labels, unconditional `bra`, per-lane predicate registers,
@@ -213,11 +213,11 @@ otherwise (taken lanes, T) is pushed and the fall-through arm runs first. `sync`
 entry and switches to it: the mask becomes the entry's and the warp goes to its pc. So an if / else
 is `ssy L; @p bra T; <else arm>; sync; T: <then arm>; sync; L: ...`: each arm ends in its own
 `sync` and L is an ordinary instruction. Every per-lane writer (arithmetic, moves, conversions,
-special registers, the SFU, `ur2r`, predicates, `lds` / `sts`, scalar `ldg` / `stg`) writes only
+special registers, the SFU, `ur2r`, predicates, `lds` / `sts`, `ldg` / `stg`, `ldg.v8` / `stg.v8`) writes only
 the active lanes; fixed timing ignores the mask. Instructions that act for the whole warp are two
 kinds. A warp-wide memory or engine operation under a partial mask is the sanitizer's PANIC:
 `tma.*`, `mma.*`, `acc.*`, `mbar.*`, `atom.*.uni`, `ldg.uni` / `lds.uni`,
-`ldg.v8` / `stg.v8`, `r2ur` and `bra.uni`. Uniform integer arithmetic (`umov`, `uadd`, ...) is
+`r2ur` and `bra.uni`. Uniform integer arithmetic (`umov`, `uadd`, ...) is
 not checked: it executes once in every arm that issues it, so a counter bumped in both arms is
 bumped twice (`usetp` writes its predicate on the active lanes only). A halt inside an arm is
 the sanitizer's PANIC too; stack overflow and a `sync` on an empty stack are the machine's.
@@ -227,7 +227,7 @@ Masked instructions: `@p` / `@!p` on a per-lane instruction. The operation runs 
 its result is written with a mask (the note that built this, trash/guards-2026-11-21.md, uses
 an older word for it). The per-lane instructions are exactly the writers above: every fixed
 arithmetic instruction (ALU, FPU, the SFU, `cvt.pack`, `mov`, `sread`, `ur2r`, `setp`) and
-`lds`, `sts`, `ldg`, `stg`. The instruction's write mask is its predicate's lanes (inverted for
+`lds`, `sts`, `ldg`, `stg`, `ldg.v8`, `stg.v8`. The instruction's write mask is its predicate's lanes (inverted for
 `@!p`); the lanes it writes are the active mask AND its write mask. The write mask is
 read from the predicate file in the instruction's operand round, the cycle a branch reads
 its predicate (issue + 1), so qtxc keeps the predicate's writer the distance it keeps a
@@ -236,7 +236,7 @@ its predicate (issue + 1), so qtxc keeps the predicate's writer the distance it 
 leaves those lanes of its register unchanged; a masked store sends nothing for them (and does
 not check their addresses). Issue does not look at the write mask (it is not known yet) and
 timing ignores it: the write booking, the SFU's cycles, the depbar and the memory slot are
-taken as if every lane were on. A masked `lds` / `sts` / `ldg` / `stg` whose write mask turns
+taken as if every lane were on. A masked `lds` / `sts` / `ldg` / `stg` (or v8 form) whose write mask turns
 every lane off makes no request and completes at its dispatch: its depbar is decremented then,
 so a waiting instruction can issue 4 cycles after it at canonical depths. Every other
 instruction refuses to be masked at qtxc, the assembler and kernel load (`uadd cannot be
@@ -377,12 +377,46 @@ as hexadecimal strings, while addresses are JSON integers. Segments are applied 
 later overlapping bytes win. The simulator runner does not know which workload authored the image.
 
 The demo launches sparse global-memory input state and runs a four-warp `ldg.v8`/`fadd`/`stg.v8`
-vector add (`kernels/vadd.launch.py` checks it bit-exactly). There is no coalescer: a scalar
-`ldg`/`stg` is one sector request per lane, `ldg.v8`/`stg.v8` move 512 contiguous bytes from a
-warp-uniform 64 B-aligned base, and `ldg.uni` is one request fanned out to every lane. The placeholder
-controller is a finite FIFO with fixed latency and one fixed-width bus behind a small LSU declared
-in the profile's `lsu` section. This is the replaceable timing policy in front of the eventual
-bank/row scheduler, not a fixed-latency whole-load shortcut.
+vector add (`kernels/vadd.launch.py` checks it bit-exactly). There is no coalescer: every lane
+of a global load or store is its own 32-byte sector request, in lane order.
+
+- `ldg rD, [rA + imm]` / `stg [rA + imm], rS`: each active lane names one word (4-byte aligned);
+  a load keeps that word of its sector and drops the rest, a store writes it with byte enables.
+- `ldg.v8 rD, [rA + imm]` / `stg.v8 [rA + imm], rS` (per lane since 2026-11-21): each active lane
+  names one whole sector at its own address (32-byte aligned; the machine PANICs otherwise; on a
+  profile whose sectors are not 32 bytes qtxc, the assembler and kernel load refuse both) and
+  the sector's eight words are `rD .. rD+7` (`rS .. rS+7`) at that lane. A contiguous 512-byte
+  block is the case "lane l's address is base + 32 l"; any other set of sectors is a gather. Two
+  active lanes of one `stg.v8` naming the same sector is the sanitizer's PANIC, as two lanes on
+  one word is for `stg`. Both forms can be masked (`@p`) and used under a partial active mask.
+- `ldg.uni rD, [urA + imm]`: one request, the word fanned out to every lane.
+
+The LSU (the profile's `lsu` section) has one buffer on each pipe and no register that serves
+both: a **load buffer** between the incoming FIFO and the register file's write port, and a
+**store buffer** between the register file's read port and the outgoing FIFO. A buffer is held
+only while data is in it; the command slots (`lsu.active_commands`) hold the addresses and send
+requests ahead, so one transfer's memory latency hides behind another's data. Every load returns
+on one ordered read stream (request order), so the load buffer passes from one command to the
+next and returning data always has somewhere to go.
+
+A v8 instruction's lanes pass through the buffers in fixed groups: `lsu.load_group_lanes` and
+`lsu.store_group_lanes` (1, 2, 4, 8 or 16; 4 and 4 in the canonical profile). A buffer is 256
+bits per lane of a group. A load group is collected (its sectors arrive one lane after another)
+and then written by eight register writes, `rD + j` with the group's lanes enabled, one a cycle,
+taking write ports the way the other asynchronous writers do. A store group is read by eight
+register read beats, `rS + j`, one a cycle, and then its sectors go to the outgoing FIFO; the
+source registers stay protected until the last group has read them. Bigger groups cost buffer
+bits and save register-file port time: 16 / group x 8 writes (or reads) per instruction. A
+scalar `ldg` uses the load buffer for as many lanes as it has words (all sixteen from a group of
+two up); a scalar `stg` brings all its lanes at dispatch, so the store group is at least two
+lanes, and a scalar `stg` is accepted only when no store still has data to move.
+
+The memory controller is a finite FIFO with fixed latency and ONE fixed-width data bus, shared by
+reads and writes and by the LSU and the TMA. `gmem.turnaround_dram_ticks` (2) is the minimum idle
+time between the last data beat in one direction and the first beat in the other (ticks the bus
+was idle anyway count); the summary's `gmem bus:` line counts the changes of direction and the
+ticks waited. This is the replaceable timing policy in front of the eventual bank/row scheduler,
+not a fixed-latency whole-load shortcut.
 
 **The TMA interface below is v0.1: a good start.** It grew out of trash/rfc17.md and has been
 built on in two FlashAttention kernels and a gather experiment, but its instruction form, operand

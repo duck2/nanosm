@@ -564,7 +564,7 @@ inline bool has_write_mask(const Instruction& instruction) {
 // The instructions that can be masked (@p / @!p): the per-lane ones, which
 // already write only the divergence stack's active lanes -- every instruction
 // of the fixed arithmetic pipeline (ALU, FPU, SFU, cvt.pack, mov, sread, ur2r,
-// setp) and the per-lane memory instructions lds, sts, ldg, stg. The
+// setp) and the per-lane memory instructions lds, sts, ldg, stg, ldg.v8, stg.v8. The
 // operation runs as usual and its result is written with a mask: the lanes
 // the instruction writes (or, for sts / stg, sends) are the active mask AND
 // its write mask, the predicate's lanes (inverted for @!p), sampled with the

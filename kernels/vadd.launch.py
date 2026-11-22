@@ -1,7 +1,7 @@
 """Vector add C = A + B over 32 KiB per vector (8192 fp32), four warps, ldg.v8/stg.v8.
 
 Run from emu2: python -B -m nanosm kernels/vadd.launch.py
-Options: --profile PATH (e.g. a scratch profile with lsu.staging_vectors = 1),
+Options: --profile PATH (e.g. a scratch profile with lsu.active_commands = 1),
          --trace PATH (Perfetto output),
          --warps N (default 4; the kernel reads N_WARPS and strides by it).
 
@@ -96,7 +96,7 @@ def main() -> None:
         lsu = profile["lsu"]
         print(f"vadd ok: {N} outputs bit-exact, {traffic} bytes in {result.cycle} cycles = "
               f"{achieved:.3f} B/cycle of a declared {bus:g} B/cycle bus "
-              f"({100 * achieved / bus:.1f}%; warps={args.warps}, staging_vectors={lsu['staging_vectors']}, "
+              f"({100 * achieved / bus:.1f}%; warps={args.warps}, "
               f"active_commands={lsu['active_commands']})")
         print(result.summary, end="")
 

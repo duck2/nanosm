@@ -283,7 +283,7 @@ std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePl
         if (const auto refusal = shmem_refusal(opcode, view); refusal.has_value()) return refusal;
     }
     if (is_lsu_opcode(opcode) && !view.lsu_slot_free) return Refusal::lsu_slot;
-    if (is_lsu_opcode(opcode) && !view.assembly_free) return Refusal::lsu_assembly;
+    if (opcode == Opcode::stg && !view.store_buffer_free) return Refusal::lsu_assembly;
     return std::nullopt;
 }
 
@@ -356,6 +356,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // An mma.async's shape is one the profile lists; an acc.ld / acc.st's
     // words per row are legal (src/layout.hpp).
     check_mma_shapes(kernel_, config_);
+    // An ldg.v8 / stg.v8 needs 32-byte sectors.
+    check_v8_sectors(kernel_, config_);
     // Every uniform register named is one the profile's URF has.
     check_uniform_registers(kernel_, config_);
     // The host's part (src/image.hpp bind_launch): the warp count settled
@@ -412,11 +414,16 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         read_policy.cursor.assign(config_.rf_banks, 0);
         rf_read_policy_.poke(std::move(read_policy));
         issue_read_banks_.poke(std::vector<uint8_t>(config_.rf_banks, 0));
-        for (uint32_t index = 0; index < config_.lsu_staging_vectors; ++index) {
+        // The load buffer: 8 words per lane of a group. The store buffer the
+        // same, and at least a word per lane (a scatter's data).
+        const uint32_t load_words = 8 * config_.lsu_load_group_lanes;
+        const uint32_t store_words = std::max(8 * config_.lsu_store_group_lanes, config_.lanes);
+        for (const auto& [name, words] : {std::pair<const char*, uint32_t>{"LSU load buffer", load_words},
+                                          std::pair<const char*, uint32_t>{"LSU store buffer", store_words}}) {
             AssemblyRegister empty;
-            empty.words.assign(config_.lanes, 0);
-            empty.valid.assign(config_.lanes, 0);
-            staging_.emplace_back(registers_, "assembly register " + std::to_string(index), std::move(empty));
+            empty.words.assign(words, 0);
+            empty.valid.assign(words, 0);
+            staging_.emplace_back(registers_, name, std::move(empty));
         }
         free_id_tags_.poke(std::vector<uint8_t>(config_.lsu_sectors_in_flight, 0));
         TmaSectorRegister sector;
@@ -1153,27 +1160,24 @@ bool Machine::RfReadDecision::granted_to(RfReader reader, uint32_t index) const 
     return false;
 }
 
-// Assembly register `index` as an async RF holder: its write when it holds a
-// complete load vector (in Q), else none.
+// The load buffer as an async RF holder: its next write when it holds a
+// complete group (in Q), else none (the store buffer never writes the RF). A
+// v8 group is eight writes, rD + j one after another.
 std::optional<Machine::AsyncWrite> Machine::assembly_rf_write(uint32_t index) const {
+    if (index != load_buffer) return std::nullopt;
     const auto& assembly = staging_.at(index).cur();
-    const auto* command = assembly.owner.has_value() ? find_lsu_command(*assembly.owner) : nullptr;
-    if (command == nullptr || is_store(command->kind) || assembly.valid_count != config_.lanes) return std::nullopt;
+    if (!assembly.owner.has_value() || assembly.valid_count != assembly.expected) return std::nullopt;
+    const auto* command = find_lsu_command(*assembly.owner);
+    if (command == nullptr || is_store(command->kind)) throw SimError("internal: the load buffer's owner is not a load");
     const bool vector = command->kind == LsuKind::vector_load;
-    const auto reg = static_cast<uint8_t>(command->reg + (vector ? command->chunks_done : 0));
+    const auto reg = static_cast<uint8_t>(command->reg + (vector ? assembly.beats : 0));
     return AsyncWrite{AsyncWriter::assembly, index, command->warp, reg};
 }
 
-// The LSU's output mux: the first assembly register, from the LSU cursor, that
-// holds a complete load vector. Only it reaches the RF write decision this
-// cycle (one LSU write path); the others wait for the mux.
+// The LSU's one RF write path: the load buffer, when it holds a complete
+// group (one write a cycle).
 std::optional<uint32_t> Machine::lsu_rf_presented() const {
-    const auto registers = static_cast<uint32_t>(staging_.size());
-    const auto cursor = rf_write_policy_.cur().lsu_cursor;
-    for (uint32_t step = 0; step < registers; ++step) {
-        const auto index = (cursor + step) % registers;
-        if (assembly_rf_write(index).has_value()) return index;
-    }
+    if (assembly_rf_write(load_buffer).has_value()) return load_buffer;
     return std::nullopt;
 }
 
@@ -1258,23 +1262,40 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         return writeback;
     }
     case AsyncWriter::assembly: {
+        // One write of the load buffer's group: a v8 group's register rD + j
+        // with the group's active lanes enabled (lane l's word j); a gather
+        // group's active lanes; a uniform load's one word to every lane.
         const auto& assembly = staging_.at(write.index).cur();
         const auto& command = *find_lsu_command(*assembly.owner);
-        sanitizer_.check_assembly_lanes_valid(cycle_, write.index, assembly.valid, 0, config_.lanes, "RF drain");
-        writeback.values = assembly.words;
-        writeback.reason = opcode_name(command.instruction.opcode);
-        // A gather writes its active lanes only (their assembly lanes were
-        // filled; the inactive ones were valid from admission).
-        if (command.kind == LsuKind::scalar_load) writeback.lane_enables = command.lanes;
+        const auto width = lsu_group_width(command);
         const bool vector = command.kind == LsuKind::vector_load;
-        if (!vector || command.chunks_done + 1 == 8) {
-            // rD..rD+7 count as in flight until the last write lands.
-            const uint32_t width = vector ? 8 : 1;
-            for (uint32_t j = 0; j < width; ++j) writeback.visible_regs.push_back(static_cast<uint8_t>(command.reg + j));
+        const bool uniform = command.kind == LsuKind::uniform_load;
+        writeback.values.assign(config_.lanes, 0);
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if (uniform) {
+                writeback.values[lane] = assembly.words[0];
+                continue;
+            }
+            if ((assembly.lanes >> lane & 1) == 0) continue;
+            const uint32_t at = vector ? (lane - assembly.group * width) * 8 + assembly.beats
+                                       : lane - assembly.group * width;
+            sanitizer_.check_assembly_lanes_valid(cycle_, write.index, assembly.valid, at, 1, "RF drain");
+            writeback.values[lane] = assembly.words[at];
+        }
+        if (!uniform) writeback.lane_enables = assembly.lanes;
+        writeback.reason = opcode_name(command.instruction.opcode);
+        const bool group_done = assembly.beats + 1 == assembly.beats_total;
+        const uint32_t lanes_done = uniform ? 1 : static_cast<uint32_t>(std::popcount(assembly.lanes));
+        if (group_done && command.chunks_done + lanes_done == command.requests_total) {
+            // The command's last write: rD..rD+7 count as in flight until it lands.
+            const uint32_t registers = vector ? 8 : 1;
+            for (uint32_t j = 0; j < registers; ++j) writeback.visible_regs.push_back(static_cast<uint8_t>(command.reg + j));
             writeback.clear_depbar = command.depbar;
             writeback.release_lsu_command = command.id;
         }
-        probe(LsuEdge::rf_write_beat, command.id, write.reg, config_.lanes * 4);
+        // The bytes written: the group's enabled lanes (every lane for ldg.uni).
+        probe(LsuEdge::rf_write_beat, command.id, write.reg,
+            static_cast<uint32_t>(std::popcount(assembly.lanes)) * 4);
         return writeback;
     }
     case AsyncWriter::acc_ld: {
@@ -1452,10 +1473,15 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             w.acc_st_read = AccStBeat{store_engine->next_column,
                 cycle_ + config_.rf_read_latency_cycles + config_.tmem_port_depth, std::move(values)};
         } else {
-            sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::stg_v8);
+            // A stg.v8 reads rS + j once per lane group; the register is free
+            // to be overwritten after the last group's read.
+            if (read->last_group) sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::stg_v8);
             probe(LsuEdge::rf_read_beat, read->lsu_command, read->reg, config_.lanes * 4);
             w.lsu_rf_read.command = read->lsu_command;
             w.lsu_rf_read.assembly = read->assembly;
+            w.lsu_rf_read.group = read->group;
+            w.lsu_rf_read.beat = read->beat;
+            w.lsu_rf_read.lanes = read->lanes;
             w.lsu_rf_read.values = std::move(values);
             w.lsu_rf_read.arrive_cycle = cycle_ + config_.rf_read_latency_cycles;
         }
@@ -3986,7 +4012,10 @@ ResourceView Machine::resource_view(
         (!simt_rmw_.cur().has_value() || w.shmem.simt_rmw_started) && claims.simt_rmw == 0;
     view.lsu_slot_free = lsu_commands_.cur().size() - w.released_lsu_commands.size() + claims.lsu_commands <
         config_.lsu_active_commands;
-    view.assembly_free = free_assembly_register_count(w) > claims.lsu_commands;
+    // A scalar store's data lands in the store buffer at its dispatch, so it
+    // is accepted only when no store has data still to move: none in the
+    // command slots (Q) and none on its way through the dispatch pipeline.
+    view.store_buffer_free = store_buffer_free() && claims.lsu_stores == 0;
     return view;
 }
 
@@ -4030,7 +4059,7 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
         return {false, WarpState::structural, "LSU command slot"};
     case Refusal::lsu_assembly:
         ++trace_->lsu_counters().lsu_no_staging_cycles;
-        return {false, WarpState::structural, "LSU assembly register"};
+        return {false, WarpState::structural, "LSU store buffer"};
     }
     throw SimError("internal unknown issue refusal");
 }
@@ -4257,6 +4286,7 @@ Machine::DispatchClaims Machine::dispatch_claims() const {
         if (is_mbar_predicate_writer(opcode)) ++claims.probes;
         if (is_mbar_try_wait(opcode)) ++claims.wait_slots;
         if (is_lsu_opcode(opcode)) ++claims.lsu_commands;
+        if (opcode == Opcode::stg || opcode == Opcode::stg_v8) ++claims.lsu_stores;
         if (is_mma_command(opcode)) ++claims.mma_commands;
         if (is_acc_transfer(opcode)) ++claims.acc[is_acc_load(opcode) ? 0 : 1];
     }
@@ -4351,7 +4381,11 @@ void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
     record_depbar_completion(w, op.warp, inst.control.set_depbar,
         "depbar underflow on sb" + std::to_string(inst.control.set_depbar));
     if (const auto dst = destination_register(inst); dst.has_value()) {
-        sanitizer_.record_reg_ready(op.warp, *dst, cycle_ + 1);
+        const uint32_t registers = inst.opcode == Opcode::ldg_v8 ? 8 : 1;
+        for (uint32_t j = 0; j < registers; ++j) sanitizer_.record_reg_ready(op.warp, *dst + j, cycle_ + 1);
+    }
+    if (inst.opcode == Opcode::stg_v8) { // its sources are never read
+        for (uint32_t j = 0; j < 8; ++j) sanitizer_.record_async_reader_done(op.warp, inst.src1 + j, AsyncReader::stg_v8);
     }
 }
 
@@ -4538,18 +4572,18 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     auto command = plan_lsu_command(op);
     command.id = next_lsu_command_id_++;
     command.depbar = inst.control.set_depbar;
-    command.assembly = *free_assembly_register(w);
+    command.assembly = is_store(command.kind) ? store_buffer : load_buffer;
+    // Every load rides the one ordered LSU read stream (accept_lsu_request).
+    command.stream = lsu_stream;
     DispatchDecision::LsuAdmission admission;
     switch (command.kind) {
     case LsuKind::vector_load:
-        // Ordered vector streams 1..read_streams-1, round-robin.
-        command.stream = 1 + next_vector_stream_++ % (config_.lsu_read_streams - 1);
         ++counters.lsu_vector_loads;
-        counters.lsu_useful_bytes += 32ull * config_.lanes;
+        counters.lsu_useful_bytes += 32ull * command.sectors.size(); // its active lanes' sectors
         break;
     case LsuKind::vector_store:
         ++counters.lsu_vector_stores;
-        counters.lsu_useful_bytes += 32ull * config_.lanes;
+        counters.lsu_useful_bytes += 32ull * command.sectors.size();
         break;
     case LsuKind::scalar_load:
         ++counters.lsu_scalar_loads;
@@ -4570,8 +4604,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     }
     trace_->lsu_command_begin(cycle_, command.id, op.warp, opcode_name(inst.opcode));
     lsu_phases_[command.id].admit_cycle = cycle_;
-    // Sanitizer: every admitted command owns one assembly register for its
-    // whole life, so the admitted set can never exceed the pool.
+    // Sanitizer: the admitted set never exceeds the command slots.
     sanitizer_.check_lsu_admitted(lsu_commands_.cur().size() - w.released_lsu_commands.size() + 1);
     admission.command = std::move(command);
     w.dispatch.lsu = std::move(admission);
@@ -5627,10 +5660,6 @@ void Machine::drive_rf_write_policy(const Wires& w) {
         next.owed[bank] = booked || (next.owed[bank] != 0 && !decision.granted) ? 1 : 0;
         next.cursor[bank] = decision.cursor_after;
     }
-    const auto presented = w.rf_write.lsu_presented;
-    if (presented.has_value() && w.rf_write.granted_to(AsyncWriter::assembly, *presented)) {
-        next.lsu_cursor = (*presented + 1) % static_cast<uint32_t>(staging_.size());
-    }
     if (next == rf_write_policy_.cur()) return;
     rf_write_policy_.set_next(std::move(next), "drive_rf_write_policy");
 }
@@ -5793,11 +5822,15 @@ void Machine::drive_tma_store_registers(const Wires& w) {
 // releases, and issue's admission, in one calculation. A command released
 // now frees its slot for an admission now (d).
 void Machine::drive_lsu_commands(const Wires& w) {
-    std::vector<uint64_t> drained; // loads whose assembly register's RF write was granted now
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        if (w.rf_write.granted_to(AsyncWriter::assembly, index)) drained.push_back(*staging_[index].cur().owner);
+    // A load group whose last RF write is granted now: its lanes are done.
+    std::optional<std::pair<uint64_t, uint32_t>> drained; // (command, lanes)
+    if (load_buffer_released(w)) {
+        const auto& buffer = staging_[load_buffer].cur();
+        const auto* owner = find_lsu_command(*buffer.owner);
+        drained = std::make_pair(*buffer.owner, owner->kind == LsuKind::uniform_load
+            ? 1u : static_cast<uint32_t>(std::popcount(buffer.lanes)));
     }
-    const bool changed = !drained.empty() || w.egress.client == GmemClient::lsu ||
+    const bool changed = drained.has_value() || w.egress.client == GmemClient::lsu ||
         w.channel.granted == GmemClient::lsu || !w.controller.lsu_acks.empty() ||
         w.lsu_rf_read.command.has_value() || !w.released_lsu_commands.empty() || w.dispatch.lsu.has_value();
     if (!changed) return;
@@ -5808,15 +5841,16 @@ void Machine::drive_lsu_commands(const Wires& w) {
         }
         throw SimError("internal reference to a retired LSU command #" + std::to_string(id));
     };
-    for (const auto id : drained) ++command(id).chunks_done;
+    if (drained.has_value()) command(drained->first).chunks_done += drained->second;
     if (w.egress.client == GmemClient::lsu) {
         auto& store = command(w.egress.lsu_command);
-        if (w.egress.lsu_chunk_drained) {
-            store.words_plucked = 0;
+        store.words_plucked += static_cast<uint32_t>(w.egress.words.size());
+        if (store.kind == LsuKind::vector_store && w.egress.slot_complete) {
+            store.words_plucked = 0; // the lane's sector is in the egress FIFO
             ++store.chunks_plucked;
-        } else {
-            store.words_plucked += static_cast<uint32_t>(w.egress.words.size());
         }
+        // The group has left the store buffer: the next group's RF reads start.
+        if (w.egress.lsu_chunk_drained) store.chunks_done = 0;
     }
     if (w.channel.granted == GmemClient::lsu) ++command(w.channel.lsu_command).requests_emitted;
     for (const auto& [id, acks] : w.controller.lsu_acks) command(id).acks += acks;
@@ -5832,81 +5866,108 @@ void Machine::drive_lsu_commands(const Wires& w) {
     lsu_commands_.set_next(std::move(next), "drive_lsu_commands");
 }
 
-// Each assembly register of the pool, in one calculation, in three steps:
-//   1. the current owner empties it: a chunk drained to the RF (load) or into
-//      the egress FIFO (vector store), and the owner's release;
-//   2. dispatch installs a new owner (with a scalar store's data);
-//   3. this cycle's fills: the ingress pluck, the store-data beat at the RF
-//      output now.
-// The old owner's steps come first, so a register reused in its old owner's
-// final cycle (d) keeps everything the new owner put in. A fill is the next
-// value; it is read from the next cycle on.
+// The LSU's two buffers, each in one calculation. A buffer has an owner only
+// while data is in it (sim.hpp, AssemblyRegister).
+//   load buffer   1. one of its group's RF writes is granted now: the beat
+//                    counter moves; the group's LAST write empties it, no
+//                    owner;
+//                 2. the first word plucked for a group claims it;
+//                 3. this cycle's plucked words.
+//   store buffer  1. its data's last word is pushed into the egress FIFO now
+//                    (a v8 store's lane group, a scalar store's vector):
+//                    empty, no owner;
+//                 2. a scalar store dispatched now brings its data;
+//                 3. a v8 store's RF read beat at the RF output now: the
+//                    group's lanes of that register.
+// The emptying comes first, so a buffer reused in the cycle it empties (d)
+// keeps everything the new data put in. A fill is the next value; it is read
+// from the next cycle on.
 void Machine::drive_assembly_pool(const Wires& w) {
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        const auto& cur = staging_[index].cur();
+    const auto clear = [&](AssemblyRegister& reg) {
+        std::fill(reg.valid.begin(), reg.valid.end(), 0);
+        reg.valid_count = 0;
+        reg.expected = 0;
+        reg.beats = 0;
+        reg.beats_total = 0;
+        reg.lanes = 0;
+        reg.group = 0;
+        reg.owner.reset();
+    };
+    const auto put = [&](AssemblyRegister& reg, uint32_t at, uint32_t word) {
+        reg.words.at(at) = word;
+        if (reg.valid.at(at) != 0) throw SimError("internal: an LSU buffer word was written twice");
+        reg.valid[at] = 1;
+        ++reg.valid_count;
+    };
+    {
+        const auto& cur = staging_[load_buffer].cur();
         std::optional<AssemblyRegister> next;
         const auto edit = [&]() -> AssemblyRegister& {
             if (!next.has_value()) next = cur;
             return *next;
         };
-        const auto clear = [&] {
+        if (w.rf_write.granted_to(AsyncWriter::assembly, load_buffer)) {
+            if (load_buffer_released(w)) clear(edit());
+            else ++edit().beats;
+        }
+        if (w.ingress.load_claim.has_value()) {
             auto& reg = edit();
-            std::fill(reg.valid.begin(), reg.valid.end(), 0);
-            reg.valid_count = 0;
-        };
-
-        // 1. The current owner empties the register.
-        const bool rf_drained = w.rf_write.granted_to(AsyncWriter::assembly, index);
-        const bool egress_drained = w.egress.lsu_chunk_drained && w.egress.lsu_assembly == index;
-        const bool released = cur.owner.has_value() &&
-            std::find(w.released_lsu_commands.begin(), w.released_lsu_commands.end(), *cur.owner) !=
-                w.released_lsu_commands.end();
-        if (rf_drained || egress_drained) clear();
-        if (released) {
-            edit().owner.reset();
-            clear();
+            if (reg.owner.has_value()) throw SimError("internal: a load claimed the owned load buffer");
+            const auto& claim = *w.ingress.load_claim;
+            clear(reg);
+            reg.owner = claim.command;
+            reg.group = claim.group;
+            reg.lanes = claim.lanes;
+            reg.expected = claim.expected;
+            reg.beats_total = claim.beats_total;
         }
-
-        // 2. Dispatch installs the new owner.
-        if (w.dispatch.lsu.has_value() && w.dispatch.lsu->command.assembly == index) {
-            if (edit().owner.has_value()) throw SimError("internal LSU admission into an owned assembly register");
-            next->owner = w.dispatch.lsu->command.id;
-            clear();
-            if (const auto& data = w.dispatch.lsu->store_data; data.has_value()) {
-                next->words = *data;
-                std::fill(next->valid.begin(), next->valid.end(), 1);
-                next->valid_count = config_.lanes;
-            }
-            // A gather under a partial mask: its inactive lanes get no word,
-            // so they start valid (the RF write's lane enables skip them).
-            if (const auto& command = w.dispatch.lsu->command; command.kind == LsuKind::scalar_load) {
-                for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-                    if ((command.lanes >> lane & 1) != 0) continue;
-                    next->valid[lane] = 1;
-                    ++next->valid_count;
-                }
-            }
-        }
-
-        // 3. This cycle's fills.
         for (const auto& write : w.ingress.lanes) {
-            if (write.assembly != index) continue;
             auto& reg = edit();
-            reg.words[write.lane] = write.word;
-            if (reg.valid[write.lane] == 0) {
-                reg.valid[write.lane] = 1;
-                ++reg.valid_count;
-            }
+            if (!reg.owner.has_value()) throw SimError("internal: a word plucked into the unowned load buffer");
+            put(reg, write.lane, write.word);
+        }
+        if (next.has_value()) staging_[load_buffer].set_next(std::move(*next), "drive_assembly_pool");
+    }
+    {
+        const auto& cur = staging_[store_buffer].cur();
+        std::optional<AssemblyRegister> next;
+        const auto edit = [&]() -> AssemblyRegister& {
+            if (!next.has_value()) next = cur;
+            return *next;
+        };
+        if (w.egress.lsu_chunk_drained || w.egress.lsu_store_drained) clear(edit());
+        if (w.dispatch.lsu.has_value() && w.dispatch.lsu->store_data.has_value()) {
+            // A scatter: every lane's word (the inactive ones are never sent).
+            auto& reg = edit();
+            if (reg.owner.has_value()) throw SimError("internal: store data into the owned store buffer");
+            reg.owner = w.dispatch.lsu->command.id;
+            reg.lanes = w.dispatch.lsu->command.lanes;
+            for (uint32_t lane = 0; lane < config_.lanes; ++lane) put(reg, lane, (*w.dispatch.lsu->store_data)[lane]);
+            reg.expected = config_.lanes;
         }
         const auto& reads = lsu_read_pipe_.cur();
-        if (!reads.empty() && reads.front().arrive_cycle == cycle_ && reads.front().assembly == index) {
-            // The store-data beat at the RF output now (sampled Lr ago).
+        if (!reads.empty() && reads.front().arrive_cycle == cycle_) {
+            // The store-data beat at the RF output now (sampled Lr ago): the
+            // group's active lanes of register rS + beat.
+            const auto& beat = reads.front();
             auto& reg = edit();
-            reg.words = reads.front().values;
-            std::fill(reg.valid.begin(), reg.valid.end(), 1);
-            reg.valid_count = config_.lanes;
+            const auto lanes = static_cast<uint32_t>(std::popcount(beat.lanes));
+            if (!reg.owner.has_value()) {
+                reg.owner = *beat.command;
+                reg.group = beat.group;
+                reg.lanes = beat.lanes;
+                reg.expected = 8 * lanes;
+                reg.beats_total = 8;
+            } else if (reg.owner != beat.command || reg.group != beat.group) {
+                throw SimError("internal: a store beat landed in another group's store buffer");
+            }
+            for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+                if ((beat.lanes >> lane & 1) == 0) continue;
+                put(reg, (lane - beat.group * config_.lsu_store_group_lanes) * 8 + beat.beat, beat.values[lane]);
+            }
+            ++reg.beats;
         }
-        if (next.has_value()) staging_[index].set_next(std::move(*next), "drive_assembly_pool");
+        if (next.has_value()) staging_[store_buffer].set_next(std::move(*next), "drive_assembly_pool");
     }
 }
 
@@ -5987,23 +6048,31 @@ void Machine::drive_read_records(const Wires& w) {
         else if (record.kind == ReadKind::vector) ++vector;
         else ++free_ids;
     }
-    const std::size_t vector_sectors = std::size_t{8} * config_.lanes * 4 / config_.gmem_sector_bytes;
-    if (tma > config_.tma_sector_credits || vector > config_.lsu_active_commands * vector_sectors ||
-        free_ids > config_.lsu_sectors_in_flight) {
+    // Every LSU read is on the ordered LSU stream; requests run ahead of the
+    // load buffer, so each command slot may have all its sectors in flight
+    // (one per lane). One more entry is the tail of a retired gather or
+    // ldg.uni: such a load writes the RF, and frees its command slot, once its
+    // last word is in, while the rest of that word's sector is still coming
+    // off the bus and being read out of the ingress FIFO and dropped; its
+    // entry lives until the sector's last byte. Only one such tail can exist:
+    // the stream is ordered and the FIFO is read in order, so the next load
+    // to retire has its last word behind that tail and retires after it is
+    // gone. Hardware: lsu.active_commands x lanes + 1 entries.
+    const std::size_t command_sectors = config_.lanes;
+    const std::size_t retired_tail = 1;
+    if (tma > config_.tma_sector_credits ||
+        vector + free_ids > config_.lsu_active_commands * command_sectors + retired_tail) {
         throw SimError("internal: the read ID table holds more reads than its readers can have in flight");
     }
     read_records_.set_next(std::move(next), "drive_read_records");
 }
 
-// Free-ID tags: returned when a gather's sector is fully read or a scatter's
-// write is acknowledged; then taken by a scalar request now (a tag free in
-// Q, so today never one returned now).
+// Free-ID tags (scatter writes only): returned when a scatter's write is
+// acknowledged; then taken by a scatter's request now (a tag free in Q, so
+// today never one returned now).
 void Machine::drive_free_id_tags(const Wires& w) {
-    if (!w.channel.lsu_tag.has_value() && w.ingress.freed_tags.empty() && w.controller.freed_tags.empty()) {
-        return;
-    }
+    if (!w.channel.lsu_tag.has_value() && w.controller.freed_tags.empty()) return;
     auto next = free_id_tags_.cur();
-    for (const auto tag : w.ingress.freed_tags) next.at(tag) = 0;
     for (const auto tag : w.controller.freed_tags) next.at(tag) = 0;
     if (w.channel.lsu_tag.has_value()) next.at(*w.channel.lsu_tag) = 1;
     free_id_tags_.set_next(std::move(next), "drive_free_id_tags");

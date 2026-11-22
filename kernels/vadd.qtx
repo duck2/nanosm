@@ -1,13 +1,12 @@
 ; Vector add, C = A + B over 8192 fp32 (32 KiB per vector), four warps.
 ; Warp w streams its own 512 B blocks w, w+4, w+8, ... (16 blocks each).
-; Interleaved v8 (rfc09): register r(base+j), lane l <-> word 16*j + l of the
-; block, so one ldg.v8 is eight full-width RF writes and one stg.v8 eight
-; full-width RF reads; memory order equals register order, no corner turn.
-; The block base is warp-uniform and 64 B aligned, as v8 requires; ldg.v8 /
-; stg.v8 still take it from lane 0 of a vector register, so the warp id goes
-; through the uniform side (usread) and back with ur2r.
+; ldg.v8 / stg.v8 are per lane: each lane gives its own 32-byte-aligned
+; address and moves that sector's eight words to or from r(base) .. r(base+7)
+; at that lane. Lane l takes the block's sector l (base + 32 l), so one
+; ldg.v8 is a whole 512 B block, sixteen sector requests in lane order.
+; Elementwise work does not care which lane holds which element.
 ;
-; The launch gives the three vectors' global addresses (64 B aligned) and the
+; The launch gives the three vectors' global addresses (32 B aligned) and the
 ; warp count. Any number of warps that divides the 64 blocks works: a warp's
 ; step from one of its blocks to the next is 512 B x N_WARPS, read at run
 ; time, and it stops when its A pointer passes the end of A.
@@ -30,9 +29,14 @@
         lds.uni r26, [ur4]
         ur2r   r16, ur0
         ur2r   r18, ur1
-        ; r20 / r23 / r26 (bank 2) walk A, B and C; the step r18 (bank 0) and
-        ; the end of A r19 (bank 1) sit in the other two banks.
+        sread  r27, LANE_ID
+        shli   r27, r27, 5            ; 32 bytes per lane: this lane's sector of a block
+        add    r16, r16, r27          ; this lane's offset in the warp's first block
+        ; r20 / r23 / r26 (bank 2) walk A, B and C, one address per lane; the
+        ; step r18 (bank 0) and the end of A at this lane's offset r19 (bank 1)
+        ; sit in the other two banks, so every lane leaves the loop together.
         addi   r19, r20, BYTES
+        add    r19, r19, r27
         add    r20, r20, r16
         add    r23, r23, r16
         add    r26, r26, r16

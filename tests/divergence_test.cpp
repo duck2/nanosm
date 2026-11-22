@@ -695,7 +695,7 @@ void test_write_mask_refusals() {
     for (const auto& [line, name] : std::vector<std::pair<std::string, std::string>>{
              {"@p0 uadd ur1, ur1, ur1", "uadd"}, {"@p0 usetp.eq.u32 p1, ur1, 0", "usetp.eq.u32"},
              {"@p0 r2ur ur1, r1", "r2ur"}, {"@!p0 lds.uni r1, [ur1]", "lds.uni"},
-             {"@p0 ldg.v8 r8, [r0]", "ldg.v8"}, {"@p0 mbar.arrive [ur1]", "mbar.arrive"},
+             {"@p0 mbar.arrive [ur1]", "mbar.arrive"},
              {"@p0 halt", "halt"}, {"@p0 sync", "sync"}, {"@p0 ssy L", "ssy"}, {"@p0 fence.sh", "fence.sh"}}) {
         try {
             (void)compile(line + "\nL: halt\n");

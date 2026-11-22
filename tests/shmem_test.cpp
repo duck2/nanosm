@@ -293,9 +293,10 @@ void test_b3_lds_uni_alignment_and_bounds() {
 // reads lane 0's value; with the sanitizer, a value that differs across lanes
 // PANICs with the operand's name, as before. One test for both builds. Since
 // the uniform register file only the operands still taken from a vector
-// register are lane 0's: the ldg.v8 / stg.v8 bases and the bra.uni predicate
-// (the lds.uni / ldg.uni bases and the mbar addresses are uniform registers,
-// uniform by construction, so their cases are gone).
+// register is lane 0's: the bra.uni predicate (the lds.uni / ldg.uni bases
+// and the mbar addresses are uniform registers, uniform by construction; and
+// since 2026-11-21 ldg.v8 / stg.v8 take a per-lane address, so their cases
+// are gone).
 // ---------------------------------------------------------------------------
 
 nanosm::Launch uniformity_launch() {
@@ -329,18 +330,6 @@ void test_uniformity_uses_lane_zero() {
         std::function<void(const nanosm::Machine&)> lane_zero;  // sanitizer OFF: lane 0's value was used
     };
     const std::vector<Case> cases = {
-        {"ldg.v8 base", one_lane_differs + "ldg.v8 r8, [r0]\nhalt\n", "ldg.v8 base address is not warp-uniform",
-            [](const nanosm::Machine& machine) {
-                for (uint32_t k = 0; k < 8; ++k)
-                    for (uint32_t lane = 0; lane < 16; ++lane)
-                        require(machine.read_reg(0, lane, 8 + k) == pattern_word(16 + 16 * k + lane),
-                            "ldg.v8 did not load lane 0's block");
-            }},
-        {"stg.v8 base", one_lane_differs + "stg.v8 [r0], r8\nhalt\n", "stg.v8 base address is not warp-uniform",
-            [](const nanosm::Machine& machine) {
-                require(machine.read_gmem_u32(64) == 0 && machine.read_gmem_u32(60) == pattern_word(15),
-                    "stg.v8 did not store at lane 0's block");
-            }},
         {"bra.uni predicate",
             "sread r0, LANE_ID\nsetp.lt.u32 p0, r0, 8\n@p0 bra.uni taken\nmov r5, 1\nhalt\ntaken:\nmov r5, 2\nhalt\n",
             "bra.uni predicate is not warp-uniform",

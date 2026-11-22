@@ -25,6 +25,7 @@
 #include "sim.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -148,8 +149,8 @@ void Machine::accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan
 }
 
 // The LSU command's next request: a store's write from the egress request
-// pointer (a scatter takes a free-ID tag), or a read (gather/uniform take a
-// tag) with its ID-table entry.
+// pointer (a scatter takes a free-ID tag), or a read on the ordered LSU
+// stream with its ID-table entry.
 void Machine::accept_lsu_request(RequestChannel& channel) {
     const auto& command = *find_lsu_command(channel.lsu_command);
     channel.lsu_id = next_gmem_request_id_++;
@@ -162,28 +163,21 @@ void Machine::accept_lsu_request(RequestChannel& channel) {
         channel.lsu_write_slot = slot->id;
         channel.accepted = write_request(*slot, GmemClient::lsu, channel.lsu_id, tag);
     } else {
-        std::optional<uint32_t> tag;
-        if (command.kind != LsuKind::vector_load) {
-            tag = free_id_tag();
-            if (!tag.has_value()) throw SimError("internal scalar LSU request without a free-ID tag");
-            channel.lsu_tag = tag;
-        }
-        channel.accepted = lsu_read_request(command, channel.lsu_id, tag);
+        // Every LSU read rides the one ordered LSU read stream: its data
+        // returns in request order, which is command admission order, so the
+        // one load buffer passes from a command to the next.
+        channel.accepted = lsu_read_request(command, channel.lsu_id);
         ReadRecord record;
         record.command = command.id;
         record.stream = channel.accepted->stream;
         record.sector_address = channel.accepted->sector_address;
-        if (command.kind == LsuKind::vector_load) {
-            record.kind = ReadKind::vector;
-            record.sector_index = command.requests_emitted;
-            sanitizer_.record_ordered_request(command.stream, channel.lsu_id);
-        } else {
-            const auto& sector = command.sectors.at(command.requests_emitted);
-            record.kind = command.kind == LsuKind::uniform_load ? ReadKind::uniform : ReadKind::gather;
-            record.lane = sector.lane;
-            record.word_offset = sector.word_offset;
-            record.tag = *tag;
-        }
+        sanitizer_.record_ordered_request(command.stream, channel.lsu_id);
+        const auto& sector = command.sectors.at(command.requests_emitted);
+        record.kind = command.kind == LsuKind::vector_load ? ReadKind::vector
+            : command.kind == LsuKind::uniform_load ? ReadKind::uniform : ReadKind::gather;
+        record.sector_index = command.requests_emitted;
+        record.lane = sector.lane;
+        record.word_offset = sector.word_offset;
         channel.new_read_records.emplace_back(channel.lsu_id, std::move(record));
     }
     auto& counters = trace_->lsu_counters();
@@ -205,25 +199,12 @@ std::optional<std::size_t> Machine::select_controller_entry() const {
     const auto servable = [&](const GmemSectorRequest& entry) {
         return entry.ready_dram_tick <= dram_tick_;
     };
-    const auto free_id_read = [&](const GmemSectorRequest& entry) {
-        return entry.load && entry.stream >= config_.lsu_read_streams;
-    };
     const auto ordered_read = [&](const GmemSectorRequest& entry) {
         return entry.load && entry.stream < config_.lsu_read_streams;
     };
     const auto& front = gmem_queue_.front();
     switch (controller_test_order_) {
     case ControllerTestOrder::fifo:
-        break;
-    case ControllerTestOrder::reverse_free_ids:
-        if (free_id_read(front)) {
-            std::size_t run = 0;
-            while (run < gmem_queue_.size() && free_id_read(gmem_queue_[run])) ++run;
-            for (std::size_t index = run; index-- > 0;) {
-                if (servable(gmem_queue_[index])) return index;
-            }
-            return std::nullopt;
-        }
         break;
     case ControllerTestOrder::illegal_ordered_reorder:
         if (ordered_read(front)) {
@@ -312,9 +293,25 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
     const auto& egress = egress_fifo_.cur();
     const auto head = w.controller.egress_slots_freed; // the FIFO head, after this cycle's pops
     if (!gmem_bus_.has_value()) {
-        const auto selected = select_controller_entry();
+        auto selected = select_controller_entry();
+        // The data bus is one bidirectional bus: between the last data beat
+        // one way and the first beat the other way it stays idle for at least
+        // gmem.turnaround_dram_ticks ticks (ticks it was idle anyway count).
+        // The entry simply waits at the head of the controller's queue.
+        if (selected.has_value() && gmem_last_beat_tick_.has_value() &&
+            gmem_queue_[*selected].load != gmem_last_beat_load_ &&
+            dram_tick_ - *gmem_last_beat_tick_ <= config_.gmem_turnaround_dram_ticks) {
+            ++trace_->lsu_counters().gmem_turnaround_ticks;
+            selected.reset();
+        }
         if (selected.has_value()) {
             const auto entry = gmem_queue_.begin() + static_cast<std::ptrdiff_t>(*selected);
+            // A turn is counted when the entry of the other direction starts
+            // on the bus, whether it waited for the turnaround or the bus had
+            // been idle long enough anyway.
+            if (gmem_last_beat_tick_.has_value() && entry->load != gmem_last_beat_load_) {
+                ++trace_->lsu_counters().gmem_bus_turns;
+            }
             gmem_bus_ = std::move(*entry);
             gmem_queue_.erase(entry);
             auto& request = *gmem_bus_;
@@ -376,6 +373,8 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
         probe(LsuEdge::bus_write_beat, request.id, offset, size);
     }
     ++request.next_beat;
+    gmem_last_beat_tick_ = dram_tick_;
+    gmem_last_beat_load_ = request.load;
     trace_->gmem_bus_beat(cycle_, dram_tick_, request.id);
     if (request.next_beat != request.beats) return;
 
@@ -447,9 +446,9 @@ bool Machine::is_store(LsuKind kind) {
 }
 
 // Capture and check an accepted LSU instruction's addresses. Contract
-// violations panic here: a misaligned vector/uniform base, a misaligned or
-// out-of-bounds lane (and, in the sanitizer, a non-uniform vector/uniform
-// base: hardware uses lane 0's; two lanes of a scalar store naming one word,
+// violations panic here: a misaligned or out-of-bounds lane (a v8 lane must
+// be sector-aligned) or uniform base (and, in the sanitizer, two lanes of a
+// stg.v8 naming one sector, or two lanes of a scalar store naming one word,
 // backlog D12: UB, as on NVIDIA -- the machine sends every lane's write, one
 // request per lane in lane order, and with the placeholder controller's
 // queue-front order the highest lane's lands last; a reordering controller
@@ -460,7 +459,6 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     command.warp = op.warp;
     command.pc = op.pc;
     command.instruction = inst;
-    const uint64_t lane_bytes = static_cast<uint64_t>(config_.lanes) * 4;
     const auto checked_address = [&](uint32_t base) {
         const auto address = static_cast<int64_t>(base) + inst.imm;
         if (address < 0) panic(op, "gmem address arithmetic underflow");
@@ -469,22 +467,33 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     switch (inst.opcode) {
     case Opcode::ldg_v8:
     case Opcode::stg_v8: {
+        // One sector per ACTIVE lane, at that lane's own address: the
+        // sector's eight words are rD..rD+7 (rS..rS+7) at that lane. An
+        // inactive lane's address is never checked and it makes no request.
         const bool load = inst.opcode == Opcode::ldg_v8;
         command.kind = load ? LsuKind::vector_load : LsuKind::vector_store;
         command.reg = load ? inst.dst : inst.src1;
-        command.lanes = full_mask();
-        const auto address = checked_address(
-            uniform_reg(op, inst.src0, opcode_name(inst.opcode) + " base address"));
-        if (address % lane_bytes != 0) {
-            panic(op, opcode_name(inst.opcode) + " address " + std::to_string(address) +
-                " is not " + std::to_string(lane_bytes) + "-byte aligned");
+        command.lanes = op.active_mask;
+        if (config_.gmem_sector_bytes != 32) { // refused at kernel load (check_v8_sectors)
+            throw SimError("internal: " + opcode_name(inst.opcode) + " dispatched on a profile without 32-byte sectors");
         }
-        const uint64_t block = 8 * lane_bytes;
-        if (address > gmem_.size() || block > gmem_.size() - address) {
-            panic(op, "gmem access out of bounds");
+        std::vector<uint64_t> named;
+        const auto bases = capture(op, inst.src0);
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if ((op.active_mask >> lane & 1) == 0) continue;
+            const auto address = checked_address(bases[lane]);
+            if (address % config_.gmem_sector_bytes != 0) {
+                panic(op, opcode_name(inst.opcode) + " address " + std::to_string(address) +
+                    " is not " + std::to_string(config_.gmem_sector_bytes) + "-byte aligned");
+            }
+            if (address > gmem_.size() || gmem_.size() - address < config_.gmem_sector_bytes) {
+                panic(op, "gmem access out of bounds");
+            }
+            named.push_back(address);
+            command.sectors.push_back({address, lane, 0});
         }
-        command.base = address;
-        command.requests_total = static_cast<uint32_t>(block / config_.gmem_sector_bytes);
+        if (!load) sanitizer_.check_store_word_collision(site(op), named, "gmem sector");
+        command.requests_total = static_cast<uint32_t>(command.sectors.size());
         break;
     }
     case Opcode::ldg:
@@ -532,30 +541,43 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     return command;
 }
 
-// The lowest-numbered assembly register free after this cycle's releases (d).
-std::optional<uint32_t> Machine::free_assembly_register(const Wires& w) const {
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        const auto& owner = staging_[index].cur().owner;
-        if (!owner.has_value()) return index;
-        if (std::find(w.released_lsu_commands.begin(), w.released_lsu_commands.end(), *owner) !=
-            w.released_lsu_commands.end()) {
-            return index;
-        }
-    }
-    return std::nullopt;
+// A store whose data has not all been moved into the egress FIFO (in Q). Such
+// a store holds the store buffer or is waiting for it; stores take the buffer
+// in command order.
+bool Machine::store_has_data_left(const LsuCommand& command) {
+    return (command.kind == LsuKind::vector_store && command.chunks_plucked < command.requests_total) ||
+        (command.kind == LsuKind::scalar_store && command.words_plucked < command.sectors.size());
 }
 
-uint32_t Machine::free_assembly_register_count(const Wires& w) const {
-    uint32_t count = 0;
-    for (uint32_t index = 0; index < staging_.size(); ++index) {
-        const auto& owner = staging_[index].cur().owner;
-        if (!owner.has_value() ||
-            std::find(w.released_lsu_commands.begin(), w.released_lsu_commands.end(), *owner) !=
-                w.released_lsu_commands.end()) {
-            ++count;
-        }
+// The lanes a command's buffer group holds (fixed lane groups, so a lane's
+// place in the buffer is wiring): a v8 load's lsu.load_group_lanes, a v8
+// store's lsu.store_group_lanes, a gather's as many lanes as the load buffer
+// has words (all sixteen when it has that many); a uniform load is one word,
+// a scalar store brings every lane at its dispatch.
+uint32_t Machine::lsu_group_width(const LsuCommand& command) const {
+    switch (command.kind) {
+    case LsuKind::vector_load: return config_.lsu_load_group_lanes;
+    case LsuKind::vector_store: return config_.lsu_store_group_lanes;
+    case LsuKind::scalar_load: return std::min(config_.lanes, 8 * config_.lsu_load_group_lanes);
+    default: return config_.lanes;
     }
-    return count;
+}
+
+// The ACTIVE lanes of a command's group `group`.
+uint64_t Machine::lsu_group_lanes(const LsuCommand& command, uint32_t group) const {
+    const auto width = lsu_group_width(command);
+    uint64_t mask = 0;
+    for (uint32_t lane = group * width; lane < std::min(config_.lanes, (group + 1) * width); ++lane) {
+        mask |= uint64_t{1} << lane;
+    }
+    return mask & command.lanes;
+}
+
+// The store buffer is free for a scalar store's data at its dispatch: no
+// admitted store still has data to move (a released one has none).
+bool Machine::store_buffer_free() const {
+    const auto& commands = lsu_commands_.cur();
+    return std::none_of(commands.begin(), commands.end(), store_has_data_left);
 }
 
 std::optional<uint32_t> Machine::free_id_tag() const {
@@ -593,9 +615,10 @@ bool Machine::egress_slot_visible(const EgressSlot& slot) const {
 // The request channel serves LSU commands in admission order: the oldest
 // command with requests left is the only candidate, so one SM's gmem
 // accesses reach the controller in program order. Its next request is ready
-// when: vector load - always; store - the egress request pointer is its next
-// slot, complete and visible (scatter: and a free-ID tag); gather/uniform -
-// a free-ID tag is available.
+// when: load - always (requests run ahead of the load buffer: the data waits
+// in DRAM, in the controller and in the ingress FIFO); store - the egress
+// request pointer is its next slot, complete and visible (scatter: and a
+// free-ID tag).
 const Machine::LsuCommand* Machine::lsu_request_candidate(std::optional<uint64_t> requested_now) const {
     for (const auto& command : lsu_commands_.cur()) {
         if (command.requests_emitted == command.requests_total) continue;
@@ -613,7 +636,7 @@ const Machine::LsuCommand* Machine::lsu_request_candidate(std::optional<uint64_t
             return nullptr;
         }
         default:
-            return free_id_tag().has_value() ? &command : nullptr;
+            return &command;
         }
     }
     return nullptr;
@@ -643,8 +666,7 @@ Machine::GmemSectorRequest Machine::write_request(
     return request;
 }
 
-Machine::GmemSectorRequest Machine::lsu_read_request(
-    const LsuCommand& command, uint64_t id, std::optional<uint32_t> tag) {
+Machine::GmemSectorRequest Machine::lsu_read_request(const LsuCommand& command, uint64_t id) {
     GmemSectorRequest request;
     request.id = id;
     request.command = command.id;
@@ -653,13 +675,8 @@ Machine::GmemSectorRequest Machine::lsu_read_request(
     request.beats = beats_per_sector(config_);
     request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
     const auto index = command.requests_emitted;
-    if (command.kind == LsuKind::vector_load) {
-        request.stream = command.stream;
-        request.sector_address = command.base + static_cast<uint64_t>(index) * config_.gmem_sector_bytes;
-    } else {
-        request.stream = config_.lsu_read_streams + *tag;
-        request.sector_address = command.sectors.at(index).sector_address;
-    }
+    request.stream = command.stream;
+    request.sector_address = command.sectors.at(index).sector_address;
     return request;
 }
 
@@ -670,10 +687,10 @@ Machine::GmemSectorRequest Machine::lsu_read_request(
 // The ingress FIFO read port: lsu.pluck_words_per_cycle words per cycle from
 // the head, only from beats whose BRAM latency has passed, each word to its
 // stream's consumer. A consumer that cannot take its word (the TMA sector
-// register still holds an unplaced sector; a vector command's assembly
-// register still holds the previous chunk) stalls the head: shared-FIFO
-// head-of-line blocking. Gathers read the whole sector at this rate and keep
-// one word. The destinations are seen as this cycle's drains leave them
+// register still holds an unplaced sector; the load buffer still holds a
+// group waiting for the RF write port, the previous chunk of this load or an
+// older load's) stalls the head: shared-FIFO head-of-line blocking. Gathers
+// read the whole sector at this rate and keep one word. The destinations are seen as this cycle's drains leave them
 // (same-cycle space reuse (d)): a register drained now takes new words now,
 // visible next cycle; no word passes through.
 Machine::IngressPluck Machine::decide_ingress(const Wires& w) {
@@ -715,8 +732,8 @@ Machine::IngressPluck Machine::decide_ingress(const Wires& w) {
             if (!pluck_vector(record, beat, consumed, take, pluck, w)) break;
             note_first_return(command);
         } else {
+            if (!pick_scalar_word(record, beat, consumed, take, pluck, w)) break;
             note_first_return(command);
-            pick_scalar_word(record, beat, consumed, take, pluck);
         }
         probe(LsuEdge::ingress_read, beat.request, offset, take);
         budget -= take;
@@ -761,41 +778,70 @@ void Machine::pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t tak
     pluck.tma_ticket = std::move(returned);
 }
 
-// Ingress -> the owning vector load's assembly register at the pluck rate,
-// lane = word offset within the 64 B chunk. No sector register. Blocked
-// while the register still holds a complete chunk. The chunk being filled is
-// the command's next one, counting a chunk drained to the RF this cycle:
-// filling_chunk = chunks_done + drained now.
+// The load buffer's group whose LAST RF write is granted now: the buffer is
+// free from now on (same-cycle reuse (d)).
+bool Machine::load_buffer_released(const Wires& w) const {
+    const auto& start = staging_.at(load_buffer).cur();
+    return w.rf_write.granted_to(AsyncWriter::assembly, load_buffer) && start.beats + 1 == start.beats_total;
+}
+
+// The load buffer as a word arriving for group `group` of `command` sees it
+// this cycle: free (never owned, or its group's last RF write is granted
+// now), or owned -- in Q or by a claim earlier in this cycle's pluck. A word
+// may enter when the buffer is free (it claims it for its group) or already
+// holds this group, unfinished. It waits at the FIFO head while the buffer
+// holds another group (this load's previous one or an older load's), or this
+// group complete. Returns whether the word may enter.
+bool Machine::load_buffer_takes(const LsuCommand& command, uint32_t group, IngressPluck& pluck,
+    const Wires& w) const {
+    const auto& start = staging_.at(load_buffer).cur();
+    const bool released = load_buffer_released(w);
+    if (pluck.load_claim.has_value()) {
+        const auto& claim = *pluck.load_claim;
+        return claim.command == command.id && claim.group == group && pluck.lanes.size() != claim.expected;
+    }
+    if (!start.owner.has_value() || released) {
+        IngressPluck::LoadClaim claim;
+        claim.command = command.id;
+        claim.group = group;
+        if (command.kind == LsuKind::uniform_load) {
+            claim.lanes = full_mask();
+            claim.expected = 1;
+            claim.beats_total = 1;
+        } else {
+            claim.lanes = lsu_group_lanes(command, group);
+            const auto lanes = static_cast<uint32_t>(std::popcount(claim.lanes));
+            claim.expected = command.kind == LsuKind::vector_load ? 8 * lanes : lanes;
+            claim.beats_total = command.kind == LsuKind::vector_load ? 8 : 1;
+        }
+        pluck.load_claim = claim;
+        return true;
+    }
+    if (*start.owner != command.id || start.group != group) return false;
+    return start.valid_count + pluck.lanes.size() != start.expected;
+}
+
+// Ingress -> the load buffer at the pluck rate: a v8 load's sector is one
+// lane's eight words, word w of lane l at buffer word (l - first lane of the
+// group) x 8 + w. No sector register.
 bool Machine::pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
     uint32_t take, IngressPluck& pluck, const Wires& w) {
     const auto* command = find_lsu_command(record.command);
     if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(record.command));
-    const auto& start = staging_.at(command->assembly).cur();
-    const bool drained = w.rf_write.granted_to(AsyncWriter::assembly, command->assembly);
-    const auto lane_valid = [&](uint32_t lane) {
-        if (!drained && start.valid[lane] != 0) return true;
-        return std::any_of(pluck.lanes.begin(), pluck.lanes.end(), [&](const IngressPluck::LaneWrite& write) {
-            return write.assembly == command->assembly && write.lane == lane;
-        });
-    };
-    uint32_t valid_count = drained ? 0 : start.valid_count;
-    for (const auto& write : pluck.lanes) {
-        if (write.assembly == command->assembly) ++valid_count;
-    }
-    if (valid_count == config_.lanes) return false;
+    const auto width = lsu_group_width(*command);
+    const auto group = record.lane / width;
+    // The order of the FIFO head is checked before asking whether the buffer
+    // takes it: a sector returned out of request order may belong to a later
+    // group, which the buffer would refuse for good while it waits for the
+    // sector that was skipped (the check reads nothing forward: the count of
+    // bytes received moves only when they are consumed, below).
     sanitizer_.check_ordered_beat(cycle_, record.stream, beat.request, beat.offset + consumed);
-    const uint32_t sectors_per_chunk = config_.lanes * 4 / config_.gmem_sector_bytes;
-    const uint32_t filling_chunk = command->chunks_done + (drained ? 1 : 0);
-    if (record.sector_index / sectors_per_chunk != filling_chunk) {
-        throw SimError("internal vector sector reached the wrong chunk");
-    }
-    const uint32_t chunk_offset = (record.sector_index % sectors_per_chunk) * config_.gmem_sector_bytes;
+    if (!load_buffer_takes(*command, group, pluck, w)) return false;
     for (uint32_t byte = 0; byte < take; byte += 4) {
-        const uint32_t lane = (chunk_offset + beat.offset + consumed + byte) / 4;
-        if (lane_valid(lane)) throw SimError("internal vector word overwrote a valid lane");
+        const uint32_t index = (record.lane - group * width) * 8 + (beat.offset + consumed + byte) / 4;
         uint32_t word = 0;
         std::memcpy(&word, beat.bytes.data() + consumed + byte, 4);
-        pluck.lanes.push_back({command->assembly, lane, word});
+        pluck.lanes.push_back({load_buffer, index, word});
     }
     probe(LsuEdge::assembly_write, command->id, beat.request, take);
     record.received += take;
@@ -804,30 +850,37 @@ bool Machine::pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t
 }
 
 // Gather / ldg.uni: no sector register. The lane's word is taken off the
-// FIFO read port into its lane (uniform: every lane) of the command's
-// assembly register; the rest of the sector is read at the same rate and
-// dropped. The free-ID tag returns with the sector's last byte.
-void Machine::pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
-    uint32_t take, IngressPluck& pluck) {
+// FIFO read port into the load buffer (a gather: word l - first lane of its
+// group; uniform: the one word, fanned out to every lane by the RF write);
+// the rest of the sector is read at the same rate and dropped (those bytes
+// need no buffer). The word waits at the FIFO head while the buffer holds
+// another group. Returns false when the head must wait.
+bool Machine::pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
+    uint32_t take, IngressPluck& pluck, const Wires& w) {
     const uint32_t begin = beat.offset + consumed;
+    // As in pluck_vector: the head's order first, then the buffer.
+    sanitizer_.check_ordered_beat(cycle_, record.stream, beat.request, beat.offset + consumed);
     if (record.word_offset >= begin && record.word_offset + 4 <= begin + take) {
-        uint32_t word = 0;
-        std::memcpy(&word, beat.bytes.data() + (record.word_offset - beat.offset), sizeof(word));
         const auto* command = find_lsu_command(record.command);
         if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(record.command));
-        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            if (record.kind == ReadKind::gather && lane != record.lane) continue;
-            pluck.lanes.push_back({command->assembly, lane, word});
-        }
+        const bool uniform = record.kind == ReadKind::uniform;
+        const auto width = lsu_group_width(*command);
+        const auto group = uniform ? 0 : record.lane / width;
+        if (!load_buffer_takes(*command, group, pluck, w)) return false;
+        uint32_t word = 0;
+        std::memcpy(&word, beat.bytes.data() + (record.word_offset - beat.offset), sizeof(word));
+        pluck.lanes.push_back({load_buffer, uniform ? 0 : record.lane - group * width, word});
         probe(LsuEdge::assembly_write, command->id, beat.request, 4);
     }
     record.received += take;
-    if (record.received == config_.gmem_sector_bytes) pluck.freed_tags.push_back(record.tag);
+    sanitizer_.record_ordered_pluck(record.stream, take);
+    return true;
 }
 
 // (T) A gather or ldg.uni may already have retired while the tail of its
-// last sector is still being read out of the FIFO and dropped (its free-ID
-// tag is held until the sector's last byte), so this tolerates retirement.
+// last sector is still being read out of the FIFO and dropped (its read ID
+// table entry lives until the sector's last byte: drive_read_records), so
+// this tolerates retirement.
 void Machine::note_first_return(uint64_t command) {
     const auto found = lsu_phases_.find(command);
     if (found == lsu_phases_.end()) return;
@@ -839,29 +892,43 @@ void Machine::note_first_return(uint64_t command) {
 // client of the RF write decision: decide_rf_writes in sim.cpp.
 // ---------------------------------------------------------------------------
 
-// RF -> assembly (vector stores): the LSU's async RF reader, one full-width
-// read beat per cycle at most (decide_rf_reads grants it a read port the
-// issue register leaves free). Its candidate: the oldest vector store whose assembly register is
-// empty -- in Q, or drained into the egress FIFO now (d) -- with no beat of
-// its own still travelling to it (a beat fills the register Lr after its
-// read), reading its next source register. A stg.v8 dispatched this cycle
-// takes part (its first beat in its dispatch cycle: bypass (e)).
+// RF -> the store buffer (v8 stores): the LSU's async RF reader, one
+// full-width read beat per cycle at most (decide_rf_reads grants it a read
+// port the issue register leaves free). Stores use the one store buffer in
+// command order, so the only candidate is the OLDEST store that still has
+// data to move (in Q), when it is a v8 store. Its lanes go in fixed groups of
+// lsu.store_group_lanes: for a group it reads rS .. rS+7 once, one beat a
+// cycle (the beats follow each other through the RF read stages), and keeps
+// the group's active lanes -- beat j's lane l lands in buffer word (l - first
+// lane of the group) x 8 + j. The group's first beat needs the buffer free:
+// empty in Q, or its previous data's last word pushed into the egress FIFO
+// now (d). A stg.v8 dispatched this cycle takes part (bypass (e)).
 std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wires& w) const {
     std::vector<const LsuCommand*> commands;
     for (const auto& command : lsu_commands_.cur()) commands.push_back(&command);
     if (w.dispatch.lsu.has_value()) commands.push_back(&w.dispatch.lsu->command);
-    const auto& travelling = lsu_read_pipe_.cur();
     for (const auto* command : commands) {
-        if (command->kind != LsuKind::vector_store || command->chunks_done == 8) continue;
-        const bool in_flight = std::any_of(travelling.begin(), travelling.end(),
-            [&](const LsuRfRead& beat) { return beat.command == command->id; });
-        if (in_flight) continue;
-        const bool admitted_now = w.dispatch.lsu.has_value() && command == &w.dispatch.lsu->command;
+        if (!store_has_data_left(*command)) continue;
+        if (command->kind != LsuKind::vector_store) return std::nullopt;
         const bool drained_now = w.egress.lsu_chunk_drained && w.egress.lsu_command == command->id;
-        const bool empty = admitted_now || drained_now || staging_.at(command->assembly).cur().valid_count == 0;
-        if (!empty) continue;
-        const auto reg = static_cast<uint8_t>(command->reg + command->chunks_done);
-        return RfReadRequest{RfReader::lsu_store, 0, command->warp, reg, command->id, command->assembly};
+        const uint32_t sector = command->chunks_plucked + (drained_now ? 1 : 0);
+        if (sector == command->requests_total) return std::nullopt; // its last group has just left
+        const uint32_t beat = drained_now ? 0 : command->chunks_done;
+        if (beat == 8) return std::nullopt; // the group's eight beats are read; it is landing or draining
+        if (beat == 0 && !drained_now && !w.egress.lsu_store_drained &&
+            staging_.at(store_buffer).cur().owner.has_value()) {
+            return std::nullopt;
+        }
+        const auto width = config_.lsu_store_group_lanes;
+        RfReadRequest request{RfReader::lsu_store, 0, command->warp,
+            static_cast<uint8_t>(command->reg + beat), command->id, store_buffer};
+        request.group = command->sectors.at(sector).lane / width;
+        request.beat = beat;
+        request.lanes = lsu_group_lanes(*command, request.group);
+        // The command's last group: no active lane above it.
+        request.last_group = (request.group + 1) * width >= config_.lanes ||
+            (command->lanes >> ((request.group + 1) * width)) == 0;
+        return request;
     }
     return std::nullopt;
 }
@@ -883,7 +950,6 @@ Machine::EgressWrite Machine::decide_egress_write() {
     EgressWrite write;
     const auto& fifo = egress_fifo_.cur();
     const uint32_t sector_words = config_.gmem_sector_bytes / 4;
-    const uint32_t sectors_per_chunk = config_.lanes * 4 / config_.gmem_sector_bytes;
     const EgressSlot* open = nullptr;
     if (!fifo.empty() && fifo.back().words_written < fifo.back().words_total) open = &fifo.back();
     const auto& tma_stores = tma_store_registers_.cur();
@@ -892,15 +958,16 @@ Machine::EgressWrite Machine::decide_egress_write() {
         const bool tma_ready = tma_head.has_value() && tma_head->complete();
         const LsuCommand* lsu = nullptr;
         for (const auto& command : lsu_commands_.cur()) {
-            if ((command.kind == LsuKind::vector_store && command.chunks_plucked < 8) ||
-                (command.kind == LsuKind::scalar_store && command.words_plucked < command.sectors.size())) {
+            if (store_has_data_left(command)) {
                 lsu = &command;
                 break;
             }
         }
-        if (lsu != nullptr && lsu->kind == LsuKind::vector_store &&
-            staging_.at(lsu->assembly).cur().valid_count != config_.lanes) {
-            lsu = nullptr; // its next RF read beat has not landed yet
+        if (lsu != nullptr && lsu->kind == LsuKind::vector_store) {
+            const auto& buffer = staging_.at(store_buffer).cur();
+            if (buffer.owner != lsu->id || buffer.valid_count != buffer.expected) {
+                lsu = nullptr; // its group's eight RF read beats have not all landed yet
+            }
         }
         if (!tma_ready && lsu == nullptr) return write;
         if (fifo.size() == config_.lsu_egress_sectors) {
@@ -920,10 +987,11 @@ Machine::EgressWrite Machine::decide_egress_write() {
             slot.byte_enable = run_byte_enable(tma_head->run);
             slot.words_total = sector_words;
         } else if (lsu->kind == LsuKind::vector_store) {
+            // The next active lane's sector, in lane order.
             slot.client = GmemClient::lsu;
             slot.command = lsu->id;
-            slot.index = lsu->chunks_plucked * sectors_per_chunk + lsu->words_plucked / sector_words;
-            slot.sector_address = lsu->base + static_cast<uint64_t>(slot.index) * config_.gmem_sector_bytes;
+            slot.index = lsu->chunks_plucked;
+            slot.sector_address = lsu->sectors.at(lsu->chunks_plucked).sector_address;
             slot.byte_enable = full_byte_enable(config_.gmem_sector_bytes);
             slot.words_total = sector_words;
         } else {
@@ -958,22 +1026,37 @@ Machine::EgressWrite Machine::decide_egress_write() {
     } else {
         const auto* command = find_lsu_command(open->command);
         if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(open->command));
-        const auto& assembly = staging_.at(command->assembly).cur();
+        const auto& assembly = staging_.at(store_buffer).cur();
+        if (assembly.owner != command->id) throw SimError("internal: the egress port read another store's buffer");
         write.lsu_command = command->id;
-        write.lsu_assembly = command->assembly;
         for (uint32_t word = 0; word < words; ++word) {
             const uint32_t index = command->words_plucked + word;
             if (command->kind == LsuKind::vector_store) {
-                sanitizer_.check_assembly_lanes_valid(cycle_, command->assembly, assembly.valid, index, 1,
+                // Word `index` of the current lane's sector.
+                const auto width = config_.lsu_store_group_lanes;
+                const auto& sector = command->sectors.at(command->chunks_plucked);
+                const uint32_t at = (sector.lane - assembly.group * width) * 8 + index;
+                sanitizer_.check_assembly_lanes_valid(cycle_, store_buffer, assembly.valid, at, 1,
                     "egress write port");
-                write.words.emplace_back(index * 4 % config_.gmem_sector_bytes, assembly.words[index]);
-                if (index + 1 == config_.lanes) write.lsu_chunk_drained = true; // refillable now (d)
+                write.words.emplace_back(index * 4, assembly.words[at]);
+                if (index + 1 == sector_words) {
+                    // The lane's sector is complete; the group has left the
+                    // buffer when this was its last active lane (d).
+                    const auto next = command->chunks_plucked + 1;
+                    if (next == command->requests_total ||
+                        command->sectors.at(next).lane / width != assembly.group) {
+                        write.lsu_chunk_drained = true;
+                    }
+                }
             } else {
                 // A scatter's sectors are its active lanes', in lane order.
                 const auto& sector = command->sectors.at(index);
-                sanitizer_.check_assembly_lanes_valid(cycle_, command->assembly, assembly.valid, sector.lane, 1,
+                sanitizer_.check_assembly_lanes_valid(cycle_, store_buffer, assembly.valid, sector.lane, 1,
                     "egress write port");
                 write.words.emplace_back(sector.word_offset, assembly.words[sector.lane]);
+                // Its last word leaves: the store buffer is free from the
+                // next cycle (the command still waits for its acks).
+                if (index + 1 == command->sectors.size()) write.lsu_store_drained = true;
             }
         }
     }

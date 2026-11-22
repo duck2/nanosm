@@ -53,7 +53,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
     lanes_ = config.lanes;
     lsu_read_streams_ = config.lsu_read_streams;
     gmem_sector_bytes_ = config.gmem_sector_bytes;
-    lsu_staging_vectors_ = config.lsu_staging_vectors;
     lsu_active_commands_ = config.lsu_active_commands;
     ordered_requests_.resize(config.lsu_read_streams);
     warps_.resize(warps);
@@ -249,7 +248,11 @@ void Sanitizer::check_store_word_collision(
     const IssueSite& site, const std::vector<uint64_t>& word_addresses, const std::string& space) const {
     std::set<uint64_t> seen;
     for (const auto address : word_addresses) {
-        if (!seen.insert(address).second) throw_issue_panic(site, "multiple lanes write the same " + space + " word");
+        if (!seen.insert(address).second) {
+            // `space` names a memory ("gmem": its word) or the unit itself ("gmem sector").
+            throw_issue_panic(site, "multiple lanes write the same " + space +
+                (space.ends_with("sector") ? "" : " word"));
+        }
     }
 }
 
@@ -1038,15 +1041,14 @@ void Sanitizer::record_ordered_pluck(uint32_t stream, uint32_t bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// rfc09 3: every admitted command owns one assembly register for its whole
-// life, so the admitted set can never exceed the pool.
+// rfc09 3: the admitted commands never exceed the command slots.
 // ---------------------------------------------------------------------------
 
 void Sanitizer::check_lsu_admitted(std::size_t admitted) const {
-    if (admitted > lsu_staging_vectors_ || admitted > lsu_active_commands_) {
+    if (admitted > lsu_active_commands_) {
         throw SimError(
             "internal LSU sanitizer: " + std::to_string(admitted) +
-            " admitted commands exceed lsu.staging_vectors/active_commands");
+            " admitted commands exceed lsu.active_commands");
     }
 }
 

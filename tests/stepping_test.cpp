@@ -62,255 +62,72 @@ void test_reg_duplicate_write_panics() {
     require(reg.cur() == 3, "the register did not recover after a duplicate-write PANIC");
 }
 
-// ---- The continuing vector load's assembly register (Codex's four cases + the final chunk) ----
+// ---- The load buffer's groups (2026-11-21: per-lane ldg.v8) ----
 
-// One ldg.v8 of the 512 B block at gmem 0 (eight 64 B chunks; chunk k lands
-// in r(8+k)), seen through the edge probe.
-struct VectorLoadTimeline {
-    std::array<uint64_t, 8> first_word{}; // the chunk's first word enters the assembly register
-    std::array<uint64_t, 8> last_word{};  // its sixteenth
-    std::array<uint64_t, 8> drain{};      // its RF write beat
-    std::array<uint32_t, 8> drains{};     // RF write beats of r(8+k): must be exactly one
-    std::map<uint64_t, std::vector<uint32_t>> chunks_written_at; // cycle -> chunks receiving words
-};
-
-VectorLoadTimeline vector_load_timeline(const nanosm::Machine& machine, uint64_t command) {
-    VectorLoadTimeline t;
-    std::set<uint64_t> requests; // sector order = request order within the command
-    for (const auto& event : machine.edge_events())
-        if (event.edge == LsuEdge::assembly_write && event.id == command) requests.insert(event.aux);
-    require(requests.size() == 16, "vector load: expected 16 sectors");
-    const std::vector<uint64_t> order(requests.begin(), requests.end());
-    const auto chunk_of = [&](uint64_t request) {
-        return static_cast<uint32_t>((std::find(order.begin(), order.end(), request) - order.begin()) / 2);
-    };
-    t.first_word.fill(std::numeric_limits<uint64_t>::max());
-    for (const auto& event : machine.edge_events()) {
-        if (event.edge == LsuEdge::assembly_write && event.id == command) {
-            const auto chunk = chunk_of(event.aux);
-            t.first_word[chunk] = std::min(t.first_word[chunk], event.cycle);
-            t.last_word[chunk] = std::max(t.last_word[chunk], event.cycle);
-            t.chunks_written_at[event.cycle].push_back(chunk);
-        }
-        if (event.edge == LsuEdge::rf_write_beat && event.id == command && event.aux >= 8 && event.aux < 16) {
-            t.drain[event.aux - 8] = event.cycle;
-            ++t.drains[event.aux - 8];
-        }
-    }
-    return t;
-}
-
+// A ldg.v8 whose every lane names the same sector (a uniform base): register
+// first_reg + k holds that sector's word k in every lane.
 void require_vector_data(const nanosm::Machine& machine, uint32_t warp, uint32_t first_reg, uint32_t first_word,
     const std::string& what) {
     for (uint32_t k = 0; k < 8; ++k)
         for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(warp, lane, first_reg + k) == pattern_word(first_word + 16 * k + lane),
+            require(machine.read_reg(warp, lane, first_reg + k) == pattern_word(first_word + k),
                 what + ": r" + std::to_string(first_reg + k) + " lane " + std::to_string(lane) +
-                    " holds a word of another chunk");
+                    " does not hold word " + std::to_string(k) + " of its sector");
 }
 
-std::unique_ptr<nanosm::Machine> run_vector_load(const nanosm::DeviceProfile& config) {
+// One ldg.v8 over sixteen per-lane sectors at the canonical profile (groups
+// of four lanes): four groups, each written by eight RF writes (r8 .. r15,
+// one a cycle at most), none before the group's last word is in the buffer,
+// and no word of the next group in the buffer before the previous group's
+// last write is granted (the buffer is reused in that cycle at the earliest).
+void test_load_buffer_groups() {
+    const auto config = canonical_profile();
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 4096);
-    fill_pattern(gmem, 0, 1024, 0);
-    auto machine = std::make_unique<nanosm::Machine>(
-        config, compile("mov r0, 0\nldg.v8 r8, [r0]\nhalt\n", config), std::move(launch));
-    machine->enable_edge_probe();
-    machine->run();
-    return machine;
-}
-
-// (1) The RF drain is granted: the old vector is written exactly once, from
-// Q; the next chunk's refill starts in that same cycle (the chunk being
-// filled is chunks_done + the drain now); no new word joins the old write.
-void test_assembly_contract_drain_granted() {
-    const auto machine = run_vector_load(fast_bus_profile(2));
-    const auto t = vector_load_timeline(*machine, 0);
-    for (uint32_t k = 0; k < 8; ++k) {
-        require(t.drains[k] == 1, "r" + std::to_string(8 + k) + " was not written exactly once");
-        if (k == 7) continue;
-        require(t.first_word[k + 1] == t.drain[k],
-            "chunk " + std::to_string(k + 1) + " did not start filling in the cycle chunk " +
-                std::to_string(k) + " drained (" + std::to_string(t.first_word[k + 1]) + " vs " +
-                std::to_string(t.drain[k]) + ")");
-        for (const auto chunk : t.chunks_written_at.at(t.drain[k]))
-            require(chunk == k + 1, "a word of chunk " + std::to_string(chunk) + " entered while chunk " +
-                std::to_string(k) + " drained");
-    }
-    require_vector_data(*machine, 0, 8, 0, "drain granted");
-}
-
-// (2) The RF drain is denied by existing bookings (warp 1's fadds book the
-// same bank's write port booking_horizon cycles ahead, one per cycle): the
-// old vector stays put, the ingress FIFO is not read, and no chunk, depbar
-// or command state changes. Since I1 the denial is bounded: the denied drain
-// with service owed inhibits warp 1's new bookings to the bank, so it drains,
-// intact, once the old ones have passed (no denial outlasts the horizon).
-void test_assembly_contract_drain_denied() {
-    auto config = fast_bus_profile(2);
-    config.gmem_latency_dram_ticks = 2 * booking_horizon; // the stream fills the calendar first
-    with_long_bookings(config);
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& gmem = image_bytes(launch.gmem_image, 4096);
-    fill_pattern(gmem, 0, 1024, 0);
-    // r8 and warp 1's stream (r2, r5, ...) share RF bank 2.
-    std::string text = R"(
-        usread ur0, WARP_ID
-        ur2r r29, ur0
-        setp.ne.u32 p0, r29, 0
-        @p0 bra.uni other
-        mov r30, 0
-        ldg.v8 r8, [r30]
-        halt
-    other:
-    )";
-    text += booking_stream(2, 200);
-    text += "halt\n";
-    nanosm::Machine machine(config, compile(text, config), std::move(launch));
-    machine.enable_edge_probe();
-    uint64_t waits = machine.trace().summary().lsu_rf_write_wait_cycles;
-    uint32_t denied = 0;
-    uint32_t episode = 0;
-    uint32_t longest = 0;
-    std::size_t seen = 0;
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        tick_capped(machine);
-        const auto now = machine.trace().summary().lsu_rf_write_wait_cycles;
-        const bool was_denied = now > waits;
-        waits = now;
-        std::vector<LsuEdge> edges;
-        for (; seen < machine.edge_events().size(); ++seen) edges.push_back(machine.edge_events()[seen].edge);
-        episode = was_denied ? episode + 1 : 0;
-        longest = std::max(longest, episode);
-        if (!was_denied) continue;
-        ++denied;
-        const auto where = " in denied cycle " + std::to_string(cycle);
-        for (const auto edge : edges) {
-            require(edge != LsuEdge::rf_write_beat, "an RF write beat" + where);
-            require(edge != LsuEdge::assembly_write, "a word joined the full assembly register" + where);
-            require(edge != LsuEdge::ingress_read, "the ingress FIFO was read" + where);
-        }
-        uint32_t pending = 0;
-        for (uint8_t bar = 0; bar < 6; ++bar) pending += machine.depbar_value(0, bar);
-        require(pending == 1, "warp 0's depbar changed" + where);
-        require(machine.lsu_commands_in_flight() == 1, "the command slot changed" + where);
-    }
-    require(denied >= booking_horizon - 5,
-        "the drain was denied only " + std::to_string(denied) + " cycles; the test proves little");
-    require(longest <= booking_horizon,
-        "a denial lasted " + std::to_string(longest) + " cycles: the owed bit did not stop new bookings");
-    require(machine.trace().summary().rf_simt_inhibited != 0, "warp 1's bookings were never inhibited");
-    const auto t = vector_load_timeline(machine, 0);
-    for (uint32_t k = 0; k < 8; ++k) require(t.drains[k] == 1, "a chunk was written twice or never");
-    require_vector_data(machine, 0, 8, 0, "drain denied");
-}
-
-// (3) A fill that completes in a cycle does not drain in it: the RF write is
-// exactly the next cycle (uncontended).
-void test_assembly_contract_fill_completes() {
-    const auto machine = run_vector_load(fast_bus_profile(2));
-    const auto t = vector_load_timeline(*machine, 0);
-    for (uint32_t k = 0; k < 8; ++k)
-        require(t.drain[k] == t.last_word[k] + 1,
-            "chunk " + std::to_string(k) + ": sixteenth word at " + std::to_string(t.last_word[k]) +
-                ", RF write at " + std::to_string(t.drain[k]) + " (not the next cycle)");
-}
-
-// (4) An empty register under a wide pluck: words reach the RF no earlier
-// than the next cycle. At 8 words per cycle a chunk fills in two cycles. At
-// 16 words per cycle, once the ingress FIFO has backed up (warp 1's bookings
-// hold chunk 0's RF write port for a while), a whole chunk enters the register
-// emptied by the previous drain in one cycle, and still drains only the next.
-// (I1: the bookings warp 1 makes after chunk 0's drain land booking_horizon
-// cycles later, after the last chunk: chunks 1..7 are uncontended.)
-void test_assembly_contract_wide_pluck() {
-    {
-        const auto machine = run_vector_load(fast_bus_profile(8));
-        const auto t = vector_load_timeline(*machine, 0);
-        for (uint32_t k = 0; k < 8; ++k)
-            require(t.drain[k] == t.last_word[k] + 1, "a chunk passed through to the RF (pluck 8)");
-        require_vector_data(*machine, 0, 8, 0, "wide pluck 8");
-    }
-    auto config = fast_bus_profile(16);
-    config.dram_clock_hz = 2 * config.core_clock_hz;
-    config.gmem_latency_dram_ticks = 4 * booking_horizon; // the stream fills the calendar first
-    with_long_bookings(config);
-    nanosm::Launch launch;
-    launch.active_warps = 2;
     fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-    std::string text = R"(
-        usread ur0, WARP_ID
-        ur2r r29, ur0
-        setp.ne.u32 p0, r29, 0
-        @p0 bra.uni other
-        mov r30, 0
-        ldg.v8 r8, [r30]
-        halt
-    other:
-    )";
-    text += booking_stream(2, 100); // bank 2: r8's
-    text += "halt\n";
-    nanosm::Machine machine(config, compile(text, config), std::move(launch));
+    nanosm::Machine machine(config,
+        compile("sread r1, LANE_ID\nshli r0, r1, 5\nldg.v8 r8, [r0]\nhalt\n", config), std::move(launch));
     machine.enable_edge_probe();
     machine.run();
-    const auto t = vector_load_timeline(machine, 0);
-    uint32_t whole = 0;
-    for (uint32_t k = 0; k < 8; ++k) {
-        require(t.drain[k] > t.last_word[k], "a chunk passed through to the RF (pluck 16)");
-        if (k == 0) continue; // chunk 0 waited on warp 1's bookings
-        require(t.drain[k] == t.last_word[k] + 1, "an uncontended chunk did not drain the next cycle (pluck 16)");
-        if (t.first_word[k] == t.last_word[k]) ++whole;
+    const uint32_t group_lanes = config.lsu_load_group_lanes;
+    const uint32_t groups = 16 / group_lanes;
+    std::vector<uint64_t> requests; // in arrival order = lane order
+    std::map<uint64_t, uint64_t> first_word, last_word;
+    std::vector<nanosm::LsuEdgeEvent> writes;
+    for (const auto& event : machine.edge_events()) {
+        if (event.edge == LsuEdge::assembly_write) {
+            if (first_word.emplace(event.aux, event.cycle).second) requests.push_back(event.aux);
+            last_word[event.aux] = event.cycle;
+        }
+        if (event.edge == LsuEdge::rf_write_beat) writes.push_back(event);
     }
-    require(whole != 0, "no chunk entered its register in one cycle; the test proves little");
-    require_vector_data(machine, 0, 8, 0, "wide pluck 16");
-}
-
-// (5) The final chunk: its RF write releases the command slot and the
-// assembly register, and issue reallocates both to the next ldg.v8 in that
-// same cycle (lsu.active_commands = staging_vectors = 1). Never two owners;
-// the new command's words start after its own requests; no data mixes.
-void test_assembly_contract_final_chunk() {
-    auto config = fast_bus_profile(2);
-    config.lsu_staging_vectors = 1;
-    config.lsu_active_commands = 1;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 4096);
-    fill_pattern(gmem, 0, 1024, 0);
-    nanosm::Machine machine(config,
-        compile("mov r0, 0\nmov r1, 512\nldg.v8 r8, [r0]\nldg.v8 r16, [r1]\nhalt\n", config),
-        std::move(launch), {.timeline = true});
-    machine.enable_edge_probe();
-    while (!machine.done()) {
-        tick_capped(machine);
-        require(machine.lsu_commands_in_flight() <= 1, "two LSU commands held the one slot");
+    require(requests.size() == 16, "expected sixteen sectors, one per lane");
+    require(writes.size() == 8 * groups, "expected eight RF writes per lane group");
+    for (std::size_t k = 1; k < writes.size(); ++k)
+        require(writes[k].cycle > writes[k - 1].cycle, "the LSU wrote two RF beats in one cycle");
+    for (uint32_t group = 0; group < groups; ++group) {
+        uint64_t complete = 0;
+        for (uint32_t lane = group * group_lanes; lane < (group + 1) * group_lanes; ++lane)
+            complete = std::max(complete, last_word.at(requests[lane]));
+        for (uint32_t j = 0; j < 8; ++j) {
+            const auto& write = writes[8 * group + j];
+            require(write.aux == 8 + j, "a group's RF writes are not r8 .. r15 in order");
+            require(write.cycle > complete, "a group was written to the RF before its last word was in the buffer");
+        }
+        if (group + 1 != groups) {
+            require(first_word.at(requests[(group + 1) * group_lanes]) >= writes[8 * group + 7].cycle,
+                "the next group's word entered the buffer before the previous group's last RF write");
+        }
     }
-    std::map<uint64_t, std::pair<uint64_t, uint64_t>> life; // command -> admitted, released
-    for (const auto& event : machine.trace().events())
-        if (event.category == nanosm::TraceCategory::gmem && event.name == "ldg.v8")
-            life[event.id] = {event.start_cycle, event.start_cycle + event.duration_cycles};
-    require(life.size() == 2, "expected two ldg.v8 commands");
-    const auto first = vector_load_timeline(machine, 0);
-    const auto final_drain = first.drain[7];
-    require(life[0].second == final_drain, "the first command did not end at its final RF write");
-    // I6a: the second ldg.v8 issues in the cycle the first releases its slot
-    // (look-ahead (c)) and the LSU admits it issue_to_dispatch later.
-    const auto admitted = final_drain + nanosm::issue_to_dispatch(config);
-    require(life[1].first == admitted,
-        "the second ldg.v8 was not admitted issue_to_dispatch after the first released its slot (" +
-            std::to_string(life[1].first) + " vs " + std::to_string(admitted) + ")");
-    const auto second = vector_load_timeline(machine, 1);
-    require(second.first_word[0] > final_drain, "the new command's words entered in the reallocation cycle");
-    require_vector_data(machine, 0, 8, 0, "final chunk (old command)");
-    require_vector_data(machine, 0, 16, 128, "final chunk (new command)");
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        for (uint32_t j = 0; j < 8; ++j)
+            require(machine.read_reg(0, lane, 8 + j) == pattern_word(8 * lane + j),
+                "r" + std::to_string(8 + j) + " lane " + std::to_string(lane) + " is not word j of the lane's sector");
 }
 
 // ---- Same-cycle reuse after a load's final RF drain (staging = active = 1) ----
 
-// The one assembly register at the end of a cycle.
+// One of the LSU's two buffers at the end of a cycle.
 struct AssemblyAfter {
     std::optional<uint64_t> owner;
     std::vector<uint8_t> valid;
@@ -320,8 +137,9 @@ struct AssemblyAfter {
 struct ReuseRun {
     std::unique_ptr<nanosm::Machine> machine;
     uint64_t reuse_cycle = 0; // the second command's admission (dispatch)
-    AssemblyAfter after;      // the register after that cycle
-    std::map<uint64_t, AssemblyAfter> by_cycle; // the register after every cycle
+    AssemblyAfter after;      // the load buffer after that cycle
+    AssemblyAfter store_after; // the store buffer after that cycle
+    std::map<uint64_t, AssemblyAfter> store_by_cycle; // the store buffer after every cycle
 };
 
 // `old_load` is LSU command 0, `second` (opcode `second_name`) command 1. With
@@ -336,12 +154,13 @@ struct ReuseRun {
 ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
     const std::string& second_name) {
     auto config = fast_bus_profile(2);
-    config.lsu_staging_vectors = 1;
     config.lsu_active_commands = 1;
     nanosm::Launch launch;
     launch.active_warps = 1;
     fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-    std::string text = "sread r4, LANE_ID\nshli r5, r4, 2\nori r6, r5, 2048\nmov r0, 0\nmov r2, 2048\n";
+    // r2: 2048 + 32 x lane, a stg.v8's per-lane sectors; r0 = 0 for every
+    // lane, so the old ldg.v8 loads the sector at 0 into every lane.
+    std::string text = "sread r4, LANE_ID\nshli r5, r4, 2\nori r6, r5, 2048\nmov r0, 0\nshli r2, r4, 5\naddi r2, r2, 2048\n";
     for (uint32_t j = 0; j < 8; ++j) text += "mov r" + std::to_string(24 + j) + ", " + std::to_string(101 + j) + "\n";
     text += old_load + "\n" + second + "\nhalt\n";
     ReuseRun run;
@@ -349,11 +168,13 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
         config, compile(text, config), std::move(launch), nanosm::TraceOptions{.timeline = true});
     auto& machine = *run.machine;
     machine.enable_edge_probe();
-    std::map<uint64_t, AssemblyAfter> after;
+    std::map<uint64_t, AssemblyAfter> after;       // the load buffer
+    std::map<uint64_t, AssemblyAfter> store_after; // the store buffer
     while (!machine.done()) {
         const auto cycle = machine.cycle();
         tick_capped(machine);
         after[cycle] = {machine.assembly_owner(0), machine.assembly_valid(0), machine.assembly_valid_count(0)};
+        store_after[cycle] = {machine.assembly_owner(1), machine.assembly_valid(1), machine.assembly_valid_count(1)};
     }
     uint64_t final_drain = 0;
     for (const auto& event : machine.edge_events())
@@ -367,7 +188,8 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
         second_name + " was not admitted issue_to_dispatch after '" + old_load + "' made its final RF write");
     run.reuse_cycle = dispatch;
     run.after = after.at(dispatch);
-    run.by_cycle = std::move(after);
+    run.store_after = store_after.at(dispatch);
+    run.store_by_cycle = std::move(store_after);
     return run;
 }
 
@@ -380,17 +202,21 @@ void require_old_load_data(const nanosm::Machine& machine, const std::string& ol
         require(machine.read_reg(0, lane, 8) == pattern_word(lane), old_load + ": lane " + std::to_string(lane));
 }
 
-// A scalar store admitted in a load's final-drain cycle: after the cycle it
-// owns the register with all sixteen lanes valid (Codex 2026-10-08: the old
-// load's drain used to clear them after the store's fill). The output alone
-// cannot show it: scalar-store egress reads the words without valid_count.
+// A scalar store admitted after a load's final drain: after its dispatch
+// cycle it owns the STORE buffer with all sixteen lanes valid, and the load
+// buffer is empty and unowned (2026-11-21: one buffer per direction, owned
+// only while data is in it). The output alone cannot show it: scalar-store
+// egress reads the words without valid_count.
 void test_assembly_reuse_load_to_scalar_store() {
     for (const std::string old_load : {"ldg.v8 r8, [r0]", "ldg r8, [r5]"}) {
         const auto run = run_reuse_after_final_drain(old_load, "stg [r5 + 2048], r6", "stg");
         const auto where = " after the reuse cycle " + std::to_string(run.reuse_cycle) + " (" + old_load + ")";
-        require(run.after.owner == 1u, "the store does not own the register" + where);
-        require(run.after.valid_count == 16 && run.after.valid == std::vector<uint8_t>(16, 1),
+        require(run.store_after.owner == 1u, "the store does not own the store buffer" + where);
+        require(run.store_after.valid_count == 16 &&
+                std::count(run.store_after.valid.begin(), run.store_after.valid.begin() + 16, 1) == 16,
             "the store's valid bits were lost" + where);
+        require(!run.after.owner.has_value() && run.after.valid_count == 0,
+            "the load buffer is still owned after the load's final drain" + where);
         for (uint32_t lane = 0; lane < 16; ++lane)
             require(run.machine->read_gmem_u32(2048 + 4 * lane) == 2048 + 4 * lane,
                 "the scalar store wrote the wrong word for lane " + std::to_string(lane));
@@ -399,7 +225,8 @@ void test_assembly_reuse_load_to_scalar_store() {
 }
 
 // A stg.v8 admitted then: its first RF read beat is sampled in its admission
-// cycle (bypass (e)) and fills the register Lr later (I6a).
+// cycle (bypass (e)) and fills the store buffer Lr later (I6a); the buffer has
+// no owner until that data lands.
 void test_assembly_reuse_load_to_vector_store() {
     const std::string old_load = "ldg.v8 r8, [r0]";
     const auto run = run_reuse_after_final_drain(old_load, "stg.v8 [r2], r24", "stg.v8");
@@ -407,26 +234,28 @@ void test_assembly_reuse_load_to_vector_store() {
     for (const auto& event : run.machine->edge_events())
         if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == run.reuse_cycle) first_read_now = true;
     require(first_read_now, "the stg.v8's first RF read was not in the reuse cycle; the test proves little");
-    require(run.after.owner == 1u && run.after.valid_count == 0,
-        "the stg.v8 does not own an empty register after the reuse cycle");
-    const auto filled = run.by_cycle.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles);
-    require(filled.owner == 1u && filled.valid_count == 16 && filled.valid == std::vector<uint8_t>(16, 1),
-        "the stg.v8's first chunk is not valid Lr after the reuse cycle");
+    require(!run.store_after.owner.has_value() && run.store_after.valid_count == 0,
+        "the store buffer is owned before the stg.v8's first beat has landed");
+    const auto filled = run.store_by_cycle.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles);
+    // The first beat brings r24 for the first group's lanes: one word a lane.
+    require(filled.owner == 1u && filled.valid_count == canonical_profile().lsu_store_group_lanes,
+        "the stg.v8's first read beat is not in the store buffer Lr after the reuse cycle");
     for (uint32_t j = 0; j < 8; ++j)
         for (uint32_t lane = 0; lane < 16; ++lane)
-            require(run.machine->read_gmem_u32(2048 + 4 * (16 * j + lane)) == 101 + j,
+            require(run.machine->read_gmem_u32(2048 + 32 * lane + 4 * j) == 101 + j,
                 "the stg.v8 wrote the wrong word: r" + std::to_string(24 + j) + " lane " + std::to_string(lane));
     require_old_load_data(*run.machine, old_load);
 }
 
-// A new load admitted in that cycle starts empty. (Assembly contract 5
-// covers ldg.v8 -> ldg.v8 through the data path.)
+// A new load admitted then: the load buffer is empty and unowned until its
+// first word returns. (Assembly contract 5 covers ldg.v8 -> ldg.v8 through
+// the data path.)
 void test_assembly_reuse_load_to_load() {
     const std::string old_load = "ldg.v8 r8, [r0]";
     const auto run = run_reuse_after_final_drain(old_load, "ldg r16, [r5 + 1024]", "ldg");
-    require(run.after.owner == 1u, "the new load does not own the register after the reuse cycle");
-    require(run.after.valid_count == 0 && run.after.valid == std::vector<uint8_t>(16, 0),
-        "the new load's register is not empty after the reuse cycle");
+    require(!run.after.owner.has_value(), "the load buffer is owned before the new load's first word returned");
+    require(run.after.valid_count == 0,
+        "the load buffer is not empty after the old load's final drain");
     for (uint32_t lane = 0; lane < 16; ++lane)
         require(run.machine->read_reg(0, lane, 16) == pattern_word(256 + lane),
             "the new load returned the wrong word for lane " + std::to_string(lane));
@@ -680,7 +509,8 @@ void test_driver_shuffle_unit_kernels() {
         launch.active_warps = 2;
         fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
         std::string text = "usread ur0, WARP_ID\nur2r r29, ur0\nsetp.ne.u32 p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
-            "mov r28, 2048\nldg.v8 r0, [r30]\nldg.v8 r8, [r31]\nldg r16, [r28]\nstg.v8 [r28], r0\nhalt\nother:\n";
+            "mov r28, 2048\nsread r27, LANE_ID\nshli r27, r27, 5\naddi r27, r27, 2048\n"
+            "ldg.v8 r0, [r30]\nldg.v8 r8, [r31]\nldg r16, [r28]\nstg.v8 [r27], r0\nhalt\nother:\n";
         text += booking_stream(0, 150);
         text += "halt\n";
         return std::make_unique<nanosm::Machine>(config, compile(text, config), std::move(launch),
@@ -783,29 +613,9 @@ TEST(Stepping, reg_duplicate_write_panics) {
     test_reg_duplicate_write_panics();
 }
 
-// assembly contract 1: drain granted, refill at once
-TEST(Stepping, assembly_contract_drain_granted) {
-    test_assembly_contract_drain_granted();
-}
-
-// assembly contract 2: drain denied by a booking
-TEST(Stepping, assembly_contract_drain_denied) {
-    test_assembly_contract_drain_denied();
-}
-
-// assembly contract 3: no drain in the filling cycle
-TEST(Stepping, assembly_contract_fill_completes) {
-    test_assembly_contract_fill_completes();
-}
-
-// assembly contract 4: wide pluck, no pass-through
-TEST(Stepping, assembly_contract_wide_pluck) {
-    test_assembly_contract_wide_pluck();
-}
-
-// assembly contract 5: final chunk reallocation
-TEST(Stepping, assembly_contract_final_chunk) {
-    test_assembly_contract_final_chunk();
+// the load buffer's lane groups: eight RF writes each, after the group's last word
+TEST(Stepping, load_buffer_groups) {
+    test_load_buffer_groups();
 }
 
 // assembly reuse: final load drain -> scalar store

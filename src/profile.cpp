@@ -99,11 +99,13 @@ json profile_json(const DeviceProfile& p) {
             {"sector_bytes", p.gmem_sector_bytes},
             {"bus_bytes_per_dram_tick", p.gmem_bus_bytes_per_dram_tick},
             {"latency_dram_ticks", p.gmem_latency_dram_ticks},
+            {"turnaround_dram_ticks", p.gmem_turnaround_dram_ticks},
             {"queue_sectors", p.gmem_queue_sectors},
         }},
         {"lsu", {
             {"active_commands", p.lsu_active_commands},
-            {"staging_vectors", p.lsu_staging_vectors},
+            {"load_group_lanes", p.lsu_load_group_lanes},
+            {"store_group_lanes", p.lsu_store_group_lanes},
             {"read_streams", p.lsu_read_streams},
             {"pluck_words_per_cycle", p.lsu_pluck_words_per_cycle},
             {"ingress_sectors", p.lsu_ingress_sectors},
@@ -358,15 +360,31 @@ void validate_device_profile(const DeviceProfile& p) {
             "device profile: lsu needs sectors <= 64 B dividing a lane-wide register and a "
             "bus beat of whole words");
     }
-    if (p.lsu_active_commands == 0 || p.lsu_staging_vectors == 0 ||
-        p.lsu_pluck_words_per_cycle == 0 || p.lsu_sectors_in_flight == 0) {
+    if (p.lsu_active_commands == 0 || p.lsu_pluck_words_per_cycle == 0 || p.lsu_sectors_in_flight == 0) {
         throw ProfileError(
-            "device profile: lsu active_commands, staging_vectors, pluck_words_per_cycle and "
+            "device profile: lsu active_commands, pluck_words_per_cycle and "
             "sectors_in_flight must be nonzero");
     }
-    if (p.lsu_read_streams < 2 || p.lsu_read_streams > 64) {
+    const auto group_ok = [&](uint32_t lanes) {
+        return lanes != 0 && (lanes & (lanes - 1)) == 0 && lanes <= p.lanes && p.lanes % lanes == 0;
+    };
+    if (!group_ok(p.lsu_load_group_lanes) || !group_ok(p.lsu_store_group_lanes)) {
         throw ProfileError(
-            "device profile: lsu read_streams must be in 2..64 (stream 0 TMA, 1..n-1 vector)");
+            "device profile: lsu load_group_lanes and store_group_lanes must be powers of two "
+            "dividing the lanes (1, 2, 4, 8, 16)");
+    }
+    if (8 * p.lsu_store_group_lanes < p.lanes) {
+        throw ProfileError(
+            "device profile: lsu store_group_lanes x 8 words must hold a scalar store's lanes "
+            "(the store buffer takes a stg's data at its dispatch)");
+    }
+    // Two ordered read streams exist: the TMA's and the load / store unit's
+    // (every load returns in request order, for the one load buffer). The
+    // field says so; no other value describes this machine.
+    if (p.lsu_read_streams != 2) {
+        throw ProfileError(
+            "device profile: lsu read_streams must be 2 (stream 0 the TMA's reads, stream 1 the load / "
+            "store unit's, each in request order)");
     }
     if (p.lsu_ingress_sectors < 2 || p.lsu_egress_sectors < 2) {
         throw ProfileError("device profile: lsu ingress and egress FIFOs must hold at least two sectors");
@@ -540,11 +558,13 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.gmem_sector_bytes = field<uint32_t>(gmem, "sector_bytes");
     p.gmem_bus_bytes_per_dram_tick = field<uint32_t>(gmem, "bus_bytes_per_dram_tick");
     p.gmem_latency_dram_ticks = field<uint32_t>(gmem, "latency_dram_ticks");
+    p.gmem_turnaround_dram_ticks = field<uint32_t>(gmem, "turnaround_dram_ticks");
     p.gmem_queue_sectors = field<uint32_t>(gmem, "queue_sectors");
     if (!document.contains("lsu")) throw ProfileError("device profile: missing 'lsu' section");
     const auto& lsu = document.at("lsu");
     p.lsu_active_commands = field<uint32_t>(lsu, "active_commands");
-    p.lsu_staging_vectors = field<uint32_t>(lsu, "staging_vectors");
+    p.lsu_load_group_lanes = field<uint32_t>(lsu, "load_group_lanes");
+    p.lsu_store_group_lanes = field<uint32_t>(lsu, "store_group_lanes");
     p.lsu_read_streams = field<uint32_t>(lsu, "read_streams");
     p.lsu_pluck_words_per_cycle = field<uint32_t>(lsu, "pluck_words_per_cycle");
     p.lsu_ingress_sectors = field<uint32_t>(lsu, "ingress_sectors");

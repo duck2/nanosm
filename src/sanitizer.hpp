@@ -506,7 +506,6 @@ private:
     uint32_t lanes_ = 0;
     uint32_t lsu_read_streams_ = 0;
     uint32_t gmem_sector_bytes_ = 0;
-    uint32_t lsu_staging_vectors_ = 0;
     uint32_t lsu_active_commands_ = 0;
 
     // n is tiny (a few outstanding commands); checks are linear scans.

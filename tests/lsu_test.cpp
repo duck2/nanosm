@@ -99,53 +99,78 @@ void test_lsu_scalar_ldg_is_one_request_per_lane() {
         "scalar ldg useful/sector byte accounting is wrong");
 }
 
-// (a) Replaces "gmem v8 roundtrip" (row-per-lane): register rD+j, lane l
-// <-> byte rA + 4*(16*j + l), both directions, with guard bytes.
-void test_lsu_v8_interleaved_mapping() {
-    constexpr uint32_t source = 1024;
+// (a) ldg.v8 / stg.v8 are per lane (2026-11-21): each ACTIVE lane moves the
+// sector at ITS OWN address, and the sector's word j is rD + j (rS + j) at
+// that lane. Astra's check first: memory holds word indices and lane l names
+// the sector at 32 x (15 - l), so r(D + 3) must hold 123, 115, ..., 3 -- a
+// load and a store that shared one wrong lane permutation could not pass it.
+// Then a store to per-lane sectors with guard bytes, and both under a write
+// mask (@p): masked-off lanes make no request and keep their old values.
+void test_lsu_v8_per_lane_mapping() {
     constexpr uint32_t target = 4096;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 8192);
-    fill_pattern(gmem, source, 128, 0);
-    std::fill(gmem.begin() + target - 64, gmem.begin() + target + 512 + 64, 0xA5);
-    std::string source_text = R"(
-        mov r30, 1024
-        ldg.v8 r8, [r30]
+    const auto image = [] {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& gmem = image_bytes(launch.gmem_image, 8192);
+        for (uint32_t word = 0; word < 128; ++word) write_u32(gmem, 4 * word, word);
+        std::fill(gmem.begin() + target - 64, gmem.begin() + target + 512 + 64, 0xA5);
+        return launch;
+    };
+    // r30 = 32 x (15 - lane): the source sectors, reversed; r31 = 4096 + 32 x
+    // lane: the target sectors; r(16 + j) = lane x 256 + a tag for j.
+    std::string setup = R"(
         sread r1, LANE_ID
-        shli r2, r1, 8
+        xori r2, r1, 15
+        shli r30, r2, 5
+        shli r3, r1, 5
+        addi r31, r3, 4096
+        shli r4, r1, 8
+        andi r5, r1, 1
+        setp.ne.u32 p0, r5, 0
     )";
     for (uint32_t j = 0; j < 8; ++j)
-        source_text += "addi r" + std::to_string(16 + j) + ", r2, " + std::to_string(0x100000 + j * 0x10000) + "\n";
-    source_text += "mov r31, 4096\nstg.v8 [r31], r16\nhalt\n";
-    nanosm::Machine machine(canonical_profile(), compile(source_text), std::move(launch));
-    machine.run();
-    for (uint32_t j = 0; j < 8; ++j) {
+        setup += "addi r" + std::to_string(16 + j) + ", r4, " + std::to_string(0x100000 + j * 0x10000) + "\n";
+    for (const bool masked : {false, true}) {
+        const std::string mask = masked ? "@p0 " : "";
+        nanosm::Machine machine(canonical_profile(),
+            compile(setup + mask + "ldg.v8 r8, [r30]\n" + mask + "stg.v8 [r31], r16\nhalt\n"), image());
+        machine.run();
+        const std::string what = masked ? " (odd lanes only)" : "";
         for (uint32_t lane = 0; lane < 16; ++lane) {
-            // Written-out contract, independent of the implementation.
-            const uint32_t word = 16 * j + lane;
-            require(machine.read_reg(0, lane, 8 + j) == pattern_word(word),
-                "ldg.v8 r" + std::to_string(8 + j) + " lane " + std::to_string(lane) +
-                    " is not word 16*j + l of the block");
-            require(machine.read_gmem_u32(target + 4 * word) == lane * 256 + 0x100000 + j * 0x10000,
-                "stg.v8 r" + std::to_string(16 + j) + " lane " + std::to_string(lane) +
-                    " did not land at word 16*j + l");
+            const bool active = !masked || lane % 2 == 1;
+            if (active) {
+                require(machine.read_reg(0, lane, 11) == 123 - 8 * lane,
+                    "ldg.v8 r11 lane " + std::to_string(lane) + " is not word 3 of the sector at 32 x (15 - lane)" + what);
+            }
+            for (uint32_t j = 0; j < 8; ++j) {
+                // Written-out contract, independent of the implementation.
+                require(machine.read_reg(0, lane, 8 + j) == (active ? 8 * (15 - lane) + j : 0u),
+                    "ldg.v8 r" + std::to_string(8 + j) + " lane " + std::to_string(lane) +
+                        (active ? " is not word j of that lane's sector" : " was written though masked off") + what);
+                require(machine.read_gmem_u32(target + 32 * lane + 4 * j) ==
+                        (active ? lane * 256 + 0x100000 + j * 0x10000 : 0xA5A5A5A5u),
+                    "stg.v8 r" + std::to_string(16 + j) + " lane " + std::to_string(lane) +
+                        (active ? " did not land at word j of that lane's sector" : " was stored though masked off") + what);
+            }
         }
+        for (uint32_t byte = target - 64; byte < target; ++byte)
+            require(machine.gmem()[byte] == 0xA5, "stg.v8 damaged the guard before its sectors");
+        for (uint32_t byte = target + 512; byte < target + 576; ++byte)
+            require(machine.gmem()[byte] == 0xA5, "stg.v8 damaged the guard after its sectors");
+        const auto& summary = machine.trace().summary();
+        const uint32_t lanes = masked ? 8 : 16;
+        require(summary.lsu_vector_loads == 1 && summary.lsu_vector_stores == 1 &&
+                summary.lsu_sectors == 2 * lanes && summary.lsu_useful_bytes == 2 * 32 * lanes,
+            "a v8 command is not exactly one whole sector per active lane" + what);
     }
-    for (uint32_t byte = target - 64; byte < target; ++byte)
-        require(machine.gmem()[byte] == 0xA5, "stg.v8 damaged the guard before its block");
-    for (uint32_t byte = target + 512; byte < target + 576; ++byte)
-        require(machine.gmem()[byte] == 0xA5, "stg.v8 damaged the guard after its block");
-    const auto& summary = machine.trace().summary();
-    require(summary.lsu_vector_loads == 1 && summary.lsu_vector_stores == 1 &&
-            summary.lsu_sectors == 32 && summary.gmem_sectors == 32 && summary.lsu_useful_bytes == 1024,
-        "a v8 command is not exactly sixteen whole sectors");
 }
 
-// Replaces the old "gmem v8 source lifetime" with a uniform base.
+// A stg.v8's sources are read later, once per lane group: a younger
+// overwrite of one of them waits for the store.
 void test_lsu_v8_store_source_lifetime() {
     const std::string text = R"(
-        mov r0, 0
+        sread r1, LANE_ID
+        shli r0, r1, 5
         mov r8, 17
         mov r9, 18
         mov r10, 19
@@ -159,7 +184,7 @@ void test_lsu_v8_store_source_lifetime() {
         halt
     )";
     const auto scheduled = nanosm::compile_qtx(text, canonical_profile());
-    require(scheduled.instructions[10].control.wait_mask != 0,
+    require(scheduled.instructions[11].control.wait_mask != 0,
         "qtxc did not protect the deferred stg.v8 source tuple");
     nanosm::Launch launch;
     launch.active_warps = 1;
@@ -168,66 +193,9 @@ void test_lsu_v8_store_source_lifetime() {
     machine.run();
     for (uint32_t j = 0; j < 8; ++j)
         for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_gmem_u32(4 * (16 * j + lane)) == 17 + j,
+            require(machine.read_gmem_u32(32 * lane + 4 * j) == 17 + j,
                 "younger overwrite changed a deferred stg.v8 source");
     require(machine.read_reg(0, 3, 8) == 99, "the younger overwrite was lost");
-}
-
-void test_gmem_v8_predication_is_rejected() {
-    try {
-        (void)compile("@p0 stg.v8 [r0], r8\nhalt\n");
-        throw std::runtime_error("predicated stg.v8 was accepted (a warp-wide store cannot be masked)");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("stg.v8 cannot be masked (@p)") != std::string::npos,
-            "predicated stg.v8 produced the wrong rejection: " + std::string(error.what()));
-    }
-}
-
-// Replaces "gmem v8 shared return": LSU RF writes are full-width beats through
-// the reservations, at most one per cycle machine-wide, never single lanes.
-void test_lsu_rf_writes_are_full_width_beats() {
-    auto config = canonical_profile();
-    config.gmem_latency_dram_ticks = 0;
-    config.gmem_bus_bytes_per_dram_tick = config.gmem_sector_bytes;
-    config.dram_clock_hz = config.core_clock_hz * 64;
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& image = image_bytes(launch.gmem_image, 1024);
-    fill_pattern(image, 0, 256, 0);
-    nanosm::Machine machine(config, compile(R"(
-        usread ur0, WARP_ID
-        ur2r r0, ur0
-        shli r0, r0, 9
-        ldg.v8 r8, [r0]
-        halt
-    )", config), std::move(launch));
-    std::vector<uint32_t> previous(2 * 8 * 16, 0);
-    uint32_t writes = 0;
-    while (!machine.done()) {
-        tick_capped(machine);
-        uint32_t registers_changed = 0;
-        for (uint32_t warp = 0; warp < 2; ++warp) {
-            for (uint32_t j = 0; j < 8; ++j) {
-                uint32_t lanes_changed = 0;
-                for (uint32_t lane = 0; lane < 16; ++lane) {
-                    auto& old = previous[(warp * 8 + j) * 16 + lane];
-                    const auto value = machine.read_reg(warp, lane, 8 + j);
-                    if (value != old) ++lanes_changed;
-                    old = value;
-                }
-                require(lanes_changed == 0 || lanes_changed == 16, "an LSU RF write touched a subset of lanes");
-                if (lanes_changed == 16) ++registers_changed;
-            }
-        }
-        require(registers_changed <= 1, "the LSU wrote more than one RF beat in a cycle");
-        writes += registers_changed;
-    }
-    require(writes == 16, "two ldg.v8 commands did not make sixteen RF write beats");
-    for (uint32_t warp = 0; warp < 2; ++warp)
-        for (uint32_t j = 0; j < 8; ++j)
-            for (uint32_t lane = 0; lane < 16; ++lane)
-                require(machine.read_reg(warp, lane, 8 + j) == pattern_word(warp * 128 + 16 * j + lane),
-                    "overlapping ldg.v8 commands lost or swapped a word");
 }
 
 // (b) Replaces "gmem v8 invalid footprints": the v8/uni/scalar contracts.
@@ -248,18 +216,18 @@ void test_lsu_contract_panics() {
         nanosm::Machine machine(config, compile(text, config), std::move(launch));
         expect_sim_panic(machine, needle, what);
     };
-    // (The non-uniform ldg.v8 / stg.v8 bases moved to "uniformity: hardware
-    // uses lane 0": since I1 they are sanitizer panics, and this test runs in
-    // both builds. ldg.uni's base is a uniform register.)
-    run("mov r0, 32\nldg.v8 r8, [r0]\nhalt\n", 4096,
-        "ldg.v8 address 32 is not 64-byte aligned", "rA = 32 mod 64 ldg.v8");
-    run("mov r0, 64\nstg.v8 [r0 + 32], r8\nhalt\n", 4096,
-        "stg.v8 address 96 is not 64-byte aligned", "rA + imm = 32 mod 64 stg.v8");
+    // A v8 lane's address must be sector (32-byte) aligned: the machine's
+    // PANIC, in both builds. (Two lanes of a stg.v8 naming one sector is the
+    // sanitizer's; ldg.uni's base is a uniform register.)
+    run("mov r0, 16\nldg.v8 r8, [r0]\nhalt\n", 4096,
+        "ldg.v8 address 16 is not 32-byte aligned", "rA = 16 mod 32 ldg.v8");
+    run("mov r0, 64\nstg.v8 [r0 + 16], r8\nhalt\n", 4096,
+        "stg.v8 address 80 is not 32-byte aligned", "rA + imm = 16 mod 32 stg.v8");
     run("sread r0, LANE_ID\nshli r0, r0, 2\nldg r1, [r0 + 2]\nhalt\n", 4096,
         "unaligned 32-bit gmem access", "2-byte aligned scalar ldg");
     run("umov ur0, 6\nldg.uni r1, [ur0]\nhalt\n", 4096,
         "unaligned 32-bit gmem access", "2-byte aligned ldg.uni");
-    run("mov r0, 576\nldg.v8 r8, [r0]\nhalt\n", 1024, "out of bounds", "out-of-bounds ldg.v8 block");
+    run("mov r0, 1024\nldg.v8 r8, [r0]\nhalt\n", 1024, "out of bounds", "out-of-bounds ldg.v8 sector");
 }
 
 // Replaces "gmem command capacity" (a footprint larger than the controller
@@ -274,10 +242,10 @@ void test_lsu_commands_stream_through_small_queue() {
     auto& gmem = image_bytes(launch.gmem_image, 2048);
     fill_pattern(gmem, 0, 128, 0);
     nanosm::Machine machine(config, compile(R"(
-        mov r0, 0
+        sread r1, LANE_ID
+        shli r0, r1, 5
         ldg.v8 r8, [r0]
         stg.v8 [r0 + 1024], r8
-        sread r1, LANE_ID
         shli r1, r1, 2
         ldg r16, [r1]
         halt
@@ -357,11 +325,9 @@ void test_lsu_gather_requests() {
     const auto in_order = gather(distinct, 16, distinct_word);
     require(std::is_sorted(in_order.begin(), in_order.end()),
         "the placeholder FIFO controller reordered gather returns");
-    // Same gather with the legal free-ID reorder: returns come back out of
-    // request order and every lane still gets its own word.
-    const auto reordered = gather(distinct, 16, distinct_word, nanosm::ControllerTestOrder::reverse_free_ids);
-    require(!std::is_sorted(reordered.begin(), reordered.end()),
-        "the reverse_free_ids controller did not reorder gather returns");
+    // (A gather rides the one ordered LSU read stream since 2026-11-21: one
+    // load buffer, so every load returns in request order. The free-ID
+    // reorder hook that used to shuffle its returns is gone.)
     // Two lanes per sector (lanes 2k, 2k+1): still sixteen requests.
     gather(R"(
         shli r7, r1, 2
@@ -420,52 +386,6 @@ void test_lsu_scatter_byte_enables() {
         "each scatter is not sixteen masked sector writes");
 }
 
-// (e) The staging pool is owned at admission. With one assembly register the
-// second warp's ldg.v8 is ineligible until the first command's eighth RF
-// write commits; with two it is admitted at once.
-void test_lsu_staging_pool_admission() {
-    const auto run = [](uint32_t staging) {
-        auto config = canonical_profile();
-        config.lsu_staging_vectors = staging;
-        nanosm::Launch launch;
-        launch.active_warps = 2;
-        auto& gmem = image_bytes(launch.gmem_image, 1024);
-        fill_pattern(gmem, 0, 256, 0);
-        nanosm::Machine machine(config, compile(R"(
-            usread ur0, WARP_ID
-            ur2r r0, ur0
-            shli r0, r0, 9
-            ldg.v8 r8, [r0]
-            halt
-        )", config), std::move(launch), {.timeline = true});
-        machine.run();
-        for (uint32_t warp = 0; warp < 2; ++warp)
-            for (uint32_t j = 0; j < 8; ++j)
-                for (uint32_t lane = 0; lane < 16; ++lane)
-                    require(machine.read_reg(warp, lane, 8 + j) == pattern_word(warp * 128 + 16 * j + lane),
-                        "pool admission corrupted a vector load");
-        const auto spans = trace_spans(machine, nanosm::TraceCategory::gmem, "ldg.v8");
-        require(spans.size() == 2, "expected two ldg.v8 command events");
-        return std::make_tuple(spans[0], spans[1], machine.trace().summary().lsu_no_staging_cycles,
-            machine.trace().summary().lsu_no_slot_cycles);
-    };
-    // I6a: the second ldg.v8 issues in the cycle the first command's eighth RF
-    // write releases the register (its grant: first.end) and reaches the LSU
-    // issue_to_dispatch later (the command slice starts at dispatch).
-    const auto dispatch = nanosm::issue_to_dispatch(canonical_profile());
-    const auto [first, second, no_staging, no_slot] = run(1);
-    require(second.start == first.end + dispatch,
-        "with one assembly register the second ldg.v8 was admitted at cycle " + std::to_string(second.start) +
-            ", not at the first command's eighth write (" + std::to_string(first.end) + ") + dispatch");
-    // Warp 1 is tried every cycle from its ldg.v8 until admission.
-    require(no_staging + 4 >= second.start - first.start,
-        "no_staging did not count the ineligible cycles");
-    require(no_staging != 0 && no_slot == 0, "the wait was not attributed to the staging pool");
-    const auto [first2, second2, no_staging2, no_slot2] = run(2);
-    require(second2.start <= first2.start + 2 && no_staging2 == 0 && no_slot2 == 0,
-        "with two assembly registers the second ldg.v8 was not admitted at once");
-}
-
 // (f) The backpressure chain: RF write port blocked -> assembly register full
 // -> (B2.1: no vector sector register) ingress FIFO head blocked -> FIFO full
 // -> return-ready low ->
@@ -478,6 +398,8 @@ void test_lsu_backpressure_chain() {
         config.tma_sector_credits = 0;
         config.gmem_queue_sectors = 8;
         config.lsu_ingress_sectors = 2;
+        // The bases are uniform, so every lane of a ldg.v8 loads the same
+        // sector; its lanes pass in four groups of eight RF writes.
         with_long_bookings(config);
         nanosm::Launch launch;
         launch.active_warps = 2;
@@ -516,18 +438,23 @@ void test_lsu_backpressure_chain() {
         }
         for (uint32_t j = 0; j < 16; ++j)
             for (uint32_t lane = 0; lane < 16; ++lane)
-                require(machine.read_reg(0, lane, j) == pattern_word(16 * j + lane),
+                require(machine.read_reg(0, lane, j) == pattern_word((j < 8 ? 0 : 128) + j % 8),
                     "a byte was lost or corrupted under backpressure");
         for (uint32_t lane = 0; lane < 16; ++lane)
             require(machine.read_reg(0, lane, 16) == pattern_word(512), "the stalled scalar ldg read the wrong word");
         return std::make_tuple(linked, machine.trace().summary());
     };
     const auto [linked, summary] = run(true);
-    // I1: each of the six chunks bound for bank 0 (r0, r3, r6, r9, r12, r15)
+    // I1: each write bound for bank 0 (r0, r3, r6, r9, r12, r15, per group)
     // waits out at most the bookings already made when it was denied (the
     // owed bit then inhibits warp 1): blocked, but never starved.
-    require(summary.lsu_rf_write_wait_cycles >= 5 * booking_horizon, "the RF write port was never the blocked link");
-    require(summary.lsu_rf_write_wait_cycles <= 6 * (booking_horizon + 1), "an assembly waited past the booking horizon");
+    // A group's eight writes follow each other, so only a group's first
+    // bank-0 write meets a full horizon of old bookings; the later ones wait
+    // out only what was booked since.
+    require(summary.lsu_rf_write_wait_cycles >= 2 * booking_horizon,
+        "the RF write port was never the blocked link (" + std::to_string(summary.lsu_rf_write_wait_cycles) + " wait cycles)");
+    // Twenty-four writes go to bank 0: three per group, four groups a load.
+    require(summary.lsu_rf_write_wait_cycles <= 24 * (booking_horizon + 1), "a load group waited past the booking horizon");
     require(summary.lsu_ingress_full_cycles != 0, "return-ready never dropped (ingress FIFO never full)");
     require(summary.lsu_request_wait_cycles != 0, "request-ready never dropped");
     require(summary.lsu_no_slot_cycles != 0, "the next ldg was never ineligible");
@@ -562,7 +489,7 @@ void test_lsu_tma_and_vector_streams_interleave() {
         require(machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA stream data mismatch");
     for (uint32_t j = 0; j < 8; ++j)
         for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(0, lane, 8 + j) == pattern_word(128 + 16 * j + lane),
+            require(machine.read_reg(0, lane, 8 + j) == pattern_word(128 + j),
                 "vector stream data mismatch with TMA returns interleaved");
     uint32_t switches = 0;
     std::string previous;
@@ -585,18 +512,110 @@ void test_lsu_controller_contract_tripwire() {
     machine.set_controller_test_order(nanosm::ControllerTestOrder::illegal_ordered_reorder);
     expect_sim_panic(machine, "contract violation: read stream 1 (vector) returned request",
         "an out-of-order vector stream");
+    // Review (Astra, 2026-11-21): with both clocks at 1 GHz request 2 comes
+    // back ahead of request 1. At two lanes a group that is another group's
+    // sector, which the load buffer refuses while group 0 waits for the
+    // sector that was skipped: the order is checked before the buffer is
+    // asked, so this is the same PANIC and not a hang. At four lanes a group
+    // it is group 0's own.
+    for (const uint32_t group : {2u, 4u}) {
+        auto config = canonical_profile();
+        config.core_clock_hz = 1000000000;
+        config.dram_clock_hz = 1000000000;
+        config.lsu_load_group_lanes = group;
+        nanosm::Launch reordered;
+        reordered.active_warps = 1;
+        image_bytes(reordered.gmem_image, 512);
+        nanosm::Machine hidden(config, compile("mov r0, 0\nldg.v8 r8, [r0]\nhalt\n", config), std::move(reordered));
+        hidden.set_controller_test_order(nanosm::ControllerTestOrder::illegal_ordered_reorder);
+        try {
+            hidden.run(2000);
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("contract violation: read stream 1 (vector) returned request") !=
+                    std::string::npos,
+                "out-of-order return at " + std::to_string(group) + " lanes a group: wrong panic: " + error.what());
+            continue;
+        }
+        throw std::runtime_error("out-of-order return at " + std::to_string(group) + " lanes a group did not panic");
+    }
+}
+
+// Review (Astra, 2026-11-21): a gather writes the RF, and frees its command
+// slot, when its last word is in; the rest of that word's sector is still
+// arriving and its read ID table entry lives until the sector's last byte.
+// With a slow DRAM clock the next gather puts sixteen reads in flight from
+// that slot meanwhile: two slots' reads plus that one tail. The table holds
+// the tail (lsu.active_commands x lanes + 1); it used to trip its own limit.
+void test_lsu_gather_tail_after_retirement() {
+    auto config = canonical_profile();
+    config.dram_clock_hz = 125000000;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    fill_pattern(gmem, 0, 16, 0);
+    nanosm::Machine machine(config, compile("mov r0, 0\nldg r1, [r0]\nldg r2, [r0]\nldg r3, [r0]\nhalt\n", config),
+        std::move(launch));
+    machine.run();
+    for (uint32_t reg = 1; reg <= 3; ++reg)
+        for (uint32_t lane = 0; lane < 16; ++lane)
+            require(machine.read_reg(0, lane, reg) == pattern_word(0),
+                "gather " + std::to_string(reg) + " read the wrong word in lane " + std::to_string(lane));
+}
+
+// Review (Astra, 2026-11-21): ldg.v8 / stg.v8 need 32-byte sectors (a lane's
+// eight words are one sector). On a profile with other sectors they are
+// refused when compiled and at kernel load, not at dispatch; scalar ldg / stg
+// work there.
+void test_lsu_v8_needs_32_byte_sectors() {
+    auto config = canonical_profile();
+    config.gmem_sector_bytes = 16;
+    for (const std::string line : {"ldg.v8 r8, [r0]", "stg.v8 [r0], r8"}) {
+        try {
+            (void)compile("mov r0, 0\n" + line + "\nhalt\n", config);
+            throw std::runtime_error("qtxc accepted " + line + " on 16-byte sectors");
+        } catch (const nanosm::SimError& error) {
+            require(std::string(error.what()).find("needs 32-byte sectors") != std::string::npos,
+                "qtxc's refusal of " + line + ": " + error.what());
+        }
+    }
+    // Kernel load: a scalar ldg compiled for this profile, its opcode changed
+    // to ldg.v8 (r15 is named so the register count already covers r8..r15).
+    auto kernel = compile("mov r0, 0\nmov r15, 0\nldg r8, [r0]\nhalt\n", config);
+    auto word = nanosm::decode(kernel.words.at(2));
+    require(word.opcode == nanosm::Opcode::ldg, "expected the scalar ldg at pc 16");
+    word.opcode = nanosm::Opcode::ldg_v8;
+    kernel.words.at(2) = nanosm::encode(word);
+    try {
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        image_bytes(launch.gmem_image, 64);
+        nanosm::Machine machine(config, kernel, std::move(launch));
+        throw std::runtime_error("kernel load accepted ldg.v8 on 16-byte sectors");
+    } catch (const nanosm::SimError& error) {
+        require(std::string(error.what()).find("kernel pc 16: ldg.v8 needs 32-byte sectors") != std::string::npos,
+            std::string("kernel load's refusal: ") + error.what());
+    }
+    // A scalar gather on the same profile runs.
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& gmem = image_bytes(launch.gmem_image, 64);
+    fill_pattern(gmem, 0, 16, 0);
+    nanosm::Machine machine(config, compile("mov r0, 4\nldg r1, [r0]\nhalt\n", config), std::move(launch));
+    machine.run();
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        require(machine.read_reg(0, lane, 1) == pattern_word(1), "scalar ldg on 16-byte sectors");
 }
 
 void test_lsu_profile_and_encoding() {
     const auto profile = canonical_profile();
-    require(profile.lsu_active_commands == 2 && profile.lsu_staging_vectors == 2 &&
+    require(profile.lsu_active_commands == 2 &&
             profile.lsu_read_streams == 2 && profile.lsu_pluck_words_per_cycle == 2 &&
             profile.lsu_ingress_sectors == 8 && profile.lsu_egress_sectors == 8 &&
             profile.lsu_sectors_in_flight == 16 && profile.lsu_ingress_latency_cycles == 1 &&
             profile.lsu_egress_latency_cycles == 1,
         "canonical lsu profile values changed");
     auto other = profile;
-    other.lsu_staging_vectors = 1;
+    other.lsu_active_commands = 1;
     require(nanosm::device_profile_fingerprint(profile) != nanosm::device_profile_fingerprint(other),
         "lsu sizing was omitted from the profile fingerprint");
     for (const auto field : {&nanosm::DeviceProfile::lsu_ingress_latency_cycles,
@@ -621,24 +640,17 @@ void test_lsu_profile_and_encoding() {
         throw std::runtime_error("invalid lsu profile accepted: " + needle);
     };
     rejects([](auto& j) { j.erase("lsu"); }, "missing 'lsu'");
-    // B2.1: read_streams generalized (stream 0 TMA, 1..n-1 vector), >= 2.
-    rejects([](auto& j) { j["lsu"]["read_streams"] = 1; }, "read_streams must be in 2..64");
+    // Two ordered read streams exist, the TMA's and the load / store unit's
+    // (every load on one, since 2026-11-21): the field is 2.
+    rejects([](auto& j) { j["lsu"]["read_streams"] = 1; }, "read_streams must be 2");
+    rejects([](auto& j) { j["lsu"]["read_streams"] = 3; }, "read_streams must be 2");
     rejects([](auto& j) { j["lsu"]["ingress_sectors"] = 1; }, "at least two sectors");
     rejects([](auto& j) { j["lsu"]["egress_sectors"] = 1; }, "at least two sectors");
-    rejects([](auto& j) { j["lsu"]["staging_vectors"] = 0; }, "must be nonzero");
+    rejects([](auto& j) { j["lsu"]["active_commands"] = 0; }, "must be nonzero");
     // B2.1: a BRAM FIFO is never fall-through; latency 0 is rejected.
     rejects([](auto& j) { j["lsu"]["ingress_latency_cycles"] = 0; }, "latency must be in 1..64");
     rejects([](auto& j) { j["lsu"]["egress_latency_cycles"] = 0; }, "latency must be in 1..64");
     rejects([](auto& j) { j["lsu"].erase("egress_latency_cycles"); }, "egress_latency_cycles");
-    // active_commands > staging_vectors is a legal profile: the pool makes
-    // the extra slot ineligible (no_staging), the sanitizer asserts the bound.
-    auto loose = document;
-    loose["lsu"]["staging_vectors"] = 1;
-    (void)nanosm::parse_device_profile(loose.dump());
-    auto streams = document;
-    streams["lsu"]["read_streams"] = 3;
-    require(nanosm::parse_device_profile(streams.dump()).lsu_read_streams == 3, "read_streams = 3 rejected");
-
     const auto kernel = compile("umov ur3, 0\nldg.uni r5, [ur3 + 8]\nhalt\n");
     const auto decoded = nanosm::decode(kernel.words[1]);
     require(decoded.opcode == nanosm::Opcode::ldg_uni && decoded.dst == 5 && decoded.src0 == 3 &&
@@ -752,6 +764,9 @@ void test_lsu_edge_widths() {
             usread ur0, WARP_ID
             ur2r r0, ur0
             shli r0, r0, 9
+            sread r1, LANE_ID
+            shli r1, r1, 5
+            add r0, r0, r1
             ldg.v8 r8, [r0]
             stg.v8 [r0 + 2048], r8
             halt
@@ -876,6 +891,11 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
     config.lsu_pluck_words_per_cycle = 2;
     config.lsu_ingress_latency_cycles = ingress_latency;
     config.lsu_egress_latency_cycles = egress_latency;
+    // One group per ldg.v8 (its sixteen sectors pluck straight in, then eight
+    // RF writes); two groups of eight lanes per stg.v8 (so one handoff from a
+    // drained group to the next group's first read beat is in the timeline).
+    config.lsu_load_group_lanes = 16;
+    config.lsu_store_group_lanes = 8;
     Timelines t;
     const auto run = [&](const std::string& text, bool tma, std::size_t slot) {
         nanosm::Launch launch;
@@ -915,9 +935,13 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
         for (const auto& [request, cycle] : last_word) requests.push_back(request);
         const auto writes = of(*machine, LsuEdge::rf_write_beat);
         require(writes.size() == 8 && requests.size() == 16, "vector load: expected 8 RF beats from 16 sectors");
+        uint64_t group_done = 0; // the group's last word
+        for (const auto request : requests) group_done = std::max(group_done, last_word[request]);
         for (uint32_t j = 0; j < 8; ++j) {
-            const auto chunk_done = std::max(last_word[requests[2 * j]], last_word[requests[2 * j + 1]]);
-            t.vector_assembly_to_rf.push_back(static_cast<int64_t>(writes[j].cycle) - static_cast<int64_t>(chunk_done));
+            // Write j (rD + j) is j cycles after the first, which is the
+            // cycle after the group's last word: each entry is 1.
+            t.vector_assembly_to_rf.push_back(
+                static_cast<int64_t>(writes[j].cycle) - static_cast<int64_t>(group_done) - j);
             t.vector_rf_writes.push_back(writes[j].cycle);
         }
     }
@@ -964,12 +988,16 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
             require(machine->read_reg(0, lane, 10) == pattern_word(32 * lane + 2), "gather timeline data mismatch");
     }
     { // stg.v8: RF -> assembly -> egress FIFO -> bus -> acknowledgement
-        std::string text = "mov r0, 4096\n";
+        std::string text = "sread r1, LANE_ID\nshli r0, r1, 5\naddi r0, r0, 4096\n";
         for (uint32_t j = 0; j < 8; ++j) text += "mov r" + std::to_string(8 + j) + ", " + std::to_string(100 + j) + "\n";
         text += "stg.v8 [r0], r8\nhalt\n";
         const auto machine = run(text, false, 4);
         const auto reads = of(*machine, LsuEdge::rf_read_beat);
-        require(reads.size() == 8, "stg.v8: eight RF read beats");
+        require(reads.size() == 16, "stg.v8: eight RF read beats for each of its two lane groups");
+        for (uint32_t j = 1; j < 16; ++j) {
+            if (j == 8) continue;
+            require(reads[j].cycle == reads[j - 1].cycle + 1, "stg.v8: a group's read beats are not one a cycle");
+        }
         std::map<uint64_t, std::pair<uint64_t, uint64_t>> slot_span; // slot -> first, last egress write
         for (const auto& event : of(*machine, LsuEdge::egress_write)) {
             auto [it, fresh] = slot_span.emplace(event.id, std::make_pair(event.cycle, event.cycle));
@@ -978,11 +1006,14 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
         std::vector<std::pair<uint64_t, uint64_t>> slots;
         for (const auto& [slot, span] : slot_span) slots.push_back(span);
         require(slots.size() == 16, "stg.v8: sixteen egress slots");
-        for (uint32_t j = 0; j < 8; ++j) {
-            t.store_rf_to_egress.push_back(static_cast<int64_t>(slots[2 * j].first) - static_cast<int64_t>(reads[j].cycle));
-            if (j != 0)
+        for (uint32_t group = 0; group < 2; ++group) {
+            // The group's first egress word against its eighth read beat; the
+            // next group's first read beat against this group's last word.
+            t.store_rf_to_egress.push_back(
+                static_cast<int64_t>(slots[8 * group].first) - static_cast<int64_t>(reads[8 * group + 7].cycle));
+            if (group != 0)
                 t.store_drain_to_next_rf.push_back(
-                    static_cast<int64_t>(reads[j].cycle) - static_cast<int64_t>(slots[2 * j - 1].second));
+                    static_cast<int64_t>(reads[8 * group].cycle) - static_cast<int64_t>(slots[8 * group - 1].second));
         }
         std::map<uint64_t, uint64_t> request_of_slot, request_cycle, first_beat, last_beat_tick, ack_tick;
         for (const auto& event : of(*machine, LsuEdge::write_request)) {
@@ -1006,7 +1037,7 @@ Timelines lsu_timelines(uint32_t ingress_latency, uint32_t egress_latency) {
             if (index++ == 0) t.store_first_beat = first_beat.at(request);
         }
         for (uint32_t word = 0; word < 128; ++word)
-            require(machine->read_gmem_u32(4096 + 4 * word) == 100 + word / 16, "stg.v8 timeline data mismatch");
+            require(machine->read_gmem_u32(4096 + 4 * word) == 100 + word % 8, "stg.v8 timeline data mismatch");
     }
     return t;
 }
@@ -1022,7 +1053,7 @@ void test_lsu_no_fall_through_timelines() {
     require(all_equal(t.vector_bus_to_assembly, 1),
         "vector: bus beat -> assembly register is not exactly the ingress FIFO latency (1)");
     require(all_equal(t.vector_assembly_to_rf, 1),
-        "vector: the RF write is not the cycle after the 16th word lands");
+        "vector: the group's RF writes are not one a cycle from the cycle after its last word lands");
     require(all_equal(t.tma_bus_to_register, 1), "TMA: bus beat -> TMA sector register is not 1 cycle");
     require(t.tma_register_to_shmem == 1, "TMA: sector register -> shmem round is not the next cycle");
     require(t.uni_bus_to_assembly == 1 && t.uni_assembly_to_rf == 1, "ldg.uni: bus -> assembly -> RF is not 1 + 1");
@@ -1031,10 +1062,11 @@ void test_lsu_no_fall_through_timelines() {
     // I6a: the beat sampled at t is at the RF output, filling the assembly
     // register, at t + Lr; the egress port reads it (Q) one cycle later.
     require(all_equal(t.store_rf_to_egress, canonical_profile().rf_read_latency_cycles + 1),
-        "stg.v8: RF read beat -> first egress word is not Lr + 1 cycles");
+        "stg.v8: a group's eighth RF read beat -> its first egress word is not Lr + 1 cycles");
     // The assembly register is refilled in the cycle its last word drained
     // (its consumer runs first in the tick): a handoff, not a read-through.
-    require(all_equal(t.store_drain_to_next_rf, 0), "stg.v8: drained assembly register not refilled at once");
+    require(all_equal(t.store_drain_to_next_rf, 0),
+        "stg.v8: the next group's first read beat is not in the cycle the store buffer drained");
     require(all_equal(t.store_slot_to_request, 1), "stg.v8: complete slot -> write request is not the egress latency (1)");
     require(all_equal(t.store_request_to_bus, 0), "stg.v8: an accepted write did not start on the idle bus");
     require(all_equal(t.store_ack_after_last_beat, 4), "stg.v8: the ack is not latency_dram_ticks after the last beat");
@@ -1105,7 +1137,7 @@ void test_lsu_one_write_contract() {
         nanosm::Launch launch;
         launch.active_warps = 1;
         image_bytes(launch.gmem_image, 2048);
-        std::string text = "mov r0, 1024\nsread r1, LANE_ID\n";
+        std::string text = "sread r1, LANE_ID\nshli r0, r1, 5\naddi r0, r0, 1024\n";
         for (uint32_t j = 0; j < 8; ++j) text += "addi r" + std::to_string(8 + j) + ", r1, " + std::to_string(16 * j) + "\n";
         text += "stg.v8 [r0], r8\nhalt\n";
         nanosm::Machine machine(config, compile(text), std::move(launch));
@@ -1122,29 +1154,29 @@ void test_lsu_one_write_contract() {
         for (const auto& event : machine.edge_events()) if (event.edge == LsuEdge::write_ack) last_ack = event.cycle;
         require(released == last_ack + 1, "the stg.v8 slot was not released at the commit of its last ack");
         lsu_lags = ack_lags(machine);
-        for (uint32_t i = 0; i < 128; ++i) require(machine.read_gmem_u32(1024 + 4 * i) == i, "stg.v8 data");
+        for (uint32_t i = 0; i < 128; ++i) // lane i / 8's sector, word i % 8: r(8 + i % 8) at that lane
+            require(machine.read_gmem_u32(1024 + 4 * i) == i / 8 + 16 * (i % 8), "stg.v8 data");
     }
     require(tma_lags.size() == 16 && lsu_lags.size() == 16, "expected sixteen writes per client");
     require(all_equal(tma_lags, config.gmem_latency_dram_ticks) && tma_lags == lsu_lags,
         "TMA store and stg.v8 acks are not both gmem.latency_dram_ticks after the last beat");
 }
 
-// E4: lsu.read_streams = 3 (TMA + two vector streams). Two ldg.v8 commands
-// land on streams 1 and 2 (round-robin); the legal interleave order
-// reorders their sectors ACROSS the streams, never within one; data is
-// correct either way. With two streams (both commands on stream 1) the same
-// hook cannot interleave them, and the illegal reorder still panics.
+// E4, since 2026-11-21: every LSU read rides ONE ordered stream (stream 1;
+// lsu.read_streams is 2, the TMA's and this one), because the one load
+// buffer takes data in request order. Two ldg.v8 commands are never
+// interleaved by the legal interleave hook; the illegal reorder still panics.
 void test_lsu_read_streams_generalized() {
-    const auto run = [](uint32_t streams, nanosm::ControllerTestOrder order) {
+    const auto run = [](nanosm::ControllerTestOrder order) {
         auto config = canonical_profile();
-        config.lsu_read_streams = streams;
         nanosm::Launch launch;
         launch.active_warps = 1;
         auto& gmem = image_bytes(launch.gmem_image, 1024);
         fill_pattern(gmem, 0, 256, 0);
         nanosm::Machine machine(config, compile(R"(
-            mov r0, 0
-            mov r1, 512
+            sread r2, LANE_ID
+            shli r0, r2, 5
+            addi r1, r0, 512
             ldg.v8 r8, [r0]
             ldg.v8 r16, [r1]
             halt
@@ -1153,8 +1185,8 @@ void test_lsu_read_streams_generalized() {
         machine.run();
         for (uint32_t j = 0; j < 8; ++j)
             for (uint32_t lane = 0; lane < 16; ++lane) {
-                require(machine.read_reg(0, lane, 8 + j) == pattern_word(16 * j + lane), "stream A data mismatch");
-                require(machine.read_reg(0, lane, 16 + j) == pattern_word(128 + 16 * j + lane), "stream B data mismatch");
+                require(machine.read_reg(0, lane, 8 + j) == pattern_word(8 * lane + j), "stream A data mismatch");
+                require(machine.read_reg(0, lane, 16 + j) == pattern_word(128 + 8 * lane + j), "stream B data mismatch");
             }
         std::vector<uint64_t> served;
         for (const auto& span : trace_spans(machine, nanosm::TraceCategory::gmem, "read sector"))
@@ -1175,17 +1207,13 @@ void test_lsu_read_streams_generalized() {
         }
         return true;
     };
-    const auto fifo = run(3, nanosm::ControllerTestOrder::fifo);
+    const auto fifo = run(nanosm::ControllerTestOrder::fifo);
     require(switches(fifo) == 1 && in_order_within(fifo), "the FIFO controller reordered vector sectors");
-    const auto interleaved = run(3, nanosm::ControllerTestOrder::interleave_ordered_streams);
-    require(switches(interleaved) >= 16, "read_streams 3: the commands' sectors did not interleave across streams (" +
-        std::to_string(switches(interleaved)) + " switches)");
-    require(in_order_within(interleaved), "read_streams 3: a stream was reordered within its ID");
-    const auto same_stream = run(2, nanosm::ControllerTestOrder::interleave_ordered_streams);
+    const auto same_stream = run(nanosm::ControllerTestOrder::interleave_ordered_streams);
     require(switches(same_stream) == 1 && in_order_within(same_stream),
-        "read_streams 2: the legal hook reordered within one ID");
+        "two loads on the one LSU stream were interleaved by the legal hook (" +
+            std::to_string(switches(same_stream)) + " switches)");
     auto config = canonical_profile();
-    config.lsu_read_streams = 3;
     nanosm::Launch launch;
     launch.active_warps = 1;
     image_bytes(launch.gmem_image, 1024);
@@ -1193,7 +1221,7 @@ void test_lsu_read_streams_generalized() {
         std::move(launch));
     machine.set_controller_test_order(nanosm::ControllerTestOrder::illegal_ordered_reorder);
     expect_sim_panic(machine, "contract violation: read stream 1 (vector) returned request",
-        "an out-of-order vector stream with three read streams");
+        "an out-of-order vector stream across two loads");
 }
 
 } // namespace
@@ -1213,9 +1241,9 @@ TEST(Lsu, lsu_scalar_ldg_is_one_request_per_lane) {
     test_lsu_scalar_ldg_is_one_request_per_lane();
 }
 
-// lsu v8 interleaved mapping
-TEST(Lsu, lsu_v8_interleaved_mapping) {
-    test_lsu_v8_interleaved_mapping();
+// lsu v8 per-lane mapping (and under a write mask)
+TEST(Lsu, lsu_v8_per_lane_mapping) {
+    test_lsu_v8_per_lane_mapping();
 }
 
 // lsu v8 store source lifetime
@@ -1223,14 +1251,14 @@ TEST(Lsu, lsu_v8_store_source_lifetime) {
     test_lsu_v8_store_source_lifetime();
 }
 
-// gmem v8 predication rejection
-TEST(Lsu, gmem_v8_predication_is_rejected) {
-    test_gmem_v8_predication_is_rejected();
-}
-
-// lsu RF writes are full-width beats
-TEST(Lsu, lsu_rf_writes_are_full_width_beats) {
-    test_lsu_rf_writes_are_full_width_beats();
+// two lanes of one stg.v8 naming the same sector: the sanitizer's PANIC
+TEST(Lsu, lsu_v8_store_sector_collision) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    image_bytes(launch.gmem_image, 1024);
+    nanosm::Machine machine(canonical_profile(), compile("mov r0, 0\nstg.v8 [r0], r8\nhalt\n"), std::move(launch));
+    expect_sim_panic(machine, "multiple lanes write the same gmem sector", "a stg.v8 whose lanes name one sector");
 }
 
 // lsu contract panics
@@ -1258,11 +1286,6 @@ TEST(Lsu, lsu_scatter_byte_enables) {
     test_lsu_scatter_byte_enables();
 }
 
-// lsu staging pool admission
-TEST(Lsu, lsu_staging_pool_admission) {
-    test_lsu_staging_pool_admission();
-}
-
 // lsu backpressure chain
 TEST(Lsu, lsu_backpressure_chain) {
     test_lsu_backpressure_chain();
@@ -1277,6 +1300,16 @@ TEST(Lsu, lsu_tma_and_vector_streams_interleave) {
 TEST(Lsu, lsu_controller_contract_tripwire) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_lsu_controller_contract_tripwire();
+}
+
+// lsu: a retired gather's last sector is still arriving
+TEST(Lsu, lsu_gather_tail_after_retirement) {
+    test_lsu_gather_tail_after_retirement();
+}
+
+// lsu v8 needs 32-byte sectors (refused when compiled and at kernel load)
+TEST(Lsu, lsu_v8_needs_32_byte_sectors) {
+    test_lsu_v8_needs_32_byte_sectors();
 }
 
 // lsu profile and ldg.uni encoding

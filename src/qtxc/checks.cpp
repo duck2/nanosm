@@ -51,7 +51,20 @@ void check_write_mask(const Instruction& inst, const DeviceProfile& profile, con
     }
     throw SimError(where + ": " + opcode_name(inst.opcode, &profile.mma_shapes) +
         " cannot be masked (@p): only per-lane instructions can (arithmetic, mov, sread, ur2r, the "
-        "special functions, cvt, setp, lds, sts, ldg, stg)");
+        "special functions, cvt, setp, lds, sts, ldg, stg, ldg.v8, stg.v8)");
+}
+
+// ldg.v8 / stg.v8 move one sector per lane, a lane's eight words: they need
+// a profile whose sectors are 32 bytes. A property of the instruction and
+// the profile, so refused by qtxc and the assembler per line and at kernel
+// load per pc (check_v8_sectors), as an mma.async of an unlisted shape is.
+// Scalar ldg / stg work with any sector size.
+void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if (inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8) return;
+    if (profile.gmem_sector_bytes == 32) return;
+    throw SimError(where + ": " + opcode_name(inst.opcode) +
+        " needs 32-byte sectors (a lane's eight words are one sector); this device profile has " +
+        std::to_string(profile.gmem_sector_bytes) + "-byte sectors (gmem.sector_bytes)");
 }
 
 // Predication and the divergence stack (trash/divergence-2026-11-21.md):
@@ -142,6 +155,12 @@ void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile)
                 std::to_string(reg) + ", outside this profile's " + std::to_string(profile.urf_registers) +
                 " (urf.registers)");
         }
+    }
+}
+
+void check_v8_sectors(const Kernel& kernel, const DeviceProfile& profile) {
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        check_v8_sector(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
     }
 }
 

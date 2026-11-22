@@ -170,19 +170,32 @@ struct DeviceProfile {
     uint32_t gmem_sector_bytes = 0;
     uint32_t gmem_bus_bytes_per_dram_tick = 0;
     uint32_t gmem_latency_dram_ticks = 0;
+    // The data bus is one bidirectional bus (a DRAM channel's): the minimum
+    // number of idle DRAM ticks between the last data beat in one direction
+    // and the first beat in the other. Ticks the bus was idle anyway count.
+    // 0: a change of direction is free.
+    uint32_t gmem_turnaround_dram_ticks = 0;
     uint32_t gmem_queue_sectors = 0;
 
     // The SM's load/store unit (trash/rfc09.md section 3, B2). All config,
     // none canonical by ruling.
     // Machine-wide outstanding ldg/stg commands (vector, scalar, uniform).
     uint32_t lsu_active_commands = 0;
-    // 64 B (lane-wide) assembly registers. A command owns one from admission
-    // to its end, so admitted commands never exceed this number.
-    uint32_t lsu_staging_vectors = 0;
+    // The LSU's two buffers: one load buffer, one store buffer, each held
+    // only while data is in it (sim.hpp AssemblyRegister). A v8 instruction's
+    // lanes pass through them in fixed groups of this many lanes: the load
+    // buffer is 8 x load_group_lanes words (256 bits per lane), written to
+    // the RF as eight writes with the group's lanes enabled; the store
+    // buffer 8 x store_group_lanes words, filled by eight RF read beats.
+    // Powers of two dividing the lanes; the store buffer also holds a scalar
+    // store's lanes, so store_group_lanes x 8 >= lanes.
+    uint32_t lsu_load_group_lanes = 0;
+    uint32_t lsu_store_group_lanes = 0;
     // Ordered read IDs (rfc09 3a): 0 = TMA (one 32 B sector register),
-    // 1..n-1 = vector streams assigned round-robin to vector loads (they
-    // pluck straight into the command's assembly register). >= 2. Scalar
-    // gathers and ldg.uni ride free IDs above these.
+    // 1 = the LSU's one ordered read stream (every ldg / ldg.uni / ldg.v8:
+    // data returns in request order and passes through the one load buffer).
+    // >= 2; streams above 1 are not used. Scatter writes take free IDs above
+    // these.
     uint32_t lsu_read_streams = 0;
     // Ingress FIFO read port and the shared egress FIFO write port, 32-bit
     // words per cycle.

@@ -648,6 +648,8 @@ std::string TraceRecorder::summary_text() const {
         << " rf_write_wait=" << summary_.lsu_rf_write_wait_cycles
         << " rf_read_wait=" << summary_.lsu_rf_read_wait_cycles
         << " egress_wait=" << summary_.lsu_egress_wait_cycles << '\n';
+    out << "gmem bus: turns=" << summary_.gmem_bus_turns
+        << " turnaround_wait_ticks=" << summary_.gmem_turnaround_ticks << '\n';
     if (summary_.test_preload_bytes != 0) {
         // A test put bytes into shared memory before the first cycle, for
         // free. Printed only then, so a harness can refuse a run that has it.

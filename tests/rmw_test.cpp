@@ -1290,8 +1290,6 @@ void test_d12_1_every_uniform_op_under_a_partial_mask() {
     const std::vector<std::pair<std::string, std::string>> cases = {
         {"lds.uni", "umov ur0, 0\nlds.uni r1, [ur0]\nhalt\n"},
         {"ldg.uni", "umov ur0, 0\nldg.uni r1, [ur0]\nhalt\n"},
-        {"ldg.v8", "mov r0, 0\nldg.v8 r8, [r0]\nhalt\n"},
-        {"stg.v8", "mov r0, 0\nstg.v8 [r0], r8\nhalt\n"},
         {"mbar.init", "umov ur4, 4160\nmbar.init [ur4], 1\nhalt\n"},
         {"mbar.arrive", "umov ur4, 4096\nmbar.arrive [ur4]\nhalt\n"},
         {"mbar.arrive.expect_tx", "umov ur4, 4096\nmbar.arrive.expect_tx [ur4], 0\nhalt\n"},

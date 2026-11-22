@@ -76,6 +76,10 @@ void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
 // predicate), else a SimError naming the pc (qtxc and the assembler refuse it
 // per source line).
 void check_write_masks(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: an ldg.v8 / stg.v8 only on a profile with 32-byte sectors (a
+// lane's eight words are one sector), else a SimError naming the pc (qtxc
+// and the assembler refuse it per source line).
+void check_v8_sectors(const Kernel& kernel, const DeviceProfile& profile);
 // Kernel load: every uniform register an instruction names (src/isa.hpp
 // uniform_sources -- a tma's last coordinate register included -- and
 // uniform_destination) is below the profile's urf.registers, else a SimError

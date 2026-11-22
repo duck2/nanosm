@@ -148,12 +148,14 @@ struct TraceSummary {
     uint64_t lsu_bytes = 0;             // their sector bytes on the bus
     uint64_t lsu_useful_bytes = 0;      // bytes the instructions named
     uint64_t lsu_no_slot_cycles = 0;    // warp-cycles: LSU op ineligible, no command slot
-    uint64_t lsu_no_staging_cycles = 0; // warp-cycles: slot free, no assembly register
+    uint64_t lsu_no_staging_cycles = 0; // warp-cycles: a scalar stg waits for the store buffer
     uint64_t lsu_request_wait_cycles = 0; // LSU request ready, controller queue full
     uint64_t lsu_ingress_full_cycles = 0; // cycles a read beat was held: ingress FIFO full
     uint64_t lsu_rf_write_wait_cycles = 0;
     uint64_t lsu_rf_read_wait_cycles = 0;
     uint64_t lsu_egress_wait_cycles = 0;
+    uint64_t gmem_bus_turns = 0;        // changes of direction on the data bus
+    uint64_t gmem_turnaround_ticks = 0; // DRAM ticks a ready entry waited for gmem.turnaround_dram_ticks
     // The launch copy (0 bytes: none): where the block came from and went,
     // and when each launch flag cleared (depbar, block bytes, cycle).
     // Bytes a TEST placed in shared memory before the first cycle, untimed

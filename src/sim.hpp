@@ -26,9 +26,9 @@ namespace nanosm {
 // Test seam for the placeholder gmem controller's return order. The default
 // (fifo) serves the queue strictly in acceptance order, which is a legal
 // special case of the boundary contract (in order within a read ID, free
-// across IDs). reverse_free_ids is also legal: when the queue front is a
-// free-ID (scalar) read it serves the youngest ready free-ID read of that
-// leading run first, provoking out-of-order gather returns.
+// across IDs). (There was a reverse_free_ids order for gathers on free IDs;
+// since 2026-11-21 every load is on the one ordered LSU stream and no read
+// has a free ID, so it is gone.)
 // illegal_ordered_reorder breaks the contract on purpose (serves the second
 // entry of an ordered stream before the first) so the SM's tripwire can be
 // tested. Never used by kernels or launches.
@@ -38,7 +38,6 @@ namespace nanosm {
 // so returns interleave across stream IDs while every ID stays in order.
 enum class ControllerTestOrder : uint8_t {
     fifo,
-    reverse_free_ids,
     illegal_ordered_reorder,
     interleave_ordered_streams,
 };
@@ -108,7 +107,7 @@ struct ResourceView {
     bool probe_register_free = false;
     bool simt_rmw_register_free = false; // the SIMT RMW register is empty after this cycle
     bool lsu_slot_free = false;
-    bool assembly_free = false;
+    bool store_buffer_free = false;  // a scalar stg: no store still has data to move into the egress FIFO
 };
 
 enum class Refusal : uint8_t {
@@ -217,7 +216,6 @@ public:
     // Test seams (Q, between ticks): the RF write decision's state per bank.
     [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
     [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
-    [[nodiscard]] uint32_t rf_write_lsu_cursor() const { return rf_write_policy_.cur().lsu_cursor; }
     // Test seams (Q, between ticks): the RF read decision's state per bank,
     // and the issue register's bank use (reads its round samples this cycle).
     [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().owed.at(bank) != 0; }
@@ -755,12 +753,14 @@ private:
     // and visible at the egress FIFO's request pointer.
     enum class GmemClient : uint8_t { tma, lsu };
 
-    // Read IDs. Stream 0 is the TMA (ordered, one 32 B sector register);
-    // 1..read_streams-1 are ordered vector streams (round-robin over vector
-    // loads; no sector register, beats pluck straight into the command's
-    // assembly register). Free IDs (gathers, ldg.uni, scatters) are tags in
-    // [read_streams, read_streams + lsu.sectors_in_flight).
+    // IDs. Stream 0 is the TMA's reads (ordered, one 32 B sector register);
+    // stream 1 is every LSU read -- v8 loads, gathers, ldg.uni -- ordered, no
+    // sector register, beats pluck straight into the load buffer. lsu.
+    // read_streams is those two. Free IDs are for scatter WRITES only: tags
+    // in [read_streams, read_streams + lsu.sectors_in_flight), so that their
+    // acknowledgements may return in any order.
     static constexpr uint32_t tma_stream = 0;
+    static constexpr uint32_t lsu_stream = 1;   // every LSU read, in request order
 
     // One entry of the controller queue (capacity gmem.queue_sectors, the
     // entry in bus service included). Address/metadata only: read data lives
@@ -875,20 +875,57 @@ private:
         bool complete = false;      // all bytes in; its ticket is in the TMA queue's returns
     };
 
-    // A 64 B (lane-wide) assembly register from the lsu.staging_vectors pool.
-    // Owner: one LSU command from admission to its end (vector load: its
-    // eighth RF write; gather/uniform: its single RF write; store: its last
-    // acknowledgement). Never recycled between the chunks of a command.
-    // Loads: filled from the ingress FIFO at the pluck rate (vector: lane =
-    // word offset in the 64 B chunk; gather: the selected word; uni: one word
-    // to every lane), dumped by one full-width RF write. Stores: filled by
-    // one full-width RF read beat (vector) or the issue read (scalar), drained
-    // into the egress FIFO at the pluck rate.
+    // The LSU's two 64 B (lane-wide) buffers, one on each pipe; no register
+    // serves both directions (HUMAN 2026-11-21: "one load one store").
+    //   staging_[load_buffer]   ingress FIFO -> RF write port
+    //   staging_[store_buffer]  RF read port (or the issue read) -> egress FIFO
+    // A buffer has an owner only while data is in it:
+    //   load   from the first word plucked for a group (a vector load's 64 B
+    //          chunk; a gather's or ldg.uni's one vector) until that group's
+    //          RF write is granted. Filled at the pluck rate (vector: lane =
+    //          word offset in the chunk; gather: the selected word; uni: one
+    //          word to every lane), dumped by one full-width RF write.
+    //   store  a scalar store from its dispatch (the issue read's data), a
+    //          vector store from each RF read beat's landing, until the last
+    //          word of that data is pushed into the egress FIFO (at the pluck
+    //          rate). NOT until the write acknowledgement.
+    // The command slot holds the command (addresses, counters, depbar) to its
+    // end: a load's last RF write, a store's last acknowledgement.
+    // Why returning data always has somewhere to go: only loads use the load
+    // buffer, every LSU read returns on one ordered stream (request order =
+    // command order), and the buffer's only exit is the RF write port, which
+    // the async-owed rule always opens. So the ingress FIFO always drains
+    // and a read never holds the bus for good. A store waiting for egress
+    // room (the FIFO full, a TMA store ahead of it) waits only for the bus.
+    //
+    // What a buffer holds is one GROUP of a command: a fixed set of lanes, so
+    // a lane's place in the buffer is wiring (lsu_group_width):
+    //   ldg.v8 / stg.v8  lsu.load_group_lanes / lsu.store_group_lanes lanes,
+    //                    eight words each: word w of lane l at buffer word
+    //                    (l - the group's first lane) x 8 + w. A load group is
+    //                    written by EIGHT RF writes (rD + j, the group's
+    //                    active lanes enabled, one a cycle); a store group is
+    //                    filled by EIGHT RF read beats (rS + j, one a cycle).
+    //   ldg (gather)     as many lanes as the load buffer has words (all of
+    //                    them when it has sixteen or more), one word each;
+    //                    one RF write with those lanes enabled.
+    //   ldg.uni          one word, fanned out by its one RF write.
+    //   stg (scatter)    every lane's word, from the issue read at dispatch.
+    // Sizes: load buffer 8 x lsu.load_group_lanes words (256 bits per lane of
+    // the group); store buffer 8 x lsu.store_group_lanes words, at least one
+    // word per lane (a scatter's data). Per buffer also: owner (a command
+    // slot number), group (4 bits), the group's lane enables (lanes bits),
+    // word valid bits, and a beat counter (3 bits).
     struct AssemblyRegister {
         std::optional<uint64_t> owner;
-        std::vector<uint32_t> words;     // one per lane (lanes, sized at construction: 64 B)
-        std::vector<uint8_t> valid;      // lane enables (lanes bits)
+        uint32_t group = 0;              // which lane group of the owner
+        uint64_t lanes = 0;              // the group's active lanes (a load's RF write enables)
+        std::vector<uint32_t> words;     // the buffer's words (sized at construction)
+        std::vector<uint8_t> valid;      // one bit per word
         uint32_t valid_count = 0;
+        uint32_t expected = 0;           // words this group brings; complete when valid_count == expected
+        uint32_t beats = 0;              // v8 load: RF writes granted; v8 store: RF read beats landed
+        uint32_t beats_total = 0;        // v8: 8; a gather / uniform load: 1
     };
 
     enum class LsuKind : uint8_t { vector_load, vector_store, scalar_load, scalar_store, uniform_load };
@@ -912,22 +949,22 @@ private:
         Instruction instruction;
         uint8_t reg = 0;            // rD (loads) / rS (vector store)
         uint8_t depbar = 0;
-        uint32_t assembly = 0;      // index into staging_
-        uint64_t base = 0;          // vector: 64 B-aligned block address
-        // scalar: the issue cycle's active mask (16 bits): an inactive lane
-        // makes no request, a load writes only the active lanes (vector and
-        // uniform commands are uniform operations: all lanes).
+        uint32_t assembly = 0;      // load_buffer or store_buffer (by kind; kept for the trace and probes)
+        // The instruction's lanes (16 bits; the active mask AND its write mask,
+        // as its operands were sampled): an inactive lane makes no request, a
+        // load writes only these lanes (a uniform load: all lanes).
         uint64_t lanes = 0;
-        // scalar: one per ACTIVE lane, in lane order; uniform: one; vector:
-        // none. Hardware: the lanes' addresses latched at admission (16 x 64
-        // bits as held here; a sector address and a word offset each).
+        // One per ACTIVE lane, in lane order (ldg / stg: the lane's word; ldg.v8
+        // / stg.v8: the lane's sector, word offset 0); uniform: one. Hardware:
+        // the lanes' addresses latched at admission (16 x 64 bits as held
+        // here; a sector address and a word offset each).
         std::vector<LsuSector> sectors;
-        uint32_t stream = 0;        // vector load: its ordered read stream (1..read_streams-1)
+        uint32_t stream = 0;        // a load: the ordered LSU read stream (lsu_stream)
         uint32_t requests_total = 0;
         uint32_t requests_emitted = 0;
-        uint32_t chunks_done = 0;   // vector load: RF writes; vector store: RF reads
-        uint32_t chunks_plucked = 0; // vector store: chunks moved into the egress FIFO
-        uint32_t words_plucked = 0; // stores: words of the current chunk (vector) / sectors (scalar) in egress
+        uint32_t chunks_done = 0;   // loads: active lanes whose data is written to the RF; v8 store: RF read beats of the current group (0..8)
+        uint32_t chunks_plucked = 0; // v8 store: lanes (sectors) moved into the egress FIFO
+        uint32_t words_plucked = 0; // stores: words of the current sector (v8) / sectors (scalar) in egress
         uint32_t acks = 0;
     };
 
@@ -1282,10 +1319,8 @@ private:
     struct RfWritePolicy {
         std::vector<uint8_t> owed;
         std::vector<uint32_t> cursor;
-        // The LSU has ONE RF write path (rfc09 section 3a: one lane-wide vector
-        // per cycle). Its output mux presents at most one assembly register per
-        // cycle, round-robin from here; it moves past the register written.
-        uint32_t lsu_cursor = 0;
+        // (The LSU has ONE RF write path, rfc09 section 3a: the load buffer,
+        // one lane-wide vector per cycle. No cursor: there is one buffer.)
         bool operator==(const RfWritePolicy&) const = default;
     };
 
@@ -1435,6 +1470,10 @@ private:
         uint8_t reg = 0;
         uint64_t lsu_command = 0;    // lsu_store
         uint32_t assembly = 0;       // lsu_store
+        uint32_t group = 0;          // lsu_store: the lane group this beat is for
+        uint32_t beat = 0;           // lsu_store: which of rS .. rS+7
+        uint64_t lanes = 0;          // lsu_store: the group's active lanes
+        bool last_group = false;     // lsu_store: the command reads this register for the last time
     };
 
     // The RF read decision of this cycle, from Q before issue:
@@ -1476,8 +1515,8 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> words; // (byte offset in the slot, word)
         bool slot_complete = false;                    // the open slot's last word lands now
         uint64_t lsu_command = 0;
-        uint32_t lsu_assembly = 0;
-        bool lsu_chunk_drained = false;                // a vector store's assembly register empties
+        bool lsu_chunk_drained = false;                // a vector store's chunk has left the store buffer
+        bool lsu_store_drained = false;                // a scalar store's last word has left the store buffer
         bool tma_store_drained = false;                // the head TMA store register's last word leaves
     };
 
@@ -1593,12 +1632,20 @@ private:
     // LSU: the ingress FIFO read port this cycle.
     struct IngressPluck {
         uint32_t bytes = 0;                               // read from the FIFO head
-        struct LaneWrite { uint32_t assembly = 0; uint32_t lane = 0; uint32_t word = 0; };
-        std::vector<LaneWrite> lanes;
+        struct LaneWrite { uint32_t assembly = 0; uint32_t lane = 0; uint32_t word = 0; }; // lane: the buffer word
+        std::vector<LaneWrite> lanes;                     // words into the load buffer
+        // The group whose first word claims the free load buffer now.
+        struct LoadClaim {
+            uint64_t command = 0;
+            uint32_t group = 0;
+            uint64_t lanes = 0;       // its active lanes
+            uint32_t expected = 0;    // the words it brings
+            uint32_t beats_total = 0; // the RF writes it needs
+        };
+        std::optional<LoadClaim> load_claim;
         std::optional<TmaSectorRegister> tma_sector_after; // the TMA sector register after its fill
         std::optional<TmaReturn> tma_ticket;               // the sector completed: placement ticket
         std::map<uint64_t, std::optional<ReadRecord>> records; // updated (none: erased)
-        std::vector<uint32_t> freed_tags;
     };
 
     // The placeholder controller's DRAM ticks this core cycle.
@@ -1617,8 +1664,11 @@ private:
     struct LsuRfRead {
         std::optional<uint64_t> command;
         uint32_t assembly = 0;
-        std::vector<uint32_t> values;
+        std::vector<uint32_t> values;   // the register, every lane
         uint64_t arrive_cycle = 0;
+        uint32_t group = 0;             // the lane group it is for
+        uint32_t beat = 0;              // which of rS .. rS+7
+        uint64_t lanes = 0;             // the group's active lanes: the words kept
     };
 
     // The front end this cycle, all from Q: the fetch grant (round-robin over
@@ -1686,6 +1736,7 @@ private:
         uint32_t probes = 0;
         uint32_t wait_slots = 0;
         uint32_t lsu_commands = 0;
+        uint32_t lsu_stores = 0;     // stg / stg.v8: their data is still to move through the store buffer
         uint32_t mma_commands = 0;
         std::array<uint32_t, 2> acc{}; // [0 acc.ld, 1 acc.st]
     };
@@ -1872,7 +1923,9 @@ private:
     // table (ReadRecord) as their comments say; free-ID tags
     // lsu.sectors_in_flight bits (16, fixed).
     Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
-    std::deque<Reg<AssemblyRegister>> staging_;   // the lsu.staging_vectors pool, one register each
+    std::deque<Reg<AssemblyRegister>> staging_;   // [load_buffer], [store_buffer]: one register each
+    static constexpr uint32_t load_buffer = 0;
+    static constexpr uint32_t store_buffer = 1;
     Reg<IngressFifo> ingress_{registers_, "ingress FIFO"};
     Reg<std::deque<EgressSlot>> egress_fifo_{registers_, "egress FIFO"};
     Reg<std::map<uint64_t, ReadRecord>> read_records_{registers_, "read ID table"};
@@ -1928,6 +1981,10 @@ private:
     // profile; checked in finish_gmem_write.
     std::deque<GmemSectorRequest> gmem_queue_;
     std::optional<GmemSectorRequest> gmem_bus_;
+    // The bus's last data beat: its DRAM tick and direction (true: a read).
+    // The controller's own state, for gmem.turnaround_dram_ticks.
+    std::optional<uint64_t> gmem_last_beat_tick_;
+    bool gmem_last_beat_load_ = false;
     std::deque<WriteAck> pending_write_acks_;
     ControllerTestOrder controller_test_order_ = ControllerTestOrder::fifo;
     // Request channel: TMA/LSU alternate (the client granted last yields a tie).
@@ -1936,7 +1993,6 @@ private:
     uint64_t dram_tick_ = 0;
     uint64_t dram_phase_ = 0;
     // Id counters, advanced only by the decisions that allocate (fixed order).
-    uint32_t next_vector_stream_ = 0;     // round-robin over 1..read_streams-1
     uint64_t next_egress_slot_id_ = 0;
     uint64_t next_lsu_command_id_ = 0;
     uint64_t next_gmem_request_id_ = 0;
@@ -2304,8 +2360,12 @@ private:
     void deliver_write_acks(Wires& w);
     [[nodiscard]] static bool is_store(LsuKind kind);
     LsuCommand plan_lsu_command(const DispatchEntry& op) const;
-    [[nodiscard]] std::optional<uint32_t> free_assembly_register(const Wires& w) const;
-    [[nodiscard]] uint32_t free_assembly_register_count(const Wires& w) const;
+    [[nodiscard]] static bool store_has_data_left(const LsuCommand& command);
+    [[nodiscard]] bool store_buffer_free() const;
+    [[nodiscard]] uint32_t lsu_group_width(const LsuCommand& command) const;
+    [[nodiscard]] uint64_t lsu_group_lanes(const LsuCommand& command, uint32_t group) const;
+    [[nodiscard]] bool load_buffer_released(const Wires& w) const;
+    bool load_buffer_takes(const LsuCommand& command, uint32_t group, IngressPluck& pluck, const Wires& w) const;
     [[nodiscard]] const LsuCommand* find_lsu_command(uint64_t id) const;
     [[nodiscard]] std::optional<uint32_t> free_id_tag() const;
     [[nodiscard]] const EgressSlot* egress_request_slot(std::optional<uint64_t> requested_now) const;
@@ -2313,13 +2373,13 @@ private:
     [[nodiscard]] const LsuCommand* lsu_request_candidate(std::optional<uint64_t> requested_now) const;
     GmemSectorRequest write_request(const EgressSlot& slot, GmemClient client, uint64_t id,
         std::optional<uint32_t> tag);
-    GmemSectorRequest lsu_read_request(const LsuCommand& command, uint64_t id, std::optional<uint32_t> tag);
+    GmemSectorRequest lsu_read_request(const LsuCommand& command, uint64_t id);
     void pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t take, TmaSectorRegister& reg,
         ReadRecord& record, IngressPluck& pluck);
     [[nodiscard]] bool pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
         uint32_t take, IngressPluck& pluck, const Wires& w);
-    void pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed, uint32_t take,
-        IngressPluck& pluck);
+    [[nodiscard]] bool pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
+        uint32_t take, IngressPluck& pluck, const Wires& w);
     void note_first_return(uint64_t command);
     void probe(LsuEdge edge, uint64_t id, uint64_t aux, uint32_t bytes);
     [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;

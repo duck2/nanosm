@@ -1134,13 +1134,15 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
 
 // The fixed arithmetic pipeline's instructions (a nonzero fixed latency;
 // mbar.test_wait's one cycle is a probe, not arithmetic) and the four
-// per-lane memory instructions (src/isa.hpp).
+// per-lane memory instructions and their v8 forms (src/isa.hpp).
 bool can_be_masked(Opcode opcode) {
     switch (opcode) {
     case Opcode::lds:
     case Opcode::sts:
     case Opcode::ldg:
     case Opcode::stg:
+    case Opcode::ldg_v8:
+    case Opcode::stg_v8:
         return true;
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_test_wait_r:

@@ -130,6 +130,7 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
         check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
         check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
         check_tmem_operand(inst, profile, "line " + std::to_string(inst.line));
+        check_v8_sector(inst, profile, "line " + std::to_string(inst.line));
         kernel.words.push_back(encode(inst));
     }
     return kernel;
