@@ -5,6 +5,7 @@
 #include "limits.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
+#include "machine/fifo.hpp"
 #include "machine/fixed.hpp"
 #include "machine/pipe.hpp"
 #include "machine/reg.hpp"
@@ -80,6 +81,9 @@ enum class LsuEdge : uint8_t {
     write_request,     // a write's request accepted by the controller. id = request, aux = slot
     bus_write_beat,    // egress FIFO -> bus. id = request, aux = byte offset in sector
     write_ack,         // the write's acknowledgement. id = request
+    // Not a movement: a zero fill found the placement tickets' write port
+    // taken by a sector the ingress completed, and waits. id = tma command
+    tma_zero_fill_wait,
 };
 
 struct LsuEdgeEvent {
@@ -197,9 +201,12 @@ public:
     [[nodiscard]] uint32_t depbar_value(uint32_t warp, uint8_t bar) const { return depbar_.cur().at(warp).at(bar); }
     [[nodiscard]] std::size_t mma_queue_depth() const { return mma_.cur().slots.size(); }
     // Test seams (Q, between ticks): the owner of the load buffer (0) or the
-    // store buffer (1) (an LSU command id), its valid bits and their count.
+    // store buffer (1) (an LSU command id: the buffer holds its slot), its
+    // valid bits and their count.
     [[nodiscard]] std::optional<uint64_t> lsu_buffer_owner(uint32_t index) const {
-        return lsu_buffers_.at(index).cur().owner;
+        const auto& owner = lsu_buffers_.at(index).cur().owner;
+        if (!owner.has_value()) return std::nullopt;
+        return lsu_commands_.cur().in_slot(*owner).id;
     }
     [[nodiscard]] std::vector<uint8_t> lsu_buffer_valid(uint32_t index) const {
         return lsu_buffers_.at(index).cur().valid;
@@ -817,7 +824,8 @@ private:
         };
 
         uint64_t id = 0;            // simulator request number (trace, probe); the wire is stream + tag
-        uint64_t command = 0;       // tma command id or lsu command id
+        uint64_t command = 0;       // (T) tma command id or lsu command id
+        uint8_t lsu_slot = 0;       // an LSU write: its command's slot (the acknowledgement's owner)
         uint32_t stream = 0;        // read ID; writes: free-ID tag stream for scatters
         uint64_t sector_address = 0;
         uint64_t ready_dram_tick = 0;
@@ -828,7 +836,7 @@ private:
         // checked there). The SM never holds it: its beats go on the bus.
         std::vector<uint8_t> data;
         uint64_t byte_enable = 0;   // writes: bit b enables sector byte b (AXI strobes)
-        uint64_t egress_slot = 0;   // writes: the egress FIFO slot holding the data
+        uint64_t egress_slot = 0;   // (T) writes: the running number of the egress slot holding the data
         uint32_t beats = 0;
         uint32_t next_beat = 0;
     };
@@ -853,8 +861,12 @@ private:
     // sectors): command slot 2 + global address 64 + shared address 16 +
     // elements 6 (1..32) + element size 2 + zero fill 1 + layout 1 +
     // transposed 1 + spacing 5 (its log2) = 98 bits.
+    // A store's command may leave its slot once its last sector is captured,
+    // while its store registers and egress slots still hold its runs; from
+    // then on nothing looks its slot up (the egress path needs no owner).
     struct TmaRun {
-        uint64_t command = 0;         // hardware: the command's queue slot (2 bits at 4 commands)
+        uint8_t slot = 0;             // the command's queue slot (2 bits at 4 commands)
+        uint64_t command = 0;         // (T) the command's number, for the trace and the sanitizer
         uint64_t global_address = 0;  // element 0's global byte address (a zero fill: 0, unused)
         uint32_t shared_address = 0;  // element 0's unshuffled shared byte address
         uint8_t elements = 0;         // 1 .. sector bytes / element bytes
@@ -866,42 +878,72 @@ private:
     };
 
     // What the SM remembers about an accepted read until its sector has been
-    // consumed: where each returning byte goes. This is request metadata (an
-    // ID-indexed table), not payload storage. Hardware size: one entry per
-    // read in flight -- the TMA's (at most tma.sector_credits), the vector
-    // loads' (lsu.active_commands x the 8 x lanes x 4 / gmem.sector_bytes
-    // sectors of a block) and the free IDs (lsu.sectors_in_flight): 16 + 2 x
-    // 16 + 16 = 64 entries at the canonical profile; checked in
-    // drive_read_records. Here a map keyed by the 64-bit request number; in
-    // hardware a table indexed by stream and tag (the TMA's stream is in
-    // order, so its part is a FIFO of runs).
-    enum class ReadKind : uint8_t { tma, vector, gather, uniform };
-    struct ReadRecord {
-        ReadKind kind = ReadKind::tma;
-        uint32_t stream = 0;
+    // consumed: where each returning byte goes. Request metadata, not payload
+    // storage. Both read streams return in request order (the controller's
+    // contract: in order within a read ID) and each sector's bytes are read
+    // out of the ingress FIFO in order, so per stream an entry is added when
+    // its read is accepted, only the oldest is ever looked at, and it leaves
+    // when its sector's last byte is consumed: two FIFOs, one per stream
+    // (tma_reads_, lsu_reads_). A returning word says which stream it is on,
+    // which picks the head; one counter per stream says how many bytes of the
+    // head's sector have been consumed (the next byte's place in it).
+    //   TMA stream  the sector's run (TmaRun: 98 bits; its sector address
+    //               follows from it): at most tma.sector_credits entries (a
+    //               credit is held from the walk to the placement's end).
+    //   LSU stream  LsuRead below: requests run ahead of the load buffer, so
+    //               each command slot may have one sector per lane in flight,
+    //               plus the tail of a retired gather or ldg.uni (see
+    //               drive_read_records): lsu.active_commands x lanes + 1
+    //               entries (33 at the canonical profile).
+    enum class LsuReadKind : uint8_t { vector, gather, uniform };
+    struct LsuRead {
+        LsuReadKind kind = LsuReadKind::vector; // 2 bits
+        uint8_t slot = 0;           // the command's slot (1 bit at 2 commands)
+        uint8_t lane = 0;           // the lane that asked (4 bits)
+        uint8_t word_offset = 0;    // gather / uniform: the word's byte offset in the sector (3 bits of word)
+        // (T) The command's number. A gather or ldg.uni retires (and frees its
+        // slot) once its word is in, while the rest of its sector is still
+        // read and dropped; meanwhile its slot may hold a new command. The
+        // tail's bytes look nothing up in the slot; only the trace's first
+        // return is stamped, by this number, and finds nothing.
         uint64_t command = 0;
-        uint64_t sector_address = 0;
-        uint32_t sector_index = 0;  // vector: sector within the 512 B block
-        uint32_t lane = 0;          // gather: the lane that asked
-        uint32_t word_offset = 0;   // gather/uniform: the word's byte offset in the sector
-        uint32_t tag = 0;           // gather/uniform: free-ID tag
-        uint32_t received = 0;      // bytes plucked at the SM
-        TmaRun run;                 // tma: the sector's run (where its bytes go)
     };
 
-    // One bus beat in the SM's ingress FIFO (a BRAM, simple dual port).
-    // Capacity lsu.ingress_sectors x sector bytes (256 B, 32 beats of 8 B at
-    // the canonical profile; checked in drive_ingress). Written by the bus
-    // (one beat per DRAM tick); readable from visible_cycle = write cycle +
-    // lsu.ingress_latency_cycles; read lsu.pluck_words_per_cycle words per
-    // cycle. Never fall-through. (Room freed by a read is a separate
-    // contract: reusable from the next cycle, see tick_gmem_controller.)
+    // One bus beat as the controller delivers it this cycle (a wire): bus ->
+    // ingress FIFO.
     struct IngressBeat {
-        uint64_t request = 0;       // hardware: the read ID (stream / tag) beside the beat
+        uint64_t request = 0;       // (T) the simulator's request number
+        uint8_t stream = 0;         // the read stream it returns on (tma_stream or lsu_stream)
         uint32_t offset = 0;        // byte offset of this beat in its sector
         std::vector<uint8_t> bytes; // gmem.bus_bytes_per_dram_tick at most (8)
-        uint32_t consumed = 0;      // bytes already plucked (the FIFO's read pointer, within the head beat)
-        uint64_t visible_cycle = 0; // (the BRAM's write-to-read latency, modelled as a time stamp)
+    };
+
+    // One word of the SM's ingress FIFO (a BRAM, simple dual port), as the
+    // read port sees it. The FIFO is written a bus beat wide (one beat per
+    // DRAM tick: up to ceil(DRAM clock / core clock) beats per core cycle) and
+    // read lsu.pluck_words_per_cycle words wide, so its read pointer moves by
+    // words and a beat may be read over several cycles. Capacity
+    // lsu.ingress_sectors x sector words (64 words, 256 B, at the canonical
+    // profile). An entry is readable lsu.ingress_latency_cycles after it is
+    // written (never fall-through). Room freed by a read is a separate
+    // contract: reusable from the next cycle (tick_gmem_controller).
+    // Hardware: the word and its stream, 33 bits.
+    struct IngressWord {
+        uint32_t word = 0;
+        uint8_t stream = 0;         // tma_stream or lsu_stream (1 bit)
+        uint64_t request = 0;       // (S, T) the request number: the sanitizer's order check, the edge probe
+        uint32_t offset = 0;        // (S) its byte offset in its sector, as the bus sent it
+    };
+
+    // A run of words the read port takes this cycle for one consumer: one
+    // stream's words inside one bus beat of one sector (a wire).
+    struct IngressPiece {
+        uint8_t stream = 0;
+        uint32_t offset = 0;        // its first byte's place in the sector: the stream head's bytes consumed
+        Bounded<uint32_t, limits::sector_bytes / 4> words;
+        uint64_t request = 0;       // (S, T) the first word's request number
+        uint32_t sent_offset = 0;   // (S) the first word's offset as the bus sent it
+        [[nodiscard]] uint32_t bytes() const { return static_cast<uint32_t>(4 * words.size()); }
     };
 
     // The TMA stream's 32 B sector register (flops). Filled from the ingress
@@ -956,7 +998,7 @@ private:
     // slot number), group (4 bits), the group's lane enables (lanes bits),
     // word valid bits, and a beat counter (3 bits).
     struct LsuBuffer {
-        std::optional<uint64_t> owner;
+        std::optional<uint8_t> owner;    // the owning command's slot
         uint32_t group = 0;              // which lane group of the owner
         uint64_t lanes = 0;              // the group's active lanes (a load's RF write enables)
         Bounded<uint32_t, limits::v8_registers * limits::lanes> words;     // the buffer's words (sized at construction)
@@ -981,7 +1023,8 @@ private:
     // (lsu.active_commands) from admission until its completion commits; it
     // holds the load or the store buffer only while its data is in it.
     struct LsuCommand {
-        uint64_t id = 0;
+        uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer, the wires' names
+        uint8_t slot = 0;           // the command slot it holds (chosen at its dispatch)
         LsuKind kind = LsuKind::vector_load;
         uint32_t warp = 0;
         uint32_t pc = 0;
@@ -1011,15 +1054,35 @@ private:
     // The load / store unit's command slots: lsu.active_commands slots (2),
     // each holding one command from its dispatch until its last
     // acknowledgement or register write, and which is older. A command takes
-    // the lowest free slot. Requests, store data and register reads are
-    // chosen oldest first; a command leaves from either slot. Other state
-    // names a command by its number (LsuCommand::id), found here by comparing
-    // the slots; in hardware that reference would be the slot's number.
+    // the lowest free slot (as its dispatch cycle's releases leave them).
+    // Requests, store data and register reads are chosen oldest first; a
+    // command leaves from either slot. State that refers to a command (a
+    // buffer's owner, a read record, an egress slot, a read in the store-data
+    // pipeline) holds its slot number; this cycle's wires name it by its
+    // number (LsuCommand::id), found here by comparing the slots.
     struct LsuCommandSlots {
         std::array<std::optional<LsuCommand>, limits::lsu_active_commands> slots{};
         Bounded<uint8_t, limits::lsu_active_commands> by_age; // occupied slots, oldest first
         [[nodiscard]] std::size_t size() const { return by_age.size(); }
         [[nodiscard]] bool empty() const { return by_age.empty(); }
+        // The command in slot `slot`; it must be there.
+        [[nodiscard]] const LsuCommand& in_slot(uint8_t slot) const {
+            if (slot >= slots.size() || !slots[slot].has_value()) {
+                throw SimError("internal reference to the empty LSU command slot " + std::to_string(slot));
+            }
+            return *slots[slot];
+        }
+        // The lowest slot of the profile's `capacity` free once the commands
+        // `leaving` (by number) have left.
+        [[nodiscard]] std::optional<uint8_t> lowest_free(std::size_t capacity, const std::vector<uint64_t>& leaving) const {
+            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
+                if (!slots[slot].has_value() ||
+                    std::find(leaving.begin(), leaving.end(), slots[slot]->id) != leaving.end()) {
+                    return static_cast<uint8_t>(slot);
+                }
+            }
+            return std::nullopt;
+        }
         [[nodiscard]] const LsuCommand* find(uint64_t id) const {
             for (const auto slot : by_age) {
                 if (slots[slot]->id == id) return &*slots[slot];
@@ -1035,15 +1098,14 @@ private:
             for (const auto slot : by_age) commands.push_back(&*slots[slot]);
             return commands;
         }
-        // A new command takes the lowest free slot of the profile's `capacity`.
+        // A new command takes the slot its dispatch chose (the lowest free one).
         void take(const LsuCommand& command, std::size_t capacity) {
-            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
-                if (slots[slot].has_value()) continue;
-                slots[slot] = command;
-                by_age.push_back(static_cast<uint8_t>(slot));
-                return;
+            if (command.slot >= capacity || command.slot >= slots.size() || slots[command.slot].has_value() ||
+                lowest_free(capacity, {}) != command.slot) {
+                throw SimError("internal: the LSU holds more than lsu.active_commands commands");
             }
-            throw SimError("internal: the LSU holds more than lsu.active_commands commands");
+            slots[command.slot] = command;
+            by_age.push_back(command.slot);
         }
         void release(uint64_t id) {
             for (std::size_t index = 0; index < by_age.size(); ++index) {
@@ -1069,34 +1131,63 @@ private:
         uint64_t egress_wait = 0;
     };
 
-    // One 32 B slot of the egress FIFO (a BRAM, lsu.egress_sectors slots: 8 at
-    // the canonical profile; checked in drive_egress).
-    // Every store client writes here through one shared write port of
-    // lsu.pluck_words_per_cycle words, one client per cycle, granted per
-    // slot (a started slot is never preempted; TMA wins each new grant).
-    // A slot's write request is offered only when all of its words are in
-    // and visible (complete_cycle + lsu.egress_latency_cycles); its beats
-    // leave at one per DRAM tick; the slot is free after its last beat.
+    // The egress FIFO: lsu.egress_sectors slots of 32 B (8 at the canonical
+    // profile), a BRAM. Every store client writes it through one shared write
+    // port of lsu.pluck_words_per_cycle words, one client per cycle, granted
+    // per slot (a started slot is never preempted; TMA wins each new grant).
     // A scalar stg lane is one slot holding one word and 4 byte enables.
-    struct EgressSlot {
-        uint64_t id = 0;            // running slot number (trace / probe)
+    // A slot passes three points, each the head of its own queue:
+    //   open      the write port fills it (EgressOpenSlot, the port's
+    //             register); when its last word is written it is pushed,
+    //             complete, into both FIFOs below at once;
+    //   request   the request FIFO's head is the request pointer: the oldest
+    //             complete slot whose write request the controller has not
+    //             accepted. It is offered lsu.egress_latency_cycles after
+    //             the push (the RAM's write-to-read latency) and leaves when
+    //             accepted;
+    //   data      the data FIFO's head is the slot the bus reads, one beat
+    //             per DRAM tick; it leaves after its last beat.
+    // Writes leave in FIFO order, so the bus's head is always the oldest
+    // accepted request. Slots in use: the data FIFO's entries and the open
+    // one; a new grant needs a free slot (drive_egress checks it).
+    struct EgressOpenSlot {
         GmemClient client = GmemClient::lsu;
-        uint64_t command = 0;
+        uint8_t owner = 0;          // LSU: its command's slot
         uint32_t index = 0;         // LSU: the command's request index this slot carries
         uint64_t sector_address = 0;
-        std::vector<uint8_t> data;  // gmem.sector_bytes (32 B of the BRAM)
         uint64_t byte_enable = 0;
         uint32_t words_total = 0;   // words the client writes into this slot
         uint32_t words_written = 0;
-        uint64_t complete_cycle = 0;
-        std::optional<uint64_t> request; // write request accepted by the controller
+        // The words written so far. In hardware they are in the RAM at the
+        // write pointer's slot already; the write pointer moves on (the push)
+        // when the last one is written.
+        std::array<uint8_t, limits::sector_bytes> data{};
+        uint64_t id = 0;            // (T) running slot number (trace / probe)
+        uint64_t command = 0;       // (T) its command's number
+    };
+    // The request FIFO's entry: what the write request needs (and the LSU's
+    // check that the request pointer is its command's next sector).
+    struct EgressRequest {
+        GmemClient client = GmemClient::lsu;
+        uint8_t owner = 0;          // LSU: its command's slot
+        uint32_t index = 0;         // LSU: the command's request index
+        uint64_t sector_address = 0;
+        uint64_t byte_enable = 0;
+        uint64_t id = 0;            // (T) running slot number
+        uint64_t command = 0;       // (T) its command's number
+    };
+    // The data FIFO's entry: the slot's sector (gmem.sector_bytes of it).
+    struct EgressSector {
+        std::array<uint8_t, limits::sector_bytes> data{};
+        uint64_t id = 0;            // (T) running slot number: the controller's check that it is at the head
     };
 
     struct WriteAck {
         uint64_t dram_tick = 0;
         uint64_t request = 0;
         GmemClient client = GmemClient::lsu;
-        uint64_t command = 0;
+        uint8_t lsu_slot = 0;        // LSU: the command's slot
+        uint64_t command = 0;        // (T)
         std::optional<uint32_t> tag; // scalar scatter: the free-ID tag to return
     };
 
@@ -1115,7 +1206,8 @@ private:
     // The decoded descriptor is not kept here: it goes into the walker's
     // registers when the descriptor read returns (TmaWalker).
     struct TmaCommand {
-        uint64_t id = 0;
+        uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer
+        uint8_t slot = 0;           // the queue slot it holds (set when it takes one)
         uint32_t warp = 0;
         uint32_t pc = 0;
         DecodedInstruction instruction;
@@ -1152,7 +1244,8 @@ private:
     //     (needs a credit and the request channel) or a store sector (a
     //     credit, a free store register and A-read);
     //   - a load's out-of-range stretch, at most a sector's bytes of it per
-    //     step: a zero fill (a credit);
+    //     step: a zero fill (a credit, and the placement tickets' write port,
+    //     which a sector the ingress completes in that cycle has first);
     //   - a store's out-of-range stretch of one row, skipped whole (needs
     //     nothing; one step, one cycle: an entirely out-of-range store takes
     //     one cycle per row).
@@ -1200,7 +1293,8 @@ private:
     // bit by bit) and the command's queue slot; 0 stages: no pipeline, the
     // walker is loaded at the descriptor's return, the timing before.
     struct TmaWalkerStart {
-        uint64_t command = 0;
+        uint8_t slot = 0;           // the command's queue slot
+        uint64_t command = 0;       // (T) its number
         TmaWalker walker;
     };
 
@@ -1234,13 +1328,20 @@ private:
     // A TMA sector ready for placement (port-B write): either the TMA
     // stream's sector register (complete; it stays occupied until its last
     // round) or a synthetic OOB zero fill (no bus data: run.zero_fill).
+    // The tickets wait in tma_returns_, a FIFO of runs (98 bits each): every
+    // entry holds a sector credit (from its walk to its placement's end), so
+    // at most tma.sector_credits entries (16): a 16 x 98-bit LUTRAM FIFO.
     struct TmaReturn {
         TmaRun run;
         uint64_t sector_request = 0; // (T) the request id (trace, probe)
     };
 
     // A TMA store sector register (32 B flops; tma.store_sector_registers of
-    // them, a ring in reservation order). The store-sector path, one one-round
+    // them, a group used as a ring in reservation order: a source read
+    // reserves the register after the held ones, its rounds fill it by its
+    // index -- several may be filling while an older one drains -- and the
+    // egress drains the oldest, the head; tma_store_head_ is that pointer).
+    // Not a FIFO: a register is written after it is taken. The store-sector path, one one-round
     // sector, L = D + Lb, d = ceil(sector words / lsu.pluck_words_per_cycle):
     //   g          the walker's source read is granted on A-read (bypass (h):
     //              planned from Q and this cycle's egress drain). The register
@@ -1262,18 +1363,10 @@ private:
     struct TmaStoreRegister {
         TmaRun run;                 // its sector's run: each returned byte's place in `data`, the byte enables
         uint32_t rounds = 0;        // the source read's rounds
-        std::vector<uint8_t> data;  // gmem.sector_bytes (32 B)
+        std::array<uint8_t, limits::sector_bytes> data{}; // gmem.sector_bytes of it (32 B)
         uint32_t returned = 0;      // source rounds whose words are in `data`
         uint32_t words_out = 0;     // words already written into the egress FIFO
         [[nodiscard]] bool complete() const { return returned == rounds; }
-    };
-    struct TmaStoreRegisters {
-        std::vector<std::optional<TmaStoreRegister>> ring; // tma.store_sector_registers, sized at construction
-        uint32_t head = 0;          // the oldest held register: the one the egress drains
-        [[nodiscard]] uint32_t held() const {
-            return static_cast<uint32_t>(std::count_if(ring.begin(), ring.end(),
-                [](const auto& reg) { return reg.has_value(); }));
-        }
     };
 
     struct IssueAttempt {
@@ -1324,7 +1417,8 @@ private:
     // A TMA placement's last round reaches the RAM: its command's load write
     // ends (pending count, credit release, data complete).
     struct PlacementEnd {
-        uint64_t command = 0;
+        uint8_t slot = 0;        // the command's queue slot
+        uint64_t command = 0;    // (T) its number
         uint32_t shared_end = 0; // the end of the run's bytes in shared memory (the launch copy's mark)
     };
 
@@ -1495,23 +1589,22 @@ private:
     };
 
     // The TMA engine's command queue and walker bookkeeping. One group:
-    // credits, tickets, the walker and each command's pending counts move
-    // together. (Its event register, shmem transactions and the two sector
-    // registers are separate registers.) Sizes, checked in drive_tma_queue:
-    //   commands  tma.queue_commands entries (4), in id order; the oldest
-    //             walking or descriptor-state one is the frontend. (A map here;
-    //             in hardware 4 slots of about 120 bits plus an age order.)
-    //   returns   a FIFO of runs (98 bits each). Every entry holds a sector
-    //             credit (from its walk to its placement's end), so at most
-    //             tma.sector_credits entries (16): a 16 x 98-bit LUTRAM FIFO.
+    // credits, the walker and each command's pending counts move together.
+    // (Its event register, shmem transactions, the sector registers and the
+    // placement tickets, tma_returns_, are separate.) Sizes, checked in
+    // drive_tma_queue:
+    //   commands  tma.queue_commands entries (4); the oldest walking or
+    //             descriptor-state one is the frontend (4 slots of about 120
+    //             bits plus an age order).
     // The TMA's command slots: tma.queue_commands slots (4), each holding one
     // command from the cycle its operand read pushes it until it leaves, and
     // the slots' age order. A command takes the lowest free slot; the
     // frontend and the event presentation choose the oldest command in the
     // state they want; a command leaves from any slot (a store can be done
-    // before an older load's placements have landed). Other state names a
-    // command by its number (TmaCommand::id), found here by comparing the
-    // slots; in hardware that reference would be the slot's number.
+    // before an older load's placements have landed). A run (TmaRun), a
+    // placement's end and a walker start name their command by its slot; the
+    // frontend and the event register's command are still named by number,
+    // found here by comparing the slots.
     struct TmaCommandSlots {
         std::array<std::optional<TmaCommand>, limits::tma_queue_commands> slots{};
         Bounded<uint8_t, limits::tma_queue_commands> by_age; // occupied slots, oldest first
@@ -1532,6 +1625,24 @@ private:
             return *command;
         }
         [[nodiscard]] TmaCommand& at(uint64_t id) { return const_cast<TmaCommand&>(std::as_const(*this).at(id)); }
+        // The command in slot `slot`; `id` is the number the referring state
+        // carries beside the slot (a check that the slot was not reused).
+        [[nodiscard]] const TmaCommand& in_slot(uint8_t slot, uint64_t id) const {
+            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) {
+                throw SimError("internal: TMA command #" + std::to_string(id) + " is not in slot " + std::to_string(slot));
+            }
+            return *slots[slot];
+        }
+        [[nodiscard]] TmaCommand& in_slot(uint8_t slot, uint64_t id) {
+            return const_cast<TmaCommand&>(std::as_const(*this).in_slot(slot, id));
+        }
+        [[nodiscard]] const TmaCommand* find_in_slot(uint8_t slot, uint64_t id) const {
+            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) return nullptr;
+            return &*slots[slot];
+        }
+        [[nodiscard]] TmaCommand* find_in_slot(uint8_t slot, uint64_t id) {
+            return const_cast<TmaCommand*>(std::as_const(*this).find_in_slot(slot, id));
+        }
         // The commands, oldest first.
         [[nodiscard]] Bounded<const TmaCommand*, limits::tma_queue_commands> oldest_first() const {
             Bounded<const TmaCommand*, limits::tma_queue_commands> commands;
@@ -1543,6 +1654,7 @@ private:
             for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
                 if (slots[slot].has_value()) continue;
                 slots[slot] = command;
+                slots[slot]->slot = static_cast<uint8_t>(slot);
                 by_age.push_back(static_cast<uint8_t>(slot));
                 return;
             }
@@ -1564,16 +1676,7 @@ private:
         std::optional<uint64_t> frontend;        // the command the descriptor / walker frontend serves
         std::optional<uint64_t> event_command;   // whose completion event is in the TMA's event register
         uint32_t credits_used = 0;               // of tma.sector_credits (5 bits)
-        std::deque<TmaReturn> returns;           // sectors ready for placement (port-B write)
         TmaWalker walker;                        // the frontend command's walk
-    };
-
-    // The ingress FIFO (IngressBeat): at most lsu.ingress_sectors x sector
-    // bytes (`bytes`), in at most that many sectors' beats; checked in
-    // drive_ingress.
-    struct IngressFifo {
-        std::deque<IngressBeat> beats;
-        uint32_t bytes = 0;
     };
 
     // =======================================================================
@@ -1621,6 +1724,7 @@ private:
         uint8_t reg = 0;
         uint64_t lsu_command = 0;    // lsu_store
         uint32_t buffer = 0;       // lsu_store
+        uint8_t lsu_slot = 0;        // lsu_store: the command's slot
         uint32_t group = 0;          // lsu_store: the lane group this beat is for
         uint32_t beat = 0;           // lsu_store: which of rS .. rS+7
         uint64_t lanes = 0;          // lsu_store: the group's active lanes
@@ -1654,7 +1758,8 @@ private:
     // A-read's port output -> a TMA store register (one source round's words).
     struct TmaStoreFill {
         uint32_t store_register = 0;
-        uint64_t command = 0;
+        uint8_t slot = 0;          // the command's queue slot
+        uint64_t command = 0;      // (T) its number
         std::vector<std::pair<uint32_t, uint8_t>> bytes;  // (byte offset in the sector, byte): at most a sector's
         bool last = false;                                // the source read's last round: the register is complete
     };
@@ -1662,7 +1767,7 @@ private:
     // LSU / TMA -> egress FIFO (the shared egress write port).
     struct EgressWrite {
         std::optional<GmemClient> client;              // who writes the egress FIFO this cycle
-        std::optional<EgressSlot> new_slot;            // a new grant opens this slot
+        std::optional<EgressOpenSlot> new_slot;        // a new grant opens this slot
         std::vector<std::pair<uint32_t, uint32_t>> words; // (byte offset in the slot, word)
         bool slot_complete = false;                    // the open slot's last word lands now
         uint64_t lsu_command = 0;
@@ -1707,16 +1812,17 @@ private:
         std::optional<GmemClient> granted;
         uint64_t lsu_command = 0;                  // the LSU command granted
         bool tma_write = false;                    // the TMA's grant is its store write (else its walker's read)
-        std::optional<uint64_t> tma_write_slot;    // the egress slot whose write request is accepted now
-        std::optional<uint64_t> lsu_write_slot;
+        bool egress_requested = false;             // the egress request FIFO's head is accepted now (a write)
         bool walker_proceeds = false;              // the walker emits its sector this cycle
-        // Request ids, assigned in the fixed order TMA write, walker sector, LSU.
+        // Request ids, assigned in the fixed order TMA write, walker sector, LSU
+        // (a zero fill takes its id after them, in step_tma).
         uint64_t tma_write_id = 0;
-        uint64_t walker_id = 0;
+        uint64_t walker_id = 0;                    // the walker's read sector
         uint64_t lsu_id = 0;
         std::optional<uint32_t> lsu_tag;           // the free-ID tag an LSU scalar request takes
         std::optional<GmemSectorRequest> accepted; // the request the controller queue takes
-        std::vector<std::pair<uint64_t, ReadRecord>> new_read_records; // reads accepted now
+        std::optional<TmaRun> new_tma_read;        // a TMA read accepted now: its read record
+        std::optional<LsuRead> new_lsu_read;       // an LSU read accepted now: its read record
     };
 
     // The shmem grants of this cycle: one select per service.
@@ -1782,12 +1888,21 @@ private:
 
     // LSU: the ingress FIFO read port this cycle.
     struct IngressPluck {
-        uint32_t bytes = 0;                               // read from the FIFO head
+        uint32_t words = 0;                               // read from the FIFO head (they leave it)
         struct LaneWrite { uint32_t buffer = 0; uint32_t lane = 0; uint32_t word = 0; }; // lane: the buffer word
         std::vector<LaneWrite> lanes;                     // words into the load buffer
+        // Each stream's read records: the heads whose sector's last byte was
+        // consumed now (they leave), and the bytes consumed of the head after.
+        struct StreamHead {
+            uint32_t finished = 0;
+            uint32_t received = 0;
+            bool changed = false;
+        };
+        StreamHead tma_reads;
+        StreamHead lsu_reads;
         // The group whose first word claims the free load buffer now.
         struct LoadClaim {
-            uint64_t command = 0;
+            uint8_t slot = 0;         // its command's slot
             uint32_t group = 0;
             uint64_t lanes = 0;       // its active lanes
             uint32_t expected = 0;    // the words it brings
@@ -1796,7 +1911,6 @@ private:
         std::optional<LoadClaim> load_claim;
         std::optional<TmaSectorRegister> tma_sector_after; // the TMA sector register after its fill
         std::optional<TmaReturn> tma_ticket;               // the sector completed: placement ticket
-        std::map<uint64_t, std::optional<ReadRecord>> records; // updated (none: erased)
     };
 
     // The placeholder controller's DRAM ticks this core cycle.
@@ -1813,7 +1927,7 @@ private:
     // the RF output Lr cycles later (the last stage of lsu_read_pipe_), when
     // it fills the store buffer.
     struct LsuRfRead {
-        std::optional<uint64_t> command;
+        std::optional<uint8_t> command;  // the store's command slot
         uint32_t buffer = 0;
         LaneWords values;   // the register, every lane
         uint32_t group = 0;             // the lane group it is for
@@ -1944,6 +2058,10 @@ private:
         IngressPluck ingress;
         ControllerTick controller;
         TmaQueue tma_next;
+        // The placement ticket entering tma_returns_ now through its one write
+        // port (step_tma); whether its head leaves now (its placement starts).
+        std::optional<TmaReturn> tma_returns_pushed;
+        bool tma_return_taken = false;
         // A walker start entering the start pipeline's stage 0 now (its
         // descriptor came back this cycle; tma.walker_start_cycles > 0).
         std::optional<TmaWalkerStart> tma_walker_starting;
@@ -2107,7 +2225,14 @@ private:
     Reg<std::optional<TmaPortRequest>> tma_write_txn_{registers_, "TMA placement transaction"};
     Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, "TMA read transaction"};
     Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
-    Reg<TmaStoreRegisters> tma_store_registers_{registers_, "TMA store sector registers"};
+    // The placement tickets (TmaReturn): tma.sector_credits entries, one
+    // write port (muxed between the ingress's completed sector and the
+    // walker's zero fill; the sector has it first).
+    Fifo<TmaReturn> tma_returns_{registers_, "TMA placement tickets"};
+    // tma.store_sector_registers registers, and the ring's head (the oldest
+    // held one, which the egress drains).
+    Regs<std::optional<TmaStoreRegister>> tma_store_registers_{registers_, "TMA store sector registers"};
+    Reg<uint32_t> tma_store_head_{registers_, "TMA store sector registers: head"};
     // The URF's round counter (UrfReadRounds above), then the TMA operand
     // read's URF read stages with their tags (Lu stages) and holding register.
     Reg<std::optional<UrfReadRounds>> urf_read_rounds_{registers_, "URF operand read: round counter"};
@@ -2116,16 +2241,24 @@ private:
     // LSU.
     // Sizes: command slots lsu.active_commands (2; checked in
     // drive_lsu_commands); one load buffer and one store buffer (LsuBuffer);
-    // the ingress FIFO and egress FIFO (IngressFifo, EgressSlot), the read ID
-    // table (ReadRecord) as their comments say; free-ID tags
-    // lsu.sectors_in_flight bits (16, fixed).
+    // the ingress FIFO (IngressWord), the egress FIFO (EgressOpenSlot and its
+    // two FIFOs) and the read records (LsuRead, TmaRun) as their comments
+    // say, each built from the profile (a push past one is an internal
+    // error); free-ID tags lsu.sectors_in_flight bits (16, fixed).
     Reg<LsuCommandSlots> lsu_commands_{registers_, "LSU command slots"};
     Regs<LsuBuffer> lsu_buffers_{registers_, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
     static constexpr uint32_t load_buffer = 0;
     static constexpr uint32_t store_buffer = 1;
-    Reg<IngressFifo> ingress_{registers_, "ingress FIFO"};
-    Reg<std::deque<EgressSlot>> egress_fifo_{registers_, "egress FIFO"};
-    Reg<std::map<uint64_t, ReadRecord>> read_records_{registers_, "read ID table"};
+    Fifo<IngressWord> ingress_{registers_, "ingress FIFO"};
+    Reg<std::optional<EgressOpenSlot>> egress_open_{registers_, "egress FIFO: the write port's open slot"};
+    Fifo<EgressRequest> egress_requests_{registers_, "egress FIFO: write requests"};
+    Fifo<EgressSector> egress_data_{registers_, "egress FIFO: sectors"};
+    // The read records, one FIFO per read stream, and the bytes consumed of
+    // each head's sector.
+    Fifo<TmaRun> tma_reads_{registers_, "read records: TMA stream"};
+    Fifo<LsuRead> lsu_reads_{registers_, "read records: LSU stream"};
+    Reg<uint32_t> tma_read_received_{registers_, "read records: TMA stream head's bytes consumed"};
+    Reg<uint32_t> lsu_read_received_{registers_, "read records: LSU stream head's bytes consumed"};
     Regs<uint8_t> free_id_tags_{registers_, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
     // The RF write path: fixed results waiting for their booked port cycle,
     // and every write from its port cycle until it lands (src/timing.hpp).
@@ -2355,6 +2488,7 @@ private:
     void drive_tma_transactions(const Wires& w);
     void drive_tma_sector(const Wires& w);
     void drive_tma_store_registers(const Wires& w);
+    void drive_tma_returns(const Wires& w);
     void drive_tma_operand_read(const Wires& w);
     void drive_lsu_commands(const Wires& w);
     void drive_lsu_buffers(const Wires& w);
@@ -2485,7 +2619,7 @@ private:
     void apply_tma_walker(TmaQueue& tma, Wires& w);
     void complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w);
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
-    void complete_tma_store_capture(TmaQueue& tma, uint64_t command);
+    void complete_tma_store_capture(TmaQueue& tma, uint8_t slot, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
     // The launch copy (README "Launch"): the TMA's first command and walker
     // and the warps' launch flags, from the launch record; each landed
@@ -2494,6 +2628,10 @@ private:
     void land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires& w);
     void release_tma_credit(TmaQueue& tma);
     void trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle);
+    // (T) The placement tickets as step_tma has left them so far this cycle:
+    // what trace_tma_depths reports.
+    std::size_t tma_returns_traced_ = 0;
+    [[nodiscard]] std::size_t tma_store_registers_held() const;
     [[nodiscard]] std::optional<uint64_t> next_tma_frontend_command(const TmaQueue& tma) const;
     [[nodiscard]] std::optional<uint64_t> next_data_complete_tma_command(const TmaQueue& tma) const;
     // A TMA transaction's bank rounds, each a list of pieces (a wire: the
@@ -2560,7 +2698,6 @@ private:
     [[nodiscard]] std::size_t gmem_outstanding_sectors() const;
     [[nodiscard]] std::optional<std::size_t> select_controller_entry() const;
     void tick_gmem_controller(Wires& w, bool& return_ready_low);
-    [[nodiscard]] std::optional<uint64_t> egress_slot_request(const EgressSlot& slot, const Wires& w) const;
     void finish_gmem_write(GmemSectorRequest request);
     void deliver_write_acks(Wires& w);
     [[nodiscard]] static bool is_store(LsuKind kind);
@@ -2572,19 +2709,18 @@ private:
     [[nodiscard]] bool load_buffer_released(const Wires& w) const;
     bool load_buffer_takes(const LsuCommand& command, uint32_t group, IngressPluck& pluck, const Wires& w) const;
     [[nodiscard]] const LsuCommand* find_lsu_command(uint64_t id) const;
+    [[nodiscard]] const LsuCommand& lsu_read_command(const LsuRead& record) const;
     [[nodiscard]] std::optional<uint32_t> free_id_tag() const;
-    [[nodiscard]] const EgressSlot* egress_request_slot(std::optional<uint64_t> requested_now) const;
-    [[nodiscard]] bool egress_slot_visible(const EgressSlot& slot) const;
-    [[nodiscard]] const LsuCommand* lsu_request_candidate(std::optional<uint64_t> requested_now) const;
-    GmemSectorRequest write_request(const EgressSlot& slot, GmemClient client, uint64_t id,
+    [[nodiscard]] const EgressRequest* egress_request_slot(bool head_requested_now) const;
+    [[nodiscard]] const LsuCommand* lsu_request_candidate(bool head_requested_now) const;
+    GmemSectorRequest write_request(const EgressRequest& slot, GmemClient client, uint64_t id,
         std::optional<uint32_t> tag);
     GmemSectorRequest lsu_read_request(const LsuCommand& command, uint64_t id);
-    void pluck_tma(const IngressBeat& beat, uint32_t consumed, uint32_t take, TmaSectorRegister& reg,
-        ReadRecord& record, IngressPluck& pluck);
-    [[nodiscard]] bool pluck_vector(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
-        uint32_t take, IngressPluck& pluck, const Wires& w);
-    [[nodiscard]] bool pick_scalar_word(ReadRecord& record, const IngressBeat& beat, uint32_t consumed,
-        uint32_t take, IngressPluck& pluck, const Wires& w);
+    void pluck_tma(const IngressPiece& piece, const TmaRun& run, TmaSectorRegister& reg, IngressPluck& pluck);
+    [[nodiscard]] bool pluck_vector(const LsuRead& record, const IngressPiece& piece, IngressPluck& pluck,
+        const Wires& w);
+    [[nodiscard]] bool pick_scalar_word(const LsuRead& record, const IngressPiece& piece, IngressPluck& pluck,
+        const Wires& w);
     void note_first_return(uint64_t command);
     void probe(LsuEdge edge, uint64_t id, uint64_t aux, uint32_t bytes);
     [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;
@@ -2600,17 +2736,11 @@ uint32_t half_to_float_bits(uint16_t half);
 uint16_t float_to_half_bits(uint32_t bits);
 
 // ---- Clocked state that is not yet a fixed bundle of bits ----
-// Every other register, group and pipeline of the machine holds a payload of
-// a fixed size (machine/state.hpp checks it when this compiles). These nine
-// still hold a container; each line says which, and what it would become.
-// Removing a line makes the compiler point at what is left to do.
+// Every other register, group, pipeline and FIFO of the machine holds a
+// payload of a fixed size (machine/state.hpp checks it when this compiles).
+// These four still hold a container; each line says which, and what it would
+// become. Removing a line makes the compiler point at what is left to do.
 //
-// Queues toward global memory (they become FIFOs):
-template <> struct NotYetFixedPayload<Machine::IngressFifo> : std::true_type {};                    // ingress_: a deque of bus beats, a byte vector per beat
-template <> struct NotYetFixedPayload<std::deque<Machine::EgressSlot>> : std::true_type {};         // egress_fifo_: a deque of sectors, a byte vector per slot
-template <> struct NotYetFixedPayload<std::map<uint64_t, Machine::ReadRecord>> : std::true_type {}; // read_records_: a map by request number; two in-order queues
-template <> struct NotYetFixedPayload<Machine::TmaQueue> : std::true_type {};                       // tma_: its returns (a deque of sectors ready for placement)
-template <> struct NotYetFixedPayload<Machine::TmaStoreRegisters> : std::true_type {};              // tma_store_registers_: a vector ring, a byte vector per register
 // Stored bank schedules and the register file's write path (their own design steps):
 template <> struct NotYetFixedPayload<std::optional<Machine::LoadSlot>> : std::true_type {};  // load_slots_: SlotRounds::rounds, a list of rounds of lanes
 template <> struct NotYetFixedPayload<std::optional<Machine::StoreSlot>> : std::true_type {}; // store_slots_: the same

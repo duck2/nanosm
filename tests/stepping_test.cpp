@@ -423,6 +423,99 @@ void test_regs_members_hold_write_and_panic() {
     throw std::runtime_error("a second write of one member in one tick did not panic");
 }
 
+// A FIFO: the next pop returns the oldest entry; an entry pushed at t is
+// readable from t + its read latency; a pop and a push in one tick; its ports'
+// widths; a push past its capacity is an internal error. A FIFO of single
+// bits reads a bit by value and holds it across a tick; a zero-capacity FIFO
+// takes a pop of nothing and holds.
+void test_fifo_order_latency_and_widths() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 3;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Fifo<int> fifo(file, "test FIFO", 8);
+    fifo.build(4, nanosm::FifoPorts{2, 2, 2});
+    const auto tick = [&] {
+        file.commit();
+        sanitizer.record_cycle_start();
+    };
+    sanitizer.record_cycle_start();
+    fifo.push(std::vector<int>{1, 2}, "writer");
+    require(fifo.count() == 0, "a push changed Q before the clock edge");
+    tick();
+    require(fifo.count() == 2 && fifo.readable() == 0, "an entry was readable before its read latency");
+    tick();
+    require(fifo.readable() == 2 && fifo.front(0) == 1 && fifo.front(1) == 2, "the head is not the oldest entry");
+    fifo.pop(1, "reader");
+    fifo.push(3, "writer");
+    tick();
+    require(fifo.count() == 2 && fifo.readable() == 1 && fifo.front() == 2, "a pop and a push in one tick went wrong");
+    tick();
+    require(fifo.readable() == 2 && fifo.front(1) == 3, "a FIFO nobody wrote did not hold its order");
+    const auto size = fifo.size();
+    require(std::string(size.kind) == "FIFO" && size.entries == 4 && size.bits_per_entry == std::optional<uint64_t>(8),
+        "the FIFO does not report its capacity and its entries' declared bits");
+    bool refused = false;
+    try {
+        (void)fifo.front(2); // past the read port
+    } catch (const nanosm::SimError&) {
+        refused = true;
+    }
+    require(refused, "a read past the read port's width was allowed");
+    fifo.push(std::vector<int>{4, 5}, "writer");
+    tick();
+    fifo.push(6, "writer");
+    refused = false;
+    try {
+        tick();
+    } catch (const nanosm::SimError& error) {
+        refused = std::string(error.what()).find("holds more than its 4 entries") != std::string::npos;
+    }
+    require(refused, "a push past the capacity was not an internal error");
+    // (A machine stops at an internal error; these two get a register file of their own.)
+    nanosm::Sanitizer quiet;
+    nanosm::RegisterFile other(quiet, cycle);
+    nanosm::Fifo<bool> bits(other, "test bits FIFO", 1);
+    bits.build(2);
+    nanosm::Fifo<int> none(other, "zero-capacity FIFO");
+    none.build(0);
+    const auto other_tick = [&] {
+        other.commit();
+        quiet.record_cycle_start();
+    };
+    quiet.record_cycle_start();
+    bits.push(true, "writer");
+    none.pop(0, "reader");
+    other_tick();
+    none.pop(0, "reader");
+    other_tick();
+    const bool held = bits.front();
+    require(held && bits.readable() == 1, "a one-bit FIFO did not hold its bit across a tick");
+    require(none.empty() && none.room() == 0, "a zero-capacity FIFO did not hold after a pop of nothing");
+}
+
+// A second push into one FIFO in one tick PANICs, as a second write of a register.
+void test_fifo_second_push_panics() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 3;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Fifo<int> second(file, "second FIFO");
+    second.build(2);
+    sanitizer.record_cycle_start();
+    second.push(1, "first");
+    try {
+        second.push(2, "second");
+    } catch (const nanosm::SimError& error) {
+        const std::string message = error.what();
+        for (const std::string needle : {std::string("second FIFO (push)"), std::string("first by 'first'"),
+                 std::string("then by 'second'")}) {
+            require(message.find(needle) != std::string::npos,
+                "the FIFO's second-push PANIC lacks '" + needle + "': " + message);
+        }
+        return;
+    }
+    throw std::runtime_error("a second push in one tick did not panic");
+}
+
 // A group of single bits: a member's value is read by value (the bits have no
 // address to refer to), holds across a tick nobody writes it, and takes its
 // own write.
@@ -931,6 +1024,17 @@ TEST(Stepping, bounded_payload_and_limits) {
 TEST(Stepping, regs_members_hold_write_and_panic) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_regs_members_hold_write_and_panic();
+}
+
+// FIFO: oldest first, read latency, port widths, capacity, one-bit entries, zero capacity
+TEST(Stepping, fifo_order_latency_and_widths) {
+    test_fifo_order_latency_and_widths();
+}
+
+// FIFO: a second push in one tick PANICs
+TEST(Stepping, fifo_second_push_panics) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_fifo_second_push_panics();
 }
 
 // group: a one-bit member is read by value and holds

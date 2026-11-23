@@ -76,7 +76,7 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
 // every warp. Issue reads the counters' Q, so a waiting instruction can
 // issue from the next cycle, when the bytes are in the RAM.
 void Machine::land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires& w) {
-    auto* found = tma.commands.find(placed.command);
+    auto* found = tma.commands.find_in_slot(placed.slot, placed.command);
     if (found == nullptr || !found->launch) return;
     auto& command = *found;
     const auto& record = *launch_record_;

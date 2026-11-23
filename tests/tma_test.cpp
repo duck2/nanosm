@@ -1342,6 +1342,48 @@ void test_tma_out_of_range_bands() {
     }
 }
 
+// The placement tickets take one entry a cycle. A 64 x 32 fp32 tile of an
+// 8-column tensor: every row is one sector read and seven zero fills, so the
+// walker zero-fills while earlier rows' sectors come back, and on this
+// profile some fill falls in a cycle the ingress completes a sector. That
+// sector's ticket enters and the zero fill waits a cycle; every element
+// still lands.
+void test_tma_zero_fill_waits_for_a_returning_sector() {
+    constexpr uint32_t mbar_address = 128;
+    constexpr uint32_t tile_address = 1024;
+    constexpr uint32_t length = 64;
+    constexpr uint32_t rows = 32;
+    nanosm::TmaDescriptor descriptor;
+    descriptor.dimensions = {8, rows, 1, 1};
+    descriptor.strides = {8, 0, 0};
+    descriptor.tile_length = length;
+    descriptor.tile_rows = rows;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.test_shmem, tile_address + 4 * length * rows);
+    auto& gmem = image_bytes(launch.gmem_image, 4 * 8 * rows);
+    for (uint32_t i = 0; i < 8 * rows; ++i) write_u32(gmem, 4 * i, 0x100 + i);
+    std::fill(shmem.begin() + tile_address, shmem.end(), 0xa5);
+    write_tma_descriptor(shmem, 0, descriptor);
+    write_tx_mbar(shmem, mbar_address, 4 * length * rows);
+    nanosm::Machine machine(canonical_profile(),
+        compile(tma_operands_asm(4, tile_address, 3, mbar_address, 8, {0, 0}) + "tma.load.2d [ur4], [0, ur8], [ur3]\n" +
+            tma_wait),
+        std::move(launch));
+    machine.enable_edge_probe();
+    machine.run(50000);
+    const auto& events = machine.edge_events();
+    require(std::any_of(events.begin(), events.end(),
+                [](const auto& event) { return event.edge == nanosm::LsuEdge::tma_zero_fill_wait; }),
+        "no zero fill met a returning sector's ticket in its cycle; the test proves little");
+    for (uint32_t y = 0; y < rows; ++y) for (uint32_t x = 0; x < length; ++x) {
+        const uint32_t expected = x < 8 ? 0x100 + 8 * y + x : 0;
+        require(machine.read_shmem_u32(tile_address + 4 * (length * y + x)) == expected,
+            "zero fills between returning sectors: element (" + std::to_string(x) + ", " + std::to_string(y) + ")");
+    }
+    require(machine.trace().summary().tma_port_requests == 8 * rows, "expected a sector and seven zero fills per row");
+}
+
 // A transposed swizzle64 fp16 tile (64 stored rows of 16 positions, 32-byte
 // rows) at (-8, -2) of a 40 x 20 tensor: positions 8..47 along dimension 0
 // and tile rows 2..15 are inside. The load places element (x, y) at
@@ -1576,6 +1618,11 @@ TEST(Tma, tma_store_entirely_out_of_range) {
 // out-of-range bands on every side: zero-filled by a load, untouched by a store
 TEST(Tma, tma_out_of_range_bands) {
     test_tma_out_of_range_bands();
+}
+
+// zero fills: one placement ticket a cycle; a returning sector's goes first
+TEST(Tma, tma_zero_fill_waits_for_a_returning_sector) {
+    test_tma_zero_fill_waits_for_a_returning_sector();
 }
 
 // a transposed swizzle64 tile with out-of-range parts, loaded and stored

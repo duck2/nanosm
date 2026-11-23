@@ -187,9 +187,31 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         TmaSectorRegister sector;
         sector.data.assign(config_.gmem_sector_bytes, 0);
         tma_sector_.poke(std::move(sector));
-        TmaStoreRegisters stores;
-        stores.ring.resize(config_.tma_store_sector_registers);
-        tma_store_registers_.poke(std::move(stores));
+        tma_store_registers_.build(config_.tma_store_sector_registers);
+        // The FIFOs toward memory. The bus writes at most one beat per DRAM
+        // tick, ceil(DRAM clock / core clock) ticks in a core cycle; the
+        // ingress read port is a pluck wide, and the pluck may reach that
+        // many bytes into the read records of its sectors (one more when it
+        // starts inside one).
+        const uint64_t dram_ticks_per_cycle = config_.dram_clock_hz / config_.core_clock_hz +
+            (config_.dram_clock_hz % config_.core_clock_hz != 0 ? 1 : 0);
+        const uint32_t pluck_bytes = 4 * config_.lsu_pluck_words_per_cycle;
+        const std::size_t records_per_pluck = (pluck_bytes + config_.gmem_sector_bytes - 1) / config_.gmem_sector_bytes + 1;
+        ingress_.build(std::size_t{config_.lsu_ingress_sectors} * config_.gmem_sector_bytes / 4,
+            FifoPorts{static_cast<std::size_t>(dram_ticks_per_cycle * (config_.gmem_bus_bytes_per_dram_tick / 4)),
+                config_.lsu_pluck_words_per_cycle, config_.lsu_ingress_latency_cycles});
+        ingress_.declare_entry_bits(32 + 1); // the word and its stream
+        egress_open_.poke(std::nullopt);
+        // The request pointer's FIFO shows its next entry too: the LSU's view
+        // of the channel after a TMA write took the head (egress_request_slot).
+        egress_requests_.build(config_.lsu_egress_sectors, FifoPorts{1, 2, config_.lsu_egress_latency_cycles});
+        // The bus may finish a slot and start the next within one core cycle.
+        egress_data_.build(config_.lsu_egress_sectors,
+            FifoPorts{1, static_cast<std::size_t>(dram_ticks_per_cycle) + 1, config_.lsu_egress_latency_cycles});
+        egress_data_.declare_entry_bits(uint64_t{8} * config_.gmem_sector_bytes);
+        tma_reads_.build(config_.tma_sector_credits, FifoPorts{1, records_per_pluck, 1});
+        lsu_reads_.build(std::size_t{config_.lsu_active_commands} * config_.lanes + 1, FifoPorts{1, records_per_pluck, 1});
+        tma_returns_.build(config_.tma_sector_credits);
         tma_walker_start_pipe_.build(config_.tma_walker_start_cycles);
         warps_.reserve(launch.active_warps);
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
@@ -360,6 +382,9 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          at t + 1; a branch accepted at t blocks its warp's fetch from
 //          t + 1. Issue sees the FIFO heads' Q: a word landing at t issues
 //          from t + 1.
+//      (j) A zero fill of the TMA walker goes only in a cycle the ingress
+//          completes no TMA sector (the placement tickets' one write port):
+//          the ingress read decision -> the walker's step, in one cycle.
 // 2. DRIVERS. Each register's next value, from Q and the wires. They run in
 //    any order (set_driver_shuffle_seed() permutes them every cycle).
 // 3. CLOCK EDGE. Every register takes D; shmem takes the write rounds that
@@ -498,9 +523,10 @@ bool Machine::done() const {
     return warps_halted && wait_slots_empty && shmem_idle && acc_ld_pipe_.empty() && acc_st_pipe_.empty() &&
         !tma_mbar_event_.cur().has_value() && !mma_mbar_event_.cur().has_value() && gmem_queue_.empty() &&
         !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.cur().empty() &&
-        read_records_.cur().empty() && ingress_.cur().beats.empty() && egress_fifo_.cur().empty() &&
-        !tma_sector_.cur().request.has_value() && tma_store_registers_.cur().held() == 0 &&
-        tma.commands.empty() && tma.returns.empty() && !tma.event_command.has_value() &&
+        tma_reads_.empty() && lsu_reads_.empty() && ingress_.empty() && empty(egress_open_) &&
+        egress_requests_.empty() && egress_data_.empty() &&
+        !tma_sector_.cur().request.has_value() && all_empty(tma_store_registers_) &&
+        tma.commands.empty() && tma_returns_.empty() && !tma.event_command.has_value() &&
         tma.credits_used == 0 && tma_walker_start_pipe_.empty() && empty(urf_read_rounds_) &&
         tma_read_pairs_.empty() &&
         empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
@@ -584,7 +610,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 41> canonical = {
+    static constexpr std::array<Driver, 42> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -610,6 +636,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_tma_transactions,
         &Machine::drive_tma_sector,
         &Machine::drive_tma_store_registers,
+        &Machine::drive_tma_returns,
         &Machine::drive_tma_operand_read,
         &Machine::drive_lsu_commands,
         &Machine::drive_lsu_buffers,

@@ -40,7 +40,6 @@ Machine::RequestChannel Machine::select_request_channel(const TmaRequests& tma, 
     const bool ready = outstanding < config_.gmem_queue_sectors;
     const bool tma_turn = !(request_channel_last_ == GmemClient::tma && lsu.command.has_value());
     const bool walker_reads = tma.walker.has_value() && tma.walker->sector == Sector::load;
-    const EgressSlot* tma_slot = tma.write_request ? egress_request_slot(std::nullopt) : nullptr;
     if (ready && tma_turn && tma.write_request) {
         channel.granted = GmemClient::tma;
         channel.tma_write = true;
@@ -48,12 +47,11 @@ Machine::RequestChannel Machine::select_request_channel(const TmaRequests& tma, 
         channel.granted = GmemClient::tma;
         channel.walker_proceeds = true;
     }
-    if (tma.walker.has_value() && tma.walker->sector == Sector::zero_fill) {
-        channel.walker_proceeds = true; // needs no request channel (a store sector goes on its A-read grant)
-    }
+    // (A zero fill needs no request channel: it goes when the placement
+    // tickets' write port is free, step_tma; a store sector goes on its
+    // A-read grant.)
 
-    const auto requested_now = channel.tma_write ? std::optional<uint64_t>(tma_slot->id) : std::nullopt;
-    const auto* lsu_command = lsu_request_candidate(requested_now);
+    const auto* lsu_command = lsu_request_candidate(channel.tma_write);
     const bool ready_after = outstanding + (channel.granted.has_value() ? 1 : 0) < config_.gmem_queue_sectors;
     if (lsu_command != nullptr) {
         if (!ready_after) { // request-ready low
@@ -71,26 +69,25 @@ Machine::RequestChannel Machine::select_request_channel(const TmaRequests& tma, 
 
 // The requests the channel decision lets through this cycle, with their ids
 // assigned in the fixed order TMA write, walker sector, LSU (ids appear in
-// traces, so their order must not depend on anything else).
+// traces, so their order must not depend on anything else; a zero fill takes
+// its id after these, when it goes in step_tma).
 void Machine::assign_channel_requests(RequestChannel& channel, const TmaRequests& tma) {
-    using Sector = TmaWalkerPlan::Sector;
     if (channel.tma_write) {
-        const auto* slot = egress_request_slot(std::nullopt);
+        const auto* slot = egress_request_slot(false);
         channel.tma_write_id = next_gmem_request_id_++;
-        channel.tma_write_slot = slot->id;
+        channel.egress_requested = true;
         channel.accepted = write_request(*slot, GmemClient::tma, channel.tma_write_id, std::nullopt);
     }
-    // A walker sector takes an id whether it reads (a channel request) or
-    // zero-fills (a placement ticket); a store sector has none yet.
-    if (channel.walker_proceeds && tma.walker->sector != Sector::store) {
+    // The walker's read sector (a store sector has no id yet).
+    if (channel.walker_proceeds) {
         channel.walker_id = next_gmem_request_id_++;
-        if (tma.walker->sector == Sector::load) accept_tma_read(channel, *tma.walker);
+        accept_tma_read(channel, *tma.walker);
     }
     if (channel.granted == GmemClient::lsu) accept_lsu_request(channel);
 }
 
-// The TMA walker's sector read. Its placement description rides in the SM's
-// ID table; the data returns through the ingress FIFO and the TMA sector
+// The TMA walker's sector read. Its run is its read record, at the TMA
+// stream's tail; the data returns through the ingress FIFO and the TMA sector
 // register.
 void Machine::accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan) {
     GmemSectorRequest request;
@@ -102,48 +99,40 @@ void Machine::accept_tma_read(RequestChannel& channel, const TmaWalkerPlan& plan
     request.load = true;
     request.owner = GmemSectorRequest::Owner::tma_load;
     request.beats = beats_per_sector(config_);
-    ReadRecord record;
-    record.kind = ReadKind::tma;
-    record.stream = tma_stream;
-    record.command = plan.run.command;
-    record.sector_address = plan.sector_address;
-    record.run = plan.run;
-    channel.new_read_records.emplace_back(request.id, std::move(record));
+    channel.new_tma_read = plan.run;
     sanitizer_.record_ordered_request(tma_stream, request.id);
     channel.accepted = std::move(request);
 }
 
 // The LSU command's next request: a store's write from the egress request
 // pointer (a scatter takes a free-ID tag), or a read on the ordered LSU
-// stream with its ID-table entry.
+// stream with its read record.
 void Machine::accept_lsu_request(RequestChannel& channel) {
     const auto& command = *find_lsu_command(channel.lsu_command);
     channel.lsu_id = next_gmem_request_id_++;
     if (is_store(command.kind)) {
-        const auto* slot = egress_request_slot(std::nullopt);
+        const auto* slot = egress_request_slot(false);
         if (slot->index != command.requests_emitted) throw SimError("internal egress slot out of request order");
         std::optional<uint32_t> tag;
         if (command.kind == LsuKind::scalar_store) tag = free_id_tag();
         channel.lsu_tag = tag;
-        channel.lsu_write_slot = slot->id;
+        channel.egress_requested = true;
         channel.accepted = write_request(*slot, GmemClient::lsu, channel.lsu_id, tag);
     } else {
         // Every LSU read rides the one ordered LSU read stream: its data
         // returns in request order, which is command admission order, so the
         // one load buffer passes from a command to the next.
         channel.accepted = lsu_read_request(command, channel.lsu_id);
-        ReadRecord record;
-        record.command = command.id;
-        record.stream = channel.accepted->stream;
-        record.sector_address = channel.accepted->sector_address;
         sanitizer_.record_ordered_request(command.stream, channel.lsu_id);
         const auto& sector = command.sectors.at(command.requests_emitted);
-        record.kind = command.kind == LsuKind::vector_load ? ReadKind::vector
-            : command.kind == LsuKind::uniform_load ? ReadKind::uniform : ReadKind::gather;
-        record.sector_index = command.requests_emitted;
-        record.lane = sector.lane;
-        record.word_offset = sector.word_offset;
-        channel.new_read_records.emplace_back(channel.lsu_id, std::move(record));
+        LsuRead record;
+        record.kind = command.kind == LsuKind::vector_load ? LsuReadKind::vector
+            : command.kind == LsuKind::uniform_load ? LsuReadKind::uniform : LsuReadKind::gather;
+        record.slot = command.slot;
+        record.lane = static_cast<uint8_t>(sector.lane);
+        record.word_offset = static_cast<uint8_t>(sector.word_offset);
+        record.command = command.id;
+        channel.new_lsu_read = record;
     }
     auto& counters = trace_->lsu_counters();
     ++counters.lsu_sectors;
@@ -234,15 +223,6 @@ void Machine::step_gmem_controller(Wires& w) {
     }
 }
 
-// The write request an egress slot carries: accepted in an earlier cycle (in
-// Q), or by the channel now.
-std::optional<uint64_t> Machine::egress_slot_request(const EgressSlot& slot, const Wires& w) const {
-    if (slot.request.has_value()) return slot.request;
-    if (w.channel.tma_write_slot == slot.id) return w.channel.tma_write_id;
-    if (w.channel.lsu_write_slot == slot.id) return w.channel.lsu_id;
-    return std::nullopt;
-}
-
 // One DRAM tick: deliver due write acks, start the next entry on an idle bus,
 // move one beat. A read beat needs return-ready: room in the ingress FIFO,
 // counting its start-of-cycle occupancy (Q) plus the beats the bus already
@@ -251,12 +231,19 @@ std::optional<uint64_t> Machine::egress_slot_request(const EgressSlot& slot, con
 // (that field sets only when a written beat becomes readable): a fixed,
 // conservative capacity convention. Without return-ready the controller
 // holds the beat in its entry and the bus waits.
-// A write beat comes from the egress FIFO's head slot, whose data has been
-// complete and visible since its request.
+// A write beat comes from the egress data FIFO's head slot, whose data has
+// been complete and readable since its request.
 void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
     deliver_write_acks(w);
-    const auto& egress = egress_fifo_.cur();
-    const auto head = w.controller.egress_slots_freed; // the FIFO head, after this cycle's pops
+    const auto head = w.controller.egress_slots_freed; // the data FIFO's head, after this cycle's pops
+    // Writes leave in FIFO order: the head is the slot of the oldest accepted
+    // request (the running numbers are the simulator's check of it).
+    const auto head_slot = [&]() -> const EgressSector& {
+        if (head >= egress_data_.readable()) {
+            throw SimError("internal fall-through: egress slot on the bus before it is visible");
+        }
+        return egress_data_.front(head);
+    };
     if (!gmem_bus_.has_value()) {
         auto selected = select_controller_entry();
         // The data bus is one bidirectional bus: between the last data beat
@@ -288,7 +275,7 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
                 std::memcpy(request.data.data(),
                     gmem_.data() + static_cast<std::size_t>(request.sector_address),
                     static_cast<std::size_t>(available));
-            } else if (head >= egress.size() || egress_slot_request(egress[head], w) != request.id) {
+            } else if (head >= egress_data_.readable() || egress_data_.front(head).id != request.egress_slot) {
                 throw SimError("internal write request is not at the egress FIFO head");
             }
             std::string owner = "lsu";
@@ -309,7 +296,7 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
     if (request.load) {
         const uint64_t capacity =
             static_cast<uint64_t>(config_.lsu_ingress_sectors) * config_.gmem_sector_bytes;
-        uint64_t occupied = ingress_.cur().bytes;
+        uint64_t occupied = 4 * ingress_.count();
         for (const auto& beat : w.controller.ingress_beats) occupied += beat.bytes.size();
         if (occupied + size > capacity) {
             if (!return_ready_low) { // return-ready low: hold the beat
@@ -320,16 +307,13 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
         }
         IngressBeat beat;
         beat.request = request.id;
+        beat.stream = static_cast<uint8_t>(request.stream);
         beat.offset = offset;
         beat.bytes.assign(request.data.begin() + offset, request.data.begin() + offset + size);
-        beat.visible_cycle = cycle_ + config_.lsu_ingress_latency_cycles;
         w.controller.ingress_beats.push_back(std::move(beat));
         probe(LsuEdge::bus_read_beat, request.id, offset, size);
     } else {
-        const auto& slot = egress.at(head);
-        if (!egress_slot_visible(slot)) {
-            throw SimError("internal fall-through: egress slot on the bus before it is visible");
-        }
+        const auto& slot = head_slot();
         // AXI write strobes: the controller never writes an unselected byte.
         for (uint32_t byte = offset; byte < offset + size; ++byte) {
             if (((request.byte_enable >> byte) & 1u) == 0) continue;
@@ -361,6 +345,7 @@ void Machine::finish_gmem_write(GmemSectorRequest request) {
     ack.dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
     ack.request = request.id;
     ack.command = request.command;
+    ack.lsu_slot = request.lsu_slot;
     ack.client = request.owner == GmemSectorRequest::Owner::tma_store ? GmemClient::tma : GmemClient::lsu;
     if (ack.client == GmemClient::lsu && request.stream >= config_.lsu_read_streams)
         ack.tag = request.stream - config_.lsu_read_streams;
@@ -387,8 +372,12 @@ void Machine::deliver_write_acks(Wires& w) {
             continue;
         }
         if (ack.tag.has_value()) w.controller.freed_tags.push_back(*ack.tag);
-        const auto* command = find_lsu_command(ack.command);
-        if (command == nullptr) throw SimError("internal reference to a retired LSU command #" + std::to_string(ack.command));
+        // A store holds its slot until its last acknowledgement.
+        const auto* command = &lsu_commands_.cur().in_slot(ack.lsu_slot);
+        if (command->id != ack.command) {
+            throw SimError("internal: LSU command #" + std::to_string(ack.command) + "'s write was acknowledged to #" +
+                std::to_string(command->id));
+        }
         const auto acks = command->acks + ++w.controller.lsu_acks[ack.command];
         if (acks != command->requests_total) continue;
         Writeback completion;

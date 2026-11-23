@@ -466,38 +466,65 @@ void test_lsu_backpressure_chain() {
 // access already in port A, never for one granted after it became ready.
 // (h) Read streams: TMA (ID 0) and vector (ID 1) sectors interleave in the
 // controller's global order at sector granularity; each lands correctly.
+// Also with a read port of three words on eight-byte beats and a bus as fast
+// as the core: the head beat is then left half read, and one cycle's read
+// can end one stream's sector and start the other's; each word still goes to
+// its own stream's oldest read record.
 void test_lsu_tma_and_vector_streams_interleave() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 4096);
-    write_rank1_load(shmem, 0, 0, 128, 128);
-    auto& gmem = image_bytes(launch.gmem_image, 1024);
-    fill_pattern(gmem, 0, 256, 0);
-    nanosm::Machine machine(canonical_profile(), compile(tma_operands_asm(10, 1024, 3, 128, 8) + R"(
-        mov r30, 512
-        tma.load.1d [ur10], [0, ur8], [ur3]
-        ldg.v8 r8, [r30]
-    wait:
-        mbar.try_wait p1, [ur3], 0
-        @!p1 bra.uni wait
-        halt
-    )"), std::move(launch), {.timeline = true});
-    machine.run();
-    for (uint32_t i = 0; i < 128; ++i)
-        require(machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA stream data mismatch");
-    for (uint32_t j = 0; j < 8; ++j)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(0, lane, 8 + j) == pattern_word(128 + j),
-                "vector stream data mismatch with TMA returns interleaved");
-    uint32_t switches = 0;
-    std::string previous;
-    for (const auto& span : trace_spans(machine, nanosm::TraceCategory::gmem, "read sector")) {
-        const auto owner = span.detail.substr(span.detail.find("owner="));
-        if (!previous.empty() && owner != previous) ++switches;
-        previous = owner;
+    for (const bool odd_pluck : {false, true}) {
+        auto config = canonical_profile();
+        if (odd_pluck) {
+            config.lsu_pluck_words_per_cycle = 3;
+            config.dram_clock_hz = config.core_clock_hz;
+        }
+        const auto where = std::string(odd_pluck ? " (three-word read port)" : "");
+        nanosm::Launch launch;
+        launch.active_warps = 1;
+        auto& shmem = image_bytes(launch.test_shmem, 4096);
+        write_rank1_load(shmem, 0, 0, 128, 128);
+        auto& gmem = image_bytes(launch.gmem_image, 1024);
+        fill_pattern(gmem, 0, 256, 0);
+        nanosm::Machine machine(config, compile(tma_operands_asm(10, 1024, 3, 128, 8) + R"(
+            mov r30, 512
+            tma.load.1d [ur10], [0, ur8], [ur3]
+            ldg.v8 r8, [r30]
+        wait:
+            mbar.try_wait p1, [ur3], 0
+            @!p1 bra.uni wait
+            halt
+        )", config), std::move(launch), {.timeline = true});
+        machine.enable_edge_probe();
+        machine.run();
+        for (uint32_t i = 0; i < 128; ++i)
+            require(machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i), "TMA stream data mismatch" + where);
+        for (uint32_t j = 0; j < 8; ++j)
+            for (uint32_t lane = 0; lane < 16; ++lane)
+                require(machine.read_reg(0, lane, 8 + j) == pattern_word(128 + j),
+                    "vector stream data mismatch with TMA returns interleaved" + where);
+        uint32_t switches = 0;
+        std::string previous;
+        for (const auto& span : trace_spans(machine, nanosm::TraceCategory::gmem, "read sector")) {
+            const auto owner = span.detail.substr(span.detail.find("owner="));
+            if (!previous.empty() && owner != previous) ++switches;
+            previous = owner;
+        }
+        require(switches >= 8, "TMA and vector returns did not interleave at sector granularity (" +
+            std::to_string(switches) + " owner switches)" + where);
+        if (!odd_pluck) continue;
+        // A read that starts inside a beat, and a cycle that reads both streams.
+        bool half_read_head = false;
+        std::set<uint64_t> tma_cycles;
+        std::set<uint64_t> lsu_cycles;
+        for (const auto& event : machine.edge_events()) {
+            if (event.edge == LsuEdge::ingress_read && event.aux % 8 != 0) half_read_head = true;
+            if (event.edge == LsuEdge::tma_reg_write) tma_cycles.insert(event.cycle);
+            if (event.edge == LsuEdge::buffer_write) lsu_cycles.insert(event.cycle);
+        }
+        const bool both_streams = std::any_of(tma_cycles.begin(), tma_cycles.end(),
+            [&](uint64_t cycle) { return lsu_cycles.contains(cycle); });
+        require(half_read_head && both_streams,
+            "no read started inside a beat, or no cycle read both streams; the test proves little" + where);
     }
-    require(switches >= 8, "TMA and vector returns did not interleave at sector granularity (" +
-        std::to_string(switches) + " owner switches)");
 }
 
 // The boundary tripwire: a controller that returns an ordered ID out of
@@ -540,24 +567,50 @@ void test_lsu_controller_contract_tripwire() {
 
 // A gather writes the RF, and frees its command
 // slot, when its last word is in; the rest of that word's sector is still
-// arriving and its read ID table entry lives until the sector's last byte.
+// arriving and its read record lives until the sector's last byte.
 // With a slow DRAM clock the next gather puts sixteen reads in flight from
-// that slot meanwhile: two slots' reads plus that one tail. The table holds
-// the tail (lsu.active_commands x lanes + 1).
+// that slot meanwhile: two slots' reads plus that one tail. The read records
+// hold the tail (lsu.active_commands x lanes + 1). The third gather takes the
+// first one's slot while that tail still drains; the tail looks nothing up
+// there, so each gather gets its own data and its own first return in the
+// trace (not its predecessor's, whose tail is read first).
 void test_lsu_gather_tail_after_retirement() {
     auto config = canonical_profile();
     config.dram_clock_hz = 125000000;
     nanosm::Launch launch;
     launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 64);
-    fill_pattern(gmem, 0, 16, 0);
-    nanosm::Machine machine(config, compile("mov r0, 0\nldg r1, [r0]\nldg r2, [r0]\nldg r3, [r0]\nhalt\n", config),
-        std::move(launch));
+    auto& gmem = image_bytes(launch.gmem_image, 256);
+    fill_pattern(gmem, 0, 64, 0);
+    // Every lane of gather k reads word 0 of the sector at 64 x k.
+    nanosm::Machine machine(config,
+        compile("mov r0, 0\nmov r4, 64\nmov r5, 128\nldg r1, [r0]\nldg r2, [r4]\nldg r3, [r5]\nhalt\n", config),
+        std::move(launch), {.timeline = true});
+    machine.enable_edge_probe();
     machine.run();
     for (uint32_t reg = 1; reg <= 3; ++reg)
         for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(0, lane, reg) == pattern_word(0),
+            require(machine.read_reg(0, lane, reg) == pattern_word(16 * (reg - 1)),
                 "gather " + std::to_string(reg) + " read the wrong word in lane " + std::to_string(lane));
+    std::map<uint64_t, std::pair<uint64_t, uint64_t>> commands; // id -> (admitted, first return)
+    for (const auto& event : machine.trace().events()) {
+        if (event.category != nanosm::TraceCategory::gmem || event.name != "ldg") continue;
+        const auto at = event.detail.find("first_return=");
+        require(at != std::string::npos, "an ldg's trace slice has no first return");
+        commands[event.id] = {event.start_cycle, std::stoull(event.detail.substr(at + 13))};
+    }
+    require(commands.size() == 3, "expected three gathers in the trace");
+    // The first gather's last word's request, and the last cycle its sector was read.
+    uint64_t last_request = 0;
+    for (const auto& event : machine.edge_events())
+        if (event.edge == LsuEdge::buffer_write && event.id == 0) last_request = event.aux;
+    uint64_t tail_end = 0;
+    for (const auto& event : machine.edge_events())
+        if (event.edge == LsuEdge::ingress_read && event.id == last_request) tail_end = event.cycle;
+    require(commands.at(2).first < tail_end,
+        "the third gather was admitted after the first one's tail was read; the test proves little");
+    require(commands.at(0).second < commands.at(1).second && commands.at(1).second < commands.at(2).second,
+        "a gather's first return is not its own (" + std::to_string(commands.at(0).second) + ", " +
+            std::to_string(commands.at(1).second) + ", " + std::to_string(commands.at(2).second) + ")");
 }
 
 // ldg.v8 / stg.v8 need 32-byte sectors (a lane's

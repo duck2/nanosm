@@ -86,8 +86,8 @@ std::optional<Machine::AsyncWrite> Machine::lsu_buffer_rf_write(uint32_t index) 
     if (index != load_buffer) return std::nullopt;
     const auto& buffer = lsu_buffers_.at(index).cur();
     if (!buffer.owner.has_value() || buffer.valid_count != buffer.expected) return std::nullopt;
-    const auto* command = find_lsu_command(*buffer.owner);
-    if (command == nullptr || is_store(command->kind)) throw SimError("internal: the load buffer's owner is not a load");
+    const auto* command = &lsu_commands_.cur().in_slot(*buffer.owner);
+    if (is_store(command->kind)) throw SimError("internal: the load buffer's owner is not a load");
     const bool vector = command->kind == LsuKind::vector_load;
     const auto reg = static_cast<uint8_t>(command->reg + (vector ? buffer.beats : 0));
     return AsyncWrite{AsyncWriter::lsu_buffer, index, command->warp, reg};
@@ -184,7 +184,7 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         // with the group's active lanes enabled (lane l's word j); a gather
         // group's active lanes; a uniform load's one word to every lane.
         const auto& buffer = lsu_buffers_.at(write.index).cur();
-        const auto& command = *find_lsu_command(*buffer.owner);
+        const auto& command = lsu_commands_.cur().in_slot(*buffer.owner);
         const auto width = lsu_group_width(command);
         const bool vector = command.kind == LsuKind::vector_load;
         const bool uniform = command.kind == LsuKind::uniform_load;
@@ -240,7 +240,7 @@ void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
         if (!lsu_buffer_rf_write(index).has_value() || decision.granted_to(AsyncWriter::lsu_buffer, index)) continue;
         trace_->rf_async_wait();
         ++trace_->lsu_counters().lsu_rf_write_wait_cycles;
-        ++lsu_phases_[*lsu_buffers_.at(index).cur().owner].rf_wait;
+        ++lsu_phases_[lsu_commands_.cur().in_slot(*lsu_buffers_.at(index).cur().owner).id].rf_wait;
     }
 }
 
@@ -379,7 +379,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             // to be overwritten after the last group's read.
             if (read->last_group) sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::stg_v8);
             probe(LsuEdge::rf_read_beat, read->lsu_command, read->reg, config_.lanes * 4);
-            w.lsu_rf_read.command = read->lsu_command;
+            w.lsu_rf_read.command = read->lsu_slot;
             w.lsu_rf_read.buffer = read->buffer;
             w.lsu_rf_read.group = read->group;
             w.lsu_rf_read.beat = read->beat;

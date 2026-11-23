@@ -25,8 +25,8 @@ namespace nanosm {
 //   4. The frontend command: its descriptor read (A-read), or the walker's
 //      step (plan_tma_walker) -- a load sector wants the request channel, a
 //      store sector the A-read of its source (and a free TMA store register
-//      for its words); a zero fill or a skipped store stretch wants no shared
-//      resource. One TMA read in service at a time: none while a descriptor
+//      for its words); a zero fill wants the placement tickets' write port
+//      (apply_tma_walker), a skipped store stretch nothing. One TMA read in service at a time: none while a descriptor
 //      read's words are still coming back, or while a store-source read has
 //      rounds left to be granted. There is no mbar read at the start: the
 //      walk begins once the descriptor is decoded and the
@@ -49,11 +49,11 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
             want.present_event = std::move(event);
         }
     }
-    const auto* slot = egress_request_slot(std::nullopt);
-    want.write_request = slot != nullptr && slot->client == GmemClient::tma && egress_slot_visible(*slot);
+    const auto* slot = egress_request_slot(false);
+    want.write_request = slot != nullptr && slot->client == GmemClient::tma;
 
-    if (!tma_write_txn_.cur().has_value() && !tma.returns.empty()) {
-        const auto& ticket = tma.returns.front();
+    if (!tma_write_txn_.cur().has_value() && tma_returns_.readable() != 0) {
+        const auto& ticket = tma_returns_.front();
         want.placement = tma_port_request(TmaPortKind::load_write, ticket.run, ticket.sector_request);
     }
 
@@ -65,6 +65,7 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
         if (!read_free) return want;
         // The descriptor read: the run of its sixteen words (dense).
         TmaRun run;
+        run.slot = command.slot;
         run.command = command.id;
         run.shared_address = command.descriptor_address;
         run.elements = static_cast<uint8_t>(tma_descriptor_bytes / 4);
@@ -93,11 +94,16 @@ Machine::TmaRequests Machine::tma_requests(const EgressWrite& egress) const {
 // The TMA store register a source read granted now would reserve: the ring's
 // tail, when a register is free in Q or the head one drains this cycle (d).
 std::optional<uint32_t> Machine::tma_store_register_free(const EgressWrite& egress) const {
-    const auto& stores = tma_store_registers_.cur();
-    const auto size = static_cast<uint32_t>(stores.ring.size());
-    const auto held = stores.held();
+    const auto size = static_cast<uint32_t>(tma_store_registers_.count());
+    const auto held = static_cast<uint32_t>(tma_store_registers_held());
     if (held == size && !egress.tma_store_drained) return std::nullopt;
-    return (stores.head + held) % size; // full and draining: the head itself
+    return (tma_store_head_.cur() + held) % size; // full and draining: the head itself
+}
+
+std::size_t Machine::tma_store_registers_held() const {
+    const auto& registers = tma_store_registers_.cur();
+    return static_cast<std::size_t>(
+        std::count_if(registers.begin(), registers.end(), [](const auto& reg) { return reg.has_value(); }));
 }
 
 // The walker's step this cycle, planned from Q (TmaWalker, machine.hpp): ONE
@@ -115,7 +121,8 @@ std::optional<uint32_t> Machine::tma_store_register_free(const EgressWrite& egre
 // shorter than a sector takes a sector request per row.
 // Blocked (Sector::none; nothing changes): no credit; a store sector without
 // a free store register (and A-read). A load sector also needs the request
-// channel, which select_request_channel decides.
+// channel, which select_request_channel decides; a zero fill the placement
+// tickets' write port (apply_tma_walker).
 Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const TmaWalker& walker,
     uint32_t credits_used, bool store_register_free) const {
     using Sector = TmaWalkerPlan::Sector;
@@ -146,6 +153,7 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
             return plan;
         }
         auto& run = plan.run;
+        run.slot = command.slot;
         run.command = command.id;
         run.elements = static_cast<uint8_t>(end - x);
         run.element_bytes = static_cast<uint8_t>(bytes);
@@ -191,6 +199,7 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
 // commits it with issue's new command.
 void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
+    tma_returns_traced_ = tma_returns_.count();
     // The launch copy, done last cycle, leaves the queue: it has no
     // completion event.
     for (const auto* done : tma.commands.oldest_first()) {
@@ -215,8 +224,8 @@ void Machine::step_tma(Wires& w) {
     // the command walks from the next cycle.
     if (const auto& leaving = tma_walker_start_pipe_.last(); leaving.has_value()) {
         const auto& start = *leaving;
-        auto& command = tma.commands.at(start.command);
-        if (command.state != TmaCommandState::starting || tma.frontend != start.command) {
+        auto& command = tma.commands.in_slot(start.slot, start.command);
+        if (command.state != TmaCommandState::starting || tma.frontend != command.id) {
             throw SimError("internal: a tma walker start left its pipeline for a command not starting");
         }
         tma.walker = start.walker;
@@ -224,14 +233,16 @@ void Machine::step_tma(Wires& w) {
     }
     if (w.shmem.tma_read_done.has_value()) complete_tma_frontend_read(tma, *w.shmem.tma_read_done, w);
     if (w.shmem.tma_store_fill.has_value() && w.shmem.tma_store_fill->last) {
-        complete_tma_store_capture(tma, w.shmem.tma_store_fill->command);
+        complete_tma_store_capture(tma, w.shmem.tma_store_fill->slot, w.shmem.tma_store_fill->command);
     }
     if (w.shmem.tma_placed.has_value()) {
         land_launch_bytes(tma, *w.shmem.tma_placed, w);
         complete_tma_load_write(tma, *w.shmem.tma_placed);
     }
     if (w.ingress.tma_ticket.has_value()) {
-        tma.returns.push_back(*w.ingress.tma_ticket);
+        if (w.tma_returns_pushed.has_value()) throw SimError("internal: two placement tickets in one cycle");
+        w.tma_returns_pushed = *w.ingress.tma_ticket;
+        ++tma_returns_traced_;
         trace_tma_depths(tma, cycle_);
     }
     for (uint32_t release = 0; release < w.controller.tma_credit_releases; ++release) release_tma_credit(tma);
@@ -244,7 +255,8 @@ void Machine::apply_tma_requests(TmaQueue& tma, Wires& w) {
         tma.event_command = w.tma.present;
     }
     if (w.shmem.b_write == BWriteUser::tma_start) {
-        tma.returns.pop_front(); // its rounds read the sector register until the last one
+        w.tma_return_taken = true; // its rounds read the sector register until the last one
+        --tma_returns_traced_;
         trace_tma_depths(tma, cycle_);
     }
     tma.frontend = w.tma.frontend;
@@ -260,11 +272,17 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
     using Sector = TmaWalkerPlan::Sector;
     const auto& plan = *w.tma.walker;
     auto& command = tma.commands.at(*tma.frontend);
-    // A store sector goes when A-read grants its source read; the others
-    // when the request channel lets them through; a skip always goes.
+    // A store sector goes when A-read grants its source read; a load sector
+    // when the request channel lets it through; a zero fill when the
+    // placement tickets' one write port is free: a sector the ingress
+    // completes now has it (that sector's last word would otherwise hold the
+    // ingress FIFO's head, and both read streams behind it), and the zero
+    // fill tries again next cycle. A skip always goes.
     const bool store_read_granted = w.shmem.a_read.user == AReadUser::tma && w.shmem.a_read.tma_start;
     const bool emits = plan.sector == Sector::store ? store_read_granted
-        : (plan.sector == Sector::load || plan.sector == Sector::zero_fill) && w.channel.walker_proceeds;
+        : plan.sector == Sector::load ? w.channel.walker_proceeds
+        : plan.sector == Sector::zero_fill && !w.ingress.tma_ticket.has_value();
+    if (plan.sector == Sector::zero_fill && !emits) probe(LsuEdge::tma_zero_fill_wait, plan.run.command, 0, 0);
     if (plan.sector == Sector::skip || emits) {
         tma.walker = plan.walker_after;
         if (plan.done_after) command.walker_done = true;
@@ -278,9 +296,11 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
         case Sector::zero_fill: {
             TmaReturn returned;
             returned.run = plan.run;
-            returned.sector_request = w.channel.walker_id;
+            returned.sector_request = next_gmem_request_id_++; // (T) after this cycle's channel requests
             ++command.pending_load_writes;
-            tma.returns.push_back(std::move(returned));
+            if (w.tma_returns_pushed.has_value()) throw SimError("internal: two placement tickets in one cycle");
+            w.tma_returns_pushed = std::move(returned);
+            ++tma_returns_traced_;
             trace_tma_depths(tma, cycle_);
             break;
         }
@@ -312,7 +332,7 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
 // signed).
 void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w) {
     const auto& request = read.request;
-    auto* found = tma.commands.find(request.run.command);
+    auto* found = tma.commands.find_in_slot(request.run.slot, request.run.command);
     if (found == nullptr) throw SimError("orphaned tma shmem transaction");
     auto& command = *found;
 
@@ -333,7 +353,7 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction
             tma.walker = std::move(walker);
             command.state = TmaCommandState::walking;
         } else {
-            w.tma_walker_starting = TmaWalkerStart{command.id, std::move(walker)};
+            w.tma_walker_starting = TmaWalkerStart{command.slot, command.id, std::move(walker)};
             command.state = TmaCommandState::starting;
         }
         return;
@@ -351,7 +371,7 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction
 // sanitizer PANICs at the placement write. The machine just wrote the
 // bytes.
 void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed) {
-    auto* found = tma.commands.find(placed.command);
+    auto* found = tma.commands.find_in_slot(placed.slot, placed.command);
     if (found == nullptr) throw SimError("orphaned tma shmem transaction");
     auto& command = *found;
     if (command.direction != TmaDirection::load || command.pending_load_writes == 0) {
@@ -366,8 +386,8 @@ void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed)
 
 // A store sector's source is captured: its TMA store register is complete
 // (from the next cycle it waits for the egress write port).
-void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
-    auto* found = tma.commands.find(command_id);
+void Machine::complete_tma_store_capture(TmaQueue& tma, uint8_t slot, uint64_t command_id) {
+    auto* found = tma.commands.find_in_slot(slot, command_id);
     if (found == nullptr) throw SimError("orphaned tma shmem transaction");
     auto& command = *found;
     if (command.direction != TmaDirection::store || command.pending_store_captures == 0) {
@@ -513,7 +533,7 @@ void Machine::release_tma_credit(TmaQueue& tma) {
 }
 
 void Machine::trace_tma_depths(const TmaQueue& tma, uint64_t at_cycle) {
-    trace_->tma_depths(at_cycle, tma.commands.size(), tma.credits_used, tma.returns.size());
+    trace_->tma_depths(at_cycle, tma.commands.size(), tma.credits_used, tma_returns_traced_);
 }
 
 // Hardware: the command's data movement is done. Sanitizer: its box
@@ -643,10 +663,20 @@ void Machine::drive_tma_queue(const Wires& w) {
     if (next.commands.size() > config_.tma_queue_commands) {
         throw SimError("internal: the TMA queue holds more than tma.queue_commands commands");
     }
-    if (next.credits_used > config_.tma_sector_credits || next.returns.size() > next.credits_used) {
+    const auto tickets = tma_returns_.count() - (w.tma_return_taken ? 1 : 0) + (w.tma_returns_pushed.has_value() ? 1 : 0);
+    if (next.credits_used > config_.tma_sector_credits || tickets > next.credits_used) {
         throw SimError("internal: TMA placement tickets exceed the sector credits");
     }
     tma_.set_next(std::move(next), "drive_tma_queue");
+}
+
+// The placement tickets: the head leaves when its placement starts (port-B
+// write grants its first round); a ticket enters at the tail through the one
+// write port, from the ingress's completed sector or the walker's zero fill
+// (never both in a cycle: apply_tma_walker).
+void Machine::drive_tma_returns(const Wires& w) {
+    if (w.tma_return_taken) tma_returns_.pop(1, "drive_tma_returns");
+    if (w.tma_returns_pushed.has_value()) tma_returns_.push(*w.tma_returns_pushed, "drive_tma_returns");
 }
 
 // The walker start pipeline: a start whose descriptor came back now enters

@@ -117,10 +117,11 @@ void Machine::advance_tma_read(Wires& w) {
 // register the round names (its return context). The register's own source
 // map says where each byte goes in the sector; the last round completes it.
 void Machine::fill_tma_store_register(const ReadBeat& beat, Wires& w) {
-    const auto& reg = tma_store_registers_.cur().ring.at(beat.slot);
+    const auto& reg = tma_store_registers_.at(beat.slot).cur();
     if (!reg.has_value() || reg->complete()) throw SimError("internal: a TMA store round returned to a free register");
     TmaStoreFill fill;
     fill.store_register = beat.slot;
+    fill.slot = reg->run.slot;
     fill.command = reg->run.command;
     // The store-source read's request as its rounds were planned: the
     // register's run (a store read: whole words, no rotation rule).
@@ -192,14 +193,14 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
     }
     // (The launch copy writes the kernel's `.mbar` states: that is how they
     // get there.)
-    const auto* placing = tma_.cur().commands.find(run.command);
+    const auto* placing = tma_.cur().commands.find_in_slot(run.slot, run.command);
     if (placing == nullptr || !placing->launch) {
         sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(run.command) + " placement", written);
     }
     probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);
     trace_->shmem_grant(cycle_, ShmemService::b_write, ShmemClient::tma);
     if (request.next_round + 1 == rounds) {
-        beat.placed = PlacementEnd{run.command,
+        beat.placed = PlacementEnd{run.slot, run.command,
             run.shared_address + uint32_t{run.elements} * run.element_bytes};
         trace_->shmem_end(ShmemService::b_write, cycle_ + 1);
     }
@@ -328,41 +329,49 @@ void Machine::drive_tma_sector(const Wires& w) {
     }
 }
 
-// The TMA store sector registers, in one calculation: the head register's
-// words drain into the egress FIFO and its last word frees it (the head
-// moves on); a source read granted now reserves the tail register -- the
-// one just freed, when the ring was full (d); a source round's words land in
-// the register the round names.
+// The TMA store sector registers, each register in one calculation: the
+// head register's words drain into the egress FIFO and its last word frees
+// it (the head moves on); a source read granted now reserves the register
+// after the held ones -- the one just freed, when all were held (d); a
+// source round's words land in the register the round names.
 void Machine::drive_tma_store_registers(const Wires& w) {
     const bool draining = w.egress.client == GmemClient::tma;
     const auto& reserved = w.shmem.tma_store_reserved;
     const auto& fill = w.shmem.tma_store_fill;
     if (!draining && !reserved.has_value() && !fill.has_value()) return;
-    auto next = tma_store_registers_.cur();
-    const auto size = static_cast<uint32_t>(next.ring.size());
+    // The registers this cycle changes, each with its next value (at most three).
+    Bounded<std::pair<uint32_t, std::optional<TmaStoreRegister>>, 3> changed;
+    const auto edit = [&](uint32_t index) -> std::optional<TmaStoreRegister>& {
+        for (auto& [at, value] : changed) {
+            if (at == index) return value;
+        }
+        changed.push_back({index, tma_store_registers_.at(index).cur()});
+        return changed.back().second;
+    };
+    const auto head = tma_store_head_.cur();
     if (draining) {
-        auto& head = next.ring.at(next.head);
-        head->words_out += static_cast<uint32_t>(w.egress.words.size());
+        auto& reg = edit(head);
+        reg->words_out += static_cast<uint32_t>(w.egress.words.size());
         if (w.egress.tma_store_drained) {
-            head.reset();
-            next.head = (next.head + 1) % size;
+            reg.reset();
+            tma_store_head_.set_next((head + 1) % static_cast<uint32_t>(tma_store_registers_.count()),
+                "drive_tma_store_registers");
         }
     }
     if (reserved.has_value()) {
-        auto& reg = next.ring.at(*reserved);
+        auto& reg = edit(*reserved);
         if (reg.has_value()) throw SimError("internal: a TMA store register reserved twice");
         TmaStoreRegister fresh;
         fresh.run = w.tma.walker->run;
         fresh.rounds = w.tma.a_read->rounds;
-        fresh.data.assign(config_.gmem_sector_bytes, 0);
-        reg = std::move(fresh);
+        reg = fresh;
     }
     if (fill.has_value()) {
-        auto& reg = next.ring.at(fill->store_register);
+        auto& reg = edit(fill->store_register);
         for (const auto& [offset, byte] : fill->bytes) reg->data.at(offset) = byte;
         ++reg->returned;
     }
-    tma_store_registers_.set_next(std::move(next), "drive_tma_store_registers");
+    for (const auto& [index, value] : changed) tma_store_registers_.set_next(index, value, "drive_tma_store_registers");
 }
 
 } // namespace nanosm
