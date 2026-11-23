@@ -166,7 +166,7 @@ void Machine::decide_issue(Wires& w) {
     bool issued = false;
     uint64_t fifo_empty = 0;
     for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
-        if (!front_end[warp].halted && front_end[warp].fifo.empty()) ++fifo_empty;
+        if (!front_end[warp].halted && front_end[warp].buffer.empty()) ++fifo_empty;
     }
     trace_->instruction_fifo_empty(fifo_empty);
     // The scan keeps going past the winner (for the trace), so it walks from
@@ -197,7 +197,7 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::no_instruction, "branch unresolved"};
             continue;
         }
-        if (front_end[index].fifo.empty()) {
+        if (front_end[index].buffer.empty()) {
             states[index] = {WarpState::no_instruction, "instruction FIFO empty"};
             continue;
         }
@@ -243,7 +243,7 @@ void Machine::decide_issue(Wires& w) {
 //      (alignment, bounds) happen there, at dispatch.
 // The issue unit's own state (stall count, the SFU and the arithmetic operand
 // latches) changes in place; everything else goes into w.issue, which its
-// drivers apply -- the FIFO's pop and the warp's pc included
+// drivers apply -- the buffer's pop and the warp's pc included
 // (step_front_end).
 Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
     const auto inst = head_instruction(warp);
@@ -398,7 +398,7 @@ ResourceView Machine::resource_view(
     view.tma_queue_room = w.tma_next.commands.size() + (w.tma_pushed.has_value() ? 1 : 0) +
         tma_commands_being_read() < config_.tma_queue_commands;
     view.urf_ports_held = urf_read_ports_held();
-    view.mma_queue_room = w.mma_next.queue.size() + claims.mma_commands < config_.mma_queue_commands;
+    view.mma_queue_room = w.mma_next.slots.size() + claims.mma_commands < config_.mma_queue_commands;
     if (is_acc_transfer(inst.opcode)) {
         const bool load = is_acc_load(inst.opcode);
         view.acc_engine_free = acc_engine_available(w, load) && claims.acc[load ? 0 : 1] == 0;
@@ -500,7 +500,7 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         // resolving this cycle: an ssy does not hold its warp, so the halt
         // right behind it issues in the cycle the ssy's push resolves, one
         // cycle before the registered depth shows it.
-        const auto& divergence = divergence_.cur().warps.at(warp.id);
+        const auto& divergence = divergence_.cur().at(warp.id);
         uint32_t depth = divergence.depth;
         uint64_t active = divergence.active;
         if (w.branch.has_value() && w.branch->warp == warp.id) {
@@ -714,12 +714,27 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
 // completions were checked for underflow when recorded.)
 void Machine::drive_depbar(const Wires& w) {
     if (w.depbar_completions.empty() && !w.issue.depbar_admission.has_value()) return;
-    auto next = depbar_.cur();
-    for (const auto& completion : w.depbar_completions) --next.at(completion.warp).at(completion.bar);
-    if (const auto& admission = w.issue.depbar_admission; admission.has_value()) {
-        ++next.at(admission->warp).at(admission->bar);
+    // (One calculation per warp: its counters' next values together.)
+    std::vector<uint8_t> touched(depbar_.count(), 0);
+    for (const auto& completion : w.depbar_completions) touched.at(completion.warp) = 1;
+    if (const auto& admission = w.issue.depbar_admission; admission.has_value()) touched.at(admission->warp) = 1;
+    for (uint32_t warp = 0; warp < touched.size(); ++warp) {
+        if (touched[warp] == 0) continue;
+        auto next = depbar_.cur()[warp];
+        for (const auto& completion : w.depbar_completions) {
+            if (completion.warp == warp) --next.at(completion.bar);
+        }
+        if (const auto& admission = w.issue.depbar_admission; admission.has_value() && admission->warp == warp) {
+            auto& counter = next.at(admission->bar);
+            if (counter >= depbar_counter_max_) {
+                throw SimError("internal: warp " + std::to_string(warp) + " depbar sb" +
+                    std::to_string(admission->bar) + " would count past " + std::to_string(depbar_counter_max_) +
+                    " (the counter's width) at cycle " + std::to_string(cycle_));
+            }
+            ++counter;
+        }
+        depbar_.set_next(warp, next, "drive_depbar");
     }
-    depbar_.set_next(std::move(next), "drive_depbar");
 }
 
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {

@@ -57,6 +57,7 @@ public:
     // valid bit is counted beside it), or none where not declared yet.
     Pipe(RegisterFile& file, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
         : RegisterBase(file, std::move(name)), payload_bits_(payload_bits) {
+        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
         hold_point_ = new_write_point();
     }
 

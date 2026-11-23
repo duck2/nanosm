@@ -35,11 +35,16 @@
 //   common.cpp         helpers shared by the units: float bit conversions, round-robin grants, the lane mask and
 //                      panics.
 //   reg.hpp            Reg<T>, the clocked register every unit's state is made of.
+//   regs.hpp           Regs<T>, a group of registers under one name: one per warp, per bank, per slot.
 //   pipe.hpp           Pipe<T>, N stages in a row: what is in flight for a fixed number of cycles.
+//   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles; the
+//                      payloads not there yet are listed at the end of machine.hpp).
+//   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.
 //   internal.hpp       small pure functions that more than one unit uses (setp's comparison, a sector's
 //                      bus beats). The opcode classes are src/isa.hpp's.
 //
 // What the machine shares with the toolchain (src/, beside src/qtxc/) and which unit it goes with:
+//   limits.hpp         the architectural maxima a profile may give the knobs that size state.
 //   isa.hpp            the instruction set: opcodes, their classes, the instruction word. Every unit.
 //   profile.hpp        the device profile: every size and delay. Every unit.
 //   timing.hpp         every distance counted from an instruction's issue, and the read-port rule:
@@ -145,40 +150,32 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         acc_engines_.poke(AccEngines{});
         acc_ld_pipe_.build(config_.tmem_port_depth + config_.tmem_read_latency_cycles);
         acc_st_pipe_.build(config_.rf_read_latency_cycles + config_.tmem_port_depth);
-        for (uint32_t index = 0; index < config_.shmem_load_slots; ++index) {
-            load_slots_.emplace_back(registers_, "load slot " + std::to_string(index));
-        }
-        for (uint32_t index = 0; index < config_.shmem_store_slots; ++index) {
-            store_slots_.emplace_back(registers_, "store slot " + std::to_string(index));
-        }
+        load_slots_.build(config_.shmem_load_slots);
+        store_slots_.build(config_.shmem_store_slots);
         a_read_pipe_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
         a_write_pipe_.build(config_.shmem_port_a_depth);
         b_write_pipe_.build(config_.shmem_port_a_depth);
         rmw_alu_.build(config_.shmem_rmw_compute_cycles);
         mma_reads_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
         mma_results_.build(config_.mma_result_latency_cycles + config_.tmem_port_depth);
-        RfWritePolicy policy;
-        policy.owed.assign(config_.rf_banks, 0);
-        policy.cursor.assign(config_.rf_banks, 0);
-        rf_write_policy_.poke(std::move(policy));
-        mbar_wait_slots_.poke(WaitSlots(config_.mbar_wait_slots));
-        RfReadPolicy read_policy;
-        read_policy.owed.assign(config_.rf_banks, 0);
-        read_policy.cursor.assign(config_.rf_banks, 0);
-        rf_read_policy_.poke(std::move(read_policy));
-        issue_read_banks_.poke(std::vector<uint8_t>(config_.rf_banks, 0));
+        rf_write_policy_.build(config_.rf_banks);
+        mbar_wait_slots_.build(config_.mbar_wait_slots);
+        rf_read_policy_.build(config_.rf_banks);
+        issue_read_banks_.build(config_.rf_banks);
+        issue_read_banks_.declare_member_bits(std::bit_width(config_.rf_read_ports_per_bank));
         // The load buffer: 8 words per lane of a group. The store buffer the
         // same, and at least a word per lane (a scatter's data).
         const uint32_t load_words = 8 * config_.lsu_load_group_lanes;
         const uint32_t store_words = std::max(8 * config_.lsu_store_group_lanes, config_.lanes);
-        for (const auto& [name, words] : {std::pair<const char*, uint32_t>{"LSU load buffer", load_words},
-                                          std::pair<const char*, uint32_t>{"LSU store buffer", store_words}}) {
+        lsu_buffers_.build(2);
+        for (const auto& [index, words] : {std::pair<uint32_t, uint32_t>{load_buffer, load_words},
+                                           std::pair<uint32_t, uint32_t>{store_buffer, store_words}}) {
             LsuBuffer empty;
             empty.words.assign(words, 0);
             empty.valid.assign(words, 0);
-            lsu_buffers_.emplace_back(registers_, name, std::move(empty));
+            lsu_buffers_.poke(index, std::move(empty));
         }
-        free_id_tags_.poke(std::vector<uint8_t>(config_.lsu_sectors_in_flight, 0));
+        free_id_tags_.build(config_.lsu_sectors_in_flight);
         lsu_read_pipe_.build(config_.rf_read_latency_cycles);
         dispatch_pipe_.build(issue_to_dispatch(config_));
         arithmetic_reads_.build(issue_to_operands(config_));
@@ -207,17 +204,68 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         tma_read_pairs_.build(config_.urf_read_latency_cycles);
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
         // from pc 0; a slot not launched stays halted.
-        std::vector<WarpFrontEnd> front_end(config_.core_warps);
-        for (uint32_t slot = launch.active_warps; slot < config_.core_warps; ++slot) front_end[slot].halted = true;
-        front_end_.poke(std::move(front_end));
+        front_end_.build(config_.core_warps);
+        for (uint32_t slot = launch.active_warps; slot < config_.core_warps; ++slot) {
+            WarpFrontEnd idle;
+            idle.halted = true;
+            front_end_.poke(slot, idle);
+        }
         // Every warp slot starts converged: all lanes active, an empty stack.
-        DivergenceState divergence;
-        divergence.warps.assign(config_.core_warps, WarpDivergence{full_mask(), 0, {}});
-        divergence_.poke(std::move(divergence));
+        divergence_.build(config_.core_warps, WarpDivergence{full_mask(), 0, {}});
+        // The mask, the depth, and the top copy (a pc and a mask).
+        divergence_.declare_member_bits(uint64_t{config_.lanes} +
+            static_cast<uint64_t>(std::bit_width(config_.core_divergence_stack_entries)) + 32 + config_.lanes);
         divergence_stack_.assign(static_cast<std::size_t>(config_.core_warps) * config_.core_divergence_stack_entries,
             DivergenceEntry{});
-        depbar_.poke(DepbarCounters(launch.active_warps));
-        shmem_to_ram_.poke(std::vector<uint32_t>(launch.active_warps, 0));
+        // Per warp slot, launched or not (a slot not launched never counts).
+        depbar_.build(config_.core_warps);
+        // The most one warp can have counted on one depbar. An instruction
+        // counts from its admission (lds, lds.uni, sts, an atomic, ldg / stg
+        // and their v8 forms, acc.ld / acc.st, mma.async; nothing else sets
+        // a depbar) until its decrement, and all that time it is in exactly
+        // one of these places, each of which holds only so many:
+        //   shmem.load_slots    an lds, lds.uni or atomic: its load slot, or
+        //                       its claim on one in the dispatch pipeline,
+        //                       until the register-file write decision
+        //                       grants its write;
+        //   shmem.store_slots   an sts: its store slot or its claim on one,
+        //                       until its last round is granted (a store
+        //                       whose lanes are all off is decremented at
+        //                       dispatch, still holding its claim; so for a
+        //                       load);
+        //   shmem.port_a_depth  an sts's last round on its way to the RAM:
+        //                       one round per A-write stage, decremented at
+        //                       the last (its slot is free meanwhile);
+        //   lsu.active_commands an ldg or stg: its command slot or its claim
+        //                       on one, a load's until its last register
+        //                       write is granted, a store's until its last
+        //                       acknowledgement's decrement;
+        //   mma.queue_commands  an mma.async: decremented when its operands
+        //                       are consumed, its command still in its slot;
+        //   2                   an acc.ld and an acc.st: each engine, or the
+        //                       claim on it (acc.st is decremented as it
+        //                       frees its engine; acc.ld frees its engine
+        //                       when its last read is launched);
+        //   tmem.port_depth + tmem.read_latency_cycles
+        //                       an acc.ld's last beat in the acc.ld pipeline
+        //                       (one beat per stage, held there until its
+        //                       register write is granted);
+        //   rf.banks x rf.write_ports_per_bank x rf.write_depth_cycles
+        //                       a load's last register write (lds, atomic,
+        //                       ldg, acc.ld) between its grant and its
+        //                       landing, where it is decremented: every
+        //                       such write took a write port in its grant
+        //                       cycle and is write_depth_cycles on the way;
+        //   1                   a launch flag, counted from the launch until
+        //                       the copy passes its cut.
+        depbar_counter_max_ = config_.shmem_load_slots + config_.shmem_store_slots + config_.shmem_port_a_depth +
+            config_.lsu_active_commands + config_.mma_queue_commands + 2 +
+            config_.tmem_port_depth + config_.tmem_read_latency_cycles +
+            config_.rf_banks * config_.rf_write_ports_per_bank * config_.rf_write_depth_cycles + 1;
+        depbar_.declare_member_bits(6 * static_cast<uint64_t>(std::bit_width(depbar_counter_max_)));
+        shmem_to_ram_.build(config_.core_warps);
+        shmem_to_ram_.declare_member_bits(
+            static_cast<uint64_t>(std::bit_width(config_.shmem_port_a_depth > 0 ? config_.shmem_port_a_depth - 1 : 0u)));
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
         throw SimError("machine state does not fit in host memory");
@@ -427,7 +475,7 @@ bool Machine::done() const {
     const auto& front_end = front_end_.cur();
     const bool warps_halted = std::all_of(front_end.begin(), front_end.end(), [](const WarpFrontEnd& warp) {
         return warp.halted;
-    }) && !fetch_read_.cur().has_value() && !divergence_.cur().refill.has_value();
+    }) && !fetch_read_.cur().has_value() && !divergence_refill_.cur().has_value();
     const auto& waits = mbar_wait_slots_.cur();
     const bool wait_slots_empty = std::all_of(
         waits.begin(), waits.end(), [](const auto& slot) { return !slot.has_value(); });
@@ -435,12 +483,15 @@ bool Machine::done() const {
     const auto& mma = mma_.cur();
     const auto& acc = acc_engines_.cur();
     const auto empty = [](const auto& reg) { return !reg.cur().has_value(); };
+    const auto all_empty = [](const auto& group) {
+        return std::all_of(group.cur().begin(), group.cur().end(), [](const auto& slot) { return !slot.has_value(); });
+    };
     // The slots in every state, the probe register, the RMW
     // engine (its SIMT RMW register, operation and ALU stages) and the
     // services' pipelines (a store whose slot is free may still be travelling
     // to its write edge).
-    const bool shmem_idle = std::all_of(load_slots_.begin(), load_slots_.end(), empty) &&
-        std::all_of(store_slots_.begin(), store_slots_.end(), empty) && empty(mbar_probe_) && empty(simt_rmw_) &&
+    const bool shmem_idle = all_empty(load_slots_) && all_empty(store_slots_) && empty(mbar_probe_) &&
+        empty(simt_rmw_) &&
         !rmw_.cur().active.has_value() && rmw_alu_.empty() && a_read_pipe_.empty() &&
         a_write_pipe_.empty() && b_write_pipe_.empty() && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
@@ -454,7 +505,7 @@ bool Machine::done() const {
         tma_read_pairs_.empty() &&
         empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
         dispatch_pipe_.empty() && lsu_read_pipe_.empty() && urf_pipe_.empty() &&
-        mma.queue.empty() && mma_results_.empty() && !mma.fetch.has_value() && mma_reads_.empty() &&
+        mma.slots.empty() && mma_results_.empty() && !mma.fetch.has_value() && mma_reads_.empty() &&
         mma.arriving.empty() &&
         !acc[0].has_value() && !acc[1].has_value();
 }
@@ -501,9 +552,9 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
 }
 
 void Machine::test_set_fetch_pc(uint32_t warp, uint32_t pc) {
-    auto front_end = front_end_.cur();
-    front_end.at(warp).fetch_pc = pc;
-    front_end_.poke(std::move(front_end));
+    auto front_end = front_end_.cur().at(warp);
+    front_end.fetch_pc = pc;
+    front_end_.poke(warp, front_end);
 }
 
 uint32_t Machine::read_reg(

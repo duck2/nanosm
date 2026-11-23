@@ -23,6 +23,7 @@
 // replace D. Correct code never writes twice, so both builds compute the same.
 
 #include "machine/sanitizer.hpp"
+#include "machine/state.hpp"
 
 #include <cstddef>
 #include <optional>
@@ -75,7 +76,9 @@ template <typename T>
 class Reg final : public RegisterBase {
 public:
     Reg(RegisterFile& file, std::string name, T initial = T{})
-        : RegisterBase(file, std::move(name)), q_(std::move(initial)) {}
+        : RegisterBase(file, std::move(name)), q_(std::move(initial)) {
+        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
+    }
 
     // Q: the value at the start of this tick, for every reader, all tick.
     [[nodiscard]] const T& cur() const { return q_; }

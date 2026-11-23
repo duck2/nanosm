@@ -35,10 +35,10 @@ std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
     if (!branch.has_value()) return std::nullopt;
     const auto& inst = branch->instruction;
     const auto& warp = warps_.at(branch->warp);
-    const auto& divergence = divergence_.cur();
-    const auto& state = divergence.warps.at(branch->warp);
+    const auto& state = divergence_.cur().at(branch->warp);
+    const auto& refill = divergence_refill_.cur();
     const IssueSite here{cycle_, branch->warp, branch->pc, inst};
-    if (divergence.refill.has_value() && divergence.refill->warp == branch->warp) {
+    if (refill.has_value() && refill->warp == branch->warp) {
         throw SimError("internal: warp " + std::to_string(branch->warp) +
             " resolves a control instruction while its stack top is being refilled, at cycle " +
             std::to_string(cycle_));
@@ -118,7 +118,7 @@ std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
 // A pop presented the new top's address last cycle (DivergenceRefill): the
 // entry is at the stack memory's output now.
 std::optional<std::pair<uint32_t, Machine::DivergenceEntry>> Machine::divergence_memory_output() const {
-    const auto& refill = divergence_.cur().refill;
+    const auto& refill = divergence_refill_.cur();
     if (!refill.has_value()) return std::nullopt;
     return std::make_pair(refill->warp, divergence_stack_.at(
         static_cast<std::size_t>(refill->warp) * config_.core_divergence_stack_entries + refill->index));
@@ -143,26 +143,29 @@ void Machine::drive_issue_branch(const Wires& w) {
 // mask. A refill and a resolution never touch one warp in one cycle
 // (resolve_branch checks it).
 void Machine::drive_divergence(const Wires& w) {
-    const auto& cur = divergence_.cur();
     const bool stack_effect =
         w.branch.has_value() && (w.branch->mask.has_value() || w.branch->push.has_value() || w.branch->pop);
-    if (!cur.refill.has_value() && !stack_effect) return;
-    auto next = cur;
-    next.refill.reset();
-    if (w.divergence_refilled.has_value()) next.warps.at(w.divergence_refilled->first).top = w.divergence_refilled->second;
+    if (!divergence_refill_.cur().has_value() && !stack_effect) return;
+    std::optional<DivergenceRefill> refill;
+    if (w.divergence_refilled.has_value()) {
+        auto warp = divergence_.cur().at(w.divergence_refilled->first);
+        warp.top = w.divergence_refilled->second;
+        divergence_.set_next(w.divergence_refilled->first, warp, "drive_divergence: the refill");
+    }
     if (stack_effect) {
-        auto& warp = next.warps.at(w.branch->warp);
+        auto warp = divergence_.cur().at(w.branch->warp);
         if (w.branch->push.has_value()) {
             warp.top = *w.branch->push;
             ++warp.depth;
         }
         if (w.branch->pop) {
             --warp.depth;
-            if (warp.depth > 0) next.refill = DivergenceRefill{w.branch->warp, warp.depth - 1};
+            if (warp.depth > 0) refill = DivergenceRefill{w.branch->warp, warp.depth - 1};
         }
         if (w.branch->mask.has_value()) warp.active = *w.branch->mask;
+        divergence_.set_next(w.branch->warp, warp, "drive_divergence");
     }
-    divergence_.set_next(std::move(next), "drive_divergence");
+    if (refill != divergence_refill_.cur()) divergence_refill_.set_next(refill, "drive_divergence");
 }
 
 std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predicate) const {

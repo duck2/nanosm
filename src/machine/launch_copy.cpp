@@ -57,16 +57,16 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
     tma.walker = walker;
     tma.frontend = command.id;
     trace_->launch_copy_begin(0, command.id, record.global_address, record.shared_address, record.bytes);
-    tma.commands.emplace(command.id, std::move(command));
+    tma.commands.take(command, config_.tma_queue_commands);
     tma_.poke(std::move(tma));
-    auto depbar = depbar_.cur();
-    for (const auto& flag : record.flags) {
-        for (uint32_t warp = 0; warp < depbar.size(); ++warp) {
-            depbar.at(warp).at(flag.bar) = 1;
-            trace_->depbar(0, warp, flag.bar, 1);
-        }
+    for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
+        auto counters = depbar_.cur().at(warp);
+        for (const auto& flag : record.flags) counters.at(flag.bar) = 1;
+        depbar_.poke(warp, counters);
     }
-    depbar_.poke(std::move(depbar));
+    for (const auto& flag : record.flags) {
+        for (uint32_t warp = 0; warp < warps_.size(); ++warp) trace_->depbar(0, warp, flag.bar, 1);
+    }
     sanitizer_.record_launch_copy(record.shared_address, record.shared_address + record.bytes);
 }
 
@@ -76,9 +76,9 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
 // every warp. Issue reads the counters' Q, so a waiting instruction can
 // issue from the next cycle, when the bytes are in the RAM.
 void Machine::land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires& w) {
-    const auto found = tma.commands.find(placed.command);
-    if (found == tma.commands.end() || !found->second.launch) return;
-    auto& command = found->second;
+    auto* found = tma.commands.find(placed.command);
+    if (found == nullptr || !found->launch) return;
+    auto& command = *found;
     const auto& record = *launch_record_;
     const uint32_t landed = placed.shared_end - record.shared_address;
     if (placed.shared_end <= record.shared_address + command.launch_landed || landed > record.bytes) {

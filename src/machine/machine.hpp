@@ -2,12 +2,16 @@
 
 #include "qtxc/qtxc.hpp"
 #include "image.hpp"
+#include "limits.hpp"
 #include "mbar.hpp"
 #include "profile.hpp"
+#include "machine/fixed.hpp"
 #include "machine/pipe.hpp"
 #include "machine/reg.hpp"
+#include "machine/regs.hpp"
 #include "timing.hpp"
 #include "machine/sanitizer.hpp"
+#include "machine/state.hpp"
 #include "machine/trace.hpp"
 #include "tma_descriptor.hpp"
 
@@ -20,6 +24,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 // class Machine: the whole simulated SM, one class whose member functions are
@@ -190,20 +195,20 @@ public:
     [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.cur().has_value(); }
     // Test seams (Q, between ticks): a warp's depbar counter; the MMA queue's depth.
     [[nodiscard]] uint32_t depbar_value(uint32_t warp, uint8_t bar) const { return depbar_.cur().at(warp).at(bar); }
-    [[nodiscard]] std::size_t mma_queue_depth() const { return mma_.cur().queue.size(); }
+    [[nodiscard]] std::size_t mma_queue_depth() const { return mma_.cur().slots.size(); }
     // Test seams (Q, between ticks): the owner of the load buffer (0) or the
     // store buffer (1) (an LSU command id), its valid bits and their count.
     [[nodiscard]] std::optional<uint64_t> lsu_buffer_owner(uint32_t index) const {
         return lsu_buffers_.at(index).cur().owner;
     }
-    [[nodiscard]] const std::vector<uint8_t>& lsu_buffer_valid(uint32_t index) const {
+    [[nodiscard]] std::vector<uint8_t> lsu_buffer_valid(uint32_t index) const {
         return lsu_buffers_.at(index).cur().valid;
     }
     [[nodiscard]] uint32_t lsu_buffer_valid_count(uint32_t index) const {
         return lsu_buffers_.at(index).cur().valid_count;
     }
     [[nodiscard]] uint32_t lsu_buffer_group(uint32_t index) const { return lsu_buffers_.at(index).cur().group; }
-    [[nodiscard]] const std::vector<uint32_t>& lsu_buffer_words(uint32_t index) const {
+    [[nodiscard]] std::vector<uint32_t> lsu_buffer_words(uint32_t index) const {
         return lsu_buffers_.at(index).cur().words;
     }
     // Every clocked register's declared size, in declaration order.
@@ -220,13 +225,13 @@ public:
     // Test seams (Q, between ticks): a warp's active mask and its divergence
     // stack's depth. The mask is set only by
     // the machine (ssy / divergent bra / sync); there is no seam to set it.
-    [[nodiscard]] uint64_t active_mask(uint32_t warp) const { return divergence_.cur().warps.at(warp).active; }
-    [[nodiscard]] uint32_t divergence_depth(uint32_t warp) const { return divergence_.cur().warps.at(warp).depth; }
-    // Test seams (Q, between ticks): a warp's front end -- its FIFO's valid
+    [[nodiscard]] uint64_t active_mask(uint32_t warp) const { return divergence_.cur().at(warp).active; }
+    [[nodiscard]] uint32_t divergence_depth(uint32_t warp) const { return divergence_.cur().at(warp).depth; }
+    // Test seams (Q, between ticks): a warp's front end -- its buffer's valid
     // packets, its pc (the next instruction's) and fetch pc (the next packet
     // to read) -- and the warp whose packet is at the instruction memory's
     // output now (a read in flight), if any.
-    [[nodiscard]] std::size_t instruction_fifo_packets(uint32_t warp) const { return front_end_.cur().at(warp).fifo.size(); }
+    [[nodiscard]] std::size_t instruction_fifo_packets(uint32_t warp) const { return front_end_.cur().at(warp).buffer.size(); }
     [[nodiscard]] uint32_t warp_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
     [[nodiscard]] uint32_t warp_fetch_pc(uint32_t warp) const { return front_end_.cur().at(warp).fetch_pc; }
     [[nodiscard]] std::optional<uint32_t> fetch_in_flight() const {
@@ -237,12 +242,12 @@ public:
     // front end's consistency check (step_front_end) catches a broken state.
     void test_set_fetch_pc(uint32_t warp, uint32_t pc);
     // Test seams (Q, between ticks): the RF write decision's state per bank.
-    [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().owed.at(bank) != 0; }
-    [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().cursor.at(bank); }
+    [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().at(bank).owed != 0; }
+    [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().at(bank).cursor; }
     // Test seams (Q, between ticks): the RF read decision's state per bank,
     // and the issue register's bank use (reads its round samples this cycle).
-    [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().owed.at(bank) != 0; }
-    [[nodiscard]] uint32_t rf_read_cursor(uint32_t bank) const { return rf_read_policy_.cur().cursor.at(bank); }
+    [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().at(bank).owed != 0; }
+    [[nodiscard]] uint32_t rf_read_cursor(uint32_t bank) const { return rf_read_policy_.cur().at(bank).cursor; }
     [[nodiscard]] uint32_t issue_read_bank_use(uint32_t bank) const { return issue_read_banks_.cur().at(bank); }
     // Test seam (Q, between ticks): stage `stage` of the acc.ld engine's
     // pipeline (tmem.port_depth stages to the tmem sample, then
@@ -292,6 +297,15 @@ private:
     // Machine structures: what each unit's state is made of
     // =======================================================================
 
+    // One register's words, a word per lane (core.lanes of them).
+    using LaneWords = Bounded<uint32_t, limits::lanes>;
+    // An fp16 value with the shared-memory byte address it was read from.
+    struct Fp16At {
+        uint32_t first = 0;  // the byte address
+        uint16_t second = 0; // the bits
+        bool operator==(const Fp16At&) const = default;
+    };
+
     struct MbarWaitSlot {
         uint32_t warp = 0;
         uint32_t byte_address = 0;
@@ -304,7 +318,7 @@ private:
     // Issue-internal warp state (only the scheduler reads or writes it), plus
     // the warp's RF and predicate memories. The depbar counters and the mbar
     // wait slots, which other units complete, are registers (below), and so
-    // is the warp's front end (its PCs, instruction FIFO and halted bit,
+    // is the warp's front end (its PCs, instruction buffer and halted bit,
     // WarpFrontEnd), which fetch reads.
     struct Warp {
         uint32_t id = 0;
@@ -325,24 +339,40 @@ private:
     };
 
     // One warp slot's front end, one
-    // of core.warps. Its instruction FIFO is a shift FIFO of
+    // of core.warps. Its instruction buffer holds up to
     // core.instruction_buffer_packets fetch packets: a packet is the two
     // 64-bit words at an aligned 16-byte address, read together. Only valid
     // entries are held, head first (the valid bits are a thermometer,
-    // fifo.size() is the occupancy). The warp's next instruction is the head
+    // buffer.size() is the occupancy). The warp's next instruction is the head
     // packet's word that pc names: pc bit 3 selects the half, so no other
     // per-warp state says which half is next (a branch into a packet's second
     // half starts there; its first half is never used). Issuing the head's
     // second half pops the packet; a landing fetch appends; both in one
     // next-state update, with the accepted word captured by the issue
     // register at that same edge. Consecutive entries are consecutive
-    // packets: fetch is sequential and a taken branch clears the FIFO. Byte
+    // packets: fetch is sequential and a taken branch clears the buffer. Byte
     // PCs (32 bits; the instruction memory's address width in hardware).
     // While the warp runs, fetch_pc = pc rounded down to 16 + 16 x (valid
     // packets + its read in flight): step_front_end checks it every cycle.
     using FetchPacket = std::array<uint64_t, 2>;
+    // The instruction buffer: a few registers in a row (two packets at the
+    // canonical profile), not a memory. Its operations are the front end's:
+    // the head packet is read by issue, popped when its second half issues;
+    // a landing fetch appends behind the valid packets; a redirect or a halt
+    // flushes it. All of them in one next-state calculation per warp
+    // (step_front_end).
+    struct InstructionBuffer {
+        Bounded<FetchPacket, limits::instruction_buffer_packets> packets; // head first
+        [[nodiscard]] std::size_t size() const { return packets.size(); }
+        [[nodiscard]] bool empty() const { return packets.empty(); }
+        [[nodiscard]] const FetchPacket& head() const { return packets.front(); }
+        void pop_head() { packets.pop_front(); }
+        void append(const FetchPacket& packet) { packets.push_back(packet); }
+        void flush() { packets.clear(); }
+        bool operator==(const InstructionBuffer&) const = default;
+    };
     struct WarpFrontEnd {
-        std::vector<FetchPacket> fifo; // fetched packets, head first
+        InstructionBuffer buffer;      // fetched packets, head first
         uint32_t pc = 0;               // the warp's next instruction (in the head packet when it is valid)
         uint32_t fetch_pc = 0;         // the next packet to read (a multiple of 16)
         bool halted = false;           // a halt was accepted (or the slot was not launched): no fetch, no issue
@@ -371,7 +401,7 @@ private:
     struct IssuedBranch {
         uint32_t warp = 0;
         uint32_t pc = 0;         // the instruction's own pc (32 bits)
-        Instruction instruction; // opcode, predicate, invert, offset
+        DecodedInstruction instruction; // opcode, predicate, invert, offset
     };
 
     // The divergence stack. Every entry is
@@ -407,10 +437,6 @@ private:
         uint32_t index = 0;
         bool operator==(const DivergenceRefill&) const = default;
     };
-    struct DivergenceState {
-        std::vector<WarpDivergence> warps;
-        std::optional<DivergenceRefill> refill;
-    };
 
     // One write through the RF write port (src/timing.hpp): PRESENTED at
     // port_cycle -- a fixed result's booked cycle, an async holder's grant --
@@ -438,7 +464,6 @@ private:
         // An async result's registers: the sanitizer marks them visible as
         // the write lands (a fixed result's visibility is known at issue).
         std::vector<uint8_t> visible_regs;
-        std::string reason;
     };
 
     // A fixed-latency instruction in the arithmetic pipeline, from accepted
@@ -451,11 +476,11 @@ private:
         // Its result's lane enables (16 bits): the issue cycle's active mask,
         // ANDed with the instruction's write mask at the sample.
         uint64_t active_mask = 0;
-        Instruction instruction;
-        std::vector<uint8_t> reads;                  // the round's registers
-        std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
-        std::vector<uint8_t> uniform_reads;          // ur2r: the round's uniform register
-        std::vector<uint32_t> uniform_operands;      // by uniform read, latched at the sample
+        DecodedInstruction instruction;
+        Bounded<uint8_t, limits::round_reads> reads;                  // the round's registers
+        Bounded<LaneWords, limits::round_reads> operands; // by read, latched at the sample
+        Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // ur2r: the round's uniform register
+        Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
     };
 
     // A memory / engine / mbar instruction between accepted issue and its
@@ -474,11 +499,11 @@ private:
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t active_mask = 0;
-        Instruction instruction;
-        std::vector<uint8_t> reads;                  // the round's registers
-        std::vector<std::vector<uint32_t>> operands; // by read, latched at the sample
-        std::vector<uint8_t> uniform_reads;          // the round's uniform registers
-        std::vector<uint32_t> uniform_operands;      // by uniform read, latched at the sample
+        DecodedInstruction instruction;
+        Bounded<uint8_t, limits::round_reads> reads;                  // the round's registers
+        Bounded<LaneWords, limits::round_reads> operands; // by read, latched at the sample
+        Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // the round's uniform registers
+        Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
     };
 
     // One uniform-register write in the URF write pipeline (src/timing.hpp),
@@ -509,8 +534,8 @@ private:
         uint32_t warp = 0;
         uint32_t pc = 0;                  // (S) PANIC text: the instruction's own pc
         uint64_t active_mask = 0;
-        Instruction instruction;          // the opcode, its registers and immediate
-        std::vector<uint32_t> operands;   // from the sample: the uniform sources in operand order, or r2ur's lane 0
+        DecodedInstruction instruction;          // the opcode, its registers and immediate
+        Bounded<uint32_t, limits::round_uniform_reads> operands;   // from the sample: the uniform sources in operand order, or r2ur's lane 0
         std::optional<uint32_t> value;    // the result, from its execution on
     };
 
@@ -552,7 +577,7 @@ private:
         SlotRounds access;
         uint8_t dst = 0;
         uint8_t depbar = 0;
-        std::vector<uint32_t> words;
+        LaneWords words;
         std::size_t returned = 0;  // rounds whose words are in `words`
         bool engine_filled = false; // an atomic's return slot: one fill from the RMW engine
         [[nodiscard]] bool complete() const { return returned == (engine_filled ? 1 : access.rounds.size()); }
@@ -577,7 +602,7 @@ private:
         uint32_t address = 0;         // lane 0's logical tmem word (the pointer + the beat's column)
         uint32_t row_words = 0;       // the region's words per row: lane l reads address + l x row_words
         bool sampled = false;
-        std::vector<uint32_t> values; // the words, from the tmem sample on
+        LaneWords values; // the words, from the tmem sample on
         bool last = false;    // the transfer's final beat: its sample ends the read, its RF write clears the depbar
         uint8_t depbar = 0;
         bool operator==(const AccLdBeat&) const = default;
@@ -592,7 +617,7 @@ private:
     // acc_st_pipe_: written at that cycle's edge).
     struct AccStBeat {
         uint32_t column = 0;
-        std::vector<uint32_t> values;
+        LaneWords values;
     };
 
     // The transfer an engine is running: the region at `pointer` (a logical
@@ -641,12 +666,12 @@ private:
     struct MmaResult {
         uint64_t command = 0;
         uint32_t address = 0;            // the block's first logical tmem word (the trace's)
-        std::vector<uint32_t> words;     // its core_m x core_n physical tmem words, row-major
+        Bounded<uint32_t, limits::mma_block> words;     // its core_m x core_n physical tmem words, row-major
         bool init_step = false;          // C = 0 instead of the tmem words
-        std::vector<uint16_t> a;         // the step's A block, core_m x core_k fp16
-        std::vector<uint16_t> b;         // its B block, core_n x core_k fp16 (transposed snapshot)
+        Bounded<uint16_t, limits::mma_block> a;         // the step's A block, core_m x core_k fp16
+        Bounded<uint16_t, limits::mma_block> b;         // its B block, core_n x core_k fp16 (transposed snapshot)
         bool c_sampled = false;
-        std::vector<uint32_t> values;    // the result, computed at the C sample
+        Bounded<uint32_t, limits::mma_block> values;    // the result, computed at the C sample
     };
 
     // One core step: which tile, which K block, and whether it reloads the
@@ -683,8 +708,8 @@ private:
     struct MmaRead {
         MmaStep step;
         bool last_round = false;
-        std::vector<uint32_t> elements;                       // fp16 element byte addresses
-        std::vector<std::pair<uint32_t, uint16_t>> values;    // (address, bits), read at the RAM sample
+        Bounded<uint32_t, 2 * limits::shmem_banks> elements;                       // fp16 element byte addresses
+        Bounded<Fp16At, 2 * limits::shmem_banks> values;    // (address, bits), read at the RAM sample
     };
 
     // What the RMW engine does with the word(s) it reads: an mbar operation
@@ -721,7 +746,7 @@ private:
         uint8_t parity = 0;             // (S) the host's complete_tx (complete_mbar_tx): the phase it says it completes
         std::optional<uint64_t> tma_command; // (S) a TMA's complete_tx: its command (the accept-time phase peek)
         uint32_t pc = 0;                // (S) PANIC text
-        Instruction instruction;        // (S) PANIC text
+        DecodedInstruction instruction;        // (S) PANIC text
     };
 
     // The two engines that present mbar events to the RMW engine.
@@ -758,7 +783,7 @@ private:
         uint32_t byte_address = 0;
         uint8_t parity = 0;
         uint32_t pc = 0;                // (S) PANIC text
-        Instruction instruction;        // (S) PANIC text
+        DecodedInstruction instruction;        // (S) PANIC text
     };
 
     // ---- gmem controller (placeholder) + LSU ----
@@ -886,7 +911,7 @@ private:
     struct TmaSectorRegister {
         std::optional<uint64_t> request;
         uint64_t sector_address = 0;
-        std::vector<uint8_t> data;  // gmem.sector_bytes, sized at construction (32 B)
+        Bounded<uint8_t, limits::sector_bytes> data;  // gmem.sector_bytes, sized at construction (32 B)
         uint32_t filled = 0;        // bytes plucked in
         bool complete = false;      // all bytes in; its ticket is in the TMA queue's returns
     };
@@ -934,8 +959,8 @@ private:
         std::optional<uint64_t> owner;
         uint32_t group = 0;              // which lane group of the owner
         uint64_t lanes = 0;              // the group's active lanes (a load's RF write enables)
-        std::vector<uint32_t> words;     // the buffer's words (sized at construction)
-        std::vector<uint8_t> valid;      // one bit per word
+        Bounded<uint32_t, limits::v8_registers * limits::lanes> words;     // the buffer's words (sized at construction)
+        Bounded<uint8_t, limits::v8_registers * limits::lanes> valid;      // one bit per word
         uint32_t valid_count = 0;
         uint32_t expected = 0;           // words this group brings; complete when valid_count == expected
         uint32_t beats = 0;              // v8 load: RF writes granted; v8 store: RF read beats landed
@@ -960,7 +985,7 @@ private:
         LsuKind kind = LsuKind::vector_load;
         uint32_t warp = 0;
         uint32_t pc = 0;
-        Instruction instruction;
+        DecodedInstruction instruction;
         uint8_t reg = 0;            // rD (loads) / rS (vector store)
         uint8_t depbar = 0;
         uint32_t buffer = 0;      // load_buffer or store_buffer (by kind; kept for the trace and probes)
@@ -972,7 +997,7 @@ private:
         // / stg.v8: the lane's sector, word offset 0); uniform: one. Hardware:
         // the lanes' addresses latched at admission (16 x 64 bits as held
         // here; a sector address and a word offset each).
-        std::vector<LsuSector> sectors;
+        Bounded<LsuSector, limits::lanes> sectors;
         uint32_t stream = 0;        // a load: the ordered LSU read stream (lsu_stream)
         uint32_t requests_total = 0;
         uint32_t requests_emitted = 0;
@@ -981,6 +1006,55 @@ private:
         uint32_t sectors_pushed = 0; // v8 store: lanes (sectors) moved into the egress FIFO
         uint32_t words_pushed = 0; // stores: words of the current sector (v8) / sectors (scalar) in egress
         uint32_t acks = 0;
+    };
+
+    // The load / store unit's command slots: lsu.active_commands slots (2),
+    // each holding one command from its dispatch until its last
+    // acknowledgement or register write, and which is older. A command takes
+    // the lowest free slot. Requests, store data and register reads are
+    // chosen oldest first; a command leaves from either slot. Other state
+    // names a command by its number (LsuCommand::id), found here by comparing
+    // the slots; in hardware that reference would be the slot's number.
+    struct LsuCommandSlots {
+        std::array<std::optional<LsuCommand>, limits::lsu_active_commands> slots{};
+        Bounded<uint8_t, limits::lsu_active_commands> by_age; // occupied slots, oldest first
+        [[nodiscard]] std::size_t size() const { return by_age.size(); }
+        [[nodiscard]] bool empty() const { return by_age.empty(); }
+        [[nodiscard]] const LsuCommand* find(uint64_t id) const {
+            for (const auto slot : by_age) {
+                if (slots[slot]->id == id) return &*slots[slot];
+            }
+            return nullptr;
+        }
+        [[nodiscard]] LsuCommand* find(uint64_t id) {
+            return const_cast<LsuCommand*>(std::as_const(*this).find(id));
+        }
+        // The commands, oldest first.
+        [[nodiscard]] Bounded<const LsuCommand*, limits::lsu_active_commands> oldest_first() const {
+            Bounded<const LsuCommand*, limits::lsu_active_commands> commands;
+            for (const auto slot : by_age) commands.push_back(&*slots[slot]);
+            return commands;
+        }
+        // A new command takes the lowest free slot of the profile's `capacity`.
+        void take(const LsuCommand& command, std::size_t capacity) {
+            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
+                if (slots[slot].has_value()) continue;
+                slots[slot] = command;
+                by_age.push_back(static_cast<uint8_t>(slot));
+                return;
+            }
+            throw SimError("internal: the LSU holds more than lsu.active_commands commands");
+        }
+        void release(uint64_t id) {
+            for (std::size_t index = 0; index < by_age.size(); ++index) {
+                const auto slot = by_age[index];
+                if (slots[slot]->id != id) continue;
+                slots[slot].reset();
+                by_age.erase_at(index);
+                return;
+            }
+            throw SimError("internal: LSU command #" + std::to_string(id) + " left a slot it is not in");
+        }
     };
 
     // (T) Trace phases and per-command stall reasons of an LSU command. Read
@@ -1044,7 +1118,7 @@ private:
         uint64_t id = 0;
         uint32_t warp = 0;
         uint32_t pc = 0;
-        Instruction instruction;
+        DecodedInstruction instruction;
         // The instruction's operands: the opcode's direction, the descriptor
         // (a constant), the tile's coordinates c0..c3 (zero past the opcode's
         // N), the buffer's and the barrier's shared addresses (their low bits
@@ -1214,9 +1288,11 @@ private:
 
     // A shmem write: its bytes land at the clock edge of the cycle it reaches
     // the RAM; every read of shmem in that cycle sees the old word (READ_FIRST).
+    // (At most 8 bytes: an mbar's two words. A store's lane and an atomic
+    // write a word; a placement piece 1, 2 or 4 bytes.)
     struct ShmemWrite {
         uint32_t address = 0;
-        std::vector<uint8_t> bytes;
+        Bounded<uint8_t, 8> bytes;
     };
 
     struct DepbarEvent {
@@ -1235,8 +1311,8 @@ private:
         ReadClient client = ReadClient::load_slot;
         uint32_t slot = 0;                    // load_slot / tma_store: which load slot / store register
         std::size_t round = 0;                // load_slot / tma_*: the transaction's round
-        std::vector<uint32_t> addresses;      // word-aligned byte addresses, at most one per bank
-        std::vector<uint32_t> words;          // their contents, read at the RAM sample
+        Bounded<uint32_t, limits::shmem_banks> addresses;      // word-aligned byte addresses, at most one per bank
+        Bounded<uint32_t, limits::shmem_banks> words;          // their contents, read at the RAM sample
         std::optional<MbarReadRequest> probe; // probe: the request
     };
 
@@ -1255,8 +1331,11 @@ private:
     // One granted write round in a write pipeline (A-write, port-B write): D
     // stages to the RAM; at the last its bytes land at the clock edge and its
     // completion happens in that cycle.
+    // A round writes at most a word per bank, as pieces: 4 x shmem.banks
+    // one-byte pieces at the most. (Hardware holds a word and byte enables
+    // per bank; here the pieces are kept as they were made.)
     struct WriteBeat {
-        std::vector<ShmemWrite> writes;
+        Bounded<ShmemWrite, 4 * limits::shmem_banks> writes;
         std::optional<DepbarEvent> sts_done;   // an sts's last round: its depbar clears
         std::optional<MbarWake> wake;          // an RMW write that flips the phase wakes the waiters
         std::optional<PlacementEnd> placed;    // a TMA placement's last round: its load write ends
@@ -1315,8 +1394,8 @@ private:
     // per RF bank: the read_owed bit and the round-robin cursor
     // over the async readers.
     struct RfReadPolicy {
-        std::vector<uint8_t> owed;
-        std::vector<uint32_t> cursor;
+        uint8_t owed = 0;
+        uint32_t cursor = 0;
         bool operator==(const RfReadPolicy&) const = default;
     };
 
@@ -1324,29 +1403,42 @@ private:
     // async_owed bit and the round-robin cursor over the async holders. Both
     // change in the same calculation.
     struct RfWritePolicy {
-        std::vector<uint8_t> owed;
-        std::vector<uint32_t> cursor;
+        uint8_t owed = 0;
+        uint32_t cursor = 0;
         // (The LSU has ONE RF write path: the load buffer,
         // one lane-wide vector per cycle. No cursor: there is one buffer.)
         bool operator==(const RfWritePolicy&) const = default;
     };
 
-    using WaitSlots = std::vector<std::optional<MbarWaitSlot>>;
-    using DepbarCounters = std::vector<std::array<uint32_t, 6>>;             // [warp][sb]
+    // One warp's depbar counters, sb0..sb5: how many of the warp's
+    // instructions that count on the depbar are admitted and not yet
+    // decremented. The counter's width follows from the places such an
+    // instruction can be between its admission and its decrement
+    // (Machine::depbar_counter_max_, where each place is listed: 23 at the
+    // canonical profile, a 5-bit counter). An admission past it is an
+    // internal error.
+    using DepbarCounters = std::array<uint32_t, 6>;
     using AccEngines = std::array<std::optional<AccTransfer>, 2>; // [0 the acc.ld engine, 1 the acc.st engine]
 
     // The MMA engine's queue and pipeline. One group: a command's next_step
     // and operands_consumed track the fetch, its outstanding_results the
     // result list. (Its event register is separate.)
     struct MmaPipeline {
-        std::deque<MmaCommand> queue;   // mma.queue_commands; issue pushes at the back
+        // The command slots: mma.queue_commands commands in order, oldest
+        // first (a pair at the canonical profile). Issue's command takes the
+        // place behind the last; commands retire in order, from the front.
+        // The second can issue steps while the first still waits for its
+        // results, and a result finds its command by the command's number,
+        // so this is a row of slots with an order, not a queue read only at
+        // its head.
+        Bounded<MmaCommand, limits::mma_queue_commands> slots;
         std::optional<MmaFetch> fetch;  // the step whose rounds port B is granting
         // The core's operand latch: the values of the step whose rounds are
         // arriving at the port output (A + B of one step: at most 128 B).
-        std::vector<std::pair<uint32_t, uint16_t>> arriving;
+        std::vector<Fp16At> arriving;
         // The held A block: core_m x core_k fp16 (64 B at 4x8), written when a
         // reloading step enters the core, used by the steps after it.
-        std::vector<uint16_t> a_held;
+        Bounded<uint16_t, limits::mma_block> a_held;
     };
 
     // The URF's multi-round operand read (the rounds are src/timing.hpp
@@ -1383,7 +1475,7 @@ private:
         uint32_t warp = 0;
         uint32_t pc = 0;            // (S) PANIC text: the instruction's own pc
         uint64_t active_mask = 0;   // (S) the uniform operation's partial-mask PANIC
-        Instruction instruction;    // the opcode and its registers (a tma: the descriptor address, the direction and N)
+        DecodedInstruction instruction;    // the opcode and its registers (a tma: the descriptor address, the direction and N)
     };
     struct UrfReadRounds {
         UrfReadHeader header;
@@ -1393,7 +1485,7 @@ private:
         uint32_t round = 0;                  // 0: the buffer and the barrier; k >= 1: coordinates 2(k-1) ..
         bool last = false;                   // the command's last round
         std::optional<UrfReadHeader> header; // round 0: the instruction's fields
-        std::vector<uint32_t> words;         // the sampled registers' values, in operand order
+        Bounded<uint32_t, limits::round_uniform_reads> words;         // the sampled registers' values, in operand order
     };
     struct TmaReadHolding {
         UrfReadHeader header;
@@ -1412,8 +1504,63 @@ private:
     //   returns   a FIFO of runs (98 bits each). Every entry holds a sector
     //             credit (from its walk to its placement's end), so at most
     //             tma.sector_credits entries (16): a 16 x 98-bit LUTRAM FIFO.
+    // The TMA's command slots: tma.queue_commands slots (4), each holding one
+    // command from the cycle its operand read pushes it until it leaves, and
+    // the slots' age order. A command takes the lowest free slot; the
+    // frontend and the event presentation choose the oldest command in the
+    // state they want; a command leaves from any slot (a store can be done
+    // before an older load's placements have landed). Other state names a
+    // command by its number (TmaCommand::id), found here by comparing the
+    // slots; in hardware that reference would be the slot's number.
+    struct TmaCommandSlots {
+        std::array<std::optional<TmaCommand>, limits::tma_queue_commands> slots{};
+        Bounded<uint8_t, limits::tma_queue_commands> by_age; // occupied slots, oldest first
+        [[nodiscard]] std::size_t size() const { return by_age.size(); }
+        [[nodiscard]] bool empty() const { return by_age.empty(); }
+        [[nodiscard]] const TmaCommand* find(uint64_t id) const {
+            for (const auto slot : by_age) {
+                if (slots[slot]->id == id) return &*slots[slot];
+            }
+            return nullptr;
+        }
+        [[nodiscard]] TmaCommand* find(uint64_t id) {
+            return const_cast<TmaCommand*>(std::as_const(*this).find(id));
+        }
+        [[nodiscard]] const TmaCommand& at(uint64_t id) const {
+            const auto* command = find(id);
+            if (command == nullptr) throw SimError("internal: TMA command #" + std::to_string(id) + " is in no slot");
+            return *command;
+        }
+        [[nodiscard]] TmaCommand& at(uint64_t id) { return const_cast<TmaCommand&>(std::as_const(*this).at(id)); }
+        // The commands, oldest first.
+        [[nodiscard]] Bounded<const TmaCommand*, limits::tma_queue_commands> oldest_first() const {
+            Bounded<const TmaCommand*, limits::tma_queue_commands> commands;
+            for (const auto slot : by_age) commands.push_back(&*slots[slot]);
+            return commands;
+        }
+        // A new command takes the lowest free slot of the profile's `capacity`.
+        void take(const TmaCommand& command, std::size_t capacity) {
+            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
+                if (slots[slot].has_value()) continue;
+                slots[slot] = command;
+                by_age.push_back(static_cast<uint8_t>(slot));
+                return;
+            }
+            throw SimError("internal: the TMA holds more than tma.queue_commands commands");
+        }
+        void release(uint64_t id) {
+            for (std::size_t index = 0; index < by_age.size(); ++index) {
+                const auto slot = by_age[index];
+                if (slots[slot]->id != id) continue;
+                slots[slot].reset();
+                by_age.erase_at(index);
+                return;
+            }
+            throw SimError("internal: TMA command #" + std::to_string(id) + " left a slot it is not in");
+        }
+    };
     struct TmaQueue {
-        std::map<uint64_t, TmaCommand> commands; // tma.queue_commands; issue inserts
+        TmaCommandSlots commands;                // tma.queue_commands slots; issue's command takes one
         std::optional<uint64_t> frontend;        // the command the descriptor / walker frontend serves
         std::optional<uint64_t> event_command;   // whose completion event is in the TMA's event register
         uint32_t credits_used = 0;               // of tma.sector_credits (5 bits)
@@ -1668,7 +1815,7 @@ private:
     struct LsuRfRead {
         std::optional<uint64_t> command;
         uint32_t buffer = 0;
-        std::vector<uint32_t> values;   // the register, every lane
+        LaneWords values;   // the register, every lane
         uint32_t group = 0;             // the lane group it is for
         uint32_t beat = 0;              // which of rS .. rS+7
         uint64_t lanes = 0;             // the group's active lanes: the words kept
@@ -1827,7 +1974,7 @@ private:
         struct DispatchSample {
             std::size_t stage = 0;
             bool later_round = false;
-            std::vector<std::vector<uint32_t>> operands;
+            Bounded<LaneWords, limits::round_reads> operands;
             std::size_t uniform_first = 0;
             std::vector<uint32_t> uniform_operands;
             // A masked entry's write mask as lanes, sampled from the
@@ -1881,16 +2028,19 @@ private:
     // The front end: per warp slot its FIFO,
     // PCs and halted bit; the instruction memory's read in flight; the fetch
     // round-robin cursor (4 bits at 16 warps); the issue register's branch.
-    Reg<std::vector<WarpFrontEnd>> front_end_{registers_, "instruction FIFOs and PCs"};
+    Regs<WarpFrontEnd> front_end_{registers_, "instruction buffers and PCs"}; // per warp slot
     Reg<std::optional<FetchRead>> fetch_read_{registers_, "instruction memory read (address, tag)"};
     Reg<uint32_t> fetch_cursor_{registers_, "fetch round-robin cursor"};
     Reg<std::optional<IssuedBranch>> issue_branch_{registers_, "issue register: branch"};
-    // Per warp slot its active mask, stack depth and top copy; the stack
-    // memory's read in flight (DivergenceState above).
-    Reg<DivergenceState> divergence_{registers_, "active masks, divergence stack depths and tops"};
+    // Per warp slot (core.warps) its active mask, stack depth and top copy;
+    // and the stack memory's one read in flight.
+    Regs<WarpDivergence> divergence_{registers_, "active masks, divergence stack depths and tops"};
+    Reg<std::optional<DivergenceRefill>> divergence_refill_{registers_, "divergence stack memory read"};
     // Scheduler-visible state other units complete.
-    Reg<DepbarCounters> depbar_{registers_, "depbar counters"};
-    Reg<WaitSlots> mbar_wait_slots_{registers_, "mbar wait slots"};
+    // (Per warp slot, core.warps; sync.mbar_wait_slots slots.)
+    Regs<DepbarCounters> depbar_{registers_, "depbar counters"};
+    uint32_t depbar_counter_max_ = 0;
+    Regs<std::optional<MbarWaitSlot>> mbar_wait_slots_{registers_, "mbar wait slots"};
     // shmem: the SIMT service slots, the probe register, the RMW
     // engine and its three requester registers, the services' pipelines and
     // arbiters. Each requester holds at most one pending RMW in its own
@@ -1902,8 +2052,8 @@ private:
     //         complete_mbar_tx). An engine stalls only on its own register.
     //   MMA:  a commit's arrive {address}.
     // A request written at t is visible to the RMW engine from t + 1.
-    std::deque<Reg<std::optional<LoadSlot>>> load_slots_;   // shmem.load_slots, one register each
-    std::deque<Reg<std::optional<StoreSlot>>> store_slots_; // shmem.store_slots, one register each
+    Regs<std::optional<LoadSlot>> load_slots_{registers_, "load slots"};    // shmem.load_slots
+    Regs<std::optional<StoreSlot>> store_slots_{registers_, "store slots"}; // shmem.store_slots
     Reg<std::optional<MbarReadRequest>> mbar_probe_{registers_, "SIMT mbar probe"};
     Reg<std::optional<MbarRmwRequest>> simt_rmw_{registers_, "SIMT RMW register"};
     Reg<RmwEngine> rmw_{registers_, "RMW engine"};
@@ -1923,8 +2073,8 @@ private:
     // the warp's latest granted shmem round reaches the RAM (a write's edge,
     // a read's sample: grant + D). A grant at g sets it to D - 1 at g + 1; it
     // counts down to 0, the cycle that round is at the RAM. 0..D-1:
-    // ceil(log2(D)) bits per warp.
-    Reg<std::vector<uint32_t>> shmem_to_ram_{registers_, "per-warp shmem cycles to the RAM"};
+    // ceil(log2(D)) bits per warp slot (core.warps).
+    Regs<uint32_t> shmem_to_ram_{registers_, "per-warp shmem cycles to the RAM"};
     Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{registers_, "TMA mbar event register"};
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
     // MMA and accumulator transfers.
@@ -1969,25 +2119,25 @@ private:
     // the ingress FIFO and egress FIFO (IngressFifo, EgressSlot), the read ID
     // table (ReadRecord) as their comments say; free-ID tags
     // lsu.sectors_in_flight bits (16, fixed).
-    Reg<std::deque<LsuCommand>> lsu_commands_{registers_, "LSU command slots"}; // admission order
-    std::deque<Reg<LsuBuffer>> lsu_buffers_;   // [load_buffer], [store_buffer]: one register each
+    Reg<LsuCommandSlots> lsu_commands_{registers_, "LSU command slots"};
+    Regs<LsuBuffer> lsu_buffers_{registers_, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
     static constexpr uint32_t load_buffer = 0;
     static constexpr uint32_t store_buffer = 1;
     Reg<IngressFifo> ingress_{registers_, "ingress FIFO"};
     Reg<std::deque<EgressSlot>> egress_fifo_{registers_, "egress FIFO"};
     Reg<std::map<uint64_t, ReadRecord>> read_records_{registers_, "read ID table"};
-    Reg<std::vector<uint8_t>> free_id_tags_{registers_, "free-ID tags"}; // 1 = in flight
+    Regs<uint8_t> free_id_tags_{registers_, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
     // The RF write path: fixed results waiting for their booked port cycle,
     // and every write from its port cycle until it lands (src/timing.hpp).
     Reg<std::deque<Writeback>> writebacks_{registers_, "RF write pipeline"};
-    Reg<RfWritePolicy> rf_write_policy_{registers_, "RF write policy (async_owed, cursors)"};
-    Reg<RfReadPolicy> rf_read_policy_{registers_, "RF read policy (read_owed, cursors)"};
+    Regs<RfWritePolicy> rf_write_policy_{registers_, "RF write policy (async_owed, cursor), per bank"};
+    Regs<RfReadPolicy> rf_read_policy_{registers_, "RF read policy (read_owed, cursor), per bank"};
     // The issue register's RF bank use: per bank,
     // how many registers the instruction accepted last cycle samples now (at
     // most rf.read_ports_per_bank: one bit per bank at the canonical one
     // port; zero when nothing was accepted). It owns those read ports this
     // cycle; the async readers take the rest (decide_rf_reads).
-    Reg<std::vector<uint8_t>> issue_read_banks_{registers_, "issue register: RF read bank use"};
+    Regs<uint8_t> issue_read_banks_{registers_, "issue register: RF read bank use"}; // per bank
     // Issue -> units: the issue register and the RF read pipeline
     // (issue_to_dispatch stages), carrying memory / engine instructions.
     // issue_to_dispatch stages: an instruction accepted at t is in stage k at
@@ -2024,7 +2174,7 @@ private:
     // from the last one; the async writers use the current write port. (There
     // is no read calendar: reads are one round at issue + 1, owned by the
     // issue register -- issue_read_banks_.)
-    Pipe<std::vector<uint32_t>> write_calendar_{registers_, "RF write calendar"};
+    Pipe<Bounded<uint32_t, limits::rf_banks>> write_calendar_{registers_, "RF write calendar"};
     // gmem controller (outside the SM): its queue, bus and B channel. The
     // queue and the bus entry together hold at most gmem.queue_sectors (64;
     // checked in step_gmem_controller). The B channel holds an ack per write
@@ -2398,7 +2548,7 @@ private:
         const std::vector<ImageSegment>& image,
         const std::string& name);
     Writeback register_writeback(
-        const Warp& warp, uint8_t dst, uint64_t port_cycle, std::vector<uint32_t> values, std::string reason) const;
+        const Warp& warp, uint8_t dst, uint64_t port_cycle, std::vector<uint32_t> values) const;
     Writeback predicate_writeback(
         const Warp& warp, uint8_t dst, uint64_t port_cycle, std::vector<uint32_t> values) const;
     [[noreturn]] void panic(const Warp& warp, const Instruction& inst, const std::string& reason) const;
@@ -2448,5 +2598,23 @@ float bits_float(uint32_t value);
 // spec. Finite and infinite halves round-trip exactly.
 uint32_t half_to_float_bits(uint16_t half);
 uint16_t float_to_half_bits(uint32_t bits);
+
+// ---- Clocked state that is not yet a fixed bundle of bits ----
+// Every other register, group and pipeline of the machine holds a payload of
+// a fixed size (machine/state.hpp checks it when this compiles). These nine
+// still hold a container; each line says which, and what it would become.
+// Removing a line makes the compiler point at what is left to do.
+//
+// Queues toward global memory (they become FIFOs):
+template <> struct NotYetFixedPayload<Machine::IngressFifo> : std::true_type {};                    // ingress_: a deque of bus beats, a byte vector per beat
+template <> struct NotYetFixedPayload<std::deque<Machine::EgressSlot>> : std::true_type {};         // egress_fifo_: a deque of sectors, a byte vector per slot
+template <> struct NotYetFixedPayload<std::map<uint64_t, Machine::ReadRecord>> : std::true_type {}; // read_records_: a map by request number; two in-order queues
+template <> struct NotYetFixedPayload<Machine::TmaQueue> : std::true_type {};                       // tma_: its returns (a deque of sectors ready for placement)
+template <> struct NotYetFixedPayload<Machine::TmaStoreRegisters> : std::true_type {};              // tma_store_registers_: a vector ring, a byte vector per register
+// Stored bank schedules and the register file's write path (their own design steps):
+template <> struct NotYetFixedPayload<std::optional<Machine::LoadSlot>> : std::true_type {};  // load_slots_: SlotRounds::rounds, a list of rounds of lanes
+template <> struct NotYetFixedPayload<std::optional<Machine::StoreSlot>> : std::true_type {}; // store_slots_: the same
+template <> struct NotYetFixedPayload<Machine::MmaPipeline> : std::true_type {};              // mma_: the fetch's round_elements and the arriving operands (by byte address)
+template <> struct NotYetFixedPayload<std::deque<Machine::Writeback>> : std::true_type {};    // writebacks_: results of every latency in one deque, removed from the middle
 
 } // namespace nanosm

@@ -397,7 +397,6 @@ void Machine::deliver_write_acks(Wires& w) {
         completion.warp = command->warp;
         completion.clear_depbar = command->depbar;
         completion.release_lsu_command = command->id;
-        completion.reason = opcode_name(command->instruction.opcode);
         w.new_writebacks.push_back(std::move(completion));
     }
 }

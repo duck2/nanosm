@@ -106,7 +106,7 @@ std::optional<uint32_t> Machine::lsu_rf_presented() const {
 std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
     std::optional<uint32_t> lsu_presented) const {
     std::vector<std::optional<AsyncWrite>> holders;
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         const auto& slot = load_slots_[index].cur();
         if (slot.has_value() && slot->complete()) {
             holders.push_back(AsyncWrite{AsyncWriter::load_slot, index, slot->warp, slot->dst});
@@ -114,7 +114,7 @@ std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
             holders.emplace_back();
         }
     }
-    for (uint32_t index = 0; index < lsu_buffers_.size(); ++index) {
+    for (uint32_t index = 0; index < lsu_buffers_.count(); ++index) {
         holders.push_back(lsu_presented == index ? lsu_buffer_rf_write(index) : std::nullopt);
     }
     if (const auto& output = acc_ld_pipe_.cur().back(); output.has_value()) {
@@ -148,12 +148,12 @@ Machine::RfWriteDecision Machine::decide_rf_writes() const {
             ready[holder] = write.has_value() && write->reg % config_.rf_banks == bank ? 1 : 0;
         }
         const auto free_ports = config_.rf_write_ports_per_bank - writes_booked_now(bank);
-        const auto choice = round_robin_grant(ready, policy.cursor.at(bank), free_ports);
+        const auto choice = round_robin_grant(ready, policy.at(bank).cursor, free_ports);
         for (const auto holder : choice.granted) decision.granted[holder] = 1;
         auto& state = decision.banks[bank];
         state.ready = std::find(ready.begin(), ready.end(), 1) != ready.end();
         state.granted = !choice.granted.empty();
-        state.inhibit_simt = state.ready && !state.granted && policy.owed.at(bank) != 0;
+        state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
     }
     return decision;
@@ -176,7 +176,6 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
         writeback.values = slot.words;
         writeback.lane_enables = slot.mask;
         writeback.clear_depbar = slot.depbar;
-        writeback.reason = slot.engine_filled ? "atom" : "lds"; // an atomic's old value, or an lds
         writeback.visible_regs = {write.reg};
         return writeback;
     }
@@ -202,7 +201,6 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
             writeback.values[lane] = buffer.words[at];
         }
         if (!uniform) writeback.lane_enables = buffer.lanes;
-        writeback.reason = opcode_name(command.instruction.opcode);
         const bool group_done = buffer.beats + 1 == buffer.beats_total;
         const uint32_t lanes_done = uniform ? 1 : static_cast<uint32_t>(std::popcount(buffer.lanes));
         if (group_done && command.lanes_written + lanes_done == command.requests_total) {
@@ -220,7 +218,6 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
     case AsyncWriter::acc_ld: {
         const auto& beat = *acc_ld_pipe_.cur().back();
         writeback.values = beat.values;
-        writeback.reason = "acc.ld";
         writeback.visible_regs = {write.reg};
         // (Its tmem read-ownership ended at the transfer's last tmem sample,
         // sample_acc_ld_beat; the destination stays not-ready until this
@@ -239,7 +236,7 @@ void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
         if (!write.has_value() || write->writer == AsyncWriter::lsu_buffer || decision.granted[holder] != 0) continue;
         trace_->rf_async_wait();
     }
-    for (uint32_t index = 0; index < lsu_buffers_.size(); ++index) {
+    for (uint32_t index = 0; index < lsu_buffers_.count(); ++index) {
         if (!lsu_buffer_rf_write(index).has_value() || decision.granted_to(AsyncWriter::lsu_buffer, index)) continue;
         trace_->rf_async_wait();
         ++trace_->lsu_counters().lsu_rf_write_wait_cycles;
@@ -353,12 +350,12 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             ready[holder] = read.has_value() && read->reg % config_.rf_banks == bank ? 1 : 0;
         }
         const auto free_ports = config_.rf_read_ports_per_bank - simt_read_now.at(bank);
-        const auto choice = round_robin_grant(ready, policy.cursor.at(bank), free_ports);
+        const auto choice = round_robin_grant(ready, policy.at(bank).cursor, free_ports);
         for (const auto holder : choice.granted) decision.granted[holder] = 1;
         auto& state = decision.banks[bank];
         state.ready = std::find(ready.begin(), ready.end(), 1) != ready.end();
         state.granted = !choice.granted.empty();
-        state.inhibit_simt = state.ready && !state.granted && policy.owed.at(bank) != 0;
+        state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
     }
     for (std::size_t holder = 0; holder < decision.holders.size(); ++holder) {
@@ -526,15 +523,15 @@ void Machine::step_rf_reads(Wires& w) {
 // (a successful SIMT booking sets it, an actual async grant clears it, set
 // wins); the cursor moves past the holder granted last, only on a grant.
 void Machine::drive_rf_write_policy(const Wires& w) {
-    auto next = rf_write_policy_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        const auto& cur = rf_write_policy_.cur()[bank];
         const auto& decision = w.rf_write.banks[bank];
         const bool booked = w.issue.rf_write_bank == bank;
-        next.owed[bank] = booked || (next.owed[bank] != 0 && !decision.granted) ? 1 : 0;
-        next.cursor[bank] = decision.cursor_after;
+        RfWritePolicy next;
+        next.owed = booked || (cur.owed != 0 && !decision.granted) ? 1 : 0;
+        next.cursor = decision.cursor_after;
+        if (next != cur) rf_write_policy_.set_next(bank, next, "drive_rf_write_policy");
     }
-    if (next == rf_write_policy_.cur()) return;
-    rf_write_policy_.set_next(std::move(next), "drive_rf_write_policy");
 }
 
 // The RF read decision's state, per bank (the write decision's, mirrored):
@@ -543,15 +540,15 @@ void Machine::drive_rf_write_policy(const Wires& w) {
 // read grant clears it, set wins); the cursor moves past the reader granted
 // last, only on a grant.
 void Machine::drive_rf_read_policy(const Wires& w) {
-    auto next = rf_read_policy_.cur();
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        const auto& cur = rf_read_policy_.cur()[bank];
         const auto& decision = w.rf_read.banks[bank];
         const bool accepted = !w.issue.rf_read_banks.empty() && w.issue.rf_read_banks[bank] != 0;
-        next.owed[bank] = accepted || (next.owed[bank] != 0 && !decision.granted) ? 1 : 0;
-        next.cursor[bank] = decision.cursor_after;
+        RfReadPolicy next;
+        next.owed = accepted || (cur.owed != 0 && !decision.granted) ? 1 : 0;
+        next.cursor = decision.cursor_after;
+        if (next != cur) rf_read_policy_.set_next(bank, next, "drive_rf_read_policy");
     }
-    if (next == rf_read_policy_.cur()) return;
-    rf_read_policy_.set_next(std::move(next), "drive_rf_read_policy");
 }
 
 // The arithmetic pipeline's operand latches: the instruction in stage 0 goes
@@ -578,10 +575,10 @@ void Machine::drive_write_calendar(const Wires& w) {
 // The issue register's bank use: the round of the instruction accepted now
 // samples in the next cycle; nothing accepted leaves it empty.
 void Machine::drive_issue_read_banks(const Wires& w) {
-    auto next = w.issue.rf_read_banks;
-    if (next.empty()) next.assign(config_.rf_banks, 0);
-    if (next == issue_read_banks_.cur()) return;
-    issue_read_banks_.set_next(std::move(next), "drive_issue_read_banks");
+    for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        const uint8_t next = w.issue.rf_read_banks.empty() ? 0 : w.issue.rf_read_banks[bank];
+        if (next != issue_read_banks_.cur()[bank]) issue_read_banks_.set_next(bank, next, "drive_issue_read_banks");
+    }
 }
 
 // The RF write schedule: the writes executed now leave it; this cycle's new
@@ -628,15 +625,13 @@ Machine::Writeback Machine::register_writeback(
     const Warp& warp,
     uint8_t dst,
     uint64_t port_cycle,
-    std::vector<uint32_t> values,
-    std::string reason) const {
+    std::vector<uint32_t> values) const {
     Writeback writeback;
     writeback.port_cycle = port_cycle;
     writeback.land_cycle = port_cycle + config_.rf_write_depth_cycles;
     writeback.warp = warp.id;
     writeback.dst = dst;
     writeback.values = std::move(values);
-    writeback.reason = std::move(reason);
     return writeback;
 }
 
@@ -653,7 +648,6 @@ Machine::Writeback Machine::predicate_writeback(
     writeback.warp = warp.id;
     writeback.predicate_dst = dst;
     writeback.values = std::move(values);
-    writeback.reason = "setp";
     return writeback;
 }
 

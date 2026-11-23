@@ -125,16 +125,16 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
         }
         trace_->mma_result(cycle_, landing->command, landing->address);
         const auto id = landing->command;
-        auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
+        auto command = std::find_if(mma.slots.begin(), mma.slots.end(),
             [id](const auto& candidate) { return candidate.id == id; });
-        if (command == mma.queue.end() || command->outstanding_results == 0)
+        if (command == mma.slots.end() || command->outstanding_results == 0)
             throw SimError("internal MMA result lost its command");
         --command->outstanding_results;
     }
-    while (!mma.queue.empty() && !mma.queue.front().commit &&
-           mma.queue.front().operands_consumed && mma.queue.front().outstanding_results == 0) {
-        sanitizer_.record_mma_retired(mma.queue.front().id); // last result retired
-        mma.queue.pop_front();
+    while (!mma.slots.empty() && !mma.slots.front().commit &&
+           mma.slots.front().operands_consumed && mma.slots.front().outstanding_results == 0) {
+        sanitizer_.record_mma_retired(mma.slots.front().id); // last result retired
+        mma.slots.pop_front();
     }
     if (const auto& at_ram = mma_reads_.stage(config_.shmem_port_a_depth - 1); at_ram.has_value()) {
         w.mma_read_sampled = *at_ram;
@@ -161,21 +161,21 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
 // held A block. A command's steps may start once the previous command's last
 // step has been granted (commands overlap in the pipelines).
 std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires& w) {
-    auto command_it = std::find_if(mma.queue.begin(), mma.queue.end(), [this](const auto& command) {
+    auto command_it = std::find_if(mma.slots.begin(), mma.slots.end(), [this](const auto& command) {
         return command.commit || command.next_step < mma_total_steps(config_, command.shape);
     });
-    if (command_it == mma.queue.end()) return std::nullopt;
+    if (command_it == mma.slots.end()) return std::nullopt;
     auto& command = *command_it;
     if (command.commit) {
         // A commit at the queue head presents into the MMA's own event
         // register: free if empty in Q, or claimed by the RMW engine now (d).
         const bool register_free = !mma_mbar_event_.cur().has_value() || w.shmem.mma_event_claimed;
-        if (command_it != mma.queue.begin() || !register_free) return std::nullopt;
+        if (command_it != mma.slots.begin() || !register_free) return std::nullopt;
         MbarRmwRequest request;
         request.operation = MbarRmwOperation::arrive;
         request.byte_address = command.mbar_address;
         w.mma_present = std::move(request);
-        mma.queue.pop_front();
+        mma.slots.pop_front();
         return std::nullopt;
     }
     // The command's shape sets the walk: rows in core_m blocks (8 for m32,
@@ -288,9 +288,9 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
     }
     if (!read.last_round || !read.step.last_step) return;
     const auto id = read.step.command;
-    auto command = std::find_if(mma.queue.begin(), mma.queue.end(),
+    auto command = std::find_if(mma.slots.begin(), mma.slots.end(),
         [id](const auto& candidate) { return candidate.id == id; });
-    if (command == mma.queue.end()) throw SimError("internal MMA read lost its command");
+    if (command == mma.slots.end()) throw SimError("internal MMA read lost its command");
     command->operands_consumed = true;
     sanitizer_.record_mma_operands_consumed(command->id); // final operand read
     record_depbar_completion(w, command->warp, command->depbar, "internal MMA depbar underflow");
@@ -302,7 +302,8 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
 // its result leaves the core result_latency after entry and lands in tmem
 // tmem.port_depth after that.
 void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w) {
-    std::map<uint32_t, uint16_t> latch(mma.arriving.begin(), mma.arriving.end());
+    std::map<uint32_t, uint16_t> latch;
+    for (const auto& value : mma.arriving) latch.emplace(value.first, value.second);
     const auto value = [&](uint32_t address) {
         const auto found = latch.find(address);
         if (found == latch.end()) throw SimError("internal MMA operand did not arrive with its step");
@@ -632,7 +633,10 @@ void Machine::drive_mma_event(const Wires& w) {
 // The MMA queue and pipeline: step_mma's result, plus issue's new command.
 void Machine::drive_mma(const Wires& w) {
     auto next = w.mma_next;
-    if (w.dispatch.mma.has_value()) next.queue.push_back(*w.dispatch.mma);
+    if (w.dispatch.mma.has_value()) next.slots.push_back(*w.dispatch.mma);
+    if (next.slots.size() > config_.mma_queue_commands) {
+        throw SimError("internal: the tensor core holds more than mma.queue_commands commands");
+    }
     mma_.set_next(std::move(next), "drive_mma");
     if (w.mma_read_sampled.has_value()) {
         mma_reads_.replace(config_.shmem_port_a_depth - 1, w.mma_read_sampled, "drive_mma: the shmem RAM's elements");

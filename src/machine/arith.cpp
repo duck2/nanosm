@@ -241,7 +241,7 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
     const auto port_cycle = cycle_ - issue_to_operands(config_) + issue_to_port(inst, config_);
     auto writeback = is_setp(inst.opcode)
         ? predicate_writeback(warp, inst.dst, port_cycle, std::move(result))
-        : register_writeback(warp, inst.dst, port_cycle, std::move(result), opcode_name(inst.opcode));
+        : register_writeback(warp, inst.dst, port_cycle, std::move(result));
     writeback.lane_enables = pending.active_mask;
     w.new_writebacks.push_back(std::move(writeback));
 }

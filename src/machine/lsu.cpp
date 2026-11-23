@@ -190,8 +190,9 @@ uint64_t Machine::lsu_group_lanes(const LsuCommand& command, uint32_t group) con
 // The store buffer is free for a scalar store's data at its dispatch: no
 // admitted store still has data to move (a released one has none).
 bool Machine::store_buffer_free() const {
-    const auto& commands = lsu_commands_.cur();
-    return std::none_of(commands.begin(), commands.end(), store_has_data_left);
+    const auto commands = lsu_commands_.cur().oldest_first();
+    return std::none_of(commands.begin(), commands.end(),
+        [](const LsuCommand* command) { return store_has_data_left(*command); });
 }
 
 std::optional<uint32_t> Machine::free_id_tag() const {
@@ -203,10 +204,7 @@ std::optional<uint32_t> Machine::free_id_tag() const {
 }
 
 const Machine::LsuCommand* Machine::find_lsu_command(uint64_t id) const {
-    for (const auto& command : lsu_commands_.cur()) {
-        if (command.id == id) return &command;
-    }
-    return nullptr;
+    return lsu_commands_.cur().find(id);
 }
 
 // The egress FIFO's request pointer: the oldest slot whose write request has
@@ -234,7 +232,8 @@ bool Machine::egress_slot_visible(const EgressSlot& slot) const {
 // request pointer is its next slot, complete and visible (scatter: and a
 // free-ID tag).
 const Machine::LsuCommand* Machine::lsu_request_candidate(std::optional<uint64_t> requested_now) const {
-    for (const auto& command : lsu_commands_.cur()) {
+    for (const auto* oldest : lsu_commands_.cur().oldest_first()) {
+        const auto& command = *oldest;
         if (command.requests_emitted == command.requests_total) continue;
         switch (command.kind) {
         case LsuKind::vector_load:
@@ -519,7 +518,7 @@ void Machine::note_first_return(uint64_t command) {
 // now (d). A stg.v8 dispatched this cycle takes part (bypass (e)).
 std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wires& w) const {
     std::vector<const LsuCommand*> commands;
-    for (const auto& command : lsu_commands_.cur()) commands.push_back(&command);
+    for (const auto* command : lsu_commands_.cur().oldest_first()) commands.push_back(command);
     if (w.dispatch.lsu.has_value()) commands.push_back(&w.dispatch.lsu->command);
     for (const auto* command : commands) {
         if (!store_has_data_left(*command)) continue;
@@ -571,9 +570,9 @@ Machine::EgressWrite Machine::decide_egress_write() {
     if (open == nullptr) {
         const bool tma_ready = tma_head.has_value() && tma_head->complete();
         const LsuCommand* lsu = nullptr;
-        for (const auto& command : lsu_commands_.cur()) {
-            if (store_has_data_left(command)) {
-                lsu = &command;
+        for (const auto* command : lsu_commands_.cur().oldest_first()) {
+            if (store_has_data_left(*command)) {
+                lsu = command;
                 break;
             }
         }
@@ -766,9 +765,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
     if (!changed) return;
     auto next = lsu_commands_.cur();
     const auto command = [&](uint64_t id) -> LsuCommand& {
-        for (auto& candidate : next) {
-            if (candidate.id == id) return candidate;
-        }
+        if (auto* found = next.find(id); found != nullptr) return *found;
         throw SimError("internal reference to a retired LSU command #" + std::to_string(id));
     };
     if (drained.has_value()) command(drained->first).lanes_written += drained->second;
@@ -784,11 +781,8 @@ void Machine::drive_lsu_commands(const Wires& w) {
     }
     if (w.channel.granted == GmemClient::lsu) ++command(w.channel.lsu_command).requests_emitted;
     for (const auto& [id, acks] : w.controller.lsu_acks) command(id).acks += acks;
-    std::erase_if(next, [&](const LsuCommand& candidate) {
-        return std::find(w.released_lsu_commands.begin(), w.released_lsu_commands.end(), candidate.id) !=
-            w.released_lsu_commands.end();
-    });
-    if (w.dispatch.lsu.has_value()) next.push_back(w.dispatch.lsu->command);
+    for (const auto released : w.released_lsu_commands) next.release(released);
+    if (w.dispatch.lsu.has_value()) next.take(w.dispatch.lsu->command, config_.lsu_active_commands);
     if (w.lsu_rf_read.command.has_value()) ++command(*w.lsu_rf_read.command).group_beats_read;
     if (next.size() > config_.lsu_active_commands) {
         throw SimError("internal: the LSU holds more than lsu.active_commands commands");
@@ -1001,10 +995,9 @@ void Machine::drive_read_records(const Wires& w) {
 // today never one returned now).
 void Machine::drive_free_id_tags(const Wires& w) {
     if (!w.channel.lsu_tag.has_value() && w.controller.freed_tags.empty()) return;
-    auto next = free_id_tags_.cur();
-    for (const auto tag : w.controller.freed_tags) next.at(tag) = 0;
-    if (w.channel.lsu_tag.has_value()) next.at(*w.channel.lsu_tag) = 1;
-    free_id_tags_.set_next(std::move(next), "drive_free_id_tags");
+    // (A tag is taken only when free in Q, so no tag is both freed and taken now.)
+    for (const auto tag : w.controller.freed_tags) free_id_tags_.set_next(tag, 0, "drive_free_id_tags");
+    if (w.channel.lsu_tag.has_value()) free_id_tags_.set_next(*w.channel.lsu_tag, 1, "drive_free_id_tags");
 }
 
 // The LSU's store-data reads in flight: the one sampled now enters the RF's

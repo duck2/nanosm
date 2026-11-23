@@ -154,7 +154,7 @@ bool Machine::store_pause() const {
 
 // The load slot whose transaction is under way on A-read (started, rounds left).
 std::optional<uint32_t> Machine::load_slot_in_service() const {
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         const auto& slot = load_slots_[index].cur();
         if (slot.has_value() && slot->access.started() && !slot->access.serviced()) return index;
     }
@@ -164,7 +164,7 @@ std::optional<uint32_t> Machine::load_slot_in_service() const {
 // The store slot whose transaction is under way on A-write (started; a
 // serviced store slot is already free).
 std::optional<uint32_t> Machine::store_slot_in_service() const {
-    for (uint32_t index = 0; index < store_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         const auto& slot = store_slots_[index].cur();
         if (slot.has_value() && slot->access.started()) return index;
     }
@@ -173,8 +173,8 @@ std::optional<uint32_t> Machine::store_slot_in_service() const {
 
 // A store transaction waits to start: a store slot held and not started.
 bool Machine::store_slot_waiting() const {
-    return std::any_of(store_slots_.begin(), store_slots_.end(), [](const auto& slot) {
-        return slot.cur().has_value() && !slot.cur()->access.started();
+    return std::any_of(store_slots_.cur().begin(), store_slots_.cur().end(), [](const auto& slot) {
+        return slot.has_value() && !slot->access.started();
     });
 }
 
@@ -215,7 +215,7 @@ Machine::AWriteGrant Machine::select_a_write(const Wires&) const {
         return grant;
     }
     if (store_pause() || !stores_turn) return grant;
-    std::vector<uint8_t> ready(store_slots_.size(), 0);
+    std::vector<uint8_t> ready(store_slots_.count(), 0);
     for (std::size_t index = 0; index < ready.size(); ++index) ready[index] = store_slots_[index].cur().has_value() ? 1 : 0;
     const auto choice = round_robin_grant(ready, shmem_arbiters_.cur().a_write, 1);
     grant.user = AWriteUser::store_slot;
@@ -246,7 +246,7 @@ Machine::AReadGrant Machine::select_a_read(const Wires& w) const {
 }
 
 Machine::AReadGrant Machine::a_read_round_robin(const Wires& w) const {
-    const auto slots = static_cast<uint32_t>(load_slots_.size());
+    const auto slots = static_cast<uint32_t>(load_slots_.count());
     std::vector<uint8_t> ready(slots + 2, 0);
     for (uint32_t index = 0; index < slots; ++index) {
         const auto& slot = load_slots_[index].cur();
@@ -447,7 +447,7 @@ void Machine::serve_b_write(Wires& w) {
 
 // Dispatch's slot: an empty one, or one whose RF write is granted now (d).
 std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         if (!load_slots_[index].cur().has_value()) return index;
         if (w.rf_write.granted_to(AsyncWriter::load_slot, index)) return index;
     }
@@ -460,7 +460,7 @@ std::optional<uint32_t> Machine::free_load_slot(const Wires& w) const {
 // would be the longest path through issue).
 uint32_t Machine::free_load_slot_count() const {
     uint32_t count = 0;
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         if (!load_slots_[index].cur().has_value()) ++count;
     }
     return count;
@@ -468,7 +468,7 @@ uint32_t Machine::free_load_slot_count() const {
 
 // A store slot frees when its last round is granted.
 std::optional<uint32_t> Machine::free_store_slot(const Wires& w) const {
-    for (uint32_t index = 0; index < store_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         if (!store_slots_[index].cur().has_value() || store_slot_released(w, index)) return index;
     }
     return std::nullopt;
@@ -476,7 +476,7 @@ std::optional<uint32_t> Machine::free_store_slot(const Wires& w) const {
 
 uint32_t Machine::free_store_slot_count(const Wires& w) const {
     uint32_t count = 0;
-    for (uint32_t index = 0; index < store_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         if (!store_slots_[index].cur().has_value() || store_slot_released(w, index)) ++count;
     }
     return count;
@@ -513,7 +513,7 @@ bool Machine::load_rounds_left(const Wires& w, uint32_t index) const {
 // a load slot with a round not yet granted.
 bool Machine::warp_unserviced_read(const Wires& w, uint32_t warp) const {
     if (warp_dispatching(warp, true, false, false)) return true;
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         const auto& slot = load_slots_[index].cur();
         if (slot.has_value() && slot->warp == warp && load_rounds_left(w, index)) return true;
     }
@@ -526,7 +526,7 @@ bool Machine::warp_unserviced_read(const Wires& w, uint32_t warp) const {
 // unserviced until its FINAL write grant).
 bool Machine::warp_unserviced_write(const Wires& w, uint32_t warp) const {
     if (warp_dispatching(warp, false, true, false)) return true;
-    for (uint32_t index = 0; index < store_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         const auto& slot = store_slots_[index].cur();
         if (slot.has_value() && slot->warp == warp && !store_slot_released(w, index)) return true;
     }
@@ -599,7 +599,7 @@ void Machine::dispatch_shared_store(const DispatchEntry& op, Wires& w) {
 // freed now, (d)); A-read grants its next round; a round's words come back
 // into the gather register.
 void Machine::drive_load_slots(const Wires& w) {
-    for (uint32_t index = 0; index < load_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         const bool written = w.rf_write.granted_to(AsyncWriter::load_slot, index);
         const bool admitted = w.dispatch.load_slot.has_value() && w.dispatch.load_slot->first == index;
         const bool granted = w.shmem.a_read.user == AReadUser::load_slot && w.shmem.a_read.slot == index;
@@ -623,7 +623,7 @@ void Machine::drive_load_slots(const Wires& w) {
 // Each store slot: A-write grants its next round, and its last grant frees
 // it -- for a dispatch in this same cycle (d).
 void Machine::drive_store_slots(const Wires& w) {
-    for (uint32_t index = 0; index < store_slots_.size(); ++index) {
+    for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         const bool granted = w.shmem.a_write.user == AWriteUser::store_slot && w.shmem.a_write.slot == index;
         const bool admitted = w.dispatch.store_slot.has_value() && w.dispatch.store_slot->first == index;
         if (!granted && !admitted) continue;
@@ -667,13 +667,12 @@ void Machine::drive_shmem_arbiters(const Wires& w) {
 // now starts again at D - 1 (that round is at the RAM D cycles from now);
 // every other count moves one cycle closer, down to 0.
 void Machine::drive_shmem_to_ram(const Wires& w) {
-    auto next = shmem_to_ram_.cur();
-    for (uint32_t warp = 0; warp < next.size(); ++warp) {
+    const auto& cur = shmem_to_ram_.cur();
+    for (uint32_t warp = 0; warp < cur.size(); ++warp) {
         const bool granted = w.shmem.a_read_warp == warp || w.shmem.a_write_warp == warp;
-        next[warp] = granted ? config_.shmem_port_a_depth - 1 : (next[warp] == 0 ? 0 : next[warp] - 1);
+        const uint32_t next = granted ? config_.shmem_port_a_depth - 1 : (cur[warp] == 0 ? 0 : cur[warp] - 1);
+        if (next != cur[warp]) shmem_to_ram_.set_next(warp, next, "drive_shmem_to_ram");
     }
-    if (next == shmem_to_ram_.cur()) return;
-    shmem_to_ram_.set_next(std::move(next), "drive_shmem_to_ram");
 }
 
 // ---------------------------------------------------------------------------

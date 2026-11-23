@@ -192,8 +192,8 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
     }
     // (The launch copy writes the kernel's `.mbar` states: that is how they
     // get there.)
-    const auto placing = tma_.cur().commands.find(run.command);
-    if (placing == tma_.cur().commands.end() || !placing->second.launch) {
+    const auto* placing = tma_.cur().commands.find(run.command);
+    if (placing == nullptr || !placing->launch) {
         sanitizer_.check_live_mbar_write(cycle_, "tma load #" + std::to_string(run.command) + " placement", written);
     }
     probe(LsuEdge::tma_place_round, request.sector_request, request.next_round, bytes);

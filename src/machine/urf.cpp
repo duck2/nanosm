@@ -47,7 +47,6 @@ void Machine::urf_ram_stage(Wires& w) {
         if (is_usetp(presented->instruction.opcode)) {
             auto predicate = predicate_writeback(warps_.at(presented->warp), presented->instruction.dst, cycle_,
                 std::vector<uint32_t>(config_.lanes, *presented->value));
-            predicate.reason = "usetp";
             predicate.lane_enables = presented->active_mask;
             w.rf_landings.push_back(std::move(predicate));
         } else {

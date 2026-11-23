@@ -227,6 +227,36 @@ struct Instruction {
     std::string text;
 };
 
+// An instruction as the machine holds it: the fields of the decoded word, a
+// fixed bundle of bits. (Instruction above is the toolchain's: it adds the
+// source line and text, which no register carries.) It converts to and from
+// an Instruction, so the helpers that take one take this too.
+struct DecodedInstruction {
+    Opcode opcode{};
+    Control control{};
+    uint8_t dst = 0;
+    uint8_t src0 = 0;
+    uint8_t src1 = 0;
+    uint8_t src2 = 0;
+    int32_t imm = 0;
+
+    DecodedInstruction() = default;
+    DecodedInstruction(const Instruction& inst)
+        : opcode(inst.opcode), control(inst.control), dst(inst.dst), src0(inst.src0), src1(inst.src1),
+          src2(inst.src2), imm(inst.imm) {}
+    operator Instruction() const {
+        Instruction inst;
+        inst.opcode = opcode;
+        inst.control = control;
+        inst.dst = dst;
+        inst.src0 = src0;
+        inst.src1 = src1;
+        inst.src2 = src2;
+        inst.imm = imm;
+        return inst;
+    }
+};
+
 // A kernel's signature (README "Launch"): the `.param` lines of its qtx, in
 // order. The launch passes one argument per parameter; nothing else crosses
 // between the host and the kernel.

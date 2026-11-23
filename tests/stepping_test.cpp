@@ -348,6 +348,138 @@ void test_pipe_duplicate_write_panics() {
     other.replace(1, std::nullopt, "stage 1");
 }
 
+// ---- Bounded<T, N> (src/machine/fixed.hpp) and the maxima (src/limits.hpp) ----
+
+// A payload of at most N items: it counts what it holds, compares only the
+// counted items, refuses one more than N, and a profile past an architectural
+// maximum is refused by name before a machine is built.
+void test_bounded_payload_and_limits() {
+    nanosm::Bounded<uint32_t, 4> words;
+    require(words.empty() && words.capacity() == 4, "a new payload is not empty");
+    for (uint32_t value = 1; value <= 4; ++value) words.push_back(value);
+    require(words.size() == 4 && words.front() == 1 && words.back() == 4, "a payload lost an item");
+    try {
+        words.push_back(5);
+        throw std::runtime_error("a payload took more items than it has places");
+    } catch (const nanosm::SimError&) {}
+    words.pop_front();
+    nanosm::Bounded<uint32_t, 4> same{2, 3, 4};
+    require(words == same && words.size() == 3, "an ordered payload's head did not leave in order");
+    words.clear();
+    require(words == nanosm::Bounded<uint32_t, 4>(), "a cleared payload is not equal to an empty one");
+    static_assert(std::is_trivially_copyable_v<nanosm::Bounded<uint32_t, 4>>);
+    static_assert(nanosm::FixedPayload<std::optional<nanosm::Bounded<uint32_t, 4>>>);
+    static_assert(!nanosm::FixedPayload<std::vector<uint32_t>>);
+
+    auto profile = canonical_profile();
+    profile.shmem_banks = static_cast<uint32_t>(nanosm::limits::shmem_banks) + 1;
+    try {
+        nanosm::validate_device_profile(profile);
+        throw std::runtime_error("a profile past an architectural maximum was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require(std::string(error.what()).find("shmem banks") != std::string::npos,
+            std::string("the refusal does not name the knob: ") + error.what());
+    }
+}
+
+// ---- Regs<T> (src/machine/regs.hpp) ----
+
+// A group is N registers under one name: a member written this tick takes its
+// value at the edge, a member nobody writes holds, different members may be
+// written in one tick, and one member written twice in a tick is a PANIC
+// naming the group, the member and both writers.
+void test_regs_members_hold_write_and_panic() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 7;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Regs<int> group(file, "test group", 5);
+    group.build(4, 9);
+    sanitizer.record_cycle_start();
+    require(group.count() == 4 && group.cur() == std::vector<int>({9, 9, 9, 9}), "a new group lacks its initial values");
+    group.set_next(1, 11, "writer of member 1");
+    group[3].set_next(13, "writer of member 3"); // another member, other logic: its own net
+    require(group.cur()[1] == 9 && group[3].cur() == 9, "set_next() changed Q before the clock edge");
+    file.commit();
+    require(group.cur() == std::vector<int>({9, 11, 9, 13}), "written members did not take D, or an unwritten one moved");
+    sanitizer.record_cycle_start();
+    file.commit();
+    require(group.cur() == std::vector<int>({9, 11, 9, 13}), "a group nobody wrote did not hold");
+    const auto size = group.size();
+    require(std::string(size.kind) == "group" && size.entries == 4 && size.bits_per_entry == std::optional<uint64_t>(5),
+        "the group does not report its members and their declared bits");
+    sanitizer.record_cycle_start();
+    group.set_next(2, 1, "first");
+    try {
+        group.set_next(2, 2, "second");
+    } catch (const nanosm::SimError& error) {
+        const std::string message = error.what();
+        for (const std::string needle : {std::string("test group [2]"), std::string("cycle=7"),
+                 std::string("first by 'first'"), std::string("then by 'second'")}) {
+            require(message.find(needle) != std::string::npos,
+                "the group's duplicate-write PANIC lacks '" + needle + "': " + message);
+        }
+        return;
+    }
+    throw std::runtime_error("a second write of one member in one tick did not panic");
+}
+
+// A group of single bits: a member's value is read by value (the bits have no
+// address to refer to), holds across a tick nobody writes it, and takes its
+// own write.
+void test_regs_one_bit_members() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 0;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Regs<bool> bits(file, "test bits", 1);
+    bits.build(3, false);
+    const nanosm::Regs<bool>& view = bits;
+    sanitizer.record_cycle_start();
+    bits.set_next(1, true, "set");
+    file.commit();
+    const bool held = bits[1].cur();
+    require(held && view[1].cur() && !bits[0].cur() && !view.at(2).cur(), "a one-bit member did not take its write");
+    sanitizer.record_cycle_start();
+    bits[2].set_next(true, "set");
+    file.commit();
+    require(bits[1].cur() && bits.at(2).cur() && !bits[0].cur(), "a one-bit member did not hold across a tick");
+}
+
+// Sixteen stores of one warp on one depbar, back to back, on a profile whose
+// A-write pipeline is long: a store leaves its slot at its last grant and
+// still counts on its depbar until that write reaches the RAM, so more
+// stores than there are slots count on sb0 at once. The counter is wide
+// enough for all of them (Machine::depbar_counter_max_) and every store
+// lands.
+void test_depbar_counts_stores_on_their_way_to_ram() {
+    auto profile = canonical_profile();
+    profile.shmem_port_a_depth = 64;
+    profile.mbar_wait_slots = 1;
+    profile.tma_queue_commands = 1;
+    nanosm::validate_device_profile(profile);
+    std::string body = "mov r1, 7\nsread r0, LANE_ID\nshli r0, r0, 2\n";
+    for (uint32_t store = 0; store < 16; ++store) {
+        body += "sts [r0 + " + std::to_string(64 * store) + "], r1 {pred=PT, stall=0, set=sb0, wait=-}\n";
+    }
+    body += "halt {pred=PT, stall=0, set=-, wait=sb0}\n";
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch));
+    uint32_t most = 0;
+    while (!machine.done()) {
+        tick_capped(machine);
+        most = std::max(most, machine.depbar_value(0, 0));
+    }
+    require(most > profile.shmem_store_slots, "the stores never outnumbered the store slots on sb0; re-derive the test");
+    for (uint32_t store = 0; store < 16; ++store) {
+        for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
+            uint32_t word = 0;
+            std::memcpy(&word, machine.shmem().data() + 64 * store + 4 * lane, 4);
+            require(word == 7,
+                "store " + std::to_string(store) + " did not land in lane " + std::to_string(lane));
+        }
+    }
+}
+
 // The stg.v8 store-data read pipe (lsu_read_pipe_): a register-file read
 // granted at t fills the store buffer at the edge of t + Lr, neither earlier
 // nor later, so a gap between two grants reappears as the same gap at the
@@ -788,6 +920,27 @@ TEST(Stepping, pipe_advance_hold_replace) {
 TEST(Stepping, pipe_duplicate_write_panics) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_pipe_duplicate_write_panics();
+}
+
+// payloads: a maximum and a count; the profile is checked against the maxima
+TEST(Stepping, bounded_payload_and_limits) {
+    test_bounded_payload_and_limits();
+}
+
+// group: members hold or take their own write; one member written twice PANICs
+TEST(Stepping, regs_members_hold_write_and_panic) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_regs_members_hold_write_and_panic();
+}
+
+// group: a one-bit member is read by value and holds
+TEST(Stepping, regs_one_bit_members) {
+    test_regs_one_bit_members();
+}
+
+// depbar: stores on their way to the RAM still count; the counter is wide enough
+TEST(Stepping, depbar_counts_stores_on_their_way_to_ram) {
+    test_depbar_counts_stores_on_their_way_to_ram();
 }
 
 // stg.v8's store-data read pipe: a grant at t lands at t + Lr; gaps are kept

@@ -193,13 +193,10 @@ void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
     // The launch copy, done last cycle, leaves the queue: it has no
     // completion event.
-    for (auto it = tma.commands.begin(); it != tma.commands.end();) {
-        if (it->second.state != TmaCommandState::launch_done) {
-            ++it;
-            continue;
-        }
-        trace_->tma_command_end(cycle_, it->second.id, it->second.logical_bytes, it->second.useful_bytes);
-        it = tma.commands.erase(it);
+    for (const auto* done : tma.commands.oldest_first()) {
+        if (done->state != TmaCommandState::launch_done) continue;
+        trace_->tma_command_end(cycle_, done->id, done->logical_bytes, done->useful_bytes);
+        tma.commands.release(done->id);
         trace_tma_depths(tma, cycle_);
     }
     // The command whose event the register holds ends in the cycle the RMW
@@ -209,7 +206,7 @@ void Machine::step_tma(Wires& w) {
     if (tma.event_command.has_value() && w.shmem.tma_event_claimed) {
         const auto& command = tma.commands.at(*tma.event_command);
         trace_->tma_command_end(cycle_ + 1, command.id, command.logical_bytes, command.useful_bytes);
-        tma.commands.erase(*tma.event_command);
+        tma.commands.release(command.id);
         tma.event_command.reset();
         trace_tma_depths(tma, cycle_ + 1);
     }
@@ -315,9 +312,9 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
 // signed).
 void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction& read, Wires& w) {
     const auto& request = read.request;
-    auto command_it = tma.commands.find(request.run.command);
-    if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
-    auto& command = command_it->second;
+    auto* found = tma.commands.find(request.run.command);
+    if (found == nullptr) throw SimError("orphaned tma shmem transaction");
+    auto& command = *found;
 
     switch (request.kind) {
     case TmaPortKind::descriptor: {
@@ -354,9 +351,9 @@ void Machine::complete_tma_frontend_read(TmaQueue& tma, const TmaReadTransaction
 // sanitizer PANICs at the placement write. The machine just wrote the
 // bytes.
 void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed) {
-    auto command_it = tma.commands.find(placed.command);
-    if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
-    auto& command = command_it->second;
+    auto* found = tma.commands.find(placed.command);
+    if (found == nullptr) throw SimError("orphaned tma shmem transaction");
+    auto& command = *found;
     if (command.direction != TmaDirection::load || command.pending_load_writes == 0) {
         throw SimError("unexpected tma load return");
     }
@@ -370,9 +367,9 @@ void Machine::complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed)
 // A store sector's source is captured: its TMA store register is complete
 // (from the next cycle it waits for the egress write port).
 void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
-    auto command_it = tma.commands.find(command_id);
-    if (command_it == tma.commands.end()) throw SimError("orphaned tma shmem transaction");
-    auto& command = command_it->second;
+    auto* found = tma.commands.find(command_id);
+    if (found == nullptr) throw SimError("orphaned tma shmem transaction");
+    auto& command = *found;
     if (command.direction != TmaDirection::store || command.pending_store_captures == 0) {
         throw SimError("unexpected tma store capture");
     }
@@ -383,18 +380,18 @@ void Machine::complete_tma_store_capture(TmaQueue& tma, uint64_t command_id) {
 }
 
 std::optional<uint64_t> Machine::next_tma_frontend_command(const TmaQueue& tma) const {
-    for (const auto& [id, command] : tma.commands) {
-        if (command.state == TmaCommandState::descriptor || command.state == TmaCommandState::starting ||
-            (command.state == TmaCommandState::walking && !command.walker_done)) {
-            return id;
+    for (const auto* command : tma.commands.oldest_first()) {
+        if (command->state == TmaCommandState::descriptor || command->state == TmaCommandState::starting ||
+            (command->state == TmaCommandState::walking && !command->walker_done)) {
+            return command->id;
         }
     }
     return std::nullopt;
 }
 
 std::optional<uint64_t> Machine::next_data_complete_tma_command(const TmaQueue& tma) const {
-    for (const auto& [id, command] : tma.commands) {
-        if (command.state == TmaCommandState::data_complete) return id;
+    for (const auto* command : tma.commands.oldest_first()) {
+        if (command->state == TmaCommandState::data_complete) return command->id;
     }
     return std::nullopt;
 }
@@ -640,7 +637,7 @@ void Machine::drive_tma_event(const Wires& w) {
 // The TMA command queue: step_tma's result, plus issue's new command.
 void Machine::drive_tma_queue(const Wires& w) {
     auto next = w.tma_next;
-    if (w.tma_pushed.has_value()) next.commands.emplace(w.tma_pushed->id, *w.tma_pushed);
+    if (w.tma_pushed.has_value()) next.commands.take(*w.tma_pushed, config_.tma_queue_commands);
     // The hardware sizes (TmaQueue, machine.hpp): issue's admission and the
     // credits keep them; exceeding one is a machine bug.
     if (next.commands.size() > config_.tma_queue_commands) {

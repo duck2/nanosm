@@ -1,4 +1,5 @@
 #include "profile.hpp"
+#include "limits.hpp"
 #include "hash.hpp"
 #include "json_fields.hpp"
 #include "timing.hpp"
@@ -208,6 +209,26 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.core_warps == 0 || p.core_warps > 64) {
         throw ProfileError("device profile: core warps must be in 1..64");
     }
+    // The architectural maxima (src/limits.hpp): the machine's state is built
+    // for at most these.
+    const auto within = [](const char* knob, uint64_t value, std::size_t limit) {
+        if (value > limit) {
+            throw ProfileError(std::string("device profile: ") + knob + " is " + std::to_string(value) +
+                "; the machine's state is built for at most " + std::to_string(limit));
+        }
+    };
+    within("lanes", p.lanes, limits::lanes);
+    within("core warps", p.core_warps, limits::warps);
+    within("rf banks", p.rf_banks, limits::rf_banks);
+    within("shmem banks", p.shmem_banks, limits::shmem_banks);
+    within("gmem sector_bytes", p.gmem_sector_bytes, limits::sector_bytes);
+    within("core instruction_buffer_packets", p.core_instruction_buffer_packets, limits::instruction_buffer_packets);
+    within("mma queue_commands", p.mma_queue_commands, limits::mma_queue_commands);
+    within("tma queue_commands", p.tma_queue_commands, limits::tma_queue_commands);
+    within("lsu active_commands", p.lsu_active_commands, limits::lsu_active_commands);
+    within("mma core_m x core_n", uint64_t{p.mma_core_m} * p.mma_core_n, limits::mma_block);
+    within("mma core_m x core_k", uint64_t{p.mma_core_m} * p.mma_core_k, limits::mma_block);
+    within("mma core_n x core_k", uint64_t{p.mma_core_n} * p.mma_core_k, limits::mma_block);
     if (p.core_instruction_buffer_packets == 0 || p.core_instruction_buffer_packets > 16) {
         throw ProfileError("device profile: core instruction_buffer_packets must be in 1..16");
     }

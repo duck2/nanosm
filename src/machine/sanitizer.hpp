@@ -53,7 +53,7 @@ struct IssueSite {
     uint64_t cycle = 0;
     uint32_t warp = 0;
     uint32_t pc = 0;
-    const Instruction& inst;
+    DecodedInstruction inst;
     const std::vector<MmaShape>* mma_shapes = nullptr;
 };
 

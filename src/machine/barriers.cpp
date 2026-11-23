@@ -71,7 +71,6 @@ void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
         predicate.warp = warp.id;
         predicate.predicate_dst = request.predicate_dst;
         predicate.values.assign(config_.lanes, complete ? 1 : 0);
-        predicate.reason = "mbar.test_wait";
         w.rf_landings.push_back(std::move(predicate));
         sanitizer_.record_pred_ready(warp.id, request.predicate_dst, cycle_ + 1);
         return;
@@ -391,7 +390,6 @@ void Machine::complete_mbar_try_wait(Wires& w, uint32_t index, bool result) {
     predicate.warp = slot.warp;
     predicate.predicate_dst = slot.predicate_dst;
     predicate.values.assign(config_.lanes, result ? 1 : 0);
-    predicate.reason = "mbar.try_wait";
     w.rf_landings.push_back(std::move(predicate));
     sanitizer_.record_pred_ready(slot.warp, slot.predicate_dst, cycle_ + 1);
     w.completed_waits.push_back(index);
@@ -541,19 +539,27 @@ void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
 // incomplete parks; issue may take a slot freed this cycle (d).
 void Machine::drive_wait_slots(const Wires& w) {
     if (w.completed_waits.empty() && !w.shmem.park.has_value() && !w.dispatch.wait_slot.has_value()) return;
-    auto next = mbar_wait_slots_.cur();
-    for (const auto slot : w.completed_waits) next.at(slot).reset();
-    if (const auto& park = w.shmem.park; park.has_value()) {
-        auto& slot = next.at(park->first);
-        slot->parked = true;
-        slot->deadline_cycle = park->second;
+    // (One calculation per slot touched now: free, then park, then take.)
+    std::vector<uint32_t> touched(w.completed_waits.begin(), w.completed_waits.end());
+    if (w.shmem.park.has_value()) touched.push_back(w.shmem.park->first);
+    if (w.dispatch.wait_slot.has_value()) touched.push_back(w.dispatch.wait_slot->first);
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    for (const auto index : touched) {
+        auto next = mbar_wait_slots_.cur().at(index);
+        if (std::find(w.completed_waits.begin(), w.completed_waits.end(), index) != w.completed_waits.end()) {
+            next.reset();
+        }
+        if (const auto& park = w.shmem.park; park.has_value() && park->first == index) {
+            next->parked = true;
+            next->deadline_cycle = park->second;
+        }
+        if (const auto& taken = w.dispatch.wait_slot; taken.has_value() && taken->first == index) {
+            if (next.has_value()) throw SimError("internal mbar wait slot allocated twice");
+            next = taken->second;
+        }
+        mbar_wait_slots_.set_next(index, std::move(next), "drive_wait_slots");
     }
-    if (const auto& taken = w.dispatch.wait_slot; taken.has_value()) {
-        auto& slot = next.at(taken->first);
-        if (slot.has_value()) throw SimError("internal mbar wait slot allocated twice");
-        slot = taken->second;
-    }
-    mbar_wait_slots_.set_next(std::move(next), "drive_wait_slots");
 }
 
 // The probe register: freed by its A-read grant, refilled by dispatch (d).
