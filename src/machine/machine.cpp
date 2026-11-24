@@ -17,7 +17,7 @@
 //                      write ports' pipelines and the RAM stage. (Its timing rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
 //   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, black boxes with
-//                      their contracts and declared costs.
+//                      their contracts.
 //   shmem.cpp          shared memory: ports A and B, the selects, load and store slots, bank rounds, and what
 //                      issue sees of them.
 //   barriers.cpp       barriers (mbar): probes, the read-modify-write engine, atomics, and the try-wait slots.
@@ -43,8 +43,7 @@
 //   memory.hpp         Memory<T>, words in banks read and written only through their ports: the register
 //                      files, shared memory, tmem, the instruction memory, the divergence stack.
 //   blackbox.hpp       black boxes: units modelled opaquely behind a contract (registered inputs and outputs,
-//                      a fixed latency, a declared cost, signed off by the human only); the memories are black
-//                      boxes.
+//                      a fixed latency); the memories are black boxes.
 //   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles; the
 //                      payloads not there yet are listed at the end of machine.hpp).
 //   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.

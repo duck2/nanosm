@@ -58,31 +58,24 @@ python -m nanosm --state-report kernels/pipeline.launch.py   # first, the machin
 The state report lists every piece of the machine's state by unit with its declared hardware
 bits: in the open, flip-flops (registers, groups, pipelines) and FIFO storage, counted; behind
 walls, the black boxes (the arithmetic units, the tensor core's arithmetic, the memories), each
-with its contract, its declared cost and the sign-off its definition carries (src/machine/blackbox.hpp);
-and the totals of each, kept apart (src/machine/state_report.cpp; the C API's
-`nanosm_session_state_report`).
+with its contract and its cost (src/machine/blackbox.hpp); and the totals of each, kept apart
+(src/machine/state_report.cpp; the C API's `nanosm_session_state_report`).
 
-**Black boxes and their sign-offs.** A black box is a unit modelled opaquely: registered inputs
-and outputs, a fixed latency, a cost declared as a function of the profile, and anything inside.
-There are ten: the ALU, the FPU, the special-function unit, the tensor core's MMA core and six
-memories. Everything that defines one is between `// BLACK BOX: <name>` and
-`// END BLACK BOX: <name>`, with one sign-off line, and only the human signs it.
-`python scripts/blackboxes.py` lists each black box with its sign-off line, its state (not
-signed, signed, or changed since signing) and its fingerprint, a hash of the text between its
-markers; to sign one, write that fingerprint into its sign-off line,
-`SignOff::signed_by_human("<fingerprint>")` in place of `SignOff::not_signed`. Changing a signed
-black box is fine: the change gives it another fingerprint, so it shows as changed since signing
-until the human signs it again. The simulator runs either way; the commit hook
-(`scripts/hooks/pre-commit`) refuses a commit while a black box is not signed or has changed
-since it was signed. Setup:
+**Black boxes and their costs.** A black box is a unit modelled opaquely: registered inputs and
+outputs, a fixed latency, and anything inside. There are ten: the ALU, the FPU, the
+special-function unit, the tensor core's MMA core and six memories. A memory's size is its
+words, from its shape. What the other four cost is not part of them and changes nothing the
+machine does; the profile may say it in an optional `cost` section, plain numbers per unit
+(`alu`, `fpu`, `sfu`, `mma_core`): `flip_flops`, `memory_bits` and `basic_dsps`, each a fixed
+amount and / or `_per_lane` (core.lanes for the ALU and FPU, sfu.lanes for the special-function
+unit; the MMA core takes fixed amounts only). An entry present is that unit's whole cost (a field
+left out is zero); a unit left out takes the report's default guess, and the report says which.
+The section is not in the profile's fingerprint, so adding costs invalidates no kernel or image.
 
-```sh
-git config core.hooksPath scripts/hooks               # once per clone: enables the commit hook
-git update-index --chmod=+x scripts/hooks/pre-commit  # once, after the hook is first added on Windows
+```json
+"cost": { "fpu": { "flip_flops_per_lane": 96, "basic_dsps_per_lane": 2 },
+          "mma_core": { "flip_flops": 12256, "basic_dsps": 128 } }
 ```
-
-A `git add` on Windows records the hook as mode 100644; the second line makes it 100755, which
-Git on Unix needs to run it.
 
 No Python package or third-party binding generator is required; the wrapper uses the standard
 library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `build`. A launch may
@@ -423,6 +416,12 @@ engine-facing `complete_mbar_tx` entry point rather than a SIMT instruction.
 
 The JSON parser is the pinned nlohmann/json v3.12.0 single header under `third_party/nlohmann` so
 configuration and builds remain offline and reproducible.
+
+The vector floating point (the FPU's `fadd`, `fsub`, `fmul`, `fma`, `fmax`, `cvt.pack`; the
+special-function unit's `ex2`, `rcp`) belongs to the implementation: rounding, denormal handling
+and whether `fma` is fused are not specified. This simulator rounds to nearest even, treats
+single-precision denormals as zero of their sign on input and output, and fuses `fma`; so a
+kernel's check should carry a tolerance.
 
 MMA arithmetic is `mma.numeric_model = "fp16_raw_window25_rz_v1"`, included in the profile
 fingerprint. Each physical `core_k` step fuses its FP16 products with the FP32 accumulator:

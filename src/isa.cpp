@@ -990,11 +990,8 @@ std::string format_instruction(
     return out.str();
 }
 
-// The fixed-latency units' operations: each unit's black box
-// (src/machine/arith.cpp) prices its own list, so each list is in that
-// unit's fingerprint only.
-
-// BLACK BOX SHARED: ALU operations
+// The fixed-latency units' operations: which unit executes an instruction
+// (src/machine/arith.cpp) and so its latency (fixed_latency below).
 bool is_alu_operation(Opcode opcode) {
     switch (opcode) {
     case Opcode::sread:
@@ -1039,9 +1036,7 @@ bool is_alu_operation(Opcode opcode) {
         return false;
     }
 }
-// END BLACK BOX SHARED: ALU operations
 
-// BLACK BOX SHARED: FPU operations
 bool is_fpu_operation(Opcode opcode) {
     switch (opcode) {
     case Opcode::fadd:
@@ -1057,9 +1052,7 @@ bool is_fpu_operation(Opcode opcode) {
         return false;
     }
 }
-// END BLACK BOX SHARED: FPU operations
 
-// BLACK BOX SHARED: special-function unit operations
 bool is_sfu_operation(Opcode opcode) {
     switch (opcode) {
     case Opcode::ex2:
@@ -1069,16 +1062,13 @@ bool is_sfu_operation(Opcode opcode) {
         return false;
     }
 }
-// END BLACK BOX SHARED: special-function unit operations
 
 uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     if (is_mma_async(inst.opcode)) return 0; // asynchronous: its depbar clears at the last operand read
-    // BLACK BOX SHARED: arithmetic unit latencies
     // A fixed-latency unit's operations take its latency.
     if (is_alu_operation(inst.opcode)) return timing.alu;
     if (is_fpu_operation(inst.opcode)) return timing.fadd;
     if (is_sfu_operation(inst.opcode)) return timing.sfu;
-    // END BLACK BOX SHARED: arithmetic unit latencies
     switch (inst.opcode) {
     // The arithmetic opcodes: each is in one unit's list above. (Named here
     // so that this switch stays exhaustive: a new opcode is decided here.)

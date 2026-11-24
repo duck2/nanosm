@@ -56,9 +56,6 @@
 
 namespace nanosm {
 
-// BLACK BOX SHARED: memory shape
-// (Each memory's black box takes its shape from these: the fields' order is
-// the order of the numbers in a memory's shape, beside it in machine.hpp.)
 // A read and a write of one word in one cycle.
 enum class SameCycle : uint8_t {
     read_first, // the read sees the old word; the write lands at the clock edge
@@ -79,7 +76,6 @@ struct MemoryShape {
     uint32_t read_delay = 1;
     SameCycle same_cycle = SameCycle::read_first;
 };
-// END BLACK BOX SHARED: memory shape
 
 template <typename T>
 class Memory final : public Clocked {

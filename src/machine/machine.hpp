@@ -225,8 +225,18 @@ public:
     // The state report (src/machine/state_report.cpp): declared bits by unit,
     // flip-flops, memories and FIFO storage, the black boxes, and the totals.
     [[nodiscard]] std::string state_report() const;
-    // Every black box's contract and declared cost (src/machine/blackbox.hpp).
-    [[nodiscard]] const std::vector<BlackBoxDeclaration>& black_boxes() const { return black_boxes_; }    // The primitives that cannot declare their bits yet, by name, each with
+    // Every black box's contract (src/machine/blackbox.hpp).
+    [[nodiscard]] const std::vector<BlackBoxDeclaration>& black_boxes() const { return black_boxes_; }
+    // What a black box costs as the state report gives it: from the profile's
+    // cost section, a default guess, or (a memory) its words.
+    struct BlackBoxCost {
+        uint64_t flip_flops = 0;  // registers inside it (its input and output registers are counted in the open)
+        uint64_t memory_bits = 0; // RAM and ROM inside it
+        uint64_t basic_dsps = 0;
+        const char* source = "";  // "from the profile", "default guess", "its words"
+    };
+    [[nodiscard]] BlackBoxCost black_box_cost(const BlackBoxDeclaration& black_box) const;
+    // The primitives that cannot declare their bits yet, by name, each with
     // what is still in it.
     [[nodiscard]] std::vector<std::string> state_not_yet_declared() const {
         std::vector<std::string> names;
@@ -461,14 +471,12 @@ private:
     // core.alu_latency_cycles (setp, mov, sread and ur2r included), the FPU
     // core.fadd_latency_cycles, the special-function unit its occupancy - 1 +
     // sfu.latency_cycles -- so each is a black box of latency E
-    // (src/machine/blackbox.hpp; its contract and cost are in arith.cpp): the
+    // (src/machine/blackbox.hpp; its contract is in arith.cpp): the
     // result of an instruction it takes when it executes is in the black box's
     // output register E cycles later, at its port.
-    // BLACK BOX SHARED: arithmetic unit order
     // (The units' black boxes are arithmetic_black_boxes_ in this order.)
     enum class ArithmeticUnit : uint8_t { alu, fpu, sfu };
     static constexpr std::size_t arithmetic_units = 3;
-    // END BLACK BOX SHARED: arithmetic unit order
     struct ArithmeticResult {
         uint32_t warp = 0;
         uint8_t dst = 0;           // its register, or a setp's predicate
@@ -2211,17 +2219,10 @@ private:
     AllClocked clocked_{sanitizer_, cycle_};
 
     // ---- Memories (src/machine/memory.hpp: read and written through their ports) ----
-    // Each memory is a black box (src/machine/blackbox.hpp): between its
-    // markers are its description, its shape (built in the constructor) and
-    // its declaration as a black box with its sign-off line (read by
-    // declare_black_boxes); memory_blackbox, their shared part, gives the
-    // cost.
+    // Each memory is a black box (src/machine/blackbox.hpp): beside it are its
+    // description, its shape (built in the constructor) and its declaration as
+    // a black box (memory_blackbox; read by declare_black_boxes).
     std::vector<Warp> warps_;                     // + the predicate files
-    // BLACK BOX: vector register file
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: memory notes
-    // BLACK BOX USES: bit widths
     // The vector register file: rf.banks memories (one per bank) of
     // rf.rows_per_bank rows, a row one lane-wide register (lanes x 32 bits,
     // a write enables lanes one by one); rf.read_ports_per_bank read ports
@@ -2237,21 +2238,13 @@ private:
             SameCycle::read_first};
     }
     [[nodiscard]] BlackBoxDeclaration rf_black_box() const {
-        return memory_blackbox(rf_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "rf.read_latency_cycles", "the issue register's round, the acc.st and store-data readers (in the open)",
+        return memory_blackbox(rf_, "rf.read_latency_cycles",
+            "the issue register's round, the acc.st and store-data readers (in the open)",
             "the RF write pipelines' last stages (in the open)");
     }
-    // END BLACK BOX: vector register file
     // A warp's rows in each bank: the kernel's register count over the banks,
     // rounded up (rf_address).
     uint32_t rf_rows_per_warp_ = 0;
-    // BLACK BOX: uniform register file
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: memory notes
-    // BLACK BOX USES: bit widths
-    // BLACK BOX USES: uniform register file ports
     // The uniform register file: one memory of core.warps x urf.registers
     // 32-bit words (LUTRAM), warp w's register r at row w x urf.registers +
     // r. The SM's two read ports (urf_read_ports, src/timing.hpp: an
@@ -2265,18 +2258,10 @@ private:
             urf_write_ports, config_.urf_read_latency_cycles, SameCycle::read_first};
     }
     [[nodiscard]] BlackBoxDeclaration urf_black_box() const {
-        return memory_blackbox(urf_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "urf.read_latency_cycles",
+        return memory_blackbox(urf_, "urf.read_latency_cycles",
             "the issue register's round, the round counter, the URF write pipeline's sample (in the open)",
             "the URF write pipeline's last stage (in the open)");
     }
-    // END BLACK BOX: uniform register file
-    // BLACK BOX: shared memory
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: memory notes
-    // BLACK BOX USES: bit widths
     // Shared memory: shmem.banks memories (banks) of 4-byte words, word w of
     // the byte address space in bank w mod banks, row w / banks (shmem.bytes
     // over 4 x banks rows: 1024 at the canonical profile); a write enables
@@ -2300,21 +2285,14 @@ private:
             uint64_t{8} * word_bytes, 2, 2, config_.shmem_read_latency_cycles, SameCycle::read_first};
     }
     [[nodiscard]] BlackBoxDeclaration shmem_black_box() const {
-        return memory_blackbox(shmem_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "shmem.read_latency_cycles", "the A-read and port-B read pipelines' RAM stage (in the open)",
+        return memory_blackbox(shmem_, "shmem.read_latency_cycles",
+            "the A-read and port-B read pipelines' RAM stage (in the open)",
             "the A-write and port-B write pipelines' last stages (in the open)");
     }
-    // END BLACK BOX: shared memory
     static constexpr uint32_t shmem_port_a = 0;
     static constexpr uint32_t shmem_port_b = 1;
     uint32_t shmem_word_bytes_ = 4; // its word's bytes (shmem_shape)
     std::vector<uint8_t> gmem_;                   // the controller's (outside the SM)
-    // BLACK BOX: tensor memory
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: memory notes
-    // BLACK BOX USES: bit widths
     // tmem: tmem.fine_banks memories (fine banks) of tmem.words_per_fine_bank
     // 32-bit words; physical word w (src/layout.hpp) is in fine bank
     // w % fine_banks, row w / fine_banks. Each fine bank's two read and two
@@ -2331,13 +2309,10 @@ private:
             config_.tmem_read_latency_cycles, SameCycle::read_first};
     }
     [[nodiscard]] BlackBoxDeclaration tmem_black_box() const {
-        return memory_blackbox(tmem_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "tmem.read_latency_cycles",
+        return memory_blackbox(tmem_, "tmem.read_latency_cycles",
             "the MMA core's step tags and the acc.ld pipeline at their RAM stage (in the open)",
             "the MMA result write and acc.st pipelines' last stages (in the open)");
     }
-    // END BLACK BOX: tensor memory
     static constexpr uint32_t tmem_port_mma = 0;
     static constexpr uint32_t tmem_port_acc = 1;
     [[nodiscard]] uint32_t read_tmem(uint32_t word, uint32_t port, const char* tag) {
@@ -2346,10 +2321,6 @@ private:
     [[nodiscard]] std::size_t tmem_words() const {
         return std::size_t{config_.tmem_fine_banks} * config_.tmem_words_per_fine_bank;
     }
-    // BLACK BOX: divergence stack
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: bit widths
     // The divergence stack memory: core.warps x core.divergence_stack_entries
     // entries of 32 + core.lanes bits (DivergenceEntry: 48 canonical), warp
     // w's entry i at row w x entries + i (16 x 8 x 48 = 6144 bits canonical).
@@ -2366,18 +2337,10 @@ private:
             uint64_t{32} + config_.lanes, 1, 1, 1, SameCycle::read_first};
     }
     [[nodiscard]] BlackBoxDeclaration divergence_stack_black_box() const {
-        return memory_blackbox(divergence_stack_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "a pop's new top the next cycle", "the divergence stack memory read register (in the open)",
+        return memory_blackbox(divergence_stack_, "a pop's new top the next cycle",
+            "the divergence stack memory read register (in the open)",
             "the issue register's branch (a push; in the open)");
     }
-    // END BLACK BOX: divergence stack
-    // BLACK BOX: instruction memory
-    // BLACK BOX USES: memories
-    // BLACK BOX USES: memory shape
-    // BLACK BOX USES: memory notes
-    // BLACK BOX USES: bit widths
-    // BLACK BOX USES: instruction memory read
     // The instruction memory: the kernel's words, two to a row (a fetch
     // packet: the two 64-bit words at an aligned 16-byte address), loaded by
     // the host before the first cycle and never written. One read port: a
@@ -2391,11 +2354,9 @@ private:
             SameCycle::read_only};
     }
     [[nodiscard]] BlackBoxDeclaration instruction_memory_black_box() const {
-        return memory_blackbox(instruction_memory_,
-            SignOff::not_signed, // sign-off: only the human changes this line
-            "a fetch's packet the next cycle", "the instruction memory read register (in the open)", "");
+        return memory_blackbox(instruction_memory_, "a fetch's packet the next cycle",
+            "the instruction memory read register (in the open)", "");
     }
-    // END BLACK BOX: instruction memory
 
     // ---- Registers: the declared storage boundaries ----
     // The front end: per warp slot its FIFO,
@@ -2459,9 +2420,7 @@ private:
     // core's black box and its output register, the tags beside it (result_latency
     // stages; the C read at the RAM in stage port_depth - 1), the results'
     // write pipeline (tmem.port_depth stages to the tmem RAM, the last).
-    // BLACK BOX SHARED: MMA core output register
     BlackBox<MmaBlock, std::deque<MmaCoreStep>> mma_core_{clocked_,Unit::tensor_core, "MMA core"};
-    // END BLACK BOX SHARED: MMA core output register
     Pipe<MmaTag> mma_tags_{clocked_,Unit::tensor_core, "MMA core: step tags"};
     Pipe<MmaWrite> mma_writes_{clocked_,Unit::tensor_core, "MMA result write pipeline"};
     Reg<AccEngines> acc_engines_{clocked_,Unit::tensor_core, "acc transfer engines"};
@@ -2528,13 +2487,11 @@ private:
     // The RF write path (src/timing.hpp): the fixed units (black boxes, each
     // with its output register), then one write pipeline per RF write port
     // (bank x rf.write_ports_per_bank + port), from the port to the RAM.
-    // BLACK BOX SHARED: arithmetic output registers
     std::array<BlackBox<ArithmeticResult>, arithmetic_units> arithmetic_black_boxes_{{
         {clocked_,Unit::arithmetic, "ALU"},
         {clocked_,Unit::arithmetic, "FPU"},
         {clocked_,Unit::arithmetic, "special-function unit"},
     }};
-    // END BLACK BOX SHARED: arithmetic output registers
     // The units slowest first: at one port cycle their results are presented
     // in the order they executed.
     std::array<ArithmeticUnit, arithmetic_units> units_slowest_first_{};

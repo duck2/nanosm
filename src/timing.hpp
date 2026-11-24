@@ -147,11 +147,9 @@ namespace nanosm {
 // The issue register: one cycle from accepted issue to the RF address inputs.
 inline constexpr uint32_t issue_register_stages = 1;
 
-// BLACK BOX SHARED: instruction memory read
 // The instruction memory's read (fixed, not a profile field): an address
 // sampled at f has its word at the memory output at f + 1.
 inline constexpr uint32_t instruction_read_cycles = 1;
-// END BLACK BOX SHARED: instruction memory read
 
 // A fetch granted at f -> its word can issue (it is in the FIFO's Q) from f + 2.
 inline constexpr uint32_t fetch_to_issue = instruction_read_cycles + 1;
@@ -245,11 +243,9 @@ inline uint32_t issue_to_visible_min(const Instruction& inst, const DeviceProfil
     return uses_arithmetic_pipeline(inst) ? issue_to_visible(inst, profile) : earliest_rf_visible(profile);
 }
 
-// BLACK BOX SHARED: uniform register file ports
 // The URF's ports (fixed: two read ports, one write port).
 inline constexpr uint32_t urf_read_ports = 2;
 inline constexpr uint32_t urf_write_ports = 1;
-// END BLACK BOX SHARED: uniform register file ports
 
 // Accepted issue -> the sample of every uniform register the instruction
 // reads (the same round as its vector registers).

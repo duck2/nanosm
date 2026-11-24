@@ -32,13 +32,113 @@ std::string number(uint64_t value) {
     return digits;
 }
 
-// A black box's sign-off as its definition gives it: "not signed off", or
-// "signed off" and the fingerprint the human signed.
-std::string sign_off_text(const BlackBoxDeclaration& black_box) {
-    return black_box.signed_off() ? "signed off " + std::string(black_box.fingerprint()) : "not signed off";
+// ===========================================================================
+// What the black boxes cost. A cost is not part of a black box's contract and
+// changes nothing the machine does; every cost is a first-order estimate that
+// depends on the implementation. It is costed for an FPGA in a consumer's
+// reach (7 series, UltraScale+): flip-flops of the fabric, memory bits and
+// basic DSPs. A basic DSP is the plain hard arithmetic block every family in
+// reach has in some form: about one 25 x 18 multiply with an add and its own
+// registers (a 24-bit significand product takes two, an 11-bit one one);
+// registers a basic DSP or a block RAM has of its own are not flip-flops of
+// the fabric. Logic is not counted: take a device's LUTs to be about its
+// flip-flops. A profile that stands for an ASIC has no use for these.
+// The profile's cost section gives a unit's cost as plain numbers; a unit it
+// leaves out takes the default guess below. A memory's size is no estimate:
+// its words, from its shape.
+// ===========================================================================
+
+using Cost = Machine::BlackBoxCost;
+
+// A result's tag inside a unit: warp, destination, lane enables, a valid bit.
+uint64_t result_tag(const Config& c) { return bits_for(c.core_warps) + 8 + c.lanes + 1; }
+
+// ALU: per lane the add, the logic ops and the compare sit in a basic DSP
+// whose own registers hold the result; the barrel shifter does not, so each
+// stage after the first holds every lane's word, the tag and the setp bit.
+Cost guess_alu(const Config& c) {
+    return {(uint64_t{c.timing.alu} - 1) * (uint64_t{c.lanes} * 32 + result_tag(c) + 1), 0, c.lanes};
 }
 
+// FPU: per lane a single-precision fused multiply-add (fadd, fmul and fmax
+// are its special cases; cvt.pack is not counted separately), its 24 x 24
+// product on two basic DSPs, about 64 bits a lane and the tag a stage.
+Cost guess_fpu(const Config& c) {
+    return {(uint64_t{c.timing.fadd} - 1) * (uint64_t{c.lanes} * 64 + result_tag(c)), 0, 2 * uint64_t{c.lanes}};
+}
+
+// Special-function unit: per lane served, a 128-entry table of three
+// coefficients (64 bits) per function and a quadratic on two basic DSPs; the
+// flip-flops are the G - 1 waiting operand groups and result groups, the
+// Ls - 1 function stages (lanes, valid, group) and the tags inside.
+Cost guess_sfu(const Config& c) {
+    const uint64_t groups = (c.lanes + c.sfu_lanes - 1) / c.sfu_lanes;
+    const uint64_t inside = (c.timing.sfu - 1 + groups - 1) / groups;
+    return {2 * (groups - 1) * c.sfu_lanes * 32 +
+            (c.sfu_latency_cycles - 1) * (uint64_t{c.sfu_lanes} * 64 + 1 + bits_for(groups)) + inside * result_tag(c),
+        uint64_t{c.sfu_lanes} * 2 * 128 * 64, 2 * uint64_t{c.sfu_lanes}};
+}
+
+// MMA core: a basic DSP per product of a step. Until C is at the core (W =
+// tmem.port_depth + read_latency) its stages hold A and B; from C on, per
+// result word, the k products (28 bits) and C (27) with the window's 8-bit
+// exponent, summed by a tree halving the terms a stage; past the one sum a
+// stage only delays the packed 32-bit word (so a long latency adds 32 a word).
+Cost guess_mma_core(const Config& c) {
+    const uint64_t m = c.mma_core_m;
+    const uint64_t n = c.mma_core_n;
+    const uint64_t k = c.mma_core_k;
+    const uint64_t inner = c.mma_result_latency_cycles - 1;
+    const uint64_t before_c = std::min<uint64_t>(uint64_t{c.tmem_port_depth} + c.tmem_read_latency_cycles, inner);
+    uint64_t after_c = 0;
+    uint64_t terms = k + 1;
+    bool summed = false;
+    for (uint64_t stage = 0; before_c + stage < inner; ++stage) {
+        uint64_t word = 32;
+        if (!summed && terms > 1) {
+            word = (stage == 0 ? k * 28 + 27 : terms * (28 + stage)) + 8;
+        } else if (!summed) {
+            word = 28 + stage + 8;
+            summed = true;
+        }
+        after_c += m * n * word;
+        terms = (terms + 1) / 2;
+    }
+    return {before_c * (m * k + k * n) * 16 + after_c, 0, m * n * k};
+}
+
+struct CostedUnit {
+    const char* black_box;
+    std::optional<BlackBoxCostEntry> BlackBoxCosts::*entry;
+    uint64_t lanes; // what a per-lane amount is multiplied by
+    Cost (*guess)(const Config&);
+};
+
 } // namespace
+
+Machine::BlackBoxCost Machine::black_box_cost(const BlackBoxDeclaration& black_box) const {
+    if (black_box.memory.has_value()) {
+        const auto& shape = *black_box.memory;
+        return {0, uint64_t{shape.banks} * shape.rows * shape.word_bits, 0, "its words"};
+    }
+    const CostedUnit units[] = {{"ALU", &BlackBoxCosts::alu, config_.lanes, guess_alu},
+        {"FPU", &BlackBoxCosts::fpu, config_.lanes, guess_fpu},
+        {"special-function unit", &BlackBoxCosts::sfu, config_.sfu_lanes, guess_sfu},
+        {"MMA core", &BlackBoxCosts::mma_core, 0, guess_mma_core}};
+    for (const auto& unit : units) {
+        if (black_box.name != unit.black_box) continue;
+        const auto& entry = config_.costs.*(unit.entry);
+        if (!entry.has_value()) {
+            auto guess = unit.guess(config_);
+            guess.source = "default guess";
+            return guess;
+        }
+        return {entry->flip_flops + entry->flip_flops_per_lane * unit.lanes,
+            entry->memory_bits + entry->memory_bits_per_lane * unit.lanes,
+            entry->basic_dsps + entry->basic_dsps_per_lane * unit.lanes, "from the profile"};
+    }
+    throw SimError("internal: black box '" + black_box.name + "' has no cost (state_report.cpp)");
+}
 
 void Machine::declare_state_bits() {
     const auto& c = config_;
@@ -380,7 +480,6 @@ void Machine::declare_state_bits() {
         arithmetic_reads_.declare_note("its operands' words count only where they are held after the RF's and URF's "
             "read delays: " + number(words) + " bits");
     }
-    // BLACK BOX SHARED: memory notes
     // A memory's read data in flight: every read port's word for each cycle
     // of the read delay. (Its black box's report prints it: memory_blackbox.)
     const auto in_flight = [](auto& memory) {
@@ -395,7 +494,6 @@ void Machine::declare_state_bits() {
     in_flight(shmem_);
     in_flight(tmem_);
     instruction_memory_.declare_note("the kernel's words (no profile size)");
-    // END BLACK BOX SHARED: memory notes
     // ---- launch ----
     // The launch record: valid, the block's global and shared address and
     // bytes, and per launch flag a valid bit, its depbar (a kernel's .flag
@@ -404,10 +502,10 @@ void Machine::declare_state_bits() {
         1 + global + shared + shared_count + uint64_t{c.core_launch_flags} * (1 + depbar + shared_count));
 }
 
-// The black boxes (blackbox.hpp), each declared where it is defined, with its
-// own sign-off: the arithmetic units (arith.cpp), the tensor core's
+// The black boxes (blackbox.hpp), each declared where it is defined: the
+// arithmetic units (arith.cpp), the tensor core's
 // arithmetic (tensor_core.cpp), and the memories, beside each in machine.hpp
-// (their cost is their words: memory_blackbox). Listed by unit.
+// (their size is their words). Listed by unit.
 void Machine::declare_black_boxes() {
     declare_arithmetic_black_boxes();
     declare_mma_core_black_box();
@@ -432,8 +530,8 @@ std::vector<std::pair<const Clocked*, std::string>> Machine::not_yet_declared() 
 // The report. Per unit: what is in the open -- its flip-flops (registers,
 // groups, pipelines, a FIFO's pointers, the black boxes' output registers)
 // and its FIFO storage, counted -- and, apart, its black boxes (the memories
-// among them) with their declared costs. Then each black box's contract, and
-// the totals: counted, declared, and their sum. Not in the totals: what
+// among them) with their costs. Then each black box's contract, and the
+// totals: counted, behind walls, and their sum. Not in the totals: what
 // cannot declare its bits yet, and plain state that is not a primitive.
 // ===========================================================================
 
@@ -443,9 +541,8 @@ std::string Machine::state_report() const {
     const auto missing = not_yet_declared();
     out << "state report: " << config_.name << " (declared hardware bits)\n";
     out << "In the open: registers, groups, pipelines, FIFOs and the black boxes' output registers, counted. Behind\n"
-           "walls: black boxes, the memories among them, each a contract with a declared cost that only the human\n"
-           "signs off. A sign-off shown is the one at the black box's definition, with the fingerprint signed;\n"
-           "whether it is still current is scripts/blackboxes.py's to say.\n";
+           "walls: black boxes, the memories among them, each a contract, with its cost: from the profile, a\n"
+           "default guess, or a memory's words.\n";
     uint64_t total_flops = 0;
     uint64_t total_fifo = 0;
     for (auto unit = static_cast<uint8_t>(Unit::front_end); unit <= static_cast<uint8_t>(last_unit); ++unit) {
@@ -489,30 +586,30 @@ std::string Machine::state_report() const {
         for (const auto& black_box : black_boxes_) {
             if (black_box.unit != which) continue;
             any = true;
+            const auto cost = black_box_cost(black_box);
             char line[200];
-            std::snprintf(line, sizeof(line), "  %-9s %-52s %12s  declared; %s\n", "black box", black_box.name.c_str(),
-                number(black_box.cost.flip_flops + black_box.cost.memory_bits).c_str(), sign_off_text(black_box).c_str());
+            std::snprintf(line, sizeof(line), "  %-9s %-52s %12s  %s\n", "black box", black_box.name.c_str(),
+                number(cost.flip_flops + cost.memory_bits).c_str(), cost.source);
             out << line;
-            walls.flip_flops += black_box.cost.flip_flops;
-            walls.memory_bits += black_box.cost.memory_bits;
-            walls.multipliers += black_box.cost.multipliers;
+            walls.flip_flops += cost.flip_flops;
+            walls.memory_bits += cost.memory_bits;
+            walls.basic_dsps += cost.basic_dsps;
         }
         if (any) {
             out << "  behind walls: flip-flops " << number(walls.flip_flops) << ", memory " << number(walls.memory_bits)
-                << ", multipliers " << number(walls.multipliers) << " (declared)\n";
+                << ", basic DSPs " << number(walls.basic_dsps) << " (declared)\n";
         }
         total_flops += flops;
         total_fifo += fifo;
     }
-    // The black boxes: each one's contract, its declared cost and the
-    // function it comes from, and the sign-off its definition carries.
+    // The black boxes: each one's contract, and its cost and where that
+    // comes from.
     BlackBoxCost declared;
-    std::size_t signed_off = 0;
-    out << "\nblack boxes (a contract outside, anything inside: the cost is declared, not counted)\n";
+    out << "\nblack boxes (a contract outside, anything inside: the cost is estimated, not counted)\n";
     if (black_boxes_.empty()) out << "  none\n";
     for (const auto& black_box : black_boxes_) {
-        out << "  " << black_box.name << " (" << unit_name(black_box.unit) << "): " << sign_off_text(black_box)
-            << "\n    latency " << black_box.latency << " ("
+        out << "  " << black_box.name << " (" << unit_name(black_box.unit) << ")\n    latency " << black_box.latency
+            << " ("
             << black_box.latency_from << ")";
         if (black_box.interval > 1) out << ", a new input at most every " << black_box.interval << " cycles";
         out << "\n";
@@ -522,14 +619,19 @@ std::string Machine::state_report() const {
                     << (port.bits == 1 ? " bit, " : " bits, ") << port.held_in << "\n";
             }
         }
-        out << "    declared " << number(black_box.cost.flip_flops) << " flip-flops, "
-            << number(black_box.cost.memory_bits) << " memory bits, " << number(black_box.cost.multipliers)
-            << " multipliers: " << black_box.cost_function << "\n";
+        if (black_box.memory.has_value()) {
+            const auto& shape = *black_box.memory;
+            out << "    shape: banks x words x word bits " << shape.banks << " x " << shape.rows << " x "
+                << shape.word_bits << "; " << shape.read_ports << "R " << shape.write_ports << "W"
+                << (shape.banks > 1 ? " per bank" : "") << ", " << same_cycle_text(shape.same_cycle) << "\n";
+        }
         if (!black_box.note.empty()) out << "    " << black_box.note << "\n";
-        declared.flip_flops += black_box.cost.flip_flops;
-        declared.memory_bits += black_box.cost.memory_bits;
-        declared.multipliers += black_box.cost.multipliers;
-        if (black_box.signed_off()) ++signed_off;
+        const auto cost = black_box_cost(black_box);
+        out << "    cost " << number(cost.flip_flops) << " flip-flops, " << number(cost.memory_bits) << " memory bits, "
+            << number(cost.basic_dsps) << " basic DSPs (" << cost.source << ")\n";
+        declared.flip_flops += cost.flip_flops;
+        declared.memory_bits += cost.memory_bits;
+        declared.basic_dsps += cost.basic_dsps;
     }
     const uint64_t bram18 = 18 * 1024;
     char line[160];
@@ -538,18 +640,18 @@ std::string Machine::state_report() const {
     out << "    flip-flops       " << number(total_flops) << "\n";
     out << "    FIFO storage     " << number(total_fifo) << "\n";
     out << "    total            " << number(total_flops + total_fifo) << "\n";
-    out << "  behind walls (declared by " << black_boxes_.size() << " black boxes, " << signed_off << " signed off)\n";
+    out << "  behind walls (" << black_boxes_.size() << " black boxes)\n";
     out << "    flip-flops       " << number(declared.flip_flops) << "\n";
     out << "    memory bits      " << number(declared.memory_bits) << "\n";
     out << "    total            " << number(declared.flip_flops + declared.memory_bits) << "\n";
-    out << "    multipliers      " << number(declared.multipliers) << "\n";
+    out << "    basic DSPs       " << number(declared.basic_dsps) << "\n";
     const uint64_t all_flops = total_flops + declared.flip_flops;
     out << "  sum\n";
     out << "    flip-flops       " << number(all_flops) << "\n";
     out << "    memory bits      " << number(declared.memory_bits) << "\n";
     out << "    FIFO storage     " << number(total_fifo) << "\n";
     out << "    total            " << number(all_flops + declared.memory_bits + total_fifo) << "\n";
-    out << "    multipliers      " << number(declared.multipliers) << "\n";
+    out << "    basic DSPs       " << number(declared.basic_dsps) << "\n";
     std::snprintf(line, sizeof(line), "  memory + FIFO in 18-kilobit block RAMs: %s / %s = %.1f\n",
         number(declared.memory_bits + total_fifo).c_str(), number(bram18).c_str(),
         static_cast<double>(declared.memory_bits + total_fifo) / static_cast<double>(bram18));

@@ -29,6 +29,9 @@ std::vector<std::string> mma_shape_names(const std::vector<MmaShape>& shapes) {
     return names;
 }
 
+// What the fingerprint hashes. Not the costs: they change nothing the machine
+// does, so a kernel or launch image built for a profile stays valid when its
+// cost section changes.
 json profile_json(const DeviceProfile& p) {
     return {
         {"name", p.name},
@@ -152,6 +155,45 @@ uint32_t ranged_field(const json& value, const char* section, const char* name, 
 void optional_field(
     const json& object, const char* section, const char* name, uint32_t low, uint32_t high, uint32_t& out) {
     if (object.contains(name)) out = ranged_field(object.at(name), section, name, low, high);
+}
+
+// The optional cost section: {"<unit>": {"<field>": n, ...}, ...}, each n a
+// non-negative integer; a unit or a field it does not know is refused by name.
+BlackBoxCosts parse_costs(const json& section) {
+    if (!section.is_object()) throw ProfileError("device profile: cost must be an object of black boxes");
+    constexpr std::pair<const char*, uint64_t BlackBoxCostEntry::*> fields[] = {
+        {"flip_flops", &BlackBoxCostEntry::flip_flops}, {"flip_flops_per_lane", &BlackBoxCostEntry::flip_flops_per_lane},
+        {"memory_bits", &BlackBoxCostEntry::memory_bits}, {"memory_bits_per_lane", &BlackBoxCostEntry::memory_bits_per_lane},
+        {"basic_dsps", &BlackBoxCostEntry::basic_dsps}, {"basic_dsps_per_lane", &BlackBoxCostEntry::basic_dsps_per_lane},
+    };
+    BlackBoxCosts costs;
+    for (const auto& [unit, entry] : section.items()) {
+        auto* slot = unit == "alu" ? &costs.alu : unit == "fpu" ? &costs.fpu : unit == "sfu" ? &costs.sfu
+            : unit == "mma_core" ? &costs.mma_core : nullptr;
+        if (slot == nullptr) {
+            throw ProfileError("device profile: cost " + unit + " is not a costed black box (alu, fpu, sfu, mma_core)");
+        }
+        if (!entry.is_object()) throw ProfileError("device profile: cost " + unit + " must be an object of numbers");
+        BlackBoxCostEntry cost;
+        for (const auto& [name, value] : entry.items()) {
+            const auto* field = std::find_if(std::begin(fields), std::end(fields),
+                [&](const auto& known) { return name == known.first; });
+            if (field == std::end(fields)) {
+                throw ProfileError("device profile: cost " + unit + " " + name + " is not a cost field (flip_flops, "
+                    "memory_bits, basic_dsps, each also _per_lane)");
+            }
+            if (unit == "mma_core" && name.ends_with("_per_lane")) {
+                throw ProfileError("device profile: cost mma_core " + name + ": the MMA core has fixed amounts only");
+            }
+            if (!value.is_number_unsigned()) {
+                throw ProfileError("device profile: cost " + unit + " " + name + " must be a non-negative integer (got " +
+                    value.dump() + ")");
+            }
+            cost.*(field->second) = value.get<uint64_t>();
+        }
+        *slot = cost;
+    }
+    return costs;
 }
 
 } // namespace
@@ -540,10 +582,8 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_field(tma, "tma", "walker_start_cycles", 0, 8, p.tma_walker_start_cycles);        // absent: 2
     const auto& core = document.at("core");
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");
-    // BLACK BOX SHARED: ALU and FPU latencies
     p.timing.alu = field<uint8_t>(core, "alu_latency_cycles");
     p.timing.fadd = field<uint8_t>(core, "fadd_latency_cycles");
-    // END BLACK BOX SHARED: ALU and FPU latencies
     // Optional (absent: the canonical 16 warps, 2 packets); present: an integer
     // in [low, high].
     optional_field(core, "core", "warps", 1, 64, p.core_warps);
@@ -553,10 +593,8 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& sfu = document.at("sfu");
     p.sfu_lanes = ranged_field(sfu.at("lanes"), "sfu", "lanes", 1, p.lanes);
     p.sfu_latency_cycles = ranged_field(sfu.at("latency_cycles"), "sfu", "latency_cycles", 1, 24);
-    // BLACK BOX SHARED: special-function unit latency
     const auto sfu_occupancy = (p.lanes + p.sfu_lanes - 1) / p.sfu_lanes;
     p.timing.sfu = static_cast<uint8_t>(sfu_occupancy - 1 + p.sfu_latency_cycles);
-    // END BLACK BOX SHARED: special-function unit latency
     const auto& gmem = document.at("gmem");
     p.gmem_bytes = field<uint64_t>(gmem, "bytes");
     p.dram_clock_hz = field<uint64_t>(gmem, "dram_clock_hz");
@@ -577,6 +615,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.lsu_sectors_in_flight = field<uint32_t>(lsu, "sectors_in_flight");
     p.lsu_ingress_latency_cycles = field<uint32_t>(lsu, "ingress_latency_cycles");
     p.lsu_egress_latency_cycles = field<uint32_t>(lsu, "egress_latency_cycles");
+    if (document.contains("cost")) p.costs = parse_costs(document.at("cost"));
     validate_device_profile(p);
     report_profile_warnings(p);
     return p;

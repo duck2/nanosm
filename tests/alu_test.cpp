@@ -255,8 +255,11 @@ void test_fa_menu_numeric_vectors() {
     )"), std::move(launch));
     machine.run(10000);
 
+    // NaN canonical; a subnormal result flushed to zero of its sign (no input
+    // here is subnormal).
     const auto canonical = [](float value) {
-        return std::isnan(value) ? nan : nanosm::float_bits(value);
+        const uint32_t bits = nanosm::float_bits(value);
+        return std::isnan(value) ? nan : (bits & 0x7f800000u) == 0 ? bits & 0x80000000u : bits;
     };
     const auto as_float = nanosm::bits_float;
     for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -289,7 +292,7 @@ void test_fa_menu_numeric_vectors() {
     require(machine.read_reg(0, 0, 10) == 0x40000000u, "ex2(1) != 2");
     require(machine.read_reg(0, 2, 10) == 0x3fb504f3u, "ex2(0.5) != sqrt(2) bits");
     require(machine.read_reg(0, 3, 10) == 0x3f3504f3u, "ex2(-0.5) != 1/sqrt(2) bits");
-    require(machine.read_reg(0, 13, 10) == 0x00000200u, "ex2(-140) != subnormal 2^-140");
+    require(machine.read_reg(0, 13, 10) == 0x00000000u, "ex2(-140), a subnormal 2^-140, was not flushed to +0");
     require(machine.read_reg(0, 14, 10) == 0x00000000u, "ex2(-150) did not flush the tie to zero");
     require(machine.read_reg(0, 10, 10) == 0x00000000u, "ex2(-inf) != +0");
     require(machine.read_reg(0, 7, 11) == 0x7f800000u, "rcp(+0) != +inf");
@@ -299,6 +302,84 @@ void test_fa_menu_numeric_vectors() {
     require(machine.read_reg(0, 11, 7) == 0x40a00000u, "fmax(NaN, 5) != 5");
     require(machine.read_reg(0, 15, 8) == 0x28800000u,
         "fma lost its single rounding: (1+2^-23)^2 - (1+2^-22) != 2^-46");
+}
+
+// No subnormals in the FPU and the special-function unit: a subnormal input
+// is read as zero of its sign, a subnormal result is delivered as zero of its
+// sign; fma rounds once (its product is not flushed); normal values, zeros
+// and NaNs pass; cvt.pack keeps a half's subnormal.
+void test_fpu_flushes_subnormals() {
+    const std::array<uint32_t, 16> a{
+        0x00400000u, 0x80400000u, 0x0d800000u, 0x8d800000u, // 2^-127, -2^-127, 2^-100, -2^-100
+        0x00800001u, 0x00800001u, 0x1c800000u, 0x1c800000u, // 2^-126 (1 + 2^-23) twice, 2^-70 twice
+        0x3fc00000u, 0x80000000u, 0x00800000u, 0xc3020000u, // 1.5, -0, 2^-126, -130
+        0x7f000000u, 0x00000001u, 0x7fc00000u, 0x80000001u}; // 2^127, 2^-149, NaN, -2^-149
+    const std::array<uint32_t, 16> b{
+        0x00000000u, 0x00000000u, 0x30800000u, 0x30800000u, // +0, +0, 2^-30, 2^-30
+        0x80800000u, 0x00800000u, 0x1c800000u, 0x1c800000u, // -2^-126, 2^-126, 2^-70, 2^-70
+        0x40000000u, 0x80000000u, 0x3f800000u, 0x3f800000u, // 2, -0, 1, 1
+        0x3f800000u, 0x7f000000u, 0x3f800000u, 0x35800000u}; // 1, 2^127, 1, 2^-20
+    std::array<uint32_t, 16> c{};
+    c[6] = 0x00800000u; // 2^-70 x 2^-70 + 2^-126
+    c[8] = 0x3f800000u; // 1.5 x 2 + 1
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    auto& shmem = image_bytes(launch.test_shmem, 256);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        write_u32(shmem, lane * 4, a[lane]);
+        write_u32(shmem, 64 + lane * 4, b[lane]);
+        write_u32(shmem, 128 + lane * 4, c[lane]);
+    }
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        lds r1, [r0]
+        lds r2, [r0+64]
+        lds r3, [r0+128]
+        fmul r5, r1, r2
+        fadd r6, r1, r2
+        fsub r13, r1, r2
+        fmax r7, r1, r2
+        fma r8, r1, r2, r3
+        cvt.pack.f16x2 r14, r1, r2
+        ex2 r10, r1
+        rcp r11, r1
+        halt
+    )"), std::move(launch));
+    machine.run(10000);
+    struct Pin {
+        uint32_t lane, reg, bits;
+        const char* what;
+    };
+    for (const auto& pin : {
+             Pin{0, 6, 0x00000000u, "fadd(2^-127, +0): a subnormal input is zero"},
+             Pin{0, 7, 0x00000000u, "fmax(2^-127, +0): a subnormal input is zero"},
+             Pin{0, 10, 0x3f800000u, "ex2(2^-127) = ex2(0)"},
+             Pin{0, 11, 0x7f800000u, "rcp(2^-127) = rcp(+0) = +inf"},
+             Pin{1, 11, 0xff800000u, "rcp(-2^-127) = rcp(-0) = -inf"},
+             Pin{2, 5, 0x00000000u, "fmul 2^-100 x 2^-30: a subnormal result is +0"},
+             Pin{2, 8, 0x00000000u, "fma 2^-100 x 2^-30 + 0: a subnormal result is +0"},
+             Pin{3, 5, 0x80000000u, "fmul -2^-100 x 2^-30: a subnormal result is -0"},
+             Pin{4, 6, 0x00000000u, "fadd cancelling to 2^-149 is +0"},
+             Pin{5, 13, 0x00000000u, "fsub cancelling to 2^-149 is +0"},
+             Pin{6, 8, 0x00800200u, "fma 2^-70 x 2^-70 + 2^-126: its product is not flushed"},
+             Pin{7, 8, 0x00000000u, "fma 2^-70 x 2^-70 + 0: a subnormal result is +0"},
+             Pin{8, 5, 0x40400000u, "fmul 1.5 x 2"},
+             Pin{8, 6, 0x40600000u, "fadd 1.5 + 2"},
+             Pin{8, 8, 0x40800000u, "fma 1.5 x 2 + 1"},
+             Pin{9, 6, 0x80000000u, "fadd -0 + -0 = -0"},
+             Pin{9, 5, 0x00000000u, "fmul -0 x -0 = +0"},
+             Pin{9, 7, 0x80000000u, "fmax(-0, -0) = -0"},
+             Pin{10, 5, 0x00800000u, "fmul 2^-126 x 1: the smallest normal passes"},
+             Pin{11, 10, 0x00000000u, "ex2(-130): a subnormal result is +0"},
+             Pin{12, 11, 0x00000000u, "rcp(2^127): a subnormal result is +0"},
+             Pin{13, 5, 0x00000000u, "fmul 2^-149 x 2^127: a subnormal input is zero (not 2^-22)"},
+             Pin{14, 5, 0x7fc00000u, "fmul NaN x 1 is the canonical NaN"},
+             Pin{15, 14, 0x00108000u, "cvt.pack(-2^-149, 2^-20): -0 and a half's subnormal"},
+         }) {
+        const uint32_t got = machine.read_reg(0, pin.lane, pin.reg);
+        require(got == pin.bits, std::string(pin.what) + ": got " + std::to_string(got));
+    }
 }
 
 void test_sfu_unit_timing() {
@@ -515,6 +596,11 @@ TEST(Alu, half_conversion_and_pack_vectors) {
 // FA menu numeric vectors
 TEST(Alu, fa_menu_numeric_vectors) {
     test_fa_menu_numeric_vectors();
+}
+
+// FPU and SFU: denormals are zero in, flush to zero out
+TEST(Alu, fpu_flushes_subnormals) {
+    test_fpu_flushes_subnormals();
 }
 
 // SFU unit timing

@@ -17,6 +17,27 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A costed black box's cost in the profile's optional "cost" section (README):
+// plain numbers, each a fixed amount plus an amount per lane of the unit
+// (core.lanes for the ALU and FPU, sfu.lanes for the special-function unit;
+// the MMA core takes fixed amounts only). A field left out is zero.
+struct BlackBoxCostEntry {
+    uint64_t flip_flops = 0;
+    uint64_t flip_flops_per_lane = 0;
+    uint64_t memory_bits = 0;
+    uint64_t memory_bits_per_lane = 0;
+    uint64_t basic_dsps = 0;
+    uint64_t basic_dsps_per_lane = 0;
+};
+// An entry present is the whole cost of its unit; absent, the state report
+// takes its default guess (src/machine/state_report.cpp).
+struct BlackBoxCosts {
+    std::optional<BlackBoxCostEntry> alu;
+    std::optional<BlackBoxCostEntry> fpu;
+    std::optional<BlackBoxCostEntry> sfu;
+    std::optional<BlackBoxCostEntry> mma_core;
+};
+
 // One profile is consumed by qtxc, qtxas and the simulator. Core quantities are
 // measured in core cycles; controller quantities are measured in DRAM ticks.
 struct DeviceProfile {
@@ -209,6 +230,11 @@ struct DeviceProfile {
     uint32_t lsu_egress_latency_cycles = 0;
     // Outstanding scalar (gather, scatter, uniform) sectors = free-ID tags.
     uint32_t lsu_sectors_in_flight = 0;
+
+    // What the costed black boxes cost (the optional "cost" section). Only
+    // the state report reads it: it changes nothing the machine does, so it
+    // is not in device_profile_fingerprint.
+    BlackBoxCosts costs;
 };
 
 using Config = DeviceProfile;

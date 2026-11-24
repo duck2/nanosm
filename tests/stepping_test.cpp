@@ -521,17 +521,6 @@ void test_fifo_second_push_panics() {
     throw std::runtime_error("a second push in one tick did not panic");
 }
 
-// A black box's sign-off is the one written at its definition: a sign-off
-// cannot be copied or moved but by the declaration it is written for, a
-// declaration cannot be copied (only moved, into the machine's list), and
-// none can be made without a sign-off.
-static_assert(!std::is_copy_constructible_v<nanosm::SignOff> && !std::is_move_constructible_v<nanosm::SignOff> &&
-    !std::is_copy_assignable_v<nanosm::SignOff> && !std::is_move_assignable_v<nanosm::SignOff> &&
-    !std::is_default_constructible_v<nanosm::SignOff>);
-static_assert(!std::is_copy_constructible_v<nanosm::BlackBoxDeclaration> &&
-    !std::is_copy_assignable_v<nanosm::BlackBoxDeclaration> && std::is_move_constructible_v<nanosm::BlackBoxDeclaration> &&
-    !std::is_constructible_v<nanosm::BlackBoxDeclaration, std::string>);
-
 // A black box's output register holds a value from its inputs' cycle +
 // latency, for that one cycle; nothing passes through it in one cycle, and
 // inputs closer than its interval are refused (a refused value is not a
@@ -552,7 +541,7 @@ void test_black_box_latency_and_interval() {
         return false;
     };
     require(refused(1, 0), "a black box not yet built took a value");
-    nanosm::BlackBoxDeclaration declaration("a black box", nanosm::SignOff::not_signed);
+    nanosm::BlackBoxDeclaration declaration("a black box");
     declaration.latency = 3;
     declaration.interval = 2;
     black_box.build(declaration);
@@ -575,7 +564,7 @@ void test_black_box_latency_and_interval() {
     require(black_box.empty(), "the black box is not empty after its outputs");
 
     nanosm::BlackBox<uint32_t, int> keeper(all, nanosm::Unit::none, "a black box with an inside");
-    nanosm::BlackBoxDeclaration keeps("a black box with an inside", nanosm::SignOff::not_signed);
+    nanosm::BlackBoxDeclaration keeps("a black box with an inside");
     bool unasked = false;
     try {
         keeper.build(keeps);
@@ -696,15 +685,18 @@ void test_state_report_adds_up() {
                                       : "' declares no bits and is not listed"));
         (std::string(size.kind) == "memory" ? memory_words : declared) += size.bits().value_or(0);
     }
-    nanosm::BlackBoxCost costs;
+    nanosm::Machine::BlackBoxCost costs;
     uint64_t memory_black_boxes = 0;
     for (const auto& black_box : machine.black_boxes()) {
-        costs.flip_flops += black_box.cost.flip_flops;
-        costs.memory_bits += black_box.cost.memory_bits;
-        costs.multipliers += black_box.cost.multipliers;
+        const auto cost = machine.black_box_cost(black_box);
+        require(std::string(cost.source) == (black_box.memory.has_value() ? "its words" : "default guess"),
+            "black box '" + black_box.name + "' on the canonical profile costs '" + cost.source + "'");
+        costs.flip_flops += cost.flip_flops;
+        costs.memory_bits += cost.memory_bits;
+        costs.basic_dsps += cost.basic_dsps;
         for (const auto& size : machine.state_sizes()) {
             if (size.name == black_box.name && std::string(size.kind) == "memory") {
-                memory_black_boxes += black_box.cost.memory_bits;
+                memory_black_boxes += cost.memory_bits;
             }
         }
     }
@@ -719,8 +711,9 @@ void test_state_report_adds_up() {
     };
     const std::regex line(R"(^  (register|group|pipeline|FIFO) .* ([0-9,]+)  .*$)");
     const std::regex unit_total(R"(^  in the open: flip-flops ([0-9,]+), FIFO ([0-9,]+), total ([0-9,]+)$)");
-    const std::regex black_box_line(R"(^  black box +.+ ([0-9,]+)  declared; (not signed off|signed off [0-9a-f]{12})$)");
-    const std::regex unit_walls(R"(^  behind walls: flip-flops ([0-9,]+), memory ([0-9,]+), multipliers ([0-9,]+) \(declared\)$)");
+    const std::regex black_box_line(
+        R"(^  black box +.+ ([0-9,]+)  (default guess|from the profile|its words)$)");
+    const std::regex unit_walls(R"(^  behind walls: flip-flops ([0-9,]+), memory ([0-9,]+), basic DSPs ([0-9,]+) \(declared\)$)");
     // The first total is the open state's (then the black boxes' declared one, then the sum).
     const std::regex grand_total(R"(^    total +([0-9,]+)$)");
     std::istringstream lines(report);
@@ -769,24 +762,14 @@ void test_state_report_adds_up() {
             std::string::npos,
         "the canonical profile's open flip-flops moved from 38,546 (or its FIFO storage from 6,690)");
     require(report.find("    flip-flops       18,083\n    memory bits      1,415,296\n    total            1,433,379\n"
-                        "    multipliers      168\n") != std::string::npos,
-        "the canonical profile's declared costs moved (18,083 flip-flops, 1,415,296 memory bits, 168 multipliers)");
-    // Every black box prints the sign-off its definition gives (a signed one
-    // with its fingerprint), and the totals count the signed ones as the
-    // definitions do.
-    const auto sign_off_text = [](const nanosm::BlackBoxDeclaration& black_box) {
-        return black_box.signed_off() ? "signed off " + std::string(black_box.fingerprint())
-                                      : std::string("not signed off");
-    };
-    std::size_t signed_off = 0;
+                        "    basic DSPs       184\n") != std::string::npos,
+        "the canonical profile's declared costs moved (18,083 flip-flops, 1,415,296 memory bits, 184 basic DSPs)");
+    // Every black box's contract is printed under its name and unit.
     for (const auto& black_box : machine.black_boxes()) {
-        if (black_box.signed_off()) ++signed_off;
-        require(report.find("  " + black_box.name + " (" + nanosm::unit_name(black_box.unit) + "): " +
-                    sign_off_text(black_box) + "\n") != std::string::npos,
-            "the report does not print black box '" + black_box.name + "' with its definition's sign-off");
+        require(report.find("  " + black_box.name + " (" + nanosm::unit_name(black_box.unit) + ")\n    latency ") !=
+                std::string::npos,
+            "the report does not print black box '" + black_box.name + "'");
     }
-    require(report.find("black boxes, " + std::to_string(signed_off) + " signed off)") != std::string::npos,
-        "the report's totals do not count the black boxes signed off");
     // The MMA core: at a long result latency each further cycle only delays
     // the packed result (16 words, 512 bits); at a latency of exactly
     // tmem.port_depth + tmem.read_latency_cycles the report says plainly
@@ -798,7 +781,9 @@ void test_state_report_adds_up() {
         one.active_warps = 1;
         const nanosm::Machine varied(profile, compile("halt\n", profile), std::move(one));
         for (const auto& black_box : varied.black_boxes()) {
-            if (black_box.name == "MMA core") return std::pair{black_box.cost.flip_flops, varied.state_report()};
+            if (black_box.name == "MMA core") {
+                return std::pair{varied.black_box_cost(black_box).flip_flops, varied.state_report()};
+            }
         }
         throw std::runtime_error("no MMA core black box");
     };
@@ -857,19 +842,11 @@ void test_state_report_adds_up() {
             "the arithmetic pipeline declares " + std::to_string(bits_of("arithmetic pipeline: operand latches")) +
                 " bits" + where);
         const auto text = varied.state_report();
-        const auto sign_off_of = [&](const std::string& name) {
-            for (const auto& black_box : varied.black_boxes()) {
-                if (black_box.name == name) return sign_off_text(black_box);
-            }
-            return std::string("no such black box");
-        };
-        require(text.find("  vector register file (register file): " + sign_off_of("vector register file") +
-                    "\n    latency " + std::to_string(expected.rf_delay) + " (rf.read_latency_cycles)\n") !=
-                    std::string::npos &&
+        require(text.find("  vector register file (register file)\n    latency " + std::to_string(expected.rf_delay) +
+                    " (rf.read_latency_cycles)\n") != std::string::npos &&
                 text.find("read first\n    read data in flight: " + std::string(expected.rf_note)) !=
                     std::string::npos &&
-                text.find("  uniform register file (uniform register file): " + sign_off_of("uniform register file") +
-                    "\n    latency " +
+                text.find("  uniform register file (uniform register file)\n    latency " +
                     std::to_string(expected.urf_delay) + " (urf.read_latency_cycles)\n") != std::string::npos &&
                 text.find("2R 1W, read first\n    read data in flight: " + std::string(expected.urf_note)) !=
                     std::string::npos,
@@ -880,6 +857,92 @@ void test_state_report_adds_up() {
             ? "uniform operand (ur2r): 32 bits, the arithmetic pipeline's operand latches (in the open)\n"
             : "uniform operand (ur2r): 32 bits, the uniform register file's read registers (the memory's)\n";
         require(text.find(ur2r) != std::string::npos, "the ALU's ur2r input names the wrong source" + where);
+    }
+}
+
+// The machine's black boxes are exactly these ten. Adding a black box, or
+// changing what one takes in, gives out or how long it takes, is something to
+// tell the human plainly; this list is edited with it.
+void test_black_boxes_are_the_listed_ten() {
+    const auto config = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
+    std::vector<std::string> names;
+    for (const auto& black_box : machine.black_boxes()) names.push_back(black_box.name);
+    std::sort(names.begin(), names.end());
+    const std::vector<std::string> expected{"ALU", "FPU", "MMA core", "divergence stack", "instruction memory",
+        "shared memory", "special-function unit", "tensor memory", "uniform register file", "vector register file"};
+    require(names == expected, "the machine's black boxes are not the listed ten");
+}
+
+// The profile's cost section: an entry present is its unit's whole cost
+// (fixed amounts plus amounts per lane), a unit left out takes the report's
+// default guess; costs are not in the profile's fingerprint; an unknown name
+// and a number that is not a non-negative integer are refused by name.
+void test_state_report_profile_costs() {
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    auto costed = document;
+    costed["cost"] = {{"fpu", {{"flip_flops", 100}, {"flip_flops_per_lane", 96}, {"basic_dsps_per_lane", 2}}},
+        {"sfu", {{"memory_bits_per_lane", 1024}}}};
+    const auto profile = nanosm::parse_device_profile(costed.dump());
+    require(nanosm::device_profile_fingerprint(profile) == nanosm::device_profile_fingerprint(canonical_profile()),
+        "a cost section changed the profile's fingerprint");
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    const nanosm::Machine machine(profile, compile("halt\n", profile), std::move(launch));
+    const auto cost_of = [&](const std::string& name) {
+        for (const auto& black_box : machine.black_boxes()) {
+            if (black_box.name == name) return machine.black_box_cost(black_box);
+        }
+        throw std::runtime_error("no black box '" + name + "'");
+    };
+    // The FPU: 100 + 96 x 16 lanes flip-flops, 2 x 16 basic DSPs; the
+    // special-function unit: 1,024 x 4 lanes memory bits and nothing else.
+    const auto fpu = cost_of("FPU");
+    const auto sfu = cost_of("special-function unit");
+    const auto alu = cost_of("ALU");
+    require(fpu.flip_flops == 1636 && fpu.memory_bits == 0 && fpu.basic_dsps == 32 &&
+            std::string(fpu.source) == "from the profile",
+        "the FPU's cost is not the profile's");
+    require(sfu.flip_flops == 0 && sfu.memory_bits == 4096 && sfu.basic_dsps == 0 &&
+            std::string(sfu.source) == "from the profile",
+        "the special-function unit's cost is not the profile's");
+    require(alu.flip_flops == 0 && alu.basic_dsps == 16 && std::string(alu.source) == "default guess",
+        "the ALU's cost is not its default guess");
+    const auto report = machine.state_report();
+    require(report.find("    cost 1,636 flip-flops, 0 memory bits, 32 basic DSPs (from the profile)\n") !=
+                std::string::npos &&
+            report.find("    cost 0 flip-flops, 0 memory bits, 16 basic DSPs (default guess)\n") != std::string::npos &&
+            report.find("    cost 12,256 flip-flops, 0 memory bits, 128 basic DSPs (default guess)\n") !=
+                std::string::npos,
+        "the report does not print the costs with where they come from");
+    // Behind walls: 18,083 - 3,159 - 2,668 + 1,636 flip-flops; 1,415,296 -
+    // 65,536 + 4,096 memory bits; 184 - 32 - 8 + 32 basic DSPs.
+    require(report.find("    flip-flops       13,892\n    memory bits      1,353,856\n    total            1,367,748\n"
+                        "    basic DSPs       176\n") != std::string::npos,
+        "the report's totals behind walls do not follow the profile's costs");
+    for (const auto& [bad, name] : std::initializer_list<std::pair<nlohmann::json, const char*>>{
+             {nlohmann::json(3), "cost must be"},
+             {{{"gpu", nlohmann::json::object()}}, "cost gpu"},
+             {{{"alu", 3}}, "cost alu"},
+             {{{"alu", {{"flops", 1}}}}, "cost alu flops"},
+             {{{"alu", {{"flip_flops", -1}}}}, "cost alu flip_flops"},
+             {{{"alu", {{"basic_dsps", 1.5}}}}, "cost alu basic_dsps"},
+             {{{"mma_core", {{"basic_dsps_per_lane", 1}}}}, "cost mma_core basic_dsps_per_lane"},
+         }) {
+        auto refused = document;
+        refused["cost"] = bad;
+        try {
+            (void)nanosm::parse_device_profile(refused.dump());
+        } catch (const nanosm::ProfileError& error) {
+            require(std::string(error.what()).find(name) != std::string::npos,
+                "a refused cost section does not say which: " + std::string(error.what()));
+            continue;
+        }
+        throw std::runtime_error("the cost section " + bad.dump() + " was accepted");
     }
 }
 
@@ -1434,6 +1497,16 @@ TEST(Stepping, black_box_latency_and_interval) {
 // state report: declared bits by unit add up; exactly the listed four are not declared
 TEST(Stepping, state_report_adds_up) {
     test_state_report_adds_up();
+}
+
+// state report: a cost from the profile or a default guess, labelled; refusals
+TEST(Stepping, state_report_profile_costs) {
+    test_state_report_profile_costs();
+}
+
+// black boxes: exactly the listed ten
+TEST(Stepping, black_boxes_are_the_listed_ten) {
+    test_black_boxes_are_the_listed_ten();
 }
 
 // shared memory: the host sees shmem.bytes, not the padded last row

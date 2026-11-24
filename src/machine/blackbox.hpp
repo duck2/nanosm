@@ -18,51 +18,25 @@
 //              box in one cycle;
 //   latency    fixed, from the profile's delays;
 //   interval   a new input at most every `interval` cycles;
-//   cost       what the inside would probably use, as a function of the
-//              unit's profile parameters, written beside the black box with
-//              its reasoning;
-//   signed off only by the human, on one line where the black box is
-//              defined: SignOff::not_signed, which only the human changes to
-//              SignOff::signed_by_human("<fingerprint>"). A black box cannot
-//              be defined without that line (BlackBoxDeclaration has no
-//              default for it). The state report prints it.
-// Everything that defines a black box -- its contract, its cost function
-// with the reasoning, its sign-off line -- is between two comment lines,
-// `// BLACK BOX: <name>` and `// END BLACK BOX: <name>`. Code that several
-// black boxes rely on is between `// BLACK BOX SHARED: <name>` and
-// `// END BLACK BOX SHARED: <name>`, and each black box that relies on it
-// says so inside its own markers with `// BLACK BOX USES: <name>`. The
-// fingerprint is a hash of that text (the black box's own and the shared
-// code it uses), the sign-off line's value left out and line endings
-// normalised; scripts/blackboxes.py prints it. A signature is the fingerprint
-// of what the human read, so any change to that text un-signs the black box
-// by itself. The machine never checks it and runs either way; the commit
-// hook (scripts/hooks/pre-commit) refuses a commit while a black box is not
-// signed or has changed since it was signed.
+//   operations an arithmetic unit's: the instructions it executes (its list
+//              in src/isa.cpp).
+// What it costs is not part of it: the state report gives a cost, from the
+// profile or a default guess (state_report.cpp), and a memory's size is its
+// words. The state report prints every black box's contract.
 // The memories (memory.hpp) are black boxes by the same contract --
-// registered ports, a declared read delay, a size from the profile -- so they
+// registered ports, a declared read delay, a shape from the profile -- so they
 // are declared in the same list (memory_blackbox below, each memory's own
 // declaration beside it in machine.hpp), and the words in flight during a
 // read delay are the memory's business.
-//
-// A cost has three parts. Flip-flops and memory bits are what the state
-// report counts in the open, so a black box's cost is comparable with them.
-// Hard multipliers are what an arithmetic black box plainly has and neither
-// of the others would show: a 25 x 18-bit multiplier block (a 24-bit
-// significand product takes two, an 11-bit one takes one). Logic is not
-// declared: the report takes a device's LUTs to be about its flip-flops.
 
 #include "machine/memory.hpp"
 #include "machine/reg.hpp"
 
-#include <array>
 #include <bit>
-#include <cstddef>
 #include <deque>
 #include <optional>
 #include <stdint.h>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -70,55 +44,10 @@
 
 namespace nanosm {
 
-struct BlackBoxDeclaration;
-
-// Whether the human has signed a black box off, and the fingerprint signed
-// (its 12 hex digits, kept here). The machine only tells the two apart and
-// prints the fingerprint; whether it is still the definition's is
-// scripts/blackboxes.py's to say. A sign-off is written at a definition --
-// SignOff::not_signed or SignOff::signed_by_human("...") -- and nothing but
-// the declaration it is written for can copy it (nor can a declaration be
-// copied), so every black box's sign-off is the one at its own definition.
-class SignOff {
-public:
-    static constexpr std::size_t fingerprint_digits = 12;
-    static const SignOff not_signed;
-    template <std::size_t N>
-    static constexpr SignOff signed_by_human(const char (&fingerprint)[N]) {
-        static_assert(N == fingerprint_digits + 1, "a fingerprint is the 12 hex digits scripts/blackboxes.py prints");
-        return SignOff(fingerprint);
-    }
-    [[nodiscard]] constexpr bool is_signed() const { return signed_; }
-    [[nodiscard]] std::string_view fingerprint() const {
-        return signed_ ? std::string_view(fingerprint_.data(), fingerprint_digits) : std::string_view();
-    }
-
-private:
-    friend struct BlackBoxDeclaration;
-    constexpr SignOff() = default;
-    template <std::size_t N>
-    explicit constexpr SignOff(const char (&fingerprint)[N]) : signed_(true) {
-        for (std::size_t digit = 0; digit < fingerprint_digits; ++digit) fingerprint_[digit] = fingerprint[digit];
-    }
-    constexpr SignOff(const SignOff&) = default;
-    SignOff& operator=(const SignOff&) = default;
-    std::array<char, fingerprint_digits> fingerprint_{};
-    bool signed_ = false;
-};
-inline constexpr SignOff SignOff::not_signed{};
-
-// BLACK BOX SHARED: bit widths
 // Bits to tell `n` things apart (0 for one or none).
 inline uint64_t bits_for(uint64_t n) { return n <= 1 ? 0 : static_cast<uint64_t>(std::bit_width(n - 1)); }
-// END BLACK BOX SHARED: bit widths
 // Bits to count from 0 to `n`.
 inline uint64_t count_bits(uint64_t n) { return static_cast<uint64_t>(std::bit_width(n)); }
-
-struct BlackBoxCost {
-    uint64_t flip_flops = 0;  // registers inside the black box (its input and output registers are counted in the open)
-    uint64_t memory_bits = 0; // RAM and ROM inside it (a memory: its words)
-    uint64_t multipliers = 0; // hard 25 x 18-bit multipliers
-};
 
 // An input or an output: its bits and the register that holds it.
 struct BlackBoxPort {
@@ -127,33 +56,19 @@ struct BlackBoxPort {
     std::string held_in;
 };
 
+// A black box's contract, declared where it is defined.
 struct BlackBoxDeclaration {
-    // A black box is named and its sign-off given where it is defined; there
-    // is no default. One declaration per black box: it is moved into the
-    // machine's list and read there by reference, never copied.
-    BlackBoxDeclaration(std::string name_, const SignOff& sign_off_) : name(std::move(name_)), sign_off(sign_off_) {}
-    BlackBoxDeclaration(const BlackBoxDeclaration&) = delete;
-    BlackBoxDeclaration& operator=(const BlackBoxDeclaration&) = delete;
-    BlackBoxDeclaration(BlackBoxDeclaration&&) = default;
-    BlackBoxDeclaration& operator=(BlackBoxDeclaration&&) = default;
+    explicit BlackBoxDeclaration(std::string name_) : name(std::move(name_)) {}
 
     std::string name;
-
-private:
-    SignOff sign_off; // the one written at its definition: read through signed_off() and fingerprint()
-
-public:
     Unit unit = Unit::none;
     uint32_t latency = 1;
     std::string latency_from; // the profile's delays it is made of
     uint32_t interval = 1;
     std::vector<BlackBoxPort> inputs;
     std::vector<BlackBoxPort> outputs;
-    BlackBoxCost cost;
-    std::string cost_function; // the function, with its inputs' values
-    std::string note;          // what else the report says of it
-    [[nodiscard]] bool signed_off() const { return sign_off.is_signed(); }
-    [[nodiscard]] std::string_view fingerprint() const { return sign_off.fingerprint(); }
+    std::optional<MemoryShape> memory; // a memory's shape: its size is its words
+    std::string note;                  // what else the report says of it
 };
 
 // A black box's output register, and what the inside has finished and not
@@ -255,15 +170,13 @@ private:
     Inside inside_{};
 };
 
-// BLACK BOX SHARED: memories
-// A memory as a black box: its read delay, its ports, its words. What it
+// A memory as a black box: its read delay, its ports, its shape. What it
 // holds is its words (memory bits); a read's word in flight is in the
 // memory's own read registers (a block RAM's output register), not
-// flip-flops of the machine's. Its sign-off is given where it is declared,
-// at the call beside the memory (machine.hpp).
+// flip-flops of the machine's.
 template <typename T>
-BlackBoxDeclaration memory_blackbox(const Memory<T>& memory, const SignOff& sign_off, std::string latency_from,
-    std::string readers, std::string writers) {
+BlackBoxDeclaration memory_blackbox(const Memory<T>& memory, std::string latency_from, std::string readers,
+    std::string writers) {
     const auto& shape = memory.shape();
     const uint64_t ports_read = uint64_t{shape.banks} * shape.read_ports;
     const uint64_t ports_write = uint64_t{shape.banks} * shape.write_ports;
@@ -271,7 +184,7 @@ BlackBoxDeclaration memory_blackbox(const Memory<T>& memory, const SignOff& sign
     const auto ports = [](uint64_t count, const char* kind) {
         return std::to_string(count) + " " + kind + " port" + (count == 1 ? "" : "s");
     };
-    BlackBoxDeclaration blackbox(memory.name(), sign_off);
+    BlackBoxDeclaration blackbox(memory.name());
     blackbox.unit = memory.unit();
     blackbox.latency = shape.read_delay;
     blackbox.latency_from = std::move(latency_from);
@@ -282,14 +195,9 @@ BlackBoxDeclaration memory_blackbox(const Memory<T>& memory, const SignOff& sign
     }
     blackbox.outputs.push_back(BlackBoxPort{ports(ports_read, "read") + ": the word", ports_read * shape.word_bits,
         "the memory's read registers (its own, not flip-flops)"});
-    blackbox.cost.memory_bits = uint64_t{shape.banks} * shape.rows * shape.word_bits;
-    blackbox.cost_function = "banks x words x word bits: " + std::to_string(shape.banks) + " x " + std::to_string(shape.rows) +
-        " x " + std::to_string(shape.word_bits) + "; " + std::to_string(shape.read_ports) + "R " +
-        std::to_string(shape.write_ports) + "W" + (shape.banks > 1 ? " per bank" : "") + ", " +
-        same_cycle_text(shape.same_cycle);
+    blackbox.memory = shape;
     blackbox.note = memory.size().note;
     return blackbox;
 }
-// END BLACK BOX SHARED: memories
 
 } // namespace nanosm

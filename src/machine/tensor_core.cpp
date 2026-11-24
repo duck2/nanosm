@@ -390,35 +390,19 @@ void Machine::finish_mma_step(const MmaBlock& c) {
     waiting.pop_front();
 }
 
-// BLACK BOX: MMA core
-// BLACK BOX USES: MMA core output register
 // The core's arithmetic as a black box (src/machine/blackbox.hpp). It takes a
 // step's A and B blocks at its entry and its C at tmem's output, W =
 // tmem.port_depth + tmem.read_latency_cycles later, and has the result in its
 // output register L = mma.result_latency_cycles after entry; a step can enter
-// every cycle. It would probably use one hard multiplier per product of a
-// step, core_m x core_n x core_k (an 11 x 11 significand product fits one).
-// Its registers, in the L - 1 stages before the output register: until C is
-// at the core, the step's A and B (the multipliers' operands; the products
-// form in the multipliers' own registers as C comes). C's exponent sets the
-// window every product is aligned to (mma_numeric.cpp: in units of the
-// window's quantum an aligned product is below 2^27, C below 2^26), so from C
-// on each result word is its k products, 28 bits signed, and C, 27 bits,
-// with the window's 8-bit exponent, summed by a tree that halves the terms a
-// stage, each sum a bit wider; the stage that holds the one sum holds it and
-// the exponent (at most 9 terms of 2^27: within the sum's width), and every
-// later stage only delays the packed result, 32 bits a word. Its sign-off is
-// the line that names it: only the human changes it. (Its inside --
-// enter_mma_core, read_mma_c and finish_mma_step above, the dot products in
-// mma_numeric.cpp -- is not between its markers.)
+// every cycle. (Its inside: enter_mma_core, read_mma_c and finish_mma_step
+// above, the dot products in mma_numeric.cpp.)
 void Machine::declare_mma_core_black_box() {
     const auto& c = config_;
     const uint64_t m = c.mma_core_m;
     const uint64_t n = c.mma_core_n;
     const uint64_t k = c.mma_core_k;
-    const uint64_t latency = c.mma_result_latency_cycles;
     const uint64_t wait = uint64_t{c.tmem_port_depth} + c.tmem_read_latency_cycles;
-    BlackBoxDeclaration black_box("MMA core", SignOff::not_signed); // sign-off: only the human changes this line
+    BlackBoxDeclaration black_box("MMA core");
     black_box.unit = Unit::tensor_core;
     black_box.latency = c.mma_result_latency_cycles;
     black_box.latency_from = "mma.result_latency_cycles; C at entry + tmem.port_depth + tmem.read_latency_cycles = " +
@@ -431,35 +415,10 @@ void Machine::declare_mma_core_black_box() {
         BlackBoxPort{"C is zero (the tile's first step)", 1, "MMA core: step tags (in the open)"}};
     black_box.outputs = {BlackBoxPort{"result block (core_m x core_n words)", m * n * 32 + 1,
         mma_core_.name() + " (in the open)"}};
-    // The inner stages: entry + 1 .. entry + L - 1; those up to entry + W
-    // wait for C, the rest are after it.
-    const uint64_t inner = latency - 1;
-    const uint64_t before_c = std::min(wait, inner);
-    uint64_t after_c = 0;
-    uint64_t terms = k + 1;
-    bool summed = false; // an earlier stage held the one sum
-    for (uint64_t stage = 0; before_c + stage < inner; ++stage) {
-        uint64_t word = 32; // the packed result, delayed
-        if (!summed && terms > 1) {
-            word = (stage == 0 ? k * 28 + 27 : terms * (28 + stage)) + 8; // the tree
-        } else if (!summed) {
-            word = 28 + stage + 8; // the one sum and its exponent
-            summed = true;
-        }
-        after_c += m * n * word;
-        terms = (terms + 1) / 2;
-    }
-    black_box.cost.flip_flops = before_c * (m * k + k * n) * 16 + after_c;
-    black_box.cost.multipliers = m * n * k;
-    black_box.cost_function = "min(W, L - 1) x (core_m x core_k + core_k x core_n) x 16 + over the stages after C, "
-        "per result word: (k x 28 + 27 + 8), then terms x (28 + stage) + 8 with the terms halving, the one sum "
-        "(28 + stage) + 8, and 32 for each stage after it; core_m x core_n x core_k multipliers; core " +
-        std::to_string(m) + " x " + std::to_string(n) + " x " + std::to_string(k) + ", W " + std::to_string(wait) +
-        ", L " + std::to_string(latency);
-    if (latency <= wait) {
+    if (c.mma_result_latency_cycles <= wait) {
         black_box.note = "AT THIS PROFILE THE LATENCY IS NOT A REGISTERED ONE: mma.result_latency_cycles (" +
-            std::to_string(latency) + ") equals tmem.port_depth + tmem.read_latency_cycles (" + std::to_string(wait) +
-            "), so C is at tmem's output in the cycle the result is due in the output register and no clock edge "
+            std::to_string(c.mma_result_latency_cycles) + ") equals tmem.port_depth + tmem.read_latency_cycles (" +
+            std::to_string(wait) + "), so C is at tmem's output in the cycle the result is due in the output register and no clock edge "
             "is left for the arithmetic after C (the simulator computes at the C read, " +
             std::to_string(c.tmem_read_latency_cycles) + " cycles earlier); the profile is accepted";
     }
@@ -467,7 +426,6 @@ void Machine::declare_mma_core_black_box() {
     mma_core_.build(black_box, [](const std::deque<MmaCoreStep>& waiting) { return waiting.empty(); });
     black_boxes_.push_back(std::move(black_box));
 }
-// END BLACK BOX: MMA core
 
 // The tmem writes at the RAM now: the MMA's result block through each fine
 // bank's write port 0, an acc.st beat through write port 1 (one word per fine
