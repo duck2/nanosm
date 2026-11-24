@@ -97,7 +97,8 @@ int32_t read_memory(
     try {
         last_error.clear();
         auto& value = session(handle);
-        const auto& memory = global ? value.machine->gmem() : value.machine->shmem();
+        const auto shared = global ? std::vector<uint8_t>{} : value.machine->shmem();
+        const auto& memory = global ? value.machine->gmem() : shared;
         if (output == nullptr && size != 0) throw nanosm::SimError("memory output pointer is null");
         if (address > memory.size() || size > memory.size() - address) {
             throw nanosm::SimError(global ? "gmem read is out of bounds" : "shmem read is out of bounds");
@@ -335,6 +336,16 @@ uint64_t nanosm_session_launch_image(uint32_t handle, char* output, uint64_t cap
     try {
         last_error.clear();
         return copy_string(session(handle).launch_image, output, capacity);
+    } catch (const std::exception& error) {
+        fail(error.what());
+        return NANOSM_SIZE_ERROR;
+    }
+}
+
+uint64_t nanosm_session_state_report(uint32_t handle, char* output, uint64_t capacity) {
+    try {
+        last_error.clear();
+        return copy_string(session(handle).machine->state_report(), output, capacity);
     } catch (const std::exception& error) {
         fail(error.what());
         return NANOSM_SIZE_ERROR;

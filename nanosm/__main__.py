@@ -3,10 +3,17 @@ from __future__ import annotations
 import runpy
 import sys
 
+from . import launch
 
-if len(sys.argv) < 2:
-    raise SystemExit("usage: python -m nanosm LAUNCH.py [arguments...]")
+usage = "usage: python -m nanosm [--state-report] LAUNCH.py [arguments...]"
+arguments = sys.argv[1:]
+if arguments and arguments[0] == "--state-report":
+    # The first machine the launch builds prints its state report first.
+    launch.print_state_report = True
+    arguments = arguments[1:]
+if not arguments:
+    raise SystemExit(usage)
 
-script = sys.argv[1]
-sys.argv = sys.argv[1:]
+script = arguments[0]
+sys.argv = arguments
 runpy.run_path(script, run_name="__main__")

@@ -116,12 +116,20 @@ std::optional<Machine::BranchResolution> Machine::resolve_branch() const {
 }
 
 // A pop presented the new top's address last cycle (DivergenceRefill): the
-// entry is at the stack memory's output now.
-std::optional<std::pair<uint32_t, Machine::DivergenceEntry>> Machine::divergence_memory_output() const {
+// entry is at the stack memory's read port output now.
+std::optional<std::pair<uint32_t, Machine::DivergenceEntry>> Machine::divergence_memory_output() {
     const auto& refill = divergence_refill_.cur();
     if (!refill.has_value()) return std::nullopt;
-    return std::make_pair(refill->warp, divergence_stack_.at(
-        static_cast<std::size_t>(refill->warp) * config_.core_divergence_stack_entries + refill->index));
+    const auto row = static_cast<std::size_t>(refill->warp) * config_.core_divergence_stack_entries + refill->index;
+    return std::make_pair(refill->warp, divergence_stack_.read(0, row, "divergence stack: a pop's refill", 0)[0]);
+}
+
+// A push at the resolve cycle: its entry goes through the write port and
+// lands at the clock edge.
+void Machine::land_divergence_push(const Wires& w) {
+    if (!w.branch.has_value() || !w.branch->push.has_value()) return;
+    divergence_stack_.write(0, w.branch->push_slot, std::span<const DivergenceEntry>(&*w.branch->push, 1),
+        Memory<DivergenceEntry>::every_element, "divergence stack: a push", 0);
 }
 
 bool Machine::holds_its_warp(const IssuedBranch& branch) {
@@ -169,8 +177,10 @@ void Machine::drive_divergence(const Wires& w) {
 }
 
 std::vector<uint32_t> Machine::capture_predicate(const Warp& warp, uint8_t predicate) const {
-    const auto& bits = warp.predicates.at(predicate);
-    return std::vector<uint32_t>(bits.begin(), bits.end());
+    const uint64_t bits = predicates_.cur().at(predicate_index(warp.id, predicate));
+    std::vector<uint32_t> lanes(config_.lanes);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) lanes[lane] = static_cast<uint32_t>(bits >> lane & 1);
+    return lanes;
 }
 
 } // namespace nanosm

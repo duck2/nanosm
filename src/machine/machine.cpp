@@ -31,12 +31,16 @@
 //   sanitizer.cpp      the sanitizer (sanitizer.hpp): shadow state that only decides whether to PANIC.
 //   sanitizer_arguments.cpp what the machine hands the sanitizer: pure reads of hardware state that feed
 //                      nothing in the machine.
+//   state_report.cpp   every primitive's declared hardware bits, and the state report by unit.
 //   trace.cpp          the trace writer (trace.hpp).
 //   common.cpp         helpers shared by the units: float bit conversions, round-robin grants, the lane mask and
 //                      panics.
 //   reg.hpp            Reg<T>, the clocked register every unit's state is made of.
 //   regs.hpp           Regs<T>, a group of registers under one name: one per warp, per bank, per slot.
 //   pipe.hpp           Pipe<T>, N stages in a row: what is in flight for a fixed number of cycles.
+//   fifo.hpp           Fifo<T>, the deep queues toward global memory: push at the tail, pop at the head.
+//   memory.hpp         Memory<T>, words in banks read and written only through their ports: the register
+//                      files, shared memory, tmem, the instruction memory, the divergence stack.
 //   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles; the
 //                      payloads not there yet are listed at the end of machine.hpp).
 //   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.
@@ -143,10 +147,25 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
                 " active warps (bank " + std::to_string(bank) + ")");
         }
     }
+    // Bank 0 holds the most of a warp's rows (registers 0, banks, 2 x banks,
+    // ...), so every warp takes that many rows in every bank (rf_address).
+    rf_rows_per_warp_ = (kernel_.register_count + config_.rf_banks - 1) / config_.rf_banks;
     try {
-        shmem_.assign(config_.shmem_bytes, 0);
+        rf_.build(MemoryShape{config_.rf_banks, config_.rf_rows_per_bank, config_.lanes, uint64_t{32} * config_.lanes,
+            config_.rf_read_ports_per_bank, config_.rf_write_ports_per_bank, config_.rf_read_latency_cycles,
+            SameCycle::read_first});
+        urf_.build(MemoryShape{1, std::size_t{config_.core_warps} * config_.urf_registers, 1, 32, urf_read_ports,
+            urf_write_ports, config_.urf_read_latency_cycles, SameCycle::read_first});
+        // An mbar's two words are read and written in one round (a probe, an
+        // RMW's read and write), so a one-bank shared memory is 8 bytes wide.
+        shmem_word_bytes_ = config_.shmem_banks == 1 ? 8 : 4;
+        const std::size_t shmem_line_bytes = std::size_t{shmem_word_bytes_} * config_.shmem_banks;
+        shmem_.build(MemoryShape{config_.shmem_banks, (config_.shmem_bytes + shmem_line_bytes - 1) / shmem_line_bytes,
+            shmem_word_bytes_, uint64_t{8} * shmem_word_bytes_, 2, 2, config_.shmem_read_latency_cycles,
+            SameCycle::read_first});
         gmem_.assign(static_cast<std::size_t>(config_.gmem_bytes), 0);
-        tmem_.assign(static_cast<std::size_t>(config_.tmem_fine_banks) * config_.tmem_words_per_fine_bank, 0);
+        tmem_.build(MemoryShape{config_.tmem_fine_banks, config_.tmem_words_per_fine_bank, 1, 32, 2, 2,
+            config_.tmem_read_latency_cycles, SameCycle::read_first});
         acc_engines_.poke(AccEngines{});
         acc_ld_pipe_.build(config_.tmem_port_depth + config_.tmem_read_latency_cycles);
         acc_st_pipe_.build(config_.rf_read_latency_cycles + config_.tmem_port_depth);
@@ -182,8 +201,12 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // The furthest booking: the slowest fixed result's write port.
         write_calendar_.build(issue_to_operands(config_) +
             std::max({config_.timing.alu, config_.timing.fadd, config_.timing.sfu}) + 1);
-        write_calendar_.declare_payload_bits(
-            uint64_t{config_.rf_banks} * static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
+        // A booking d cycles ahead (1 .. stages - 1) enters at stage
+        // stages - 1 - d and is in the stage after it from the edge on, so
+        // stage 0 never holds one. Each other stage is a count of booked
+        // ports per bank, zero meaning free (no valid bit).
+        write_calendar_.declare_total_bits(uint64_t{write_calendar_.stages() - 1} * config_.rf_banks *
+            static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
         TmaSectorRegister sector;
         sector.data.assign(config_.gmem_sector_bytes, 0);
         tma_sector_.poke(std::move(sector));
@@ -217,11 +240,10 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         for (uint32_t id = 0; id < launch.active_warps; ++id) {
             Warp warp;
             warp.id = id;
-            warp.rf.resize(static_cast<std::size_t>(config_.lanes) * kernel_.register_count, 0);
-            for (auto& predicate : warp.predicates) predicate.resize(config_.lanes, 0);
-            warp.urf.resize(config_.urf_registers, 0);
             warps_.push_back(std::move(warp));
         }
+        predicates_.build(std::size_t{config_.core_warps} * predicates_per_warp);
+        predicates_.declare_member_bits(config_.lanes);
         urf_pipe_.build(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles);
         tma_read_pairs_.build(config_.urf_read_latency_cycles);
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
@@ -237,8 +259,14 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // The mask, the depth, and the top copy (a pc and a mask).
         divergence_.declare_member_bits(uint64_t{config_.lanes} +
             static_cast<uint64_t>(std::bit_width(config_.core_divergence_stack_entries)) + 32 + config_.lanes);
-        divergence_stack_.assign(static_cast<std::size_t>(config_.core_warps) * config_.core_divergence_stack_entries,
-            DivergenceEntry{});
+        divergence_stack_.build(MemoryShape{1,
+            std::size_t{config_.core_warps} * config_.core_divergence_stack_entries, 1, uint64_t{32} + config_.lanes, 1,
+            1, 1, SameCycle::read_first});
+        instruction_memory_.build(MemoryShape{1, (kernel_.words.size() + 1) / 2, 2, 128, 1, 0,
+            instruction_read_cycles, SameCycle::read_only});
+        for (std::size_t word = 0; word < kernel_.words.size(); ++word) {
+            instruction_memory_.poke(0, word / 2, word % 2, kernel_.words[word]);
+        }
         // Per warp slot, launched or not (a slot not launched never counts).
         depbar_.build(config_.core_warps);
         // The most one warp can have counted on one depbar. An instruction
@@ -288,6 +316,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         shmem_to_ram_.build(config_.core_warps);
         shmem_to_ram_.declare_member_bits(
             static_cast<uint64_t>(std::bit_width(config_.shmem_port_a_depth > 0 ? config_.shmem_port_a_depth - 1 : 0u)));
+        declare_state_bits();
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
         throw SimError("machine state does not fit in host memory");
@@ -297,7 +326,15 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     trace_.emplace(
         launch.active_warps, config_.core_clock_hz, config_.dram_clock_hz, trace_options);
     trace_->set_mma_shapes(config_.mma_shapes);
-    apply_image(shmem_, launch.test_shmem, "shmem");
+    for (const auto& segment : launch.test_shmem) {
+        if (segment.address > shmem_bytes() || segment.bytes.size() > shmem_bytes() - segment.address) {
+            throw SimError("launch shmem image segment does not fit");
+        }
+        for (std::size_t byte = 0; byte < segment.bytes.size(); ++byte) {
+            const auto at = shmem_word(static_cast<uint32_t>(segment.address + byte));
+            shmem_.poke(at.bank, at.row, at.byte, segment.bytes[byte]);
+        }
+    }
     uint64_t test_preload_bytes = 0;
     for (const auto& segment : launch.test_shmem) test_preload_bytes += segment.bytes.size();
     trace_->test_preload(test_preload_bytes);
@@ -308,7 +345,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // like a SIMT mbar.init's. A declaration is metadata;
     // the machine only checks that it names an mbar slot.
     for (const auto address : launch.mbars) {
-        if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_.size()) {
+        if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_bytes()) {
             throw SimError("launch declares an mbar at " + std::to_string(address) +
                 ", which is not 8-byte aligned in shmem");
         }
@@ -358,8 +395,9 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          data is visible at t+1; nothing passes through.
 //      (e) A dispatched stg.v8 may make its first RF read beat in its
 //          dispatch cycle.
-//      (f) Inside the MMA: a result's tmem write precedes the same cycle's
-//          accumulator read (write-first).
+//      (f) Inside the MMA: a step whose tile's previous result lands at this
+//          cycle's edge may start its operand fetch now; its C is read from
+//          tmem cycles after that landing (tmem itself is read first).
 //      (g) The placeholder controller may put a request accepted at t on the
 //          bus at t (outside the SM; the timeline test pins request -> beat 0).
 //      (h) A TMA shmem transaction is granted its first round in the cycle
@@ -387,8 +425,9 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          the ingress read decision -> the walker's step, in one cycle.
 // 2. DRIVERS. Each register's next value, from Q and the wires. They run in
 //    any order (set_driver_shuffle_seed() permutes them every cycle).
-// 3. CLOCK EDGE. Every register takes D; shmem takes the write rounds that
-//    reached the RAM this cycle (A-write, then port-B write).
+// 3. CLOCK EDGE. The writes at the memories' RAM this cycle go through their
+//    write ports (src/machine/memory.hpp); then every register takes D and
+//    every memory its writes (shmem: A-write's, then port-B write's).
 // ===========================================================================
 void Machine::tick() {
     if (done()) return;
@@ -473,16 +512,17 @@ void Machine::tick() {
     step_urf(w);
 
     run_drivers(w);
-
-    // Clock edge: the registers, then the memories' writes at their RAM now.
-    registers_.commit();
-    for (const auto& write : w.shmem.writes) {
-        std::memcpy(shmem_.data() + write.address, write.bytes.data(), write.bytes.size());
-    }
-    for (const auto& [word, value] : w.tmem_writes) tmem_[word] = value;
-    if (w.branch.has_value() && w.branch->push.has_value()) divergence_stack_.at(w.branch->push_slot) = *w.branch->push;
+    // The memories' writes at their RAM now, through their write ports (the
+    // RF's, the URF's, shared memory's ports A and B, tmem's, the divergence
+    // stack's). Each memory holds them until the clock edge.
     land_rf_writes(w);
     land_urf_write(w);
+    land_shmem_writes(w);
+    land_tmem_writes(w);
+    land_divergence_push(w);
+
+    // Clock edge: every register takes D and every memory its writes.
+    registers_.commit();
     ++cycle_;
     // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
     if (done()) sanitizer_.check_kernel_end(cycle_);
@@ -537,11 +577,11 @@ bool Machine::done() const {
 }
 
 uint32_t Machine::read_shmem_u32(uint32_t byte_address) const {
-    if (byte_address % 4 != 0 || static_cast<uint64_t>(byte_address) + 4 > shmem_.size()) {
+    if (byte_address % 4 != 0 || static_cast<uint64_t>(byte_address) + 4 > shmem_bytes()) {
         throw SimError("invalid host shmem u32 read");
     }
     uint32_t value = 0;
-    std::memcpy(&value, shmem_.data() + byte_address, sizeof(value));
+    std::memcpy(&value, shmem_.contents().data() + byte_address, sizeof(value));
     return value;
 }
 
@@ -559,7 +599,7 @@ MbarState Machine::read_mbar_state(uint32_t byte_address) const {
 }
 
 void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t parity) {
-    if (byte_address % 8 != 0 || static_cast<uint64_t>(byte_address) + 8 > shmem_.size()) {
+    if (byte_address % 8 != 0 || static_cast<uint64_t>(byte_address) + 8 > shmem_bytes()) {
         throw SimError("invalid engine mbar address");
     }
     if (parity > 1) throw SimError("invalid engine mbar parity");
@@ -588,12 +628,13 @@ uint32_t Machine::read_reg(
     if (warp >= warps_.size() || lane >= config_.lanes || reg >= kernel_.register_count) {
         throw SimError("invalid host RF read");
     }
-    return rf(warps_[warp], lane, reg);
+    const auto address = rf_address(warp, reg);
+    return rf_.peek(address.bank, address.row)[lane];
 }
 
 uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
     if (warp >= warps_.size() || reg >= config_.urf_registers) throw SimError("invalid host URF read");
-    return warps_[warp].urf[reg];
+    return urf_.peek(0, urf_row(warp, reg))[0];
 }
 
 // ===========================================================================
@@ -610,7 +651,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 42> canonical = {
+    static constexpr std::array<Driver, 43> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -645,6 +686,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_read_records,
         &Machine::drive_free_id_tags,
         &Machine::drive_writebacks,
+        &Machine::drive_predicates,
         &Machine::drive_rf_write_policy,
         &Machine::drive_rf_read_policy,
         &Machine::drive_issue_read_banks,

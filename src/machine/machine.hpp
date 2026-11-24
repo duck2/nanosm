@@ -7,6 +7,7 @@
 #include "profile.hpp"
 #include "machine/fifo.hpp"
 #include "machine/fixed.hpp"
+#include "machine/memory.hpp"
 #include "machine/pipe.hpp"
 #include "machine/reg.hpp"
 #include "machine/regs.hpp"
@@ -218,8 +219,18 @@ public:
     [[nodiscard]] std::vector<uint32_t> lsu_buffer_words(uint32_t index) const {
         return lsu_buffers_.at(index).cur().words;
     }
-    // Every clocked register's declared size, in declaration order.
+    // Every clocked register's and memory's declared size, in declaration order.
     [[nodiscard]] std::vector<StateSize> state_sizes() const { return registers_.sizes(); }
+    // The state report (src/machine/state_report.cpp): declared bits by unit,
+    // flip-flops, memories and FIFO storage, and the totals.
+    [[nodiscard]] std::string state_report() const;
+    // The primitives that cannot declare their bits yet, by name, each with
+    // what is still in it.
+    [[nodiscard]] std::vector<std::string> state_not_yet_declared() const {
+        std::vector<std::string> names;
+        for (const auto& entry : not_yet_declared()) names.push_back(entry.first->name());
+        return names;
+    }
     // Test seams (Q, between ticks): whether load slot `index` is held, and
     // whether its gathered vector is complete (a ready async RF writer);
     // whether store slot `index` is held.
@@ -276,7 +287,9 @@ public:
     }
     // Test seam (between ticks): tmem word `word` (word w is in fine bank
     // w % tmem.fine_banks).
-    [[nodiscard]] uint32_t tmem_word(uint32_t word) const { return tmem_.at(word); }
+    [[nodiscard]] uint32_t tmem_word(uint32_t word) const {
+        return tmem_.peek(word % config_.tmem_fine_banks, word / config_.tmem_fine_banks)[0];
+    }
     // Test seam (between ticks): uniform register `reg` of warp `warp`.
     [[nodiscard]] uint32_t read_ureg(uint32_t warp, uint32_t reg) const;
 
@@ -286,7 +299,12 @@ public:
     [[nodiscard]] bool done() const;
     [[nodiscard]] uint64_t cycle() const { return cycle_; }
     [[nodiscard]] const TraceRecorder& trace() const { return *trace_; }
-    [[nodiscard]] const std::vector<uint8_t>& shmem() const { return shmem_; }
+    // Shared memory's shmem.bytes bytes in address order (an observer's copy;
+    // the memory's last row may hold more, which no address reaches).
+    [[nodiscard]] std::vector<uint8_t> shmem() const {
+        return std::vector<uint8_t>(shmem_.contents().begin(),
+            shmem_.contents().begin() + static_cast<std::ptrdiff_t>(shmem_bytes()));
+    }
     [[nodiscard]] const std::vector<uint8_t>& gmem() const { return gmem_; }
 
     [[nodiscard]] uint32_t read_shmem_u32(uint32_t byte_address) const;
@@ -322,11 +340,12 @@ private:
         uint64_t deadline_cycle = 0;
     };
 
-    // Issue-internal warp state (only the scheduler reads or writes it), plus
-    // the warp's RF and predicate memories. The depbar counters and the mbar
-    // wait slots, which other units complete, are registers (below), and so
-    // is the warp's front end (its PCs, instruction buffer and halted bit,
-    // WarpFrontEnd), which fetch reads.
+    // Issue-internal warp state (only the scheduler reads or writes it). The
+    // depbar counters and the mbar wait slots, which other units complete,
+    // are registers (below), and so are the warp's front end (its PCs,
+    // instruction buffer and halted bit, WarpFrontEnd), which fetch reads,
+    // and its predicate file (predicates_). Its vector and uniform registers
+    // are in the register files' memories (rf_, urf_).
     struct Warp {
         uint32_t id = 0;
         // (The warp's active mask is a register: divergence_, below.)
@@ -336,13 +355,7 @@ private:
         // is the register's next value; nothing else -- fetch included --
         // reads it.
         uint64_t stall_until = 0;
-        std::vector<uint32_t> rf;
         // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
-        std::array<std::vector<uint8_t>, 7> predicates;
-        // The warp's uniform registers (urf.registers x 32 bits, LUTRAM),
-        // written only by the URF write pipeline's RAM stage, at the clock
-        // edge (READ_FIRST, src/timing.hpp).
-        std::vector<uint32_t> urf;
     };
 
     // One warp slot's front end, one
@@ -1854,6 +1867,7 @@ private:
         std::optional<ReadBeat> sampled;             // the read round at the RAM now, with its words
         std::optional<ReadBeat> delivered;           // the read round at the port output now
         std::vector<ShmemWrite> writes;              // the write rounds at the RAM now: land at the clock edge
+        std::size_t port_a_writes = 0;               // the first this many are A-write's (port A), the rest port B's
         AWriteGrant a_write;
         std::optional<RmwStart> rmw_start;           // the requester the RMW engine takes now (its PAUSE begins)
         AReadGrant a_read;
@@ -2022,10 +2036,12 @@ private:
         // The RF and predicate writes at the RAM now: they land at this
         // cycle's clock edge (after every read of this cycle).
         std::vector<Writeback> rf_landings;
-        // The tmem writes at the RAM now (MMA results, acc.st beats): they
-        // land at this cycle's clock edge, after every tmem read of this
-        // cycle (READ_FIRST, as shmem). (word address, value)
-        std::vector<std::pair<uint32_t, uint32_t>> tmem_writes;
+        // The tmem writes at the RAM now, through each fine bank's two write
+        // ports (MMA results, acc.st beats): they land at this cycle's clock
+        // edge, after every tmem read of this cycle (READ_FIRST, as shmem).
+        // (physical word, value)
+        std::vector<std::pair<uint32_t, uint32_t>> mma_tmem_writes;
+        std::vector<std::pair<uint32_t, uint32_t>> acc_st_tmem_writes;
         // Collected as they happen, from several steps below.
         std::vector<DepbarEvent> depbar_completions;  // in the order they happened
         std::vector<uint32_t> completed_waits;        // try-wait slots completed this cycle
@@ -2126,39 +2142,102 @@ private:
     // Every Reg below registers itself here; tick() ends with registers_.commit().
     RegisterFile registers_{sanitizer_, cycle_};
 
-    // ---- Memories (not registers: written through their ports, see tick()) ----
-    std::vector<Warp> warps_;                     // + RF and predicate files (write-first)
-    std::vector<uint8_t> shmem_;                  // writes land at the clock edge of the cycle they reach the RAM
-    std::vector<uint8_t> gmem_;                   // the controller's
-    // tmem: fine_banks x words_per_fine_bank words; word w is in fine bank
-    // w % fine_banks. Each fine bank's two read and two write services belong
-    // to the MMA (C read, result write) and to the acc.ld and acc.st engines.
-    std::vector<uint32_t> tmem_;
+    // ---- Memories (src/machine/memory.hpp: read and written through their ports) ----
+    std::vector<Warp> warps_;                     // + the predicate files
+    // The vector register file: rf.banks memories (one per bank) of
+    // rf.rows_per_bank rows, a row one lane-wide register (lanes x 32 bits,
+    // a write enables lanes one by one); rf.read_ports_per_bank read ports
+    // and rf.write_ports_per_bank write ports per bank. A read sampled at S
+    // has its words at the output S + Lr later (the pipelines that carry
+    // them: the arithmetic and dispatch pipelines, the acc.st and store-data
+    // read pipelines); a write lands at the edge of its RAM cycle (read
+    // first, src/timing.hpp). Warp w's register r is at rf_address(w, r).
+    Memory<uint32_t> rf_{registers_, Unit::register_file, "vector register file"};
+    // A warp's rows in each bank: the kernel's register count over the banks,
+    // rounded up (rf_address).
+    uint32_t rf_rows_per_warp_ = 0;
+    // The uniform register file: one memory of core.warps x urf.registers
+    // 32-bit words (LUTRAM), warp w's register r at row w x urf.registers +
+    // r. The SM's two read ports (urf_read_ports, src/timing.hpp: an
+    // instruction's round, the TMA's and the mma.async's later rounds, the
+    // uniform ALU's sample) and one write port (the URF write pipeline's RAM
+    // stage). A read sampled at S has its word at the output S + Lu later;
+    // a write lands at the edge of its RAM cycle (read first).
+    Memory<uint32_t> urf_{registers_, Unit::uniform_file, "uniform register file"};
+    // Shared memory: shmem.banks memories (banks) of 4-byte words, word w of
+    // the byte address space in bank w mod banks, row w / banks (shmem.bytes
+    // over 4 x banks rows: 1024 at the canonical profile); a write enables
+    // bytes one by one. (An mbar's two words are read and written in one
+    // round, so on a one-bank profile the words are 8 bytes: shmem_word_bytes_.
+    // The bank rounds still count 4-byte words.) Two read and two write ports
+    // per bank: port A (the
+    // A-read service's sample; the A-write service: stores, RMW writes) and
+    // port B (the tensor core's operand fetch; the TMA's placement). A
+    // round reaches the RAM D (shmem.port_a_depth) cycles after its grant
+    // (the services' pipelines), and a read's words are at the port output Lb
+    // (shmem.read_latency_cycles) after its sample; a write lands at the
+    // edge of its RAM cycle (read first).
+    Memory<uint8_t> shmem_{registers_, Unit::shared_memory, "shared memory"};
+    static constexpr uint32_t shmem_port_a = 0;
+    static constexpr uint32_t shmem_port_b = 1;
+    uint32_t shmem_word_bytes_ = 4;
+    std::vector<uint8_t> gmem_;                   // the controller's (outside the SM)
+    // tmem: tmem.fine_banks memories (fine banks) of tmem.words_per_fine_bank
+    // 32-bit words; physical word w (src/layout.hpp) is in fine bank
+    // w % fine_banks, row w / fine_banks. Each fine bank's two read and two
+    // write ports belong to the MMA (read port 0: its C read; write port 0:
+    // its results) and to the accumulator engines (read port 1: acc.ld; write
+    // port 1: acc.st). A request reaches the RAM tmem.port_depth after it
+    // leaves its producer and a read's words are at the output
+    // tmem.read_latency_cycles after the sample (the MMA's result pipeline,
+    // the acc.ld and acc.st pipelines); a write lands at the edge of its RAM
+    // cycle (read first).
+    Memory<uint32_t> tmem_{registers_, Unit::tensor_core, "tensor memory"};
+    static constexpr uint32_t tmem_port_mma = 0;
+    static constexpr uint32_t tmem_port_acc = 1;
+    [[nodiscard]] uint32_t read_tmem(uint32_t word, uint32_t port, const char* tag) {
+        return tmem_.read(word % config_.tmem_fine_banks, word / config_.tmem_fine_banks, tag, port)[0];
+    }
+    [[nodiscard]] std::size_t tmem_words() const {
+        return std::size_t{config_.tmem_fine_banks} * config_.tmem_words_per_fine_bank;
+    }
     // The divergence stack memory: core.warps x core.divergence_stack_entries
-    // entries of 48 bits (DivergenceEntry), warp w's entry i at w x entries
-    // + i (16 x 8 x 48 = 6144 bits canonical). One access per cycle: the one
-    // control instruction resolving in the issue register writes a push or
-    // presents a pop's read (its output is the next cycle's). A write lands at
-    // the clock edge of its resolve cycle.
-    std::vector<DivergenceEntry> divergence_stack_;
+    // entries of 32 + core.lanes bits (DivergenceEntry: 48 canonical), warp
+    // w's entry i at row w x entries + i (16 x 8 x 48 = 6144 bits canonical).
+    // One write port and one read port: the one control instruction resolving
+    // in the issue register writes a push, which lands at the clock edge of
+    // its resolve cycle, or presents a pop's address (divergence_refill_, the
+    // address register), whose entry is at the read port's output the next
+    // cycle (an asynchronous read of the registered address: read delay 1).
+    // A read and a write in one cycle are two warps' entries; the read would
+    // see the old entry (read first).
+    Memory<DivergenceEntry> divergence_stack_{registers_, Unit::branches, "divergence stack"};
+    // The instruction memory: the kernel's words, two to a row (a fetch
+    // packet: the two 64-bit words at an aligned 16-byte address), loaded by
+    // the host before the first cycle and never written. One read port: a
+    // fetch's address is sampled at its grant's edge (fetch_read_, the
+    // address register) and the packet is at the output the next cycle
+    // (instruction_read_cycles, src/timing.hpp). Its size is the kernel's: the
+    // profile has none.
+    Memory<uint64_t> instruction_memory_{registers_, Unit::front_end, "instruction memory"};
 
     // ---- Registers: the declared storage boundaries ----
     // The front end: per warp slot its FIFO,
     // PCs and halted bit; the instruction memory's read in flight; the fetch
     // round-robin cursor (4 bits at 16 warps); the issue register's branch.
-    Regs<WarpFrontEnd> front_end_{registers_, "instruction buffers and PCs"}; // per warp slot
-    Reg<std::optional<FetchRead>> fetch_read_{registers_, "instruction memory read (address, tag)"};
-    Reg<uint32_t> fetch_cursor_{registers_, "fetch round-robin cursor"};
-    Reg<std::optional<IssuedBranch>> issue_branch_{registers_, "issue register: branch"};
+    Regs<WarpFrontEnd> front_end_{registers_, Unit::front_end, "instruction buffers and PCs"}; // per warp slot
+    Reg<std::optional<FetchRead>> fetch_read_{registers_, Unit::front_end, "instruction memory read (address, tag)"};
+    Reg<uint32_t> fetch_cursor_{registers_, Unit::front_end, "fetch round-robin cursor"};
+    Reg<std::optional<IssuedBranch>> issue_branch_{registers_, Unit::branches, "issue register: branch"};
     // Per warp slot (core.warps) its active mask, stack depth and top copy;
     // and the stack memory's one read in flight.
-    Regs<WarpDivergence> divergence_{registers_, "active masks, divergence stack depths and tops"};
-    Reg<std::optional<DivergenceRefill>> divergence_refill_{registers_, "divergence stack memory read"};
+    Regs<WarpDivergence> divergence_{registers_, Unit::branches, "active masks, divergence stack depths and tops"};
+    Reg<std::optional<DivergenceRefill>> divergence_refill_{registers_, Unit::branches, "divergence stack memory read"};
     // Scheduler-visible state other units complete.
     // (Per warp slot, core.warps; sync.mbar_wait_slots slots.)
-    Regs<DepbarCounters> depbar_{registers_, "depbar counters"};
+    Regs<DepbarCounters> depbar_{registers_, Unit::issue, "depbar counters"};
     uint32_t depbar_counter_max_ = 0;
-    Regs<std::optional<MbarWaitSlot>> mbar_wait_slots_{registers_, "mbar wait slots"};
+    Regs<std::optional<MbarWaitSlot>> mbar_wait_slots_{registers_, Unit::barriers, "mbar wait slots"};
     // shmem: the SIMT service slots, the probe register, the RMW
     // engine and its three requester registers, the services' pipelines and
     // arbiters. Each requester holds at most one pending RMW in its own
@@ -2170,74 +2249,74 @@ private:
     //         complete_mbar_tx). An engine stalls only on its own register.
     //   MMA:  a commit's arrive {address}.
     // A request written at t is visible to the RMW engine from t + 1.
-    Regs<std::optional<LoadSlot>> load_slots_{registers_, "load slots"};    // shmem.load_slots
-    Regs<std::optional<StoreSlot>> store_slots_{registers_, "store slots"}; // shmem.store_slots
-    Reg<std::optional<MbarReadRequest>> mbar_probe_{registers_, "SIMT mbar probe"};
-    Reg<std::optional<MbarRmwRequest>> simt_rmw_{registers_, "SIMT RMW register"};
-    Reg<RmwEngine> rmw_{registers_, "RMW engine"};
+    Regs<std::optional<LoadSlot>> load_slots_{registers_, Unit::shared_memory, "load slots"};    // shmem.load_slots
+    Regs<std::optional<StoreSlot>> store_slots_{registers_, Unit::shared_memory, "store slots"}; // shmem.store_slots
+    Reg<std::optional<MbarReadRequest>> mbar_probe_{registers_, Unit::barriers, "SIMT mbar probe"};
+    Reg<std::optional<MbarRmwRequest>> simt_rmw_{registers_, Unit::barriers, "SIMT RMW register"};
+    Reg<RmwEngine> rmw_{registers_, Unit::barriers, "RMW engine"};
     // A-read: D stages to the RAM, where the round's words are sampled (stage
     // D - 1), then Lb to the port output (the last stage). A-write and port-B
     // write: D stages to the RAM (the last stage), where the bytes land.
-    Pipe<ReadBeat> a_read_pipe_{registers_, "A-read pipeline"};
-    Pipe<WriteBeat> a_write_pipe_{registers_, "A-write pipeline"};
-    Pipe<WriteBeat> b_write_pipe_{registers_, "port-B write pipeline"};
+    Pipe<ReadBeat> a_read_pipe_{registers_, Unit::shared_memory, "A-read pipeline"};
+    Pipe<WriteBeat> a_write_pipe_{registers_, Unit::shared_memory, "A-write pipeline"};
+    Pipe<WriteBeat> b_write_pipe_{registers_, Unit::shared_memory, "port-B write pipeline"};
     // The RMW engine's ALU (shmem.rmw_compute_cycles = C stages): the update
     // computed from the read's words at the port output enters stage 0 at that
     // cycle's edge; it is ready in the last stage C cycles after the port
     // output, and its write is granted then.
-    Pipe<WriteBeat> rmw_alu_{registers_, "RMW engine: ALU stages"};
-    Reg<ShmemArbiters> shmem_arbiters_{registers_, "shmem A-read / A-write arbiters"};
+    Pipe<WriteBeat> rmw_alu_{registers_, Unit::barriers, "RMW engine: ALU stages"};
+    Reg<ShmemArbiters> shmem_arbiters_{registers_, Unit::shared_memory, "shmem A-read / A-write arbiters"};
     // fence.sh, per warp: how many cycles from now until
     // the warp's latest granted shmem round reaches the RAM (a write's edge,
     // a read's sample: grant + D). A grant at g sets it to D - 1 at g + 1; it
     // counts down to 0, the cycle that round is at the RAM. 0..D-1:
     // ceil(log2(D)) bits per warp slot (core.warps).
-    Regs<uint32_t> shmem_to_ram_{registers_, "per-warp shmem cycles to the RAM"};
-    Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{registers_, "TMA mbar event register"};
-    Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, "MMA mbar event register"};
+    Regs<uint32_t> shmem_to_ram_{registers_, Unit::shared_memory, "per-warp shmem cycles to the RAM"};
+    Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{registers_, Unit::barriers, "TMA mbar event register"};
+    Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{registers_, Unit::barriers, "MMA mbar event register"};
     // MMA and accumulator transfers.
-    Reg<MmaPipeline> mma_{registers_, "MMA queue and pipeline"};
+    Reg<MmaPipeline> mma_{registers_, Unit::tensor_core, "MMA queue and pipeline"};
     // The port-B read pipeline: D stages to the shmem RAM (a round's elements
     // are sampled at stage D - 1), then Lb to the port output, the last stage.
-    Pipe<MmaRead> mma_reads_{registers_, "MMA port-B read pipeline"};
+    Pipe<MmaRead> mma_reads_{registers_, Unit::tensor_core, "MMA port-B read pipeline"};
     // The steps in the core and on their way to tmem: tmem.port_depth stages
     // to the C sample (stage port_depth - 1), result_latency from entry to
     // the core's output, tmem.port_depth more to the tmem RAM, the last stage
     // (result_latency + port_depth stages in all).
-    Pipe<MmaResult> mma_results_{registers_, "MMA core and result pipeline"};
-    Reg<AccEngines> acc_engines_{registers_, "acc transfer engines"};
+    Pipe<MmaResult> mma_results_{registers_, Unit::tensor_core, "MMA core and result pipeline"};
+    Reg<AccEngines> acc_engines_{registers_, Unit::tensor_core, "acc transfer engines"};
     // The acc.ld engine's pipeline: tmem.port_depth stages to the tmem RAM
     // (sampled at stage port_depth - 1), then tmem.read_latency_cycles to the
     // output, the last stage, which holds the whole pipeline while the RF
     // write decision denies it.
-    Pipe<AccLdBeat> acc_ld_pipe_{registers_, "acc.ld pipeline"};
+    Pipe<AccLdBeat> acc_ld_pipe_{registers_, Unit::tensor_core, "acc.ld pipeline"};
     // The acc.st engine's beats on their way to tmem: the RF's Lr read stages,
     // then tmem.port_depth stages to the RAM, the last stage.
-    Pipe<AccStBeat> acc_st_pipe_{registers_, "acc.st pipeline"};
+    Pipe<AccStBeat> acc_st_pipe_{registers_, Unit::tensor_core, "acc.st pipeline"};
     // TMA.
-    Reg<TmaQueue> tma_{registers_, "TMA command queue"};
-    Pipe<TmaWalkerStart> tma_walker_start_pipe_{registers_, "TMA walker start pipeline"};
+    Reg<TmaQueue> tma_{registers_, Unit::tma, "TMA command queue"};
+    Pipe<TmaWalkerStart> tma_walker_start_pipe_{registers_, Unit::tma, "TMA walker start pipeline"};
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
     // tma_requests builds it (bypass (h) in tick()). The placement (port-B
     // write) register holds the rounds after the first; the A-read one holds
     // a descriptor read until its last round's words are back, a
     // store-source read until its last round's grant.
-    Reg<std::optional<TmaPortRequest>> tma_write_txn_{registers_, "TMA placement transaction"};
-    Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, "TMA read transaction"};
-    Reg<TmaSectorRegister> tma_sector_{registers_, "TMA sector register"};
+    Reg<std::optional<TmaPortRequest>> tma_write_txn_{registers_, Unit::tma, "TMA placement transaction"};
+    Reg<std::optional<TmaReadTransaction>> tma_read_txn_{registers_, Unit::tma, "TMA read transaction"};
+    Reg<TmaSectorRegister> tma_sector_{registers_, Unit::tma, "TMA sector register"};
     // The placement tickets (TmaReturn): tma.sector_credits entries, one
     // write port (muxed between the ingress's completed sector and the
     // walker's zero fill; the sector has it first).
-    Fifo<TmaReturn> tma_returns_{registers_, "TMA placement tickets"};
+    Fifo<TmaReturn> tma_returns_{registers_, Unit::tma, "TMA placement tickets"};
     // tma.store_sector_registers registers, and the ring's head (the oldest
     // held one, which the egress drains).
-    Regs<std::optional<TmaStoreRegister>> tma_store_registers_{registers_, "TMA store sector registers"};
-    Reg<uint32_t> tma_store_head_{registers_, "TMA store sector registers: head"};
+    Regs<std::optional<TmaStoreRegister>> tma_store_registers_{registers_, Unit::tma, "TMA store sector registers"};
+    Reg<uint32_t> tma_store_head_{registers_, Unit::tma, "TMA store sector registers: head"};
     // The URF's round counter (UrfReadRounds above), then the TMA operand
     // read's URF read stages with their tags (Lu stages) and holding register.
-    Reg<std::optional<UrfReadRounds>> urf_read_rounds_{registers_, "URF operand read: round counter"};
-    Pipe<TmaReadPair> tma_read_pairs_{registers_, "TMA operand read: URF read stages and tags"};
-    Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, "TMA operand read: holding register"};
+    Reg<std::optional<UrfReadRounds>> urf_read_rounds_{registers_, Unit::uniform_file, "URF operand read: round counter"};
+    Pipe<TmaReadPair> tma_read_pairs_{registers_, Unit::tma, "TMA operand read: URF read stages and tags"};
+    Reg<std::optional<TmaReadHolding>> tma_holding_{registers_, Unit::tma, "TMA operand read: holding register"};
     // LSU.
     // Sizes: command slots lsu.active_commands (2; checked in
     // drive_lsu_commands); one load buffer and one store buffer (LsuBuffer);
@@ -2245,44 +2324,53 @@ private:
     // two FIFOs) and the read records (LsuRead, TmaRun) as their comments
     // say, each built from the profile (a push past one is an internal
     // error); free-ID tags lsu.sectors_in_flight bits (16, fixed).
-    Reg<LsuCommandSlots> lsu_commands_{registers_, "LSU command slots"};
-    Regs<LsuBuffer> lsu_buffers_{registers_, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
+    Reg<LsuCommandSlots> lsu_commands_{registers_, Unit::load_store, "LSU command slots"};
+    Regs<LsuBuffer> lsu_buffers_{registers_, Unit::load_store, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
     static constexpr uint32_t load_buffer = 0;
     static constexpr uint32_t store_buffer = 1;
-    Fifo<IngressWord> ingress_{registers_, "ingress FIFO"};
-    Reg<std::optional<EgressOpenSlot>> egress_open_{registers_, "egress FIFO: the write port's open slot"};
-    Fifo<EgressRequest> egress_requests_{registers_, "egress FIFO: write requests"};
-    Fifo<EgressSector> egress_data_{registers_, "egress FIFO: sectors"};
+    Fifo<IngressWord> ingress_{registers_, Unit::load_store, "ingress FIFO"};
+    Reg<std::optional<EgressOpenSlot>> egress_open_{registers_, Unit::load_store, "egress FIFO: the write port's open slot"};
+    Fifo<EgressRequest> egress_requests_{registers_, Unit::load_store, "egress FIFO: write requests"};
+    Fifo<EgressSector> egress_data_{registers_, Unit::load_store, "egress FIFO: sectors"};
     // The read records, one FIFO per read stream, and the bytes consumed of
     // each head's sector.
-    Fifo<TmaRun> tma_reads_{registers_, "read records: TMA stream"};
-    Fifo<LsuRead> lsu_reads_{registers_, "read records: LSU stream"};
-    Reg<uint32_t> tma_read_received_{registers_, "read records: TMA stream head's bytes consumed"};
-    Reg<uint32_t> lsu_read_received_{registers_, "read records: LSU stream head's bytes consumed"};
-    Regs<uint8_t> free_id_tags_{registers_, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
+    Fifo<TmaRun> tma_reads_{registers_, Unit::tma, "read records: TMA stream"};
+    Fifo<LsuRead> lsu_reads_{registers_, Unit::load_store, "read records: LSU stream"};
+    Reg<uint32_t> tma_read_received_{registers_, Unit::tma, "read records: TMA stream head's bytes consumed"};
+    Reg<uint32_t> lsu_read_received_{registers_, Unit::load_store, "read records: LSU stream head's bytes consumed"};
+    Regs<uint8_t> free_id_tags_{registers_, Unit::load_store, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
     // The RF write path: fixed results waiting for their booked port cycle,
     // and every write from its port cycle until it lands (src/timing.hpp).
-    Reg<std::deque<Writeback>> writebacks_{registers_, "RF write pipeline"};
-    Regs<RfWritePolicy> rf_write_policy_{registers_, "RF write policy (async_owed, cursor), per bank"};
-    Regs<RfReadPolicy> rf_read_policy_{registers_, "RF read policy (read_owed, cursor), per bank"};
+    Reg<std::deque<Writeback>> writebacks_{registers_, Unit::register_file, "RF write pipeline"};
+    // The predicate files: per warp slot (core.warps) seven predicates of
+    // core.lanes bits, flip-flops, not a memory (src/timing.hpp): a predicate
+    // presented at W is in the file from W + 1. Predicate p of warp w is
+    // member w x 7 + p (predicate_index); bit l is lane l.
+    Regs<uint64_t> predicates_{registers_, Unit::register_file, "predicate files"};
+    static constexpr uint32_t predicates_per_warp = 7;
+    [[nodiscard]] static std::size_t predicate_index(uint32_t warp, uint32_t predicate) {
+        return std::size_t{warp} * predicates_per_warp + predicate;
+    }
+    Regs<RfWritePolicy> rf_write_policy_{registers_, Unit::register_file, "RF write policy (async_owed, cursor), per bank"};
+    Regs<RfReadPolicy> rf_read_policy_{registers_, Unit::register_file, "RF read policy (read_owed, cursor), per bank"};
     // The issue register's RF bank use: per bank,
     // how many registers the instruction accepted last cycle samples now (at
     // most rf.read_ports_per_bank: one bit per bank at the canonical one
     // port; zero when nothing was accepted). It owns those read ports this
     // cycle; the async readers take the rest (decide_rf_reads).
-    Regs<uint8_t> issue_read_banks_{registers_, "issue register: RF read bank use"}; // per bank
+    Regs<uint8_t> issue_read_banks_{registers_, Unit::issue, "issue register: RF read bank use"}; // per bank
     // Issue -> units: the issue register and the RF read pipeline
     // (issue_to_dispatch stages), carrying memory / engine instructions.
     // issue_to_dispatch stages: an instruction accepted at t is in stage k at
     // t + 1 + k and dispatches from the last stage.
-    Pipe<DispatchEntry> dispatch_pipe_{registers_, "dispatch pipeline"};
+    Pipe<DispatchEntry> dispatch_pipe_{registers_, Unit::dispatch, "dispatch pipeline"};
     // The LSU's store-data RF reads travelling to the store buffer: the RF's
     // Lr read stages. A read granted at t is in stage 0 at t + 1 and at the RF
     // output, the last stage, at t + Lr.
-    Pipe<LsuRfRead> lsu_read_pipe_{registers_, "LSU store-data read pipeline"};
+    Pipe<LsuRfRead> lsu_read_pipe_{registers_, Unit::load_store, "LSU store-data read pipeline"};
     // The URF write pipeline (UrfWrite): L + Wu stages, the uniform ALU's and
     // r2ur's path from the issue register to the URF RAM.
-    Pipe<UrfWrite> urf_pipe_{registers_, "URF write pipeline"};
+    Pipe<UrfWrite> urf_pipe_{registers_, Unit::uniform_file, "URF write pipeline"};
 
     // ---- Unit-internal state (only its own unit's code touches it) ----
     // Issue: scheduler cursor, SFU occupancy. (Read only by the scheduler
@@ -2297,7 +2385,7 @@ private:
     // instruction accepted at t samples its round in stage 0 (t + 1) and
     // executes from the last stage (t + issue_to_operands), its operands at
     // the RF output.
-    Pipe<ArithmeticRead> arithmetic_reads_{registers_, "arithmetic pipeline: operand latches"};
+    Pipe<ArithmeticRead> arithmetic_reads_{registers_, Unit::arithmetic, "arithmetic pipeline: operand latches"};
     // The RF write port's reservation calendar (the arbiter's schedule): a
     // shift register per bank, one count of booked ports per stage (one bit
     // per bank at one write port). The last stage is this cycle's port, the
@@ -2307,7 +2395,7 @@ private:
     // from the last one; the async writers use the current write port. (There
     // is no read calendar: reads are one round at issue + 1, owned by the
     // issue register -- issue_read_banks_.)
-    Pipe<Bounded<uint32_t, limits::rf_banks>> write_calendar_{registers_, "RF write calendar"};
+    Pipe<Bounded<uint32_t, limits::rf_banks>> write_calendar_{registers_, Unit::register_file, "RF write calendar"};
     // gmem controller (outside the SM): its queue, bus and B channel. The
     // queue and the bus entry together hold at most gmem.queue_sectors (64;
     // checked in step_gmem_controller). The B channel holds an ack per write
@@ -2334,9 +2422,15 @@ private:
     uint64_t next_lsu_command_id_ = 0;
     uint64_t next_gmem_request_id_ = 0;
     uint64_t next_tma_command_id_ = 0;
-    // The launch record (src/image.hpp): host-written before the first
-    // cycle, read-only after. None: nothing to copy.
-    std::optional<LaunchRecord> launch_record_;
+    // The launch record (src/image.hpp): the registers the host writes before
+    // the first cycle, read-only after. None: nothing to copy.
+    struct LaunchRegisters {
+        uint64_t global_address = 0;
+        uint32_t shared_address = 0;
+        uint32_t bytes = 0;
+        Bounded<LaunchFlag, 6> flags; // at most core.launch_flags, one per depbar
+    };
+    Reg<std::optional<LaunchRegisters>> launch_record_{registers_, Unit::launch, "launch record"};
     uint64_t next_mma_command_id_ = 1;
     // (T) trace-only per-command LSU phases.
     std::map<uint64_t, LsuCommandPhases> lsu_phases_;
@@ -2353,9 +2447,10 @@ private:
 
     // ---- the front end, from Q only: fetch, the memory output, the branch ----
     [[nodiscard]] FetchGrant decide_fetch() const;
-    [[nodiscard]] std::optional<FetchedPacket> instruction_memory_output() const;
+    [[nodiscard]] std::optional<FetchedPacket> instruction_memory_output();
     [[nodiscard]] std::optional<BranchResolution> resolve_branch() const;
-    [[nodiscard]] std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_memory_output() const;
+    [[nodiscard]] std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_memory_output();
+    void land_divergence_push(const Wires& w);
     // Whether the control instruction in the issue register holds its warp
     // (no issue, no fetch) until it resolves: every one but ssy.
     [[nodiscard]] static bool holds_its_warp(const IssuedBranch& branch);
@@ -2386,7 +2481,16 @@ private:
     void accept_lsu_request(RequestChannel& channel);
     // shmem: the RAM stage, one select per service, their data paths.
     void step_shmem(Wires& w);
-    void shmem_ram_stage(ShmemCycle& shmem) const;
+    void shmem_ram_stage(ShmemCycle& shmem);
+    struct ShmemWord {
+        uint32_t bank = 0;
+        uint32_t row = 0;
+        uint32_t byte = 0; // the byte's place in the word
+    };
+    [[nodiscard]] ShmemWord shmem_word(uint32_t byte_address) const;
+    [[nodiscard]] uint32_t read_shmem_word(uint32_t byte_address, uint32_t port, const char* tag);
+    void land_shmem_writes(const Wires& w);
+    [[nodiscard]] std::size_t shmem_bytes() const { return config_.shmem_bytes; }
     void commit_shmem_writes(Wires& w);
     void deliver_shmem_read(Wires& w);
     [[nodiscard]] AWriteGrant select_a_write(const Wires& w) const;
@@ -2497,6 +2601,7 @@ private:
     void drive_read_records(const Wires& w);
     void drive_free_id_tags(const Wires& w);
     void drive_writebacks(const Wires& w);
+    void drive_predicates(const Wires& w);
     void drive_load_slots(const Wires& w);
     void drive_acc_ld_pipe(const Wires& w);
     void drive_rf_write_policy(const Wires& w);
@@ -2518,7 +2623,6 @@ private:
         const std::vector<std::vector<LaneAccess>>& rounds);
     [[nodiscard]] static std::vector<std::vector<uint32_t>> round_addresses(
         const std::vector<std::vector<LaneAccess>>& rounds);
-    [[nodiscard]] std::vector<uint32_t> lane_values(const Warp& warp, uint8_t reg) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, uint32_t spacing, bool a_operand, const MmaShape& shape) const;
     [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
@@ -2599,6 +2703,11 @@ private:
     void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
     void enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w);
     void sample_mma_c(MmaResult& result);
+    void land_tmem_writes(const Wires& w);
+
+    // The state report's declarations (src/machine/state_report.cpp).
+    void declare_state_bits();
+    [[nodiscard]] std::vector<std::pair<const RegisterBase*, std::string>> not_yet_declared() const;
     // The physical tmem word of logical word `logical` in a region whose rows
     // are row_words words (src/layout.hpp); dispatch panicked on any word
     // outside tmem, so past that this is an internal error.
@@ -2674,8 +2783,20 @@ private:
     [[nodiscard]] uint32_t uniform_operand(const DispatchEntry& op, uint8_t ureg) const;
     [[nodiscard]] uint32_t mbar_address_operand(const DispatchEntry& op) const;
     [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
-    [[nodiscard]] uint32_t& rf(Warp& warp, uint32_t lane, uint32_t reg);
-    [[nodiscard]] uint32_t rf(const Warp& warp, uint32_t lane, uint32_t reg) const;
+    // Where a warp's vector register is in the register file's three
+    // memories (rf_address, src/machine/rf.cpp), and a read of every lane of
+    // it through one of its bank's read ports.
+    struct RfAddress {
+        uint32_t bank = 0;
+        uint32_t row = 0;
+    };
+    [[nodiscard]] RfAddress rf_address(uint32_t warp, uint32_t reg) const;
+    [[nodiscard]] std::vector<uint32_t> read_rf(uint32_t warp, uint8_t reg, const char* tag);
+    // A uniform register through one of the URF's read ports now.
+    [[nodiscard]] uint32_t read_urf(uint32_t warp, uint8_t reg, const char* tag);
+    [[nodiscard]] std::size_t urf_row(uint32_t warp, uint32_t reg) const {
+        return std::size_t{warp} * config_.urf_registers + reg;
+    }
     // SIMT shmem bank rounds (lds/sts by bank decode; lds.uni: one access),
     // from the captured operands.
     [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(const DispatchEntry& op, bool load) const;

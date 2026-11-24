@@ -59,10 +59,12 @@ public:
 
     // member_bits: the declared hardware bits of one member, or none where
     // not declared yet.
-    Regs(RegisterFile& file, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
-        : RegisterBase(file, std::move(name)), member_bits_(member_bits) {
+    Regs(RegisterFile& file, Unit unit, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
+        : RegisterBase(file, unit, std::move(name)), member_bits_(member_bits) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
     }
+    Regs(RegisterFile& file, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
+        : Regs(file, Unit::none, std::move(name), member_bits) {}
 
     // The number of members, once, when the machine is built.
     void build(std::size_t members, const T& initial = T{}) {
@@ -77,6 +79,8 @@ public:
     // The declared hardware bits of one member, where they follow from the
     // profile (set when the machine is built).
     void declare_member_bits(uint64_t bits) { member_bits_ = bits; }
+    // Members of unequal widths: the declared bits of all of them.
+    void declare_total_bits(uint64_t bits) { total_bits_ = bits; }
 
     [[nodiscard]] std::size_t count() const { return q_.size(); }
 
@@ -114,7 +118,11 @@ public:
     // Host / test seam, only between ticks: Q changes at once.
     void poke(std::size_t index, T value) { q_.at(index) = std::move(value); }
 
-    [[nodiscard]] StateSize size() const override { return StateSize{name(), "group", q_.size(), member_bits_}; }
+    [[nodiscard]] StateSize size() const override {
+        auto size = sized("group", q_.size(), member_bits_);
+        size.total_bits = total_bits_;
+        return size;
+    }
 
 private:
     std::vector<T> q_;
@@ -123,6 +131,7 @@ private:
     std::vector<uint32_t> points_;     // one write point per member
     bool built_ = false;
     std::optional<uint64_t> member_bits_;
+    std::optional<uint64_t> total_bits_;
 };
 
 } // namespace nanosm

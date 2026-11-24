@@ -93,7 +93,7 @@ bool Machine::acc_engine_available(const Wires& w, bool load) const {
 // issue looks ahead at the queue entries it frees (c), so the next state is a
 // wire; drive_mma commits it with issue's new command. Its tmem reads (C) and
 // writes (results) use its own tmem services; the writes land at this
-// cycle's edge (w.tmem_writes).
+// cycle's edge (w.mma_tmem_writes).
 void Machine::step_mma(Wires& w) {
     auto mma = mma_.cur();
     advance_mma(mma, w);
@@ -121,7 +121,7 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
     if (const auto& landing = mma_results_.last(); landing.has_value()) {
         if (!landing->c_sampled) throw SimError("internal MMA result lands before its C sample");
         for (std::size_t i = 0; i < landing->words.size(); ++i) {
-            w.tmem_writes.emplace_back(landing->words[i], landing->values[i]);
+            w.mma_tmem_writes.emplace_back(landing->words[i], landing->values[i]);
         }
         trace_->mma_result(cycle_, landing->command, landing->address);
         const auto id = landing->command;
@@ -280,10 +280,16 @@ Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
 // operands are consumed and its depbar clears here.
 void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
     for (const auto address : read.elements) {
-        if (static_cast<uint64_t>(address) + 2 > shmem_.size())
+        if (static_cast<uint64_t>(address) + 2 > shmem_bytes())
             throw SimError("MMA operand footprint is outside shmem");
+        // Its two bytes, from the word(s) port B reads in their banks now (a
+        // round reads one word per bank; its elements share it).
         uint16_t bits = 0;
-        std::memcpy(&bits, shmem_.data() + address, 2);
+        for (uint32_t byte = 0; byte < 2; ++byte) {
+            const auto at = shmem_word(address + byte);
+            const auto bytes = shmem_.read(at.bank, at.row, "port-B read sample", shmem_port_b);
+            bits = static_cast<uint16_t>(bits | uint32_t{bytes[at.byte]} << (8 * byte));
+        }
         read.values.emplace_back(address, bits);
     }
     if (!read.last_round || !read.step.last_step) return;
@@ -343,7 +349,9 @@ void Machine::sample_mma_c(MmaResult& result) {
     result.values.resize(config_.mma_core_m * config_.mma_core_n);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            const uint32_t c = result.init_step ? 0u : tmem_.at(result.words.at(mi * config_.mma_core_n + ni));
+            const uint32_t c = result.init_step
+                ? 0u
+                : read_tmem(result.words.at(mi * config_.mma_core_n + ni), tmem_port_mma, "MMA C read");
             result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
                 std::span<const uint16_t>(result.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
                 std::span<const uint16_t>(result.b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
@@ -352,9 +360,23 @@ void Machine::sample_mma_c(MmaResult& result) {
     result.c_sampled = true;
 }
 
+// The tmem writes at the RAM now: the MMA's result block through each fine
+// bank's write port 0, an acc.st beat through write port 1 (one word per fine
+// bank each). They land at the clock edge, the acc.st beat's after the MMA's.
+void Machine::land_tmem_writes(const Wires& w) {
+    for (const auto* writes : {&w.mma_tmem_writes, &w.acc_st_tmem_writes}) {
+        const bool mma = writes == &w.mma_tmem_writes;
+        for (const auto& [word, value] : *writes) {
+            tmem_.write(word % config_.tmem_fine_banks, word / config_.tmem_fine_banks,
+                std::span<const uint32_t>(&value, 1), Memory<uint32_t>::every_element,
+                mma ? "MMA result write" : "acc.st write", mma ? tmem_port_mma : tmem_port_acc);
+        }
+    }
+}
+
 std::size_t Machine::tmem_index(uint64_t logical, uint32_t row_words) const {
     const uint64_t index = tmem_physical_word(logical, row_words);
-    if (index >= tmem_.size()) throw SimError("internal tmem layout overflow");
+    if (index >= tmem_words()) throw SimError("internal tmem layout overflow");
     return static_cast<std::size_t>(index);
 }
 
@@ -366,7 +388,7 @@ std::optional<std::vector<uint32_t>> Machine::tmem_region_words(
         for (uint32_t column = 0; column < columns; ++column) {
             const uint64_t physical = tmem_physical_word(
                 uint64_t{pointer} + uint64_t{row} * row_words + column, row_words);
-            if (physical >= tmem_.size()) return std::nullopt;
+            if (physical >= tmem_words()) return std::nullopt;
             words.push_back(static_cast<uint32_t>(physical));
         }
     }
@@ -444,7 +466,8 @@ std::optional<Machine::AccLdBeat> Machine::launch_acc_ld_beat(std::optional<AccT
 void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
     beat.values.resize(config_.lanes);
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        beat.values[lane] = tmem_[tmem_index(uint64_t{beat.address} + uint64_t{lane} * beat.row_words, beat.row_words)];
+        const auto word = tmem_index(uint64_t{beat.address} + uint64_t{lane} * beat.row_words, beat.row_words);
+        beat.values[lane] = read_tmem(static_cast<uint32_t>(word), tmem_port_acc, "acc.ld sample");
     }
     beat.sampled = true;
     trace_->tmem_beat(cycle_, beat.warp, true, beat.address);
@@ -464,7 +487,7 @@ void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
         const auto& beat = *at_ram;
         const uint64_t address = uint64_t{transfer.pointer} + beat.column;
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            w.tmem_writes.emplace_back(
+            w.acc_st_tmem_writes.emplace_back(
                 static_cast<uint32_t>(tmem_index(address + uint64_t{lane} * transfer.row_words, transfer.row_words)),
                 beat.values[lane]);
         }
@@ -525,8 +548,8 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     // be in shmem: the hull of the addresses the walk reads (under swizzle64
     // a row's piece moves inside its row, so not simply base + rows x spacing).
     const auto inside = [&](uint32_t base, uint32_t spacing, bool a_operand) {
-        return base < shmem_.size() &&
-            mma_operand_hull(config_, shape, base, spacing, a_operand).second <= shmem_.size();
+        return base < shmem_bytes() &&
+            mma_operand_hull(config_, shape, base, spacing, a_operand).second <= shmem_bytes();
     };
     if ((config_.mma_layout == TileLayout::swizzle64 && ((a | b) & 15u) != 0) ||
         !inside(a, a_spacing, true) || !inside(b, b_spacing, false))

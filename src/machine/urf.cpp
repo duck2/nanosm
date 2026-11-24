@@ -24,7 +24,12 @@ uint32_t Machine::uniform_at_next_sample(uint32_t warp, uint8_t reg) const {
         landing->instruction.dst == reg && landing->value.has_value()) {
         return *landing->value;
     }
-    return warps_.at(warp).urf.at(reg);
+    return urf_.peek(0, urf_row(warp, reg))[0];
+}
+
+uint32_t Machine::read_urf(uint32_t warp, uint8_t reg, const char* tag) {
+    if (reg >= config_.urf_registers) throw SimError("internal: uniform register " + std::to_string(reg) + " read");
+    return urf_.read(0, urf_row(warp, reg), tag)[0];
 }
 
 // ===========================================================================
@@ -133,10 +138,15 @@ uint32_t Machine::execute_uniform(const UrfWrite& write) const {
     throw_issue_panic(IssueSite{cycle_, write.warp, write.pc, inst, &config_.mma_shapes}, "not uniform arithmetic");
 }
 
-// The clock edge's URF write (after registers_.commit()).
+// The URF write at its RAM now, through the write port: it lands at the clock
+// edge.
 void Machine::land_urf_write(const Wires& w) {
     if (!w.urf_landing.has_value()) return;
-    warps_.at(w.urf_landing->warp).urf.at(w.urf_landing->instruction.dst) = w.urf_landing->value.value();
+    const auto& landing = *w.urf_landing;
+    if (landing.instruction.dst >= config_.urf_registers) throw SimError("internal: a uniform write past the URF");
+    const uint32_t value = landing.value.value();
+    urf_.write(0, urf_row(landing.warp, landing.instruction.dst), std::span<const uint32_t>(&value, 1),
+        Memory<uint32_t>::every_element, "URF write port");
 }
 
 // The URF write pipeline: each stage's work (step_urf) goes on with its

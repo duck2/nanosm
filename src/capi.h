@@ -127,6 +127,10 @@ NANOSM_CAPI uint64_t nanosm_session_trace_json(
     uint32_t handle, char* output, uint64_t capacity);
 NANOSM_CAPI uint64_t nanosm_session_launch_image(
     uint32_t handle, char* output, uint64_t capacity);
+// The machine's state report: declared hardware bits by unit (flip-flops,
+// memories, FIFO storage) and the totals. Fixed when the machine is built.
+NANOSM_CAPI uint64_t nanosm_session_state_report(
+    uint32_t handle, char* output, uint64_t capacity);
 
 // Last error is thread-local and follows the same size-query convention, but never fails.
 NANOSM_CAPI uint64_t nanosm_last_error(char* output, uint64_t capacity);

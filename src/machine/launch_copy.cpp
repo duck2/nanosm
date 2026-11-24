@@ -33,11 +33,11 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
     }
     if (record.bytes == 0 || record.bytes % 4 != 0 || record.global_address % 4 != 0 ||
         record.shared_address % 4 != 0 || record.bytes / 4 > 0xffff ||
-        uint64_t{record.shared_address} + record.bytes > shmem_.size() ||
+        uint64_t{record.shared_address} + record.bytes > shmem_bytes() ||
         record.global_address > gmem_.size() || record.bytes > gmem_.size() - record.global_address) {
         throw SimError("launch record: the launch block is not whole 4-byte words inside global and shared memory");
     }
-    launch_record_ = record;
+    launch_record_.poke(LaunchRegisters{record.global_address, record.shared_address, record.bytes, record.flags});
     auto tma = tma_.cur();
     TmaCommand command;
     command.id = next_tma_command_id_++;
@@ -79,7 +79,7 @@ void Machine::land_launch_bytes(TmaQueue& tma, const PlacementEnd& placed, Wires
     auto* found = tma.commands.find_in_slot(placed.slot, placed.command);
     if (found == nullptr || !found->launch) return;
     auto& command = *found;
-    const auto& record = *launch_record_;
+    const auto& record = *launch_record_.cur();
     const uint32_t landed = placed.shared_end - record.shared_address;
     if (placed.shared_end <= record.shared_address + command.launch_landed || landed > record.bytes) {
         throw SimError("internal: the launch copy's sectors did not land in order");

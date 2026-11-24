@@ -57,7 +57,7 @@ std::vector<uint32_t> Machine::tma_round_addresses(
     std::vector<uint32_t> addresses;
     for (const auto& piece : pieces) {
         const uint32_t address = tma_piece_address(request.run, piece);
-        if (static_cast<uint64_t>(address) + request.run.element_bytes > shmem_.size()) {
+        if (static_cast<uint64_t>(address) + request.run.element_bytes > shmem_bytes()) {
             throw SimError("tma port service is outside shmem");
         }
         const uint32_t word = address / 4 * 4;
@@ -174,7 +174,7 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
     const auto plan = tma_round_plan(request);
     for (const auto& piece : plan.at(request.next_round)) {
         const uint32_t address = tma_piece_address(run, piece);
-        if (static_cast<uint64_t>(address) + size > shmem_.size()) {
+        if (static_cast<uint64_t>(address) + size > shmem_bytes()) {
             throw SimError("tma port service is outside shmem");
         }
         std::vector<uint8_t> data(size, 0);

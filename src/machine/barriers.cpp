@@ -613,14 +613,14 @@ void Machine::drive_rmw_engine(const Wires& w) {
 
 uint32_t Machine::mbar_address_operand(const DispatchEntry& op) const {
     const auto address = uniform_operand(op, op.instruction.src0);
-    if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_.size()) {
+    if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_bytes()) {
         panic(op, "mbar address is not 8-byte aligned and in shmem");
     }
     return address;
 }
 
 MbarState Machine::load_mbar(uint32_t byte_address) const {
-    if (byte_address % 8 != 0 || static_cast<uint64_t>(byte_address) + 8 > shmem_.size()) {
+    if (byte_address % 8 != 0 || static_cast<uint64_t>(byte_address) + 8 > shmem_bytes()) {
         throw SimError("invalid 64-bit mbar shmem access");
     }
     const auto low = static_cast<uint64_t>(read_shmem_u32(byte_address));

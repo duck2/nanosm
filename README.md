@@ -52,7 +52,12 @@ memory, pass the kernel's arguments, invoke qtx compilation and simulation in-pr
 ```sh
 python -m nanosm kernels/pipeline.launch.py
 python -m nanosm kernels/pipeline_tma.launch.py
+python -m nanosm --state-report kernels/pipeline.launch.py   # first, the machine's state report
 ```
+
+The state report lists every piece of the machine's state by unit with its declared hardware
+bits: flip-flops (registers, groups, pipelines), memories (words x width, ports) and FIFO storage,
+and the totals (src/machine/state_report.cpp; the C API's `nanosm_session_state_report`).
 
 No Python package or third-party binding generator is required; the wrapper uses the standard
 library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `build`. A launch may

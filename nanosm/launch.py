@@ -9,6 +9,11 @@ from typing import Iterable, Mapping, Sequence
 
 from ._native import Session, TRACE_DEBUG, TRACE_TIMELINE, encode_tma_descriptor, kernel_info
 
+# `python -m nanosm --state-report LAUNCH.py` sets this: the first machine a
+# launch builds prints its state report (declared hardware bits by unit) to
+# stdout before it runs. Off, nothing is printed.
+print_state_report = False
+
 
 class SparseMemory:
     """Bytes the launch writes into a memory before the first cycle.
@@ -115,6 +120,10 @@ class Result:
     @property
     def summary(self) -> str:
         return self._session.summary
+
+    @property
+    def state_report(self) -> str:
+        return self._session.state_report
 
     def gmem(self, address: int, size: int) -> bytes:
         return self._session.read_gmem(address, size)
@@ -367,6 +376,10 @@ class Launch:
             max_trace_events=max_trace_events,
         )
         try:
+            global print_state_report
+            if print_state_report:
+                print_state_report = False
+                print(session.state_report, flush=True)
             session.run(cycle_limit)
             result = Result(session)
             if trace is not None:

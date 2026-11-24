@@ -48,6 +48,7 @@ set(NANOSM_SOURCES
     src/machine/tma_ports.cpp
     src/machine/tensor_core.cpp
     src/machine/sanitizer_arguments.cpp
+    src/machine/state_report.cpp
     src/machine/common.cpp
     src/machine/sanitizer.cpp
     src/machine/mma_numeric.cpp

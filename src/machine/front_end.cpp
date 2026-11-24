@@ -43,18 +43,22 @@ Machine::FetchGrant Machine::decide_fetch() const {
 }
 
 // The packet at the instruction memory's output now, for the read in
-// flight: the kernel's two words at its address, zero past the kernel's
-// words (whatever the memory holds there, no such word may have an effect
-// unless it reaches issue, which reports it: head_instruction). Whether it
-// enters its warp's buffer is step_front_end's choice.
-std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() const {
+// flight: the memory's read port, at the address its register sampled (an
+// asynchronous read of the registered address): the kernel's two words
+// there, zero past the kernel's words (whatever the memory holds there, no
+// such word may have an effect unless it reaches issue, which reports it:
+// head_instruction). Whether it enters its warp's buffer is
+// step_front_end's choice.
+std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() {
     const auto& read = fetch_read_.cur();
     if (!read.has_value()) return std::nullopt;
     FetchedPacket packet;
     packet.warp = read->warp;
-    for (uint32_t half = 0; half < 2; ++half) {
-        const auto index = read->pc / 8 + half;
-        packet.words[half] = index < kernel_.words.size() ? kernel_.words[index] : 0;
+    if (read->pc % 16 != 0) throw SimError("internal: a fetch of a packet at pc " + std::to_string(read->pc));
+    const std::size_t row = read->pc / 16;
+    if (row < instruction_memory_.rows()) {
+        const auto words = instruction_memory_.read(0, row, "fetch: the instruction memory's output", 0);
+        packet.words = {words[0], words[1]};
     }
     return packet;
 }

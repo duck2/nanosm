@@ -55,11 +55,13 @@ public:
 
     // payload_bits: the declared hardware bits of one stage's payload (the
     // valid bit is counted beside it), or none where not declared yet.
-    Pipe(RegisterFile& file, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
-        : RegisterBase(file, std::move(name)), payload_bits_(payload_bits) {
+    Pipe(RegisterFile& file, Unit unit, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
+        : RegisterBase(file, unit, std::move(name)), payload_bits_(payload_bits) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
         hold_point_ = new_write_point();
     }
+    Pipe(RegisterFile& file, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
+        : Pipe(file, Unit::none, std::move(name), payload_bits) {}
 
     // The number of stages, once, when the machine is built.
     void build(std::size_t stages) {
@@ -74,6 +76,9 @@ public:
     // The declared hardware bits of one stage's payload, where they follow
     // from the profile (set when the machine is built).
     void declare_payload_bits(uint64_t bits) { payload_bits_ = bits; }
+    // The declared bits of every stage together, valid bits included, where
+    // the stages are not all alike (a stage that never holds a value).
+    void declare_total_bits(uint64_t bits) { total_bits_ = bits; }
 
     [[nodiscard]] std::size_t stages() const { return q_.size(); }
 
@@ -140,8 +145,9 @@ public:
     }
 
     [[nodiscard]] StateSize size() const override {
-        StateSize size{name(), "pipeline", q_.size(), std::nullopt};
+        auto size = sized("pipeline", q_.size(), std::nullopt);
         if (payload_bits_.has_value()) size.bits_per_entry = *payload_bits_ + 1; // + the valid bit
+        size.total_bits = total_bits_;
         return size;
     }
 
@@ -155,6 +161,7 @@ private:
     bool built_ = false;
     std::size_t occupied_ = 0;
     std::optional<uint64_t> payload_bits_;
+    std::optional<uint64_t> total_bits_;
     uint32_t hold_point_ = 0;
     std::vector<uint32_t> stage_points_;
 };

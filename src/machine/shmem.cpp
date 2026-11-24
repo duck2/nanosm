@@ -70,19 +70,69 @@ void Machine::step_shmem(Wires& w) {
     count_engine_wait_on_other(w);
 }
 
-// The RAM stage. The sample reads shmem as it is now, before this cycle's
-// writes land at the clock edge (READ_FIRST).
-void Machine::shmem_ram_stage(ShmemCycle& shmem) const {
+// The RAM stage. The sample reads shmem through port A as it is now, before
+// this cycle's writes land at the clock edge (READ_FIRST).
+void Machine::shmem_ram_stage(ShmemCycle& shmem) {
     const auto& reads = a_read_pipe_.cur();
     shmem.delivered = reads.back();
     if (const auto& at_ram = reads.at(config_.shmem_port_a_depth - 1); at_ram.has_value()) {
         shmem.sampled = *at_ram;
-        for (const auto address : at_ram->addresses) shmem.sampled->words.push_back(read_shmem_u32(address));
+        for (const auto address : at_ram->addresses) {
+            shmem.sampled->words.push_back(read_shmem_word(address, shmem_port_a, "A-read sample"));
+        }
     }
     for (const auto* pipe : {&a_write_pipe_.cur(), &b_write_pipe_.cur()}) {
-        if (!pipe->back().has_value()) continue;
-        const auto& writes = pipe->back()->writes;
-        shmem.writes.insert(shmem.writes.end(), writes.begin(), writes.end());
+        if (pipe->back().has_value()) {
+            const auto& writes = pipe->back()->writes;
+            shmem.writes.insert(shmem.writes.end(), writes.begin(), writes.end());
+        }
+        if (pipe == &a_write_pipe_.cur()) shmem.port_a_writes = shmem.writes.size();
+    }
+}
+
+// The memory word holding byte `byte_address`: its bank and row (shmem_).
+Machine::ShmemWord Machine::shmem_word(uint32_t byte_address) const {
+    const uint32_t word = byte_address / shmem_word_bytes_;
+    return ShmemWord{word % config_.shmem_banks, word / config_.shmem_banks, byte_address % shmem_word_bytes_};
+}
+
+// The 4-byte word at `byte_address` (4-aligned) through read port `port` of
+// its bank now.
+uint32_t Machine::read_shmem_word(uint32_t byte_address, uint32_t port, const char* tag) {
+    if (byte_address % 4 != 0 || uint64_t{byte_address} + 4 > shmem_bytes()) {
+        throw SimError("internal: a shmem word read at " + std::to_string(byte_address));
+    }
+    const auto at = shmem_word(byte_address);
+    const auto bytes = shmem_.read(at.bank, at.row, tag, port);
+    uint32_t value = 0;
+    std::memcpy(&value, bytes.data() + at.byte, sizeof(value));
+    return value;
+}
+
+// The write rounds at the RAM now, through their ports (A-write's on port
+// A, the port-B write's on port B): each piece's bytes enter their words with
+// those bytes enabled, and land at the clock edge, port B's after port A's.
+void Machine::land_shmem_writes(const Wires& w) {
+    for (std::size_t index = 0; index < w.shmem.writes.size(); ++index) {
+        const auto& write = w.shmem.writes[index];
+        const uint32_t port = index < w.shmem.port_a_writes ? shmem_port_a : shmem_port_b;
+        const char* tag = port == shmem_port_a ? "A-write" : "port-B write";
+        if (uint64_t{write.address} + write.bytes.size() > shmem_bytes()) {
+            throw SimError("internal: a shmem write past the end at " + std::to_string(write.address));
+        }
+        std::size_t byte = 0;
+        while (byte < write.bytes.size()) {
+            const auto at = shmem_word(write.address + static_cast<uint32_t>(byte));
+            std::array<uint8_t, 8> values{};
+            uint64_t enables = 0;
+            for (uint32_t element = at.byte; element < shmem_word_bytes_ && byte < write.bytes.size();
+                 ++element, ++byte) {
+                values[element] = write.bytes[byte];
+                enables |= uint64_t{1} << element;
+            }
+            shmem_.write(at.bank, at.row, std::span<const uint8_t>(values.data(), shmem_word_bytes_), enables, tag,
+                port);
+        }
     }
 }
 
@@ -724,7 +774,7 @@ uint32_t Machine::shmem_address(const DispatchEntry& op, uint32_t base) const {
     }
     const auto byte_address = static_cast<uint32_t>(address);
     if (byte_address % 4 != 0) panic(op, "unaligned 32-bit shmem access");
-    if (static_cast<uint64_t>(byte_address) + 4 > shmem_.size()) {
+    if (static_cast<uint64_t>(byte_address) + 4 > shmem_bytes()) {
         panic(op, "shmem access out of bounds");
     }
     return byte_address;

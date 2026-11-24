@@ -1591,7 +1591,8 @@ void test_tma_walker_start_stages() {
             [](const auto& event) { return event.edge == LsuEdge::tma_place_round; });
         require(first != events.end(), "no tma placement round");
         completion.push_back(first->cycle);
-        landed.emplace_back(machine.shmem().begin() + tile_address, machine.shmem().begin() + tile_address + 128);
+        const auto shared = machine.shmem();
+        landed.emplace_back(shared.begin() + tile_address, shared.begin() + tile_address + 128);
         for (uint32_t i = 0; i < 32; ++i) {
             const uint32_t x = i % 16;
             const uint32_t expected = x < 4 ? 0 : 0x300 + 12 * (i / 16) + x - 4;

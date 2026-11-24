@@ -36,12 +36,6 @@ std::vector<uint32_t> Machine::access_addresses(
     return addresses;
 }
 
-std::vector<uint32_t> Machine::lane_values(const Warp& warp, uint8_t reg) const {
-    std::vector<uint32_t> values(config_.lanes);
-    for (uint32_t lane = 0; lane < config_.lanes; ++lane) values[lane] = rf(warp, lane, reg);
-    return values;
-}
-
 // Each bank round's word addresses (the sanitizer's shadow of an access).
 std::vector<std::vector<uint32_t>> Machine::round_addresses(const std::vector<std::vector<LaneAccess>>& rounds) {
     std::vector<std::vector<uint32_t>> addresses;
@@ -57,7 +51,7 @@ std::vector<std::vector<uint32_t>> Machine::round_addresses(const std::vector<st
 // edge). An access at the RAM in a command's accept cycle has REACHED it,
 // so this is what an engine command accepted now finds.
 std::vector<uint8_t> Machine::shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const {
-    std::vector<uint8_t> bytes(shmem_.begin() + address, shmem_.begin() + address + size);
+    std::vector<uint8_t> bytes(shmem_.contents().begin() + address, shmem_.contents().begin() + address + size);
     for (const auto& write : w.shmem.writes) {
         for (std::size_t byte = 0; byte < write.bytes.size(); ++byte) {
             const uint64_t at = static_cast<uint64_t>(write.address) + byte;
@@ -88,7 +82,7 @@ std::array<uint8_t, tma_descriptor_bytes> Machine::tma_descriptor_at_accept(uint
 // dispatch has panicked then).
 // Sanitizer-only: the hardware reads no mbar at TMA start.
 std::optional<uint64_t> Machine::pending_tma_completion_mbar(uint32_t mbar, const Wires& w) const {
-    if (mbar % 8 != 0 || static_cast<uint64_t>(mbar) + 8 > shmem_.size()) return std::nullopt;
+    if (mbar % 8 != 0 || static_cast<uint64_t>(mbar) + 8 > shmem_bytes()) return std::nullopt;
     auto bytes = shmem_after_edge(mbar, 8, w);
     const auto overlay_beat = [&](const std::optional<WriteBeat>& beat) {
         if (!beat.has_value()) return;

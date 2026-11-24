@@ -299,18 +299,36 @@ void Machine::rf_ram_stage(Wires& w) {
     }
 }
 
-// The clock edge's RF and predicate writes (after registers_.commit()).
+// The RF writes at their RAM now: each goes through a write port of its bank,
+// its lanes enabled one by one, and lands at the clock edge.
 void Machine::land_rf_writes(const Wires& w) {
     for (const auto& writeback : w.rf_landings) {
-        auto& warp = warps_.at(writeback.warp);
+        if (!writeback.dst.has_value()) continue;
         if (writeback.values.size() != config_.lanes) throw SimError("internal writeback lane count mismatch");
-        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            if (writeback.lane_enables.has_value() && (*writeback.lane_enables >> lane & 1) == 0) continue;
-            if (writeback.dst.has_value()) rf(warp, lane, *writeback.dst) = writeback.values[lane];
-            if (writeback.predicate_dst.has_value()) {
-                warp.predicates[*writeback.predicate_dst][lane] = writeback.values[lane] != 0;
-            }
+        const auto address = rf_address(writeback.warp, *writeback.dst);
+        rf_.write(address.bank, address.row, writeback.values, writeback.lane_enables.value_or(full_mask()),
+            "RF write port");
+    }
+}
+
+// The predicate files (flip-flops): a predicate presented now (a setp's at
+// its port cycle, a usetp's at the URF write port's) is in the file from the
+// next cycle, in its enabled lanes. One write per predicate is ever in flight
+// (src/timing.hpp), so each register takes at most one.
+void Machine::drive_predicates(const Wires& w) {
+    for (const auto& writeback : w.rf_landings) {
+        if (!writeback.predicate_dst.has_value()) continue;
+        if (writeback.values.size() != config_.lanes || *writeback.predicate_dst >= predicates_per_warp) {
+            throw SimError("internal: a predicate write of the wrong shape");
         }
+        const auto index = predicate_index(writeback.warp, *writeback.predicate_dst);
+        const uint64_t enables = writeback.lane_enables.value_or(full_mask());
+        uint64_t bits = 0;
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if (writeback.values[lane] != 0) bits |= uint64_t{1} << lane;
+        }
+        const uint64_t next = (predicates_.cur()[index] & ~enables) | (bits & enables);
+        predicates_.set_next(index, next, "drive_predicates");
     }
 }
 
@@ -370,7 +388,8 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         }
         const auto& warp = warps_.at(read->warp);
         trace_->rf_read(cycle_, warp.id, read->reg, read->reg % config_.rf_banks);
-        auto values = lane_values(warp, read->reg);
+        auto values = read_rf(warp.id, read->reg,
+            read->reader == RfReader::acc_st ? "RF read: acc.st beat" : "RF read: store data");
         if (read->reader == RfReader::acc_st) {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::acc_st);
             w.acc_st_read = AccStBeat{store_engine->next_column, std::move(values)};
@@ -411,12 +430,12 @@ void Machine::step_rf_reads(Wires& w) {
     const auto sample = [&](uint32_t warp, uint8_t reg) {
         ++simt_reads[reg % config_.rf_banks];
         trace_->rf_read(cycle_, warp, reg, reg % config_.rf_banks);
-        return lane_values(warps_[warp], reg);
+        return read_rf(warp, reg, "RF read: the issue register's round");
     };
     const auto sample_uniform = [&](uint32_t warp, const std::vector<uint8_t>& regs) {
         uniform_reads += static_cast<uint32_t>(regs.size());
         std::vector<uint32_t> values;
-        for (const auto reg : regs) values.push_back(warps_[warp].urf.at(reg));
+        for (const auto reg : regs) values.push_back(read_urf(warp, reg, "URF read: the issue register's round"));
         return values;
     };
     // The arithmetic pipeline: the instruction in its last stage has its
@@ -462,7 +481,7 @@ void Machine::step_rf_reads(Wires& w) {
             const auto sources = uniform_sources(inst);
             uniform_reads += static_cast<uint32_t>(rf_read_round(sources).size());
             std::vector<uint32_t> values;
-            for (const auto reg : sources) values.push_back(warps_[write->warp].urf.at(reg));
+            for (const auto reg : sources) values.push_back(read_urf(write->warp, reg, "URF read: uniform ALU sample"));
             w.urf_sample = std::move(values);
         }
     }
@@ -480,7 +499,9 @@ void Machine::step_rf_reads(Wires& w) {
             pair.round = rounds->round;
             pair.last = rounds->round + 1 == plan.size();
             if (rounds->round == 0) pair.header = rounds->header;
-            for (const auto reg : registers) pair.words.push_back(warps_[rounds->header.warp].urf.at(reg));
+            for (const auto reg : registers) {
+                pair.words.push_back(read_urf(rounds->header.warp, reg, "URF read: a tma's round"));
+            }
             uniform_reads += static_cast<uint32_t>(registers.size());
             w.tma_sampled = std::move(pair);
         } else if (rounds->round > 0) {
@@ -493,7 +514,9 @@ void Machine::step_rf_reads(Wires& w) {
             std::size_t first = 0;
             for (uint32_t round = 0; round < rounds->round; ++round) first += plan[round].size();
             std::vector<uint32_t> values;
-            for (const auto reg : registers) values.push_back(warps_[rounds->header.warp].urf.at(reg));
+            for (const auto reg : registers) {
+                values.push_back(read_urf(rounds->header.warp, reg, "URF read: an mma.async's later round"));
+            }
             uniform_reads += static_cast<uint32_t>(registers.size());
             w.dispatch_samples.push_back({stage, true, {}, first, std::move(values), std::nullopt});
         }
@@ -603,20 +626,27 @@ void Machine::drive_writebacks(const Wires& w) {
 // the lanes whose predicate bit differs from the invert bit (PT is set in
 // every lane, so @!PT is no lane). Sixteen XORs, beside the round's reads.
 uint64_t Machine::write_mask_lanes(const Warp& warp, const Instruction& inst) const {
-    uint64_t lanes = 0;
-    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        const bool bit = inst.control.predicate == 7 || warp.predicates.at(inst.control.predicate).at(lane) != 0;
-        if (bit != inst.control.predicate_invert) lanes |= uint64_t{1} << lane;
-    }
-    return lanes;
+    const uint64_t bits =
+        inst.control.predicate == 7 ? full_mask() : predicates_.cur().at(predicate_index(warp.id, inst.control.predicate));
+    return (inst.control.predicate_invert ? ~bits : bits) & full_mask();
 }
 
-uint32_t& Machine::rf(Warp& warp, uint32_t lane, uint32_t reg) {
-    return warp.rf.at(static_cast<std::size_t>(lane) * kernel_.register_count + reg);
+// Where warp `warp`'s register `reg` is: bank reg mod rf.banks, row
+// warp x rows per warp + reg / rf.banks. Rows per warp is the kernel's
+// register count over the banks, rounded up (bank 0 holds the most of a
+// warp's registers), the same in every bank; the launch fits when active
+// warps x that many rows fit rf.rows_per_bank (checked when the machine is
+// built). So the kernel's register count sets each warp's stride, and the
+// warps sit one after another from row 0.
+Machine::RfAddress Machine::rf_address(uint32_t warp, uint32_t reg) const {
+    return RfAddress{reg % config_.rf_banks, warp * rf_rows_per_warp_ + reg / config_.rf_banks};
 }
 
-uint32_t Machine::rf(const Warp& warp, uint32_t lane, uint32_t reg) const {
-    return warp.rf.at(static_cast<std::size_t>(lane) * kernel_.register_count + reg);
+// Every lane of one register, read through a read port of its bank now.
+std::vector<uint32_t> Machine::read_rf(uint32_t warp, uint8_t reg, const char* tag) {
+    const auto address = rf_address(warp, reg);
+    const auto word = rf_.read(address.bank, address.row, tag);
+    return std::vector<uint32_t>(word.begin(), word.end());
 }
 
 // A fixed result on its way to the RF write port it booked (port_cycle),

@@ -696,6 +696,38 @@ void test_mma_dense_profile_recurrence_bubbles() {
         "dense diagnostic footprint did not charge its shmem bank conflicts");
 }
 
+// tmem serves one word per fine bank per port per cycle: a geometry that puts
+// two rows of one fine bank in one acc.ld / acc.st beat (32 lanes) or one
+// result block (a dense 8x2 core) is refused when the profile is loaded, in
+// both builds; 16 lanes and 4x4 cores pass.
+void test_tmem_geometry_refused() {
+    auto wide = canonical_profile();
+    wide.lanes = 32;
+    try {
+        nanosm::validate_device_profile(wide);
+        throw std::runtime_error("32 lanes on 16 tmem fine banks were accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"lanes 32", "tmem fine_banks (16)"}, "the lanes rule's message");
+    }
+    auto dense = canonical_profile();
+    dense.mma_layout = nanosm::TileLayout::dense;
+    nanosm::validate_device_profile(dense); // the 4x4x8 control
+    auto tall = dense;
+    tall.mma_core_m = 8;
+    tall.mma_core_n = 2;
+    try {
+        nanosm::validate_device_profile(tall);
+        throw std::runtime_error("a dense 8x2 core was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"core_m x core_n 8x2", "one tmem fine bank"}, "the core rule's message");
+    }
+    auto column = dense;
+    column.mma_core_m = 8;
+    column.mma_core_n = 1;
+    nanosm::validate_device_profile(column); // one column of eight rows: eight fine banks
+    nanosm::validate_device_profile(canonical_profile());
+}
+
 void test_mma_bare_transfer_race_panics() {
     // The FAIL.asm shape (cases 01/02): three commands, a commit, and an
     // acc.ld with no wait on the commit mbar. Racing accepted MMA work is UB
@@ -2410,6 +2442,10 @@ TEST(MmaSlow, mma_dense_profile_recurrence_bubbles) {
 }
 
 // MMA bare transfer race panics
+TEST(Mma, tmem_geometry_refused) {
+    test_tmem_geometry_refused();
+}
+
 TEST(Mma, mma_bare_transfer_race_panics) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_mma_bare_transfer_race_panics();

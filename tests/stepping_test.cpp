@@ -2,6 +2,9 @@
 // Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
 
+#include <regex>
+#include <sstream>
+
 namespace {
 
 using namespace nanosm_test;
@@ -514,6 +517,174 @@ void test_fifo_second_push_panics() {
         return;
     }
     throw std::runtime_error("a second push in one tick did not panic");
+}
+
+// A memory: a read sees the word as it was at the start of the cycle and a
+// write lands at the clock edge (read first); a write enables its elements one
+// by one; two reads of one word through one port are one read; it reports its
+// words, width and ports.
+void test_memory_read_first_and_enables() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 0;
+    nanosm::RegisterFile file(sanitizer, cycle);
+    nanosm::Memory<uint32_t> memory(file, "test memory");
+    memory.build(nanosm::MemoryShape{2, 4, 2, 64, 1, 1, 2, nanosm::SameCycle::read_first});
+    const auto tick = [&] {
+        file.commit();
+        sanitizer.record_cycle_start();
+    };
+    sanitizer.record_cycle_start();
+    const std::array<uint32_t, 2> first{7, 8};
+    memory.write(1, 3, first, nanosm::Memory<uint32_t>::every_element, "writer");
+    require(memory.read(1, 3, "reader")[0] == 0, "a read saw a write before its clock edge");
+    tick();
+    const std::array<uint32_t, 2> second{9, 10};
+    memory.write(1, 3, second, 0b10, "writer"); // element 1 only
+    const auto word = memory.read(1, 3, "reader");
+    require(word[0] == 7 && word[1] == 8, "a read and a write of one word in one cycle did not read first");
+    (void)memory.read(1, 3, "a second reader of the same word");
+    tick();
+    require(memory.peek(1, 3)[0] == 7 && memory.peek(1, 3)[1] == 10, "a write did not keep its disabled element");
+    require(memory.contents().at((3 * 2 + 1) * 2 + 1) == 10, "the storage is not in (row, bank, element) order");
+    bool refused = false;
+    try {
+        memory.poke(0, 0, 2, 99); // element 2 of a two-element word: bank 1's word in the storage
+    } catch (const nanosm::SimError&) {
+        refused = true;
+    }
+    require(refused && memory.peek(1, 0)[0] == 0, "a poke past the word's elements reached the next word");
+    nanosm::Memory<uint32_t> rom(file, "read-only memory");
+    rom.build(nanosm::MemoryShape{1, 2, 1, 32, 1, 0, 1, nanosm::SameCycle::read_only});
+    refused = false;
+    try {
+        const std::array<uint32_t, 1> value{1};
+        rom.write(0, 0, value, nanosm::Memory<uint32_t>::every_element, "writer");
+    } catch (const nanosm::SimError&) {
+        refused = true;
+    }
+    require(refused, "a write into a memory with no write port was taken");
+    const auto size = memory.size();
+    require(std::string(size.kind) == "memory" && size.entries == 8 && size.banks == 2 &&
+            size.bits_per_entry == std::optional<uint64_t>(64) && size.read_ports == 1 && size.write_ports == 1 &&
+            size.read_delay == 2,
+        "the memory does not report its words, width, banks and ports");
+}
+
+// A memory's port asked for a second word in one cycle, or a write with every
+// write port taken, PANICs, as a second write of a register.
+void test_memory_port_panics() {
+    for (const bool write : {false, true}) {
+        nanosm::Sanitizer sanitizer;
+        uint64_t cycle = 5;
+        nanosm::RegisterFile file(sanitizer, cycle);
+        nanosm::Memory<uint32_t> memory(file, "ported memory");
+        memory.build(nanosm::MemoryShape{2, 4, 1, 32, 1, 1, 1, nanosm::SameCycle::read_first});
+        sanitizer.record_cycle_start();
+        const std::array<uint32_t, 1> value{1};
+        try {
+            if (write) {
+                memory.write(0, 1, value, nanosm::Memory<uint32_t>::every_element, "first");
+                memory.write(1, 1, value, nanosm::Memory<uint32_t>::every_element, "the other bank");
+                memory.write(0, 2, value, nanosm::Memory<uint32_t>::every_element, "second");
+            } else {
+                (void)memory.read(0, 1, "first", 0);
+                (void)memory.read(1, 2, "the other bank", 0);
+                (void)memory.read(0, 2, "second", 0);
+            }
+        } catch (const nanosm::SimError& error) {
+            const std::string message = error.what();
+            const std::string needle = write ? "ported memory' bank 0: a write of row 2 with its 1 write port taken"
+                                             : "ported memory' bank 0: read port 0 asked for row 2 after row 1";
+            require(message.find("PANIC cycle=5") != std::string::npos && message.find(needle) != std::string::npos &&
+                    message.find("'second'") != std::string::npos,
+                "the memory's port PANIC does not say what happened: " + message);
+            continue;
+        }
+        throw std::runtime_error(std::string("a second ") + (write ? "write" : "read") + " through one port did not panic");
+    }
+}
+
+// The state report: every primitive has a unit and declared bits, except
+// exactly the listed ones; each unit's lines add up to its total, the units'
+// totals to the machine's, and that is the sum of the declared sizes.
+void test_state_report_adds_up() {
+    const auto config = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
+    const auto missing = machine.state_not_yet_declared();
+    require(missing == std::vector<std::string>{"load slots", "store slots", "MMA queue and pipeline",
+                           "RF write pipeline"},
+        "the primitives not yet declared are not the four listed");
+    uint64_t declared = 0;
+    for (const auto& size : machine.state_sizes()) {
+        require(size.unit != nanosm::Unit::none, "'" + size.name + "' belongs to no unit");
+        const bool listed = std::find(missing.begin(), missing.end(), size.name) != missing.end();
+        require(size.bits().has_value() != listed,
+            "'" + size.name + (listed ? "' is listed as not yet declared but declares bits"
+                                      : "' declares no bits and is not listed"));
+        declared += size.bits().value_or(0);
+    }
+    const auto report = machine.state_report();
+    const auto value = [](const std::string& digits) {
+        std::string plain;
+        for (const char c : digits) {
+            if (c != ',') plain += c;
+        }
+        return std::stoull(plain);
+    };
+    const std::regex line(R"(^  (register|group|pipeline|FIFO|memory) .* ([0-9,]+)  .*$)");
+    const std::regex unit_total(R"(^  flip-flops ([0-9,]+), memory ([0-9,]+), FIFO ([0-9,]+), total ([0-9,]+)$)");
+    const std::regex grand_total(R"(^  total +([0-9,]+)$)");
+    std::istringstream lines(report);
+    std::string text;
+    uint64_t unit_lines = 0;
+    uint64_t units = 0;
+    uint64_t unit_count = 0;
+    std::optional<uint64_t> total;
+    std::smatch match;
+    while (std::getline(lines, text)) {
+        if (std::regex_match(text, match, line)) {
+            unit_lines += value(match[2]);
+        } else if (std::regex_match(text, match, unit_total)) {
+            const auto sum = value(match[1]) + value(match[2]) + value(match[3]);
+            require(sum == value(match[4]) && sum == unit_lines, "a unit's total is not the sum of its lines: " + text);
+            units += sum;
+            unit_lines = 0;
+            ++unit_count;
+        } else if (std::regex_match(text, match, grand_total)) {
+            total = value(match[1]);
+        }
+    }
+    require(unit_count == static_cast<uint64_t>(nanosm::last_unit), "the report does not list every unit");
+    require(total.has_value() && *total == units && units == declared,
+        "the report's total is not the sum of its units and of the declared sizes");
+    // The write calendar: 14 of its 15 stages can hold a booking, three bank
+    // counts of one bit each, zero meaning free.
+    bool calendar = false;
+    for (const auto& size : machine.state_sizes()) {
+        calendar = calendar || (size.name == "RF write calendar" && size.bits() == std::optional<uint64_t>(42));
+    }
+    require(calendar, "the RF write calendar is not declared as 42 flip-flops");
+}
+
+// The host's view of shared memory is shmem.bytes long, though the memory's
+// last row (4-byte words x banks) is whole.
+void test_shmem_host_view_is_the_configured_bytes() {
+    auto config = canonical_profile();
+    config.shmem_bytes = 65532;
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
+    require(machine.shmem().size() == 65532, "the host sees more shared memory than shmem.bytes");
+    (void)machine.read_shmem_u32(65528);
+    bool refused = false;
+    try {
+        (void)machine.read_shmem_u32(65532);
+    } catch (const nanosm::SimError&) {
+        refused = true;
+    }
+    require(refused, "a host read past shmem.bytes succeeded");
 }
 
 // A group of single bits: a member's value is read by value (the bits have no
@@ -1035,6 +1206,27 @@ TEST(Stepping, fifo_order_latency_and_widths) {
 TEST(Stepping, fifo_second_push_panics) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     test_fifo_second_push_panics();
+}
+
+// memory: read first, element enables, one port one word, its size
+TEST(Stepping, memory_read_first_and_enables) {
+    test_memory_read_first_and_enables();
+}
+
+// state report: declared bits by unit add up; exactly the listed four are not declared
+TEST(Stepping, state_report_adds_up) {
+    test_state_report_adds_up();
+}
+
+// shared memory: the host sees shmem.bytes, not the padded last row
+TEST(Stepping, shmem_host_view_is_the_configured_bytes) {
+    test_shmem_host_view_is_the_configured_bytes();
+}
+
+// memory: a port asked for a second word in one cycle PANICs
+TEST(Stepping, memory_port_panics) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    test_memory_port_panics();
 }
 
 // group: a one-bit member is read by value and holds

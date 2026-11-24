@@ -988,6 +988,12 @@ void Sanitizer::check_register_rewrite(
         "' written twice in one tick: first by '" + first + "', then by '" + tag + "'");
 }
 
+void Sanitizer::panic_memory_ports(const std::string& name, const std::string& what, uint64_t cycle,
+    const char* tag) const {
+    throw SimError("PANIC cycle=" + std::to_string(cycle) + " reason=memory '" + name + "' " + what + " (by '" +
+        tag + "')");
+}
+
 // ---------------------------------------------------------------------------
 // Boundary tripwire: an ordered ID's beats belong to its oldest outstanding
 // request, contiguous and in order. The placeholder controller cannot

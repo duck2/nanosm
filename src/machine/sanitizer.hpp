@@ -359,6 +359,10 @@ public:
     void record_register_write(uint32_t id, const char* tag);
     void check_register_rewrite(
         uint32_t id, const std::string& name, uint64_t cycle, const char* tag) const;
+    // ---- memories (src/machine/memory.hpp): a port takes one word per cycle ----
+    // A memory used more ports in one cycle than it has (what is wrong, in
+    // words): the same kind of PANIC as a second write of a register.
+    void panic_memory_ports(const std::string& name, const std::string& what, uint64_t cycle, const char* tag) const;
 
     // ---- boundary tripwire: an ordered read ID returns in request order ----
     void record_ordered_request(uint32_t stream, uint64_t request);
@@ -594,6 +598,7 @@ public:
     NANOSM_SANITIZER_NOOP(record_acc_transfer_final_beat)
     NANOSM_SANITIZER_NOOP(record_register_write)
     NANOSM_SANITIZER_NOOP(check_register_rewrite)
+    NANOSM_SANITIZER_NOOP(panic_memory_ports)
     NANOSM_SANITIZER_NOOP(record_ordered_request)
     NANOSM_SANITIZER_NOOP(check_ordered_beat)
     NANOSM_SANITIZER_NOOP(record_ordered_pluck)

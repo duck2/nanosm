@@ -117,6 +117,7 @@ for name in [
     "nanosm_session_summary",
     "nanosm_session_trace_json",
     "nanosm_session_launch_image",
+    "nanosm_session_state_report",
 ]:
     function = getattr(lib, name)
     function.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint64]
@@ -275,6 +276,11 @@ class Session:
     @property
     def launch_image(self) -> str:
         return _string(lib.nanosm_session_launch_image, self._live_handle())
+
+    @property
+    def state_report(self) -> str:
+        """Declared hardware bits by unit (src/machine/state_report.cpp)."""
+        return _string(lib.nanosm_session_state_report, self._live_handle())
 
     def _read(self, function, address: int, size: int) -> bytes:
         if address < 0 or size < 0:

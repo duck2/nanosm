@@ -165,7 +165,7 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
         // the stored row's bytes -- a shift either way.
         run.shared_address = walker.row_shared + x * (walker.transposed ? walker.spacing : bytes);
         const uint64_t step = walker.transposed ? walker.spacing : bytes;
-        if (uint64_t{run.shared_address} + (run.elements - 1) * step + bytes > shmem_.size()) {
+        if (uint64_t{run.shared_address} + (run.elements - 1) * step + bytes > shmem_bytes()) {
             throw SimError("internal: a tma run is outside shmem (the tile was checked at its decode)");
         }
         if (in_range) {
@@ -455,8 +455,8 @@ void Machine::validate_tma_runtime_descriptor(const TmaCommand& command, const T
     }
     // The buffer address is 64-byte aligned (its low bits are not wired,
     // src/tma_descriptor.hpp); the whole tile must lie in shmem.
-    if (command.shmem_address > shmem_.size() ||
-        command.logical_bytes > shmem_.size() - command.shmem_address) {
+    if (command.shmem_address > shmem_bytes() ||
+        command.logical_bytes > shmem_bytes() - command.shmem_address) {
         throw SimError("tma tile does not fit in shmem");
     }
     if (descriptor.base > gmem_.size()) {
@@ -593,7 +593,7 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     const auto& header = holding.header;
     const auto& inst = header.instruction;
     const IssueSite where{cycle_, header.warp, header.pc, inst, &config_.mma_shapes};
-    if (static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_.size()) {
+    if (static_cast<uint64_t>(inst.imm) + tma_descriptor_bytes > shmem_bytes()) {
         throw_issue_panic(where, "tma descriptor is not in shmem");
     }
     sanitizer_.check_uniform_mask(where, header.active_mask, full_mask());
@@ -609,7 +609,7 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     // The two addresses' low bits are not wired (src/tma_descriptor.hpp).
     command.shmem_address = holding.buffer & ~(tma_buffer_alignment - 1);
     command.mbar_address = holding.barrier & ~(tma_barrier_alignment - 1);
-    if (static_cast<uint64_t>(command.mbar_address) + 8 > shmem_.size()) {
+    if (static_cast<uint64_t>(command.mbar_address) + 8 > shmem_bytes()) {
         throw_issue_panic(where, "tma completion mbar is outside shmem");
     }
     // Sanitizer: the descriptor the engine will read -- memory as of this

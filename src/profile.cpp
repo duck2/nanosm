@@ -387,6 +387,31 @@ void validate_device_profile(const DeviceProfile& p) {
                              (p.mma_core_k != 4 && p.mma_core_k != 8))) {
         throw ProfileError("device profile: swizzle64 MMA layout needs a 4x4x4 or 4x4x8 core");
     }
+    // tmem gives each of its 16 fine banks one word per port per cycle, and a
+    // word's fine bank is 4 x (row % 4) + (column % 4 XOR band % 4), its band
+    // being row / 4 (src/layout.hpp: the region's words per row do not enter).
+    // So 16 consecutive rows of one column are 16 fine banks and a 17th
+    // repeats one; in one row 4 consecutive columns are 4 banks and a 5th
+    // repeats one; and two rows four apart (the next band) put a pair of
+    // neighbouring columns on the same two banks. Each port serves:
+    //   - an acc.ld / acc.st beat: one column of `lanes` consecutive rows, so
+    //     lanes <= tmem fine_banks;
+    //   - a matmul step's C read and result write: core_m consecutive rows by
+    //     core_n consecutive columns, so core_n <= 4, and core_m <= 4 unless
+    //     core_n is 1 (then core_m <= 16).
+    // Any pointer, aligned or not, keeps to these. A geometry outside them
+    // would need a beat or a block in more than one cycle; refused instead.
+    if (p.lanes > p.tmem_fine_banks) {
+        throw ProfileError("device profile: lanes " + std::to_string(p.lanes) + " is more than tmem fine_banks (" +
+            std::to_string(p.tmem_fine_banks) + "): an acc.ld / acc.st beat moves one row per lane in one cycle, "
+            "and more than 16 consecutive rows of one column repeat a fine bank");
+    }
+    if (p.mma_core_n > 4 || (p.mma_core_n > 1 && p.mma_core_m > 4) || p.mma_core_m > p.tmem_fine_banks) {
+        throw ProfileError("device profile: mma core_m x core_n " + std::to_string(p.mma_core_m) + "x" +
+            std::to_string(p.mma_core_n) + " puts two words of its result block in one tmem fine bank (its C read "
+            "and result write take one cycle): core_n must be at most 4, and core_m at most 4 unless core_n is 1 "
+            "(then at most 16)");
+    }
     if (p.tma_sector_credits >= p.gmem_queue_sectors) {
         throw ProfileError("device profile: tma sector credits must be smaller than gmem queue");
     }
