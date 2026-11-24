@@ -49,19 +49,19 @@
 namespace nanosm {
 
 template <typename T>
-class Pipe final : public RegisterBase {
+class Pipe final : public Clocked {
 public:
     using Stage = std::optional<T>;
 
     // payload_bits: the declared hardware bits of one stage's payload (the
     // valid bit is counted beside it), or none where not declared yet.
-    Pipe(RegisterFile& file, Unit unit, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
-        : RegisterBase(file, unit, std::move(name)), payload_bits_(payload_bits) {
+    Pipe(AllClocked& all, Unit unit, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
+        : Clocked(all,unit, std::move(name)), payload_bits_(payload_bits) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
         hold_point_ = new_write_point();
     }
-    Pipe(RegisterFile& file, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
-        : Pipe(file, Unit::none, std::move(name), payload_bits) {}
+    Pipe(AllClocked& all, std::string name, std::optional<uint64_t> payload_bits = std::nullopt)
+        : Pipe(all,Unit::none, std::move(name), payload_bits) {}
 
     // The number of stages, once, when the machine is built.
     void build(std::size_t stages) {

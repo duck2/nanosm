@@ -47,18 +47,18 @@ struct FifoPorts {
 };
 
 template <typename T>
-class Fifo final : public RegisterBase {
+class Fifo final : public Clocked {
 public:
     // entry_bits: the declared hardware bits of one entry, or none where not
     // declared yet.
-    Fifo(RegisterFile& file, Unit unit, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
-        : RegisterBase(file, unit, std::move(name)), entry_bits_(entry_bits) {
+    Fifo(AllClocked& all, Unit unit, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
+        : Clocked(all,unit, std::move(name)), entry_bits_(entry_bits) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
         push_point_ = new_write_point();
         pop_point_ = new_write_point();
     }
-    Fifo(RegisterFile& file, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
-        : Fifo(file, Unit::none, std::move(name), entry_bits) {}
+    Fifo(AllClocked& all, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
+        : Fifo(all,Unit::none, std::move(name), entry_bits) {}
 
     // The FIFO's shape, once, when the machine is built.
     void build(std::size_t capacity, FifoPorts ports = {}) {

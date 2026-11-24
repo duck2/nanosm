@@ -57,7 +57,7 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
 // Arithmetic pipeline
 // ===========================================================================
 
-void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
+void Machine::execute_arithmetic(const ArithmeticRead& pending) {
     auto& warp = warps_.at(pending.warp);
     const auto& inst = pending.instruction;
     // A panic names the instruction's own pc (the warp's has moved on).
@@ -233,13 +233,14 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
         break;
     default: fail("non-arithmetic instruction in RF read pipeline");
     }
-    // Into its unit's result pipeline: E cycles to the write port it booked.
-    // Every lane computes; the issue cycle's active mask AND the instruction's
-    // write mask (sampled with the operands) is the write's lane enables (the
-    // port, its cycle and the booking are the same whatever the lanes, none
-    // included).
-    w.arithmetic_result = std::pair{arithmetic_unit(inst),
-        ArithmeticResult{warp.id, inst.dst, is_setp(inst.opcode), result, pending.active_mask}};
+    // Into its unit's black box: in its output register E cycles from now,
+    // at the write port it booked. Every lane computes; the issue cycle's
+    // active mask AND the instruction's write mask (sampled with the
+    // operands) is the write's lane enables (the port, its cycle and the
+    // booking are the same whatever the lanes, none included).
+    arithmetic_black_boxes_[static_cast<std::size_t>(arithmetic_unit(inst))].deliver(
+        ArithmeticResult{warp.id, inst.dst, is_setp(inst.opcode), result, pending.active_mask}, cycle_,
+        "execute_arithmetic");
 }
 
 // Which unit executes a fixed-latency instruction: the latency class
@@ -253,12 +254,118 @@ Machine::ArithmeticUnit Machine::arithmetic_unit(const Instruction& inst) {
     }
 }
 
-// The units' result pipelines: a result executed now enters its unit's;
-// the one at each unit's output leaves (it was presented at the port).
-void Machine::drive_arithmetic_results(const Wires& w) {
-    if (!w.arithmetic_result.has_value()) return;
-    const auto& [unit, result] = *w.arithmetic_result;
-    arithmetic_results_[static_cast<std::size_t>(unit)].push(result, "drive_arithmetic_results");
+// ===========================================================================
+// The three units as black boxes (src/machine/blackbox.hpp)
+// ===========================================================================
+//
+// A unit takes an instruction when it executes (the arithmetic pipeline's
+// last stage): its operands from the vector RF's read registers, the
+// instruction, its warp and its lane enables from that stage. It computes the
+// whole result then (execute_arithmetic) and holds it E cycles, to its
+// output register. What a real unit holds in its stages is its declared cost
+// below; none of it is simulated. Each one's sign-off is the line that
+// names it: only the human changes it.
+void Machine::declare_arithmetic_black_boxes() {
+    const auto& c = config_;
+    const uint64_t lanes = c.lanes;
+    const uint64_t lane_bits = lanes * 32;
+    // A result's tag: warp, destination, lane enables and a valid bit (the
+    // ALU's also says whether it is a setp's predicate).
+    const uint64_t tag = bits_for(c.core_warps) + 8 + lanes + 1;
+    const auto operands = [&](uint64_t words) {
+        return BlackBoxPort{std::to_string(words) + " vector operand" + (words == 1 ? "" : "s"), words * lane_bits,
+            "the vector RF's read registers (the memory's)"};
+    };
+    const BlackBoxPort control{"instruction, warp, lane enables", 64 + bits_for(c.core_warps) + lanes,
+        "the arithmetic pipeline's last stage (in the open)"};
+    const auto declare = [&](ArithmeticUnit unit, BlackBoxDeclaration black_box, uint64_t result_bits) {
+        auto& at = arithmetic_black_boxes_[static_cast<std::size_t>(unit)];
+        black_box.unit = Unit::arithmetic;
+        black_box.outputs = {BlackBoxPort{"result (warp, destination, lanes' words, lane enables)", result_bits + 1,
+            at.name() + " (in the open)"}};
+        at.declare_output_bits(result_bits);
+        at.build(black_box);
+        black_boxes_.push_back(std::move(black_box));
+    };
+    const auto text = [](uint64_t value) { return std::to_string(value); };
+
+    // The ALU (mov, sread, ur2r, the integer and logic ops, shifts, setp).
+    // It would probably use, per lane, a 32-bit adder, the logic ops, a
+    // barrel shifter and a comparator between the RF's read registers and its
+    // output register, so at E = 1 nothing inside it is a register; each
+    // further stage would hold every lane's result and the tag.
+    {
+        const uint64_t e = c.timing.alu;
+        BlackBoxDeclaration alu("ALU", SignOff::not_signed); // sign-off: only the human changes this line
+        alu.latency = c.timing.alu;
+        alu.latency_from = "core.alu_latency_cycles";
+        // ur2r's uniform word: in the operand latches when the URF's read
+        // delay is shorter than the RF's (it waits there), else straight from
+        // the URF's read registers.
+        alu.inputs = {operands(2),
+            BlackBoxPort{"uniform operand (ur2r)", 32,
+                c.urf_read_latency_cycles < c.rf_read_latency_cycles
+                    ? "the arithmetic pipeline's operand latches (in the open)"
+                    : "the uniform register file's read registers (the memory's)"},
+            control};
+        alu.cost.flip_flops = (e - 1) * (lane_bits + tag + 1);
+        alu.cost_function = "(E - 1) x (lanes x 32 + tag) flip-flops; E " + text(e) + ", lanes " + text(lanes) +
+            ", tag " + text(tag + 1);
+        declare(ArithmeticUnit::alu, std::move(alu), bits_for(c.core_warps) + 8 + lane_bits + lanes + 1);
+    }
+    // The FPU (fadd, fsub, fmul, fma, fmax, cvt.pack), every lane each cycle.
+    // It would probably use, per lane, a single-precision fused multiply-add
+    // (fadd, fmul and fmax are its special cases): a 24 x 24 significand
+    // product on two hard multipliers, and between its E - 1 inner stages
+    // about 64 bits a lane (the 48-bit product and the addend aligned to it,
+    // with the exponent) and the tag.
+    {
+        const uint64_t e = c.timing.fadd;
+        BlackBoxDeclaration fpu("FPU", SignOff::not_signed); // sign-off: only the human changes this line
+        fpu.latency = c.timing.fadd;
+        fpu.latency_from = "core.fadd_latency_cycles";
+        fpu.inputs = {operands(3), control};
+        fpu.cost.flip_flops = (e - 1) * (lanes * 64 + tag);
+        fpu.cost.multipliers = 2 * lanes;
+        fpu.cost_function = "(E - 1) x (lanes x 64 + tag) flip-flops, 2 x lanes multipliers; E " + text(e) +
+            ", lanes " + text(lanes) + ", tag " + text(tag);
+        declare(ArithmeticUnit::fpu, std::move(fpu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
+    }
+    // The special-function unit (ex2, rcp). It serves sfu.lanes lanes a
+    // cycle, so an instruction's G = ceil(lanes / sfu.lanes) lane groups start
+    // one a cycle (issue keeps two instructions G apart: the interval) and
+    // the last leaves the function pipeline sfu.latency_cycles (Ls) after it
+    // starts: E = G - 1 + Ls. It would probably use, per lane served, a table
+    // of 128 entries of three polynomial coefficients (64 bits) for each of
+    // its two functions and a quadratic in Horner form (two multipliers),
+    // with about 64 bits a lane between stages. (The tables assume a
+    // single-port ROM per lane; lanes sharing dual-port block RAMs in pairs
+    // would halve their block RAMs, not their bits.) Its registers: the operands
+    // of the G - 1 groups not yet started (the RF's read registers hold them
+    // only in the cycle it takes them), the function pipeline's Ls - 1 inner
+    // stages (their lanes, a valid bit and the group number), the results of
+    // the G - 1 groups before the last (the last goes to the output
+    // register), and the tags of the instructions inside, at most
+    // ceil((E - 1) / G).
+    {
+        const uint64_t groups = (lanes + c.sfu_lanes - 1) / c.sfu_lanes;
+        const uint64_t ls = c.sfu_latency_cycles;
+        const uint64_t e = c.timing.sfu;
+        const uint64_t inside = (e - 1 + groups - 1) / groups;
+        BlackBoxDeclaration sfu("special-function unit", SignOff::not_signed); // sign-off: only the human changes this line
+        sfu.latency = c.timing.sfu;
+        sfu.latency_from = "ceil(lanes / sfu.lanes) - 1 + sfu.latency_cycles";
+        sfu.interval = static_cast<uint32_t>(groups);
+        sfu.inputs = {operands(1), control};
+        sfu.cost.flip_flops = 2 * (groups - 1) * c.sfu_lanes * 32 + (ls - 1) * (c.sfu_lanes * 64 + 1 + bits_for(groups)) +
+            inside * tag;
+        sfu.cost.memory_bits = uint64_t{c.sfu_lanes} * 2 * 128 * 64;
+        sfu.cost.multipliers = 2 * uint64_t{c.sfu_lanes};
+        sfu.cost_function = "2 x (G - 1) x sfu.lanes x 32 + (Ls - 1) x (sfu.lanes x 64 + 1 + bits(G)) + "
+            "ceil((E - 1) / G) x tag flip-flops, sfu.lanes x 2 x 128 x 64 table bits, 2 x sfu.lanes multipliers; G " +
+            text(groups) + ", sfu.lanes " + text(c.sfu_lanes) + ", Ls " + text(ls) + ", E " + text(e) + ", tag " + text(tag);
+        declare(ArithmeticUnit::sfu, std::move(sfu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
+    }
 }
 
 } // namespace nanosm

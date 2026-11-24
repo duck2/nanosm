@@ -268,7 +268,7 @@ void Machine::rf_write_port(Wires& w) {
         if (store_completions_.cur()[slot] != 0) release_lsu_command(w, lsu_commands_.cur().in_slot(slot).id);
     }
     for (const auto unit : units_slowest_first_) {
-        const auto& result = arithmetic_results_[static_cast<std::size_t>(unit)].last();
+        const auto& result = arithmetic_black_boxes_[static_cast<std::size_t>(unit)].output();
         if (!result.has_value() || result->predicate) continue;
         present(RfWrite{result->warp, result->dst, result->values, result->lane_enables, std::nullopt, {}});
     }
@@ -316,7 +316,7 @@ void Machine::rf_ram_stage(Wires& w) {
         const auto& command = lsu_commands_.cur().in_slot(slot);
         record_depbar_completion(w, command.warp, command.depbar, "depbar underflow on sb" + std::to_string(command.depbar));
     }
-    const auto& alu = arithmetic_results_[static_cast<std::size_t>(ArithmeticUnit::alu)].last();
+    const auto& alu = arithmetic_black_boxes_[static_cast<std::size_t>(ArithmeticUnit::alu)].output();
     if (alu.has_value() && alu->predicate) {
         uint64_t bits = 0;
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
@@ -463,7 +463,7 @@ void Machine::step_rf_reads(Wires& w) {
     // The arithmetic pipeline: the instruction in its last stage has its
     // operands at the RF output and executes; the one in stage 0 (accepted
     // last cycle) samples its round.
-    if (const auto& ready = arithmetic_reads_.last(); ready.has_value()) execute_arithmetic(*ready, w);
+    if (const auto& ready = arithmetic_reads_.last(); ready.has_value()) execute_arithmetic(*ready);
     if (const auto& first = arithmetic_reads_.stage(0); first.has_value()) {
         auto sampled = *first;
         for (std::size_t i = 0; i < sampled.reads.size(); ++i) {

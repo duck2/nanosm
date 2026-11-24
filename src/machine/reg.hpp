@@ -8,9 +8,10 @@
 // even from the same writer: compute the complete next value in one place
 // (ordinary locals may be edited freely) and write it once.
 //
-// Every Reg registers itself with its RegisterFile at construction, and
-// RegisterFile::commit() clocks all of them at the end of Machine::tick(), so
-// a forgotten commit cannot happen.
+// Everything clocked (Clocked below: a register, a group, a pipeline, a
+// FIFO, a memory, a black box's output) adds itself at construction to the
+// machine's AllClocked, and AllClocked::commit() clocks all of it at the end
+// of Machine::tick(), so a forgotten commit cannot happen.
 //
 // "D was written this tick" (the optional's engaged bit) is simulator
 // bookkeeping that implements the register's hold / update: commit takes D if
@@ -34,7 +35,7 @@
 
 namespace nanosm {
 
-class RegisterFile;
+class AllClocked;
 
 // The machine's units, for the state report: every piece of clocked state
 // names the one it belongs to when it is constructed.
@@ -112,12 +113,14 @@ struct StateSize {
     }
 };
 
-class RegisterBase {
+// The base of everything that takes the clock edge: a register, group,
+// pipeline, FIFO, memory or black box (not all of them registers).
+class Clocked {
 public:
-    RegisterBase(RegisterFile& file, Unit unit, std::string name);
-    RegisterBase(const RegisterBase&) = delete;
-    RegisterBase& operator=(const RegisterBase&) = delete;
-    virtual ~RegisterBase() = default;
+    Clocked(AllClocked& all, Unit unit, std::string name);
+    Clocked(const Clocked&) = delete;
+    Clocked& operator=(const Clocked&) = delete;
+    virtual ~Clocked() = default;
 
     [[nodiscard]] const std::string& name() const { return name_; }
     [[nodiscard]] Unit unit() const { return unit_; }
@@ -148,7 +151,7 @@ protected:
     [[nodiscard]] uint64_t cycle() const;
 
 private:
-    RegisterFile& file_;
+    AllClocked& all_;
     uint32_t id_ = 0;
     Unit unit_ = Unit::none;
     std::string name_;
@@ -156,13 +159,13 @@ private:
 };
 
 template <typename T>
-class Reg final : public RegisterBase {
+class Reg final : public Clocked {
 public:
-    Reg(RegisterFile& file, Unit unit, std::string name, T initial = T{})
-        : RegisterBase(file, unit, std::move(name)), q_(std::move(initial)) {
+    Reg(AllClocked& all, Unit unit, std::string name, T initial = T{})
+        : Clocked(all,unit, std::move(name)), q_(std::move(initial)) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
     }
-    Reg(RegisterFile& file, std::string name, T initial = T{}) : Reg(file, Unit::none, std::move(name), std::move(initial)) {}
+    Reg(AllClocked& all, std::string name, T initial = T{}) : Reg(all,Unit::none, std::move(name), std::move(initial)) {}
 
     // The declared hardware bits of its payload (set when the machine is
     // built, from the profile).
@@ -194,16 +197,18 @@ private:
     std::optional<uint64_t> bits_;
 };
 
-// Every register of one machine. The machine must not move after its
-// registers are built (Machine deletes its copy and move operations).
-class RegisterFile {
+// The roll call of everything clocked that the machine owns: it commits them
+// all at the end of a cycle, and the state report walks it. The machine must
+// not move after its state is built (Machine deletes its copy and move
+// operations).
+class AllClocked {
 public:
-    RegisterFile(Sanitizer& sanitizer, const uint64_t& cycle) : sanitizer_(sanitizer), cycle_(cycle) {}
-    RegisterFile(const RegisterFile&) = delete;
-    RegisterFile& operator=(const RegisterFile&) = delete;
+    AllClocked(Sanitizer& sanitizer, const uint64_t& cycle) : sanitizer_(sanitizer), cycle_(cycle) {}
+    AllClocked(const AllClocked&) = delete;
+    AllClocked& operator=(const AllClocked&) = delete;
 
-    uint32_t add(RegisterBase& reg) {
-        registers_.push_back(&reg);
+    uint32_t add(Clocked& reg) {
+        clocked_.push_back(&reg);
         return next_id_++;
     }
 
@@ -211,16 +216,16 @@ public:
     // its own: the sanitizer's write tags are kept per id).
     uint32_t new_write_point() { return next_id_++; }
 
-    // The clock edge: every register takes its D (or holds).
+    // The clock edge: everything takes its D (or holds).
     void commit() {
-        for (auto* reg : registers_) reg->commit();
+        for (auto* reg : clocked_) reg->commit();
     }
 
     // Every register's declared size, in declaration order.
     [[nodiscard]] std::vector<StateSize> sizes() const {
         std::vector<StateSize> all;
-        all.reserve(registers_.size());
-        for (const auto* reg : registers_) all.push_back(reg->size());
+        all.reserve(clocked_.size());
+        for (const auto* reg : clocked_) all.push_back(reg->size());
         return all;
     }
 
@@ -230,33 +235,33 @@ public:
 private:
     Sanitizer& sanitizer_;
     const uint64_t& cycle_;
-    std::vector<RegisterBase*> registers_;
+    std::vector<Clocked*> clocked_;
     uint32_t next_id_ = 0;
 };
 
-inline RegisterBase::RegisterBase(RegisterFile& file, Unit unit, std::string name)
-    : file_(file), unit_(unit), name_(std::move(name)) {
-    id_ = file_.add(*this);
+inline Clocked::Clocked(AllClocked& all, Unit unit, std::string name)
+    : all_(all), unit_(unit), name_(std::move(name)) {
+    id_ = all_.add(*this);
 }
 
-inline void RegisterBase::note_write(const char* tag, bool already_written) const {
+inline void Clocked::note_write(const char* tag, bool already_written) const {
     if (already_written) {
-        file_.sanitizer().check_register_rewrite(id_, name_, file_.cycle(), tag);
+        all_.sanitizer().check_register_rewrite(id_, name_, all_.cycle(), tag);
     } else {
-        file_.sanitizer().record_register_write(id_, tag);
+        all_.sanitizer().record_register_write(id_, tag);
     }
 }
 
-inline uint32_t RegisterBase::new_write_point() { return file_.new_write_point(); }
-inline Sanitizer& RegisterBase::sanitizer() const { return file_.sanitizer(); }
-inline uint64_t RegisterBase::cycle() const { return file_.cycle(); }
+inline uint32_t Clocked::new_write_point() { return all_.new_write_point(); }
+inline Sanitizer& Clocked::sanitizer() const { return all_.sanitizer(); }
+inline uint64_t Clocked::cycle() const { return all_.cycle(); }
 
-inline void RegisterBase::note_write(
+inline void Clocked::note_write(
     uint32_t point, const std::string& point_name, const char* tag, bool already_written) const {
     if (already_written) {
-        file_.sanitizer().check_register_rewrite(point, point_name, file_.cycle(), tag);
+        all_.sanitizer().check_register_rewrite(point, point_name, all_.cycle(), tag);
     } else {
-        file_.sanitizer().record_register_write(point, tag);
+        all_.sanitizer().record_register_write(point, tag);
     }
 }
 

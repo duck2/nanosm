@@ -16,8 +16,8 @@
 //   rf.cpp             the vector register file: the write calendar, the read and write port decisions, the
 //                      write ports' pipelines and the RAM stage. (Its timing rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
-//   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, and their result
-//                      pipelines.
+//   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, black boxes with
+//                      their contracts and declared costs.
 //   shmem.cpp          shared memory: ports A and B, the selects, load and store slots, bank rounds, and what
 //                      issue sees of them.
 //   barriers.cpp       barriers (mbar): probes, the read-modify-write engine, atomics, and the try-wait slots.
@@ -42,6 +42,9 @@
 //   fifo.hpp           Fifo<T>, the deep queues toward global memory: push at the tail, pop at the head.
 //   memory.hpp         Memory<T>, words in banks read and written only through their ports: the register
 //                      files, shared memory, tmem, the instruction memory, the divergence stack.
+//   blackbox.hpp       black boxes: units modelled opaquely behind a contract (registered inputs and outputs,
+//                      a fixed latency, a declared cost, signed off by the human only); the memories are black
+//                      boxes.
 //   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles; the
 //                      payloads not there yet are listed at the end of machine.hpp).
 //   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.
@@ -177,7 +180,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         b_write_pipe_.build(config_.shmem_port_a_depth);
         rmw_alu_.build(config_.shmem_rmw_compute_cycles);
         mma_reads_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
-        mma_results_.build(config_.mma_result_latency_cycles + config_.tmem_port_depth);
+        mma_tags_.build(config_.mma_result_latency_cycles);
+        mma_writes_.build(config_.tmem_port_depth);
         rf_write_policy_.build(config_.rf_banks);
         mbar_wait_slots_.build(config_.mbar_wait_slots);
         rf_read_policy_.build(config_.rf_banks);
@@ -208,21 +212,21 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // ports per bank, zero meaning free (no valid bit).
         write_calendar_.declare_total_bits(uint64_t{write_calendar_.stages() - 1} * config_.rf_banks *
             static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
-        // The fixed units' result pipelines (E stages each, src/timing.hpp),
-        // and one pipeline per RF write port, write_depth_cycles stages.
-        const std::array<uint32_t, arithmetic_units> unit_stages{
+        // The fixed units in the order of their delays (E each, src/timing.hpp;
+        // their black boxes are built with their contracts, arith.cpp), and one
+        // pipeline per RF write port, write_depth_cycles stages.
+        const std::array<uint32_t, arithmetic_units> unit_delays{
             config_.timing.alu, config_.timing.fadd, config_.timing.sfu};
         for (std::size_t unit = 0; unit < arithmetic_units; ++unit) {
-            arithmetic_results_[unit].build(unit_stages[unit]);
             units_slowest_first_[unit] = static_cast<ArithmeticUnit>(unit);
         }
         std::stable_sort(units_slowest_first_.begin(), units_slowest_first_.end(),
             [&](ArithmeticUnit a, ArithmeticUnit b) {
-                return unit_stages[static_cast<std::size_t>(a)] > unit_stages[static_cast<std::size_t>(b)];
+                return unit_delays[static_cast<std::size_t>(a)] > unit_delays[static_cast<std::size_t>(b)];
             });
         for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
             for (uint32_t port = 0; port < config_.rf_write_ports_per_bank; ++port) {
-                rf_write_pipes_.emplace_back(registers_, Unit::register_file,
+                rf_write_pipes_.emplace_back(clocked_, Unit::register_file,
                     "RF write pipeline, bank " + std::to_string(bank) + " port " + std::to_string(port));
                 rf_write_pipes_.back().build(config_.rf_write_depth_cycles);
             }
@@ -338,6 +342,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         shmem_to_ram_.declare_member_bits(
             static_cast<uint64_t>(std::bit_width(config_.shmem_port_a_depth > 0 ? config_.shmem_port_a_depth - 1 : 0u)));
         declare_state_bits();
+        declare_black_boxes();
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
         throw SimError("machine state does not fit in host memory");
@@ -543,7 +548,7 @@ void Machine::tick() {
     land_divergence_push(w);
 
     // Clock edge: every register takes D and every memory its writes.
-    registers_.commit();
+    clocked_.commit();
     ++cycle_;
     // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
     if (done()) sanitizer_.check_kernel_end(cycle_);
@@ -591,11 +596,13 @@ bool Machine::done() const {
         tma.credits_used == 0 && tma_walker_start_pipe_.empty() && empty(urf_read_rounds_) &&
         tma_read_pairs_.empty() &&
         empty(tma_holding_) && arithmetic_reads_.empty() &&
-        std::all_of(arithmetic_results_.begin(), arithmetic_results_.end(), [](const auto& pipe) { return pipe.empty(); }) &&
+        std::all_of(arithmetic_black_boxes_.begin(), arithmetic_black_boxes_.end(),
+            [](const auto& black_box) { return black_box.empty(); }) &&
         std::all_of(rf_write_pipes_.begin(), rf_write_pipes_.end(), [](const auto& pipe) { return pipe.empty(); }) &&
         std::all_of(store_completions_.cur().begin(), store_completions_.cur().end(), [](uint8_t bit) { return bit == 0; }) &&
         dispatch_pipe_.empty() && lsu_read_pipe_.empty() && urf_pipe_.empty() &&
-        mma.slots.empty() && mma_results_.empty() && !mma.fetch.has_value() && mma_reads_.empty() &&
+        mma.slots.empty() && mma_core_.empty() && mma_tags_.empty() && mma_writes_.empty() && !mma.fetch.has_value() &&
+        mma_reads_.empty() &&
         !acc[0].has_value() && !acc[1].has_value();
 }
 
@@ -674,7 +681,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 45> canonical = {
+    static constexpr std::array<Driver, 44> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -708,7 +715,6 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_egress,
         &Machine::drive_read_records,
         &Machine::drive_free_id_tags,
-        &Machine::drive_arithmetic_results,
         &Machine::drive_rf_write_pipes,
         &Machine::drive_store_completions,
         &Machine::drive_predicates,

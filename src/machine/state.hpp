@@ -7,7 +7,9 @@
 // std::array, std::optional of those, and fixed.hpp's Bounded for a field
 // with a maximum and a count). A payload with a std::vector, deque, map or
 // string in it has no declared size, so it is refused when it is compiled:
-// FixedPayload below is checked by Reg, Regs, Pipe, Fifo and Memory.
+// FixedPayload below is checked by Reg, Regs, Pipe, Fifo and Memory, and by
+// a black box's output register (blackbox.hpp; its inside is not state of this
+// kind).
 //
 // The payloads that are not there yet are named one by one, in one place:
 // the list at the end of machine.hpp, each with what is still in it. That

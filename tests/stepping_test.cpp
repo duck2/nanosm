@@ -18,18 +18,18 @@ using namespace nanosm_test;
 void test_reg_hold_write_commit() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Reg<int> reg(file, "test register", 5);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Reg<int> reg(all,"test register", 5);
     sanitizer.record_cycle_start();
-    file.commit();
+    all.commit();
     require(reg.cur() == 5, "a register nobody wrote did not hold its value");
     sanitizer.record_cycle_start();
     reg.set_next(9, "writer");
     require(reg.cur() == 5, "set_next() changed Q before the clock edge");
-    file.commit();
+    all.commit();
     require(reg.cur() == 9, "commit did not publish D");
     sanitizer.record_cycle_start();
-    file.commit();
+    all.commit();
     require(reg.cur() == 9, "the tick after a write did not hold");
 }
 
@@ -38,8 +38,8 @@ void test_reg_hold_write_commit() {
 void test_reg_duplicate_write_panics() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Reg<int> reg(file, "test register", 0);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Reg<int> reg(all,"test register", 0);
     const auto expect_panic = [&](const char* first, const char* second) {
         sanitizer.record_cycle_start();
         reg.set_next(1, first);
@@ -51,7 +51,7 @@ void test_reg_duplicate_write_panics() {
                      std::string("first by '") + first + "'", std::string("then by '") + second + "'"}) {
                 require(message.find(needle) != std::string::npos, "duplicate-write PANIC lacks '" + needle + "': " + message);
             }
-            file.commit();
+            all.commit();
             return;
         }
         throw std::runtime_error("a second write in one tick did not panic");
@@ -60,7 +60,7 @@ void test_reg_duplicate_write_panics() {
     expect_panic("drain", "drain"); // the same writer twice
     sanitizer.record_cycle_start();
     reg.set_next(3, "next tick");    // a new tick: one write is fine again
-    file.commit();
+    all.commit();
     require(reg.cur() == 3, "the register did not recover after a duplicate-write PANIC");
 }
 
@@ -271,11 +271,11 @@ void test_buffer_reuse_load_to_load() {
 void test_pipe_advance_hold_replace() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 0;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Pipe<int> pipe(file, "test pipeline", 32);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Pipe<int> pipe(all,"test pipeline", 32);
     pipe.build(3);
     const auto tick = [&]() {
-        file.commit();
+        all.commit();
         ++cycle;
         sanitizer.record_cycle_start();
     };
@@ -320,8 +320,8 @@ void test_pipe_advance_hold_replace() {
 void test_pipe_duplicate_write_panics() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Pipe<int> pipe(file, "test pipeline");
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Pipe<int> pipe(all,"test pipeline");
     pipe.build(2);
     const auto expect_panic = [&](const std::string& what, const std::function<void(const char*)>& write) {
         sanitizer.record_cycle_start();
@@ -343,7 +343,7 @@ void test_pipe_duplicate_write_panics() {
     expect_panic("replace", [&](const char* tag) { pipe.replace(0, 2, tag); });
     expect_panic("hold", [&](const char* tag) { pipe.hold(tag); });
     // Different points in one tick are different nets.
-    nanosm::Pipe<int> other(file, "other pipeline");
+    nanosm::Pipe<int> other(all,"other pipeline");
     other.build(2);
     sanitizer.record_cycle_start();
     other.push(1, "entry");
@@ -394,18 +394,18 @@ void test_bounded_payload_and_limits() {
 void test_regs_members_hold_write_and_panic() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Regs<int> group(file, "test group", 5);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Regs<int> group(all,"test group", 5);
     group.build(4, 9);
     sanitizer.record_cycle_start();
     require(group.count() == 4 && group.cur() == std::vector<int>({9, 9, 9, 9}), "a new group lacks its initial values");
     group.set_next(1, 11, "writer of member 1");
     group[3].set_next(13, "writer of member 3"); // another member, other logic: its own net
     require(group.cur()[1] == 9 && group[3].cur() == 9, "set_next() changed Q before the clock edge");
-    file.commit();
+    all.commit();
     require(group.cur() == std::vector<int>({9, 11, 9, 13}), "written members did not take D, or an unwritten one moved");
     sanitizer.record_cycle_start();
-    file.commit();
+    all.commit();
     require(group.cur() == std::vector<int>({9, 11, 9, 13}), "a group nobody wrote did not hold");
     const auto size = group.size();
     require(std::string(size.kind) == "group" && size.entries == 4 && size.bits_per_entry == std::optional<uint64_t>(5),
@@ -434,11 +434,11 @@ void test_regs_members_hold_write_and_panic() {
 void test_fifo_order_latency_and_widths() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 3;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Fifo<int> fifo(file, "test FIFO", 8);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Fifo<int> fifo(all,"test FIFO", 8);
     fifo.build(4, nanosm::FifoPorts{2, 2, 2});
     const auto tick = [&] {
-        file.commit();
+        all.commit();
         sanitizer.record_cycle_start();
     };
     sanitizer.record_cycle_start();
@@ -474,9 +474,9 @@ void test_fifo_order_latency_and_widths() {
         refused = std::string(error.what()).find("holds more than its 4 entries") != std::string::npos;
     }
     require(refused, "a push past the capacity was not an internal error");
-    // (A machine stops at an internal error; these two get a register file of their own.)
+    // (A machine stops at an internal error; these two get an AllClocked of their own.)
     nanosm::Sanitizer quiet;
-    nanosm::RegisterFile other(quiet, cycle);
+    nanosm::AllClocked other(quiet, cycle);
     nanosm::Fifo<bool> bits(other, "test bits FIFO", 1);
     bits.build(2);
     nanosm::Fifo<int> none(other, "zero-capacity FIFO");
@@ -500,8 +500,8 @@ void test_fifo_order_latency_and_widths() {
 void test_fifo_second_push_panics() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 3;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Fifo<int> second(file, "second FIFO");
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Fifo<int> second(all,"second FIFO");
     second.build(2);
     sanitizer.record_cycle_start();
     second.push(1, "first");
@@ -519,6 +519,64 @@ void test_fifo_second_push_panics() {
     throw std::runtime_error("a second push in one tick did not panic");
 }
 
+// A black box's output register holds a value from its inputs' cycle +
+// latency, for that one cycle; nothing passes through it in one cycle, and
+// inputs closer than its interval are refused (a refused value is not a
+// write: a good one may follow in the same tick). It refuses a value before
+// it is built; one that keeps an inside is built with the inside's idle
+// question, and is not empty while the inside holds work.
+void test_black_box_latency_and_interval() {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 0;
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::BlackBox<uint32_t> black_box(all, nanosm::Unit::none, "a black box");
+    const auto refused = [&](uint32_t value, uint64_t taken_at) {
+        try {
+            black_box.deliver(value, taken_at, "test");
+        } catch (const nanosm::SimError&) {
+            return true;
+        }
+        return false;
+    };
+    require(refused(1, 0), "a black box not yet built took a value");
+    nanosm::BlackBoxDeclaration declaration("a black box", nanosm::SignOff::not_signed);
+    declaration.latency = 3;
+    declaration.interval = 2;
+    black_box.build(declaration);
+    std::vector<std::optional<uint32_t>> outputs;
+    for (; cycle < 8; ++cycle) {
+        sanitizer.record_cycle_start();
+        if (cycle == 0) black_box.deliver(10, 0, "test");
+        if (cycle == 1) require(refused(11, 1), "an input one cycle after another was taken (interval 2)");
+        if (cycle == 2) {
+            require(refused(12, 1), "an input one cycle after another was taken (interval 2)");
+            black_box.deliver(12, 2, "test"); // after a refusal in the same tick
+        }
+        if (cycle == 7) require(refused(13, 4), "a value due now was delivered (it would pass in one cycle)");
+        outputs.push_back(black_box.output());
+        all.commit();
+    }
+    const std::vector<std::optional<uint32_t>> expected{
+        std::nullopt, std::nullopt, std::nullopt, 10u, std::nullopt, 12u, std::nullopt, std::nullopt};
+    require(outputs == expected, "the black box's output register does not hold each value at its inputs' cycle + 3");
+    require(black_box.empty(), "the black box is not empty after its outputs");
+
+    nanosm::BlackBox<uint32_t, int> keeper(all, nanosm::Unit::none, "a black box with an inside");
+    nanosm::BlackBoxDeclaration keeps("a black box with an inside", nanosm::SignOff::not_signed);
+    bool unasked = false;
+    try {
+        keeper.build(keeps);
+    } catch (const nanosm::SimError&) {
+        unasked = true;
+    }
+    require(unasked, "a black box that keeps an inside was built without its idle question");
+    keeper.build(keeps, [](const int& waiting) { return waiting == 0; });
+    keeper.inside() = 1;
+    require(!keeper.empty(), "a black box with work inside says it is empty");
+    keeper.inside() = 0;
+    require(keeper.empty(), "an idle black box says it is not empty");
+}
+
 // A memory: a read sees the word as it was at the start of the cycle and a
 // write lands at the clock edge (read first); a write enables its elements one
 // by one; two reads of one word through one port are one read; it reports its
@@ -526,11 +584,11 @@ void test_fifo_second_push_panics() {
 void test_memory_read_first_and_enables() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 0;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Memory<uint32_t> memory(file, "test memory");
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Memory<uint32_t> memory(all,"test memory");
     memory.build(nanosm::MemoryShape{2, 4, 2, 64, 1, 1, 2, nanosm::SameCycle::read_first});
     const auto tick = [&] {
-        file.commit();
+        all.commit();
         sanitizer.record_cycle_start();
     };
     sanitizer.record_cycle_start();
@@ -553,7 +611,7 @@ void test_memory_read_first_and_enables() {
         refused = true;
     }
     require(refused && memory.peek(1, 0)[0] == 0, "a poke past the word's elements reached the next word");
-    nanosm::Memory<uint32_t> rom(file, "read-only memory");
+    nanosm::Memory<uint32_t> rom(all,"read-only memory");
     rom.build(nanosm::MemoryShape{1, 2, 1, 32, 1, 0, 1, nanosm::SameCycle::read_only});
     refused = false;
     try {
@@ -576,8 +634,8 @@ void test_memory_port_panics() {
     for (const bool write : {false, true}) {
         nanosm::Sanitizer sanitizer;
         uint64_t cycle = 5;
-        nanosm::RegisterFile file(sanitizer, cycle);
-        nanosm::Memory<uint32_t> memory(file, "ported memory");
+        nanosm::AllClocked all(sanitizer, cycle);
+        nanosm::Memory<uint32_t> memory(all,"ported memory");
         memory.build(nanosm::MemoryShape{2, 4, 1, 32, 1, 1, 1, nanosm::SameCycle::read_first});
         sanitizer.record_cycle_start();
         const std::array<uint32_t, 1> value{1};
@@ -614,15 +672,30 @@ void test_state_report_adds_up() {
     const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
     const auto missing = machine.state_not_yet_declared();
     require(missing.empty(), "a primitive is listed as not yet declared");
+    // What is counted in the open, and the memories' words (black boxes).
     uint64_t declared = 0;
+    uint64_t memory_words = 0;
     for (const auto& size : machine.state_sizes()) {
         require(size.unit != nanosm::Unit::none, "'" + size.name + "' belongs to no unit");
         const bool listed = std::find(missing.begin(), missing.end(), size.name) != missing.end();
         require(size.bits().has_value() != listed,
             "'" + size.name + (listed ? "' is listed as not yet declared but declares bits"
                                       : "' declares no bits and is not listed"));
-        declared += size.bits().value_or(0);
+        (std::string(size.kind) == "memory" ? memory_words : declared) += size.bits().value_or(0);
     }
+    nanosm::BlackBoxCost costs;
+    uint64_t memory_black_boxes = 0;
+    for (const auto& black_box : machine.black_boxes()) {
+        costs.flip_flops += black_box.cost.flip_flops;
+        costs.memory_bits += black_box.cost.memory_bits;
+        costs.multipliers += black_box.cost.multipliers;
+        for (const auto& size : machine.state_sizes()) {
+            if (size.name == black_box.name && std::string(size.kind) == "memory") {
+                memory_black_boxes += black_box.cost.memory_bits;
+            }
+        }
+    }
+    require(memory_black_boxes == memory_words, "the memories' black boxes do not declare the memories' words");
     const auto report = machine.state_report();
     const auto value = [](const std::string& digits) {
         std::string plain;
@@ -631,13 +704,18 @@ void test_state_report_adds_up() {
         }
         return std::stoull(plain);
     };
-    const std::regex line(R"(^  (register|group|pipeline|FIFO|memory) .* ([0-9,]+)  .*$)");
-    const std::regex unit_total(R"(^  flip-flops ([0-9,]+), memory ([0-9,]+), FIFO ([0-9,]+), total ([0-9,]+)$)");
-    const std::regex grand_total(R"(^  total +([0-9,]+)$)");
+    const std::regex line(R"(^  (register|group|pipeline|FIFO) .* ([0-9,]+)  .*$)");
+    const std::regex unit_total(R"(^  in the open: flip-flops ([0-9,]+), FIFO ([0-9,]+), total ([0-9,]+)$)");
+    const std::regex black_box_line(R"(^  black box +.+ ([0-9,]+)  declared; (not signed off|signed off)$)");
+    const std::regex unit_walls(R"(^  behind walls: flip-flops ([0-9,]+), memory ([0-9,]+), multipliers ([0-9,]+) \(declared\)$)");
+    // The first total is the open state's (then the black boxes' declared one, then the sum).
+    const std::regex grand_total(R"(^    total +([0-9,]+)$)");
     std::istringstream lines(report);
     std::string text;
     uint64_t unit_lines = 0;
+    uint64_t black_box_lines = 0;
     uint64_t units = 0;
+    uint64_t walls = 0;
     uint64_t unit_count = 0;
     std::optional<uint64_t> total;
     std::smatch match;
@@ -645,18 +723,25 @@ void test_state_report_adds_up() {
         if (std::regex_match(text, match, line)) {
             unit_lines += value(match[2]);
         } else if (std::regex_match(text, match, unit_total)) {
-            const auto sum = value(match[1]) + value(match[2]) + value(match[3]);
-            require(sum == value(match[4]) && sum == unit_lines, "a unit's total is not the sum of its lines: " + text);
+            const auto sum = value(match[1]) + value(match[2]);
+            require(sum == value(match[3]) && sum == unit_lines, "a unit's total is not the sum of its lines: " + text);
             units += sum;
             unit_lines = 0;
             ++unit_count;
-        } else if (std::regex_match(text, match, grand_total)) {
+        } else if (std::regex_match(text, match, black_box_line)) {
+            black_box_lines += value(match[1]);
+        } else if (std::regex_match(text, match, unit_walls)) {
+            require(value(match[1]) + value(match[2]) == black_box_lines, "a unit's black boxes do not add up: " + text);
+            walls += black_box_lines;
+            black_box_lines = 0;
+        } else if (!total.has_value() && std::regex_match(text, match, grand_total)) {
             total = value(match[1]);
         }
     }
     require(unit_count == static_cast<uint64_t>(nanosm::last_unit), "the report does not list every unit");
     require(total.has_value() && *total == units && units == declared,
-        "the report's total is not the sum of its units and of the declared sizes");
+        "the report's open total is not the sum of its units and of the declared sizes");
+    require(walls == costs.flip_flops + costs.memory_bits, "the units' black boxes do not add up to their costs");
     // The write calendar: 14 of its 15 stages can hold a booking, three bank
     // counts of one bit each, zero meaning free.
     bool calendar = false;
@@ -664,8 +749,52 @@ void test_state_report_adds_up() {
         calendar = calendar || (size.name == "RF write calendar" && size.bits() == std::optional<uint64_t>(42));
     }
     require(calendar, "the RF write calendar is not declared as 42 flip-flops");
-    require(report.find("  flip-flops       68,210\n") != std::string::npos,
-        "the canonical profile's flip-flops moved from 68,210");
+    // The canonical numbers: counted in the open, declared behind walls (the
+    // memories' words with this one-word kernel's instruction memory, 128
+    // bits; FA's is 22,144).
+    require(report.find("  in the open (counted)\n    flip-flops       38,546\n    FIFO storage     6,690\n") !=
+            std::string::npos,
+        "the canonical profile's open flip-flops moved from 38,546 (or its FIFO storage from 6,690)");
+    require(report.find("    flip-flops       18,083\n    memory bits      1,415,296\n    total            1,433,379\n"
+                        "    multipliers      168\n") != std::string::npos,
+        "the canonical profile's declared costs moved (18,083 flip-flops, 1,415,296 memory bits, 168 multipliers)");
+    // Every black box prints the sign-off its definition gives, and the
+    // totals count the signed ones as the definitions do.
+    std::size_t signed_off = 0;
+    for (const auto& black_box : machine.black_boxes()) {
+        if (black_box.signed_off()) ++signed_off;
+        require(report.find("  " + black_box.name + " (" + nanosm::unit_name(black_box.unit) + "): " +
+                    (black_box.signed_off() ? "signed off\n" : "not signed off\n")) != std::string::npos,
+            "the report does not print black box '" + black_box.name + "' with its definition's sign-off");
+    }
+    require(report.find("black boxes, " + std::to_string(signed_off) + " signed off)") != std::string::npos,
+        "the report's totals do not count the black boxes signed off");
+    // The MMA core: at a long result latency each further cycle only delays
+    // the packed result (16 words, 512 bits); at a latency of exactly
+    // tmem.port_depth + tmem.read_latency_cycles the report says plainly
+    // that no clock edge is left after C.
+    const auto mma_core = [](uint32_t latency) {
+        auto profile = canonical_profile();
+        profile.mma_result_latency_cycles = latency;
+        nanosm::Launch one;
+        one.active_warps = 1;
+        const nanosm::Machine varied(profile, compile("halt\n", profile), std::move(one));
+        for (const auto& black_box : varied.black_boxes()) {
+            if (black_box.name == "MMA core") return std::pair{black_box.cost.flip_flops, varied.state_report()};
+        }
+        throw std::runtime_error("no MMA core black box");
+    };
+    const auto [at_3999, report_3999] = mma_core(3999);
+    const auto [at_4000, report_4000] = mma_core(4000);
+    require(at_4000 - at_3999 == 512, "one more cycle of MMA result latency costs " + std::to_string(at_4000 - at_3999) +
+        " flip-flops, not the delayed result's 512");
+    const auto [at_8, report_8] = mma_core(8);
+    require(at_8 == 12'256, "the canonical MMA core's cost moved from 12,256 flip-flops: " + std::to_string(at_8));
+    require(report_8.find("NOT A REGISTERED ONE") == std::string::npos, "the canonical MMA core is flagged");
+    const auto [at_4, report_4] = mma_core(4);
+    require(report_4.find("AT THIS PROFILE THE LATENCY IS NOT A REGISTERED ONE: mma.result_latency_cycles (4) equals "
+                          "tmem.port_depth + tmem.read_latency_cycles (4)") != std::string::npos,
+        "a result latency of port_depth + read_latency is not flagged on the MMA core's lines");
     // The operands the dispatch and arithmetic pipelines carry inside the
     // RF's and URF's read delays are the memories' (their lines give the
     // ports' bound: banks x read ports x word bits x delay); what is held
@@ -710,10 +839,21 @@ void test_state_report_adds_up() {
             "the arithmetic pipeline declares " + std::to_string(bits_of("arithmetic pipeline: operand latches")) +
                 " bits" + where);
         const auto text = varied.state_report();
-        require(text.find("read first; read data in flight: " + std::string(expected.rf_note)) != std::string::npos &&
-                text.find("2R 1W, read delay " + std::to_string(expected.urf_delay) + ", read first; read data in flight: " +
-                    expected.urf_note) != std::string::npos,
-            "the register files' read-delay notes" + where);
+        require(text.find("  vector register file (register file): not signed off\n    latency " +
+                    std::to_string(expected.rf_delay) + " (rf.read_latency_cycles)\n") != std::string::npos &&
+                text.find("read first\n    read data in flight: " + std::string(expected.rf_note)) !=
+                    std::string::npos &&
+                text.find("  uniform register file (uniform register file): not signed off\n    latency " +
+                    std::to_string(expected.urf_delay) + " (urf.read_latency_cycles)\n") != std::string::npos &&
+                text.find("2R 1W, read first\n    read data in flight: " + std::string(expected.urf_note)) !=
+                    std::string::npos,
+            "the register files' black boxes: their read delays and the read data in flight" + where);
+        // The ALU's ur2r word: in the operand latches while the URF is the
+        // faster, from the URF's read registers when the delays are equal.
+        const std::string ur2r = expected.urf_delay < expected.rf_delay
+            ? "uniform operand (ur2r): 32 bits, the arithmetic pipeline's operand latches (in the open)\n"
+            : "uniform operand (ur2r): 32 bits, the uniform register file's read registers (the memory's)\n";
+        require(text.find(ur2r) != std::string::npos, "the ALU's ur2r input names the wrong source" + where);
     }
 }
 
@@ -742,18 +882,18 @@ void test_shmem_host_view_is_the_configured_bytes() {
 void test_regs_one_bit_members() {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 0;
-    nanosm::RegisterFile file(sanitizer, cycle);
-    nanosm::Regs<bool> bits(file, "test bits", 1);
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::Regs<bool> bits(all,"test bits", 1);
     bits.build(3, false);
     const nanosm::Regs<bool>& view = bits;
     sanitizer.record_cycle_start();
     bits.set_next(1, true, "set");
-    file.commit();
+    all.commit();
     const bool held = bits[1].cur();
     require(held && view[1].cur() && !bits[0].cur() && !view.at(2).cur(), "a one-bit member did not take its write");
     sanitizer.record_cycle_start();
     bits[2].set_next(true, "set");
-    file.commit();
+    all.commit();
     require(bits[1].cur() && bits.at(2).cur() && !bits[0].cur(), "a one-bit member did not hold across a tick");
 }
 
@@ -1262,6 +1402,9 @@ TEST(Stepping, memory_read_first_and_enables) {
     test_memory_read_first_and_enables();
 }
 
+TEST(Stepping, black_box_latency_and_interval) {
+    test_black_box_latency_and_interval();
+}
 // state report: declared bits by unit add up; exactly the listed four are not declared
 TEST(Stepping, state_report_adds_up) {
     test_state_report_adds_up();

@@ -27,7 +27,7 @@
 namespace nanosm {
 
 template <typename T>
-class Regs final : public RegisterBase {
+class Regs final : public Clocked {
 public:
     // A member's Q as it is read: a reference to the value, or the value
     // itself for a group of single bits (they are packed; a bit has no
@@ -59,12 +59,12 @@ public:
 
     // member_bits: the declared hardware bits of one member, or none where
     // not declared yet.
-    Regs(RegisterFile& file, Unit unit, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
-        : RegisterBase(file, unit, std::move(name)), member_bits_(member_bits) {
+    Regs(AllClocked& all, Unit unit, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
+        : Clocked(all,unit, std::move(name)), member_bits_(member_bits) {
         static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
     }
-    Regs(RegisterFile& file, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
-        : Regs(file, Unit::none, std::move(name), member_bits) {}
+    Regs(AllClocked& all, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
+        : Regs(all,Unit::none, std::move(name), member_bits) {}
 
     // The number of members, once, when the machine is built.
     void build(std::size_t members, const T& initial = T{}) {

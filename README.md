@@ -56,8 +56,11 @@ python -m nanosm --state-report kernels/pipeline.launch.py   # first, the machin
 ```
 
 The state report lists every piece of the machine's state by unit with its declared hardware
-bits: flip-flops (registers, groups, pipelines), memories (words x width, ports) and FIFO storage,
-and the totals (src/machine/state_report.cpp; the C API's `nanosm_session_state_report`).
+bits: in the open, flip-flops (registers, groups, pipelines) and FIFO storage, counted; behind
+walls, the black boxes (the arithmetic units, the tensor core's arithmetic, the memories), each
+with its contract, its declared cost and whether the human has signed it off (src/machine/blackbox.hpp);
+and the totals of each, kept apart (src/machine/state_report.cpp; the C API's
+`nanosm_session_state_report`).
 
 No Python package or third-party binding generator is required; the wrapper uses the standard
 library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `build`. A launch may

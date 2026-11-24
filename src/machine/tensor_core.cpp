@@ -100,10 +100,11 @@ void Machine::step_mma(Wires& w) {
 }
 
 // One cycle of the MMA engine, applied to `mma` (a copy of its Q):
-//   1. the steps in the core: one whose C is at the tmem RAM now samples it
-//      and computes its result; one whose result is at the tmem RAM now
-//      writes it (at this cycle's edge) and retires; retired commands leave
-//      the queue head;
+//   1. the steps in the core: one whose C read is at the tmem RAM now reads
+//      it for the core; one whose result is in the core's output register
+//      now leaves for tmem; one whose result is at the tmem RAM now writes it
+//      (at this cycle's edge) and retires; retired commands leave the queue
+//      head;
 //   2. the port-B read pipeline: the round at the RAM samples its elements;
 //      the round at the port output adds them to the core's operand latch,
 //      and a step's last round enters the core (C is read from tmem then);
@@ -113,17 +114,17 @@ void Machine::step_mma(Wires& w) {
 // A step granted its last round at g samples it at g + D and enters the core
 // at g + D + Lb (the same D and Lb as port A).
 void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
-    if (const auto& at_c = mma_results_.stage(config_.tmem_port_depth - 1); at_c.has_value()) {
-        w.mma_result_sampled = *at_c;
-        sample_mma_c(*w.mma_result_sampled);
+    if (const auto& at_c = mma_tags_.stage(config_.tmem_port_depth - 1); at_c.has_value()) read_mma_c(*at_c);
+    if (mma_tags_.last().has_value() != mma_core_.output().has_value()) {
+        throw SimError("internal: an MMA step's tag and its result left the core apart");
     }
-    if (const auto& landing = mma_results_.last(); landing.has_value()) {
-        if (!landing->c_sampled) throw SimError("internal MMA result lands before its C sample");
-        for (std::size_t i = 0; i < landing->words.size(); ++i) {
-            w.mma_tmem_writes.emplace_back(landing->words[i], landing->values[i]);
-        }
-        trace_->mma_result(cycle_, landing->command, landing->address);
-        const auto id = landing->command;
+    if (const auto& tag = mma_tags_.last(); tag.has_value()) w.mma_write_entering = MmaWrite{*tag, *mma_core_.output()};
+    if (const auto& landing = mma_writes_.last(); landing.has_value()) {
+        const auto& tag = landing->tag;
+        const auto words = mma_block_words(tag);
+        for (std::size_t i = 0; i < words.size(); ++i) w.mma_tmem_writes.emplace_back(words[i], landing->values[i]);
+        trace_->mma_result(cycle_, tag.command, tag.c_pointer + tag.m0 * tag.row_words + tag.n0);
+        const auto id = tag.command;
         auto command = std::find_if(mma.slots.begin(), mma.slots.end(),
             [id](const auto& candidate) { return candidate.id == id; });
         if (command == mma.slots.end() || command->outstanding_results == 0)
@@ -224,24 +225,30 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
     // sweep) waits: its C must be the earlier step's result. Tiles are told
     // apart by the tmem words they write (any shared word: the same tile, or
     // two commands' overlapping results), so pointers may alias freely.
-    const auto words = mma_block_words(step);
-    const auto shares_words = [&](const std::vector<uint32_t>& other) {
-        return std::any_of(other.begin(), other.end(), [&](uint32_t word) {
+    const auto words = mma_block_words(mma_tag(step));
+    const auto shares_words = [&](const MmaTag& other) {
+        const auto other_words = mma_block_words(other);
+        return std::any_of(other_words.begin(), other_words.end(), [&](uint32_t word) {
             return std::find(words.begin(), words.end(), word) != words.end();
         });
     };
-    // In flight: the steps in the result pipeline whose write has not landed
-    // (the one in the last stage lands at this edge), the step entering the
-    // core now, and the rounds in the read pipeline.
-    const auto& results = mma_results_.cur();
+    // In flight: the steps in the core (their tags; the one entering now
+    // too), the results on their way to tmem whose write has not landed (the
+    // one in the write pipeline's last stage lands at this edge), and the
+    // rounds in the read pipeline.
+    const auto& tags = mma_tags_.cur();
+    const auto& writes = mma_writes_.cur();
     const auto& reads = mma_reads_.cur();
     const bool tile_in_flight =
-        std::any_of(results.begin(), results.end() - 1, [&](const std::optional<MmaResult>& result) {
-            return result.has_value() && shares_words(result->words);
+        std::any_of(tags.begin(), tags.end(), [&](const std::optional<MmaTag>& tag) {
+            return tag.has_value() && shares_words(*tag);
         }) ||
-        (w.mma_result_entering.has_value() && shares_words(w.mma_result_entering->words)) ||
+        std::any_of(writes.begin(), writes.end() - 1, [&](const std::optional<MmaWrite>& write) {
+            return write.has_value() && shares_words(write->tag);
+        }) ||
+        (w.mma_tag_entering.has_value() && shares_words(*w.mma_tag_entering)) ||
         std::any_of(reads.begin(), reads.end(), [&](const std::optional<MmaRead>& read) {
-            return read.has_value() && shares_words(mma_block_words(read->step));
+            return read.has_value() && shares_words(mma_tag(read->step));
         });
     if (tile_in_flight) {
         trace_->mma_recurrence_stall();
@@ -320,48 +327,141 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
 }
 
 // A step's operands are all at the port output: it enters the core. A
-// reloading step's A block replaces the held one; the others use it. Its C
-// read leaves for tmem now (sampled tmem.port_depth later, sample_mma_c);
-// its result leaves the core result_latency after entry and lands in tmem
-// tmem.port_depth after that.
+// reloading step's A block replaces the held one; the others use it. The
+// core's black box takes A and B now; the step's tag enters the tag pipeline, and
+// its C read leaves for tmem with it (at the RAM tmem.port_depth later,
+// read_mma_c); its result is in the core's output register result_latency
+// after entry and lands in tmem tmem.port_depth after that.
 void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w) {
     const std::size_t a_elements = std::size_t{config_.mma_core_m} * config_.mma_core_k;
     if (step.reload_a) mma.a_held.assign(mma.latch.begin(), mma.latch.begin() + static_cast<std::ptrdiff_t>(a_elements));
     if (mma.a_held.size() != a_elements) throw SimError("internal MMA step found no held A block");
-    // B is transposed here only in the simulator's local operand snapshot
-    // (the latch holds it k-major).
-    std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
+    MmaCoreStep entering;
+    entering.entered = cycle_;
+    entering.a = mma.a_held;
+    // B is transposed here only in the core's own copy (the latch holds it
+    // k-major).
+    entering.b.resize(std::size_t{config_.mma_core_n} * config_.mma_core_k);
     for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
         for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            b[ni * config_.mma_core_k + kk] = mma.latch[a_elements + kk * config_.mma_core_n + ni];
-    MmaResult result;
-    result.command = step.command;
-    result.address = step.c_pointer + step.m0 * step.shape.n + step.n0;
-    result.words = mma_block_words(step);
-    result.init_step = step.init_step;
-    result.a = mma.a_held;
-    result.b = std::move(b);
-    w.mma_result_entering = std::move(result);
+            entering.b[ni * config_.mma_core_k + kk] = mma.latch[a_elements + kk * config_.mma_core_n + ni];
+    mma_core_.inside().push_back(entering);
+    w.mma_tag_entering = mma_tag(step);
 }
 
-// A step's C is at the tmem RAM now: its sixteen words are sampled (one
+Machine::MmaTag Machine::mma_tag(const MmaStep& step) {
+    return MmaTag{step.command, step.c_pointer, step.m0, step.n0, step.shape.n, step.init_step};
+}
+
+// A step's C read is at the tmem RAM now: its sixteen words are read (one
 // round of the MMA's tmem read service; READ_FIRST, before this cycle's
-// writes land) and the fused dot-plus-C result is computed. It arrives in the
-// core tmem.read_latency_cycles later, before the core's last stage (profile
-// validation: result_latency >= port_depth + read_latency).
-void Machine::sample_mma_c(MmaResult& result) {
-    result.values.resize(config_.mma_core_m * config_.mma_core_n);
+// writes land), or zero for a step that starts its tile. The core takes
+// them at tmem's output, tmem.read_latency_cycles later; the simulator hands
+// them over now, as it carries every read through a memory's delay.
+void Machine::read_mma_c(const MmaTag& tag) {
+    MmaBlock c(std::size_t{config_.mma_core_m} * config_.mma_core_n, 0u);
+    if (!tag.init_step) {
+        const auto words = mma_block_words(tag);
+        for (std::size_t i = 0; i < words.size(); ++i) c[i] = read_tmem(words[i], tmem_port_mma, "MMA C read");
+    }
+    finish_mma_step(c);
+}
+
+// Inside the core's black box: the oldest step's A and B have waited for
+// this C; each of its core_m x core_n words is the fused dot-plus-C of its
+// row of A and column of B (mma_numeric.cpp), computed at once and delivered
+// for the black box's output register result_latency after the step entered.
+void Machine::finish_mma_step(const MmaBlock& c) {
+    auto& waiting = mma_core_.inside();
+    if (waiting.empty() || waiting.front().entered + config_.tmem_port_depth != cycle_) {
+        throw SimError("internal: an MMA C read found no step waiting for it");
+    }
+    const auto& step = waiting.front();
+    MmaBlock values(std::size_t{config_.mma_core_m} * config_.mma_core_n, 0u);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi) {
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni) {
-            const uint32_t c = result.init_step
-                ? 0u
-                : read_tmem(result.words.at(mi * config_.mma_core_n + ni), tmem_port_mma, "MMA C read");
-            result.values[mi * config_.mma_core_n + ni] = mma_dot_f16(
-                std::span<const uint16_t>(result.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
-                std::span<const uint16_t>(result.b).subspan(ni * config_.mma_core_k, config_.mma_core_k), c);
+            values[mi * config_.mma_core_n + ni] = mma_dot_f16(
+                std::span<const uint16_t>(step.a).subspan(mi * config_.mma_core_k, config_.mma_core_k),
+                std::span<const uint16_t>(step.b).subspan(ni * config_.mma_core_k, config_.mma_core_k),
+                c[mi * config_.mma_core_n + ni]);
         }
     }
-    result.c_sampled = true;
+    mma_core_.deliver(values, step.entered, "the MMA core");
+    waiting.pop_front();
+}
+
+// The core's arithmetic as a black box (src/machine/blackbox.hpp). It takes a
+// step's A and B blocks at its entry and its C at tmem's output, W =
+// tmem.port_depth + tmem.read_latency_cycles later, and has the result in its
+// output register L = mma.result_latency_cycles after entry; a step can enter
+// every cycle. It would probably use one hard multiplier per product of a
+// step, core_m x core_n x core_k (an 11 x 11 significand product fits one).
+// Its registers, in the L - 1 stages before the output register: until C is
+// at the core, the step's A and B (the multipliers' operands; the products
+// form in the multipliers' own registers as C comes). C's exponent sets the
+// window every product is aligned to (mma_numeric.cpp: in units of the
+// window's quantum an aligned product is below 2^27, C below 2^26), so from C
+// on each result word is its k products, 28 bits signed, and C, 27 bits,
+// with the window's 8-bit exponent, summed by a tree that halves the terms a
+// stage, each sum a bit wider; the stage that holds the one sum holds it and
+// the exponent (at most 9 terms of 2^27: within the sum's width), and every
+// later stage only delays the packed result, 32 bits a word. Its sign-off is
+// the line that names it: only the human changes it.
+void Machine::declare_mma_core_black_box() {
+    const auto& c = config_;
+    const uint64_t m = c.mma_core_m;
+    const uint64_t n = c.mma_core_n;
+    const uint64_t k = c.mma_core_k;
+    const uint64_t latency = c.mma_result_latency_cycles;
+    const uint64_t wait = uint64_t{c.tmem_port_depth} + c.tmem_read_latency_cycles;
+    BlackBoxDeclaration black_box("MMA core", SignOff::not_signed); // sign-off: only the human changes this line
+    black_box.unit = Unit::tensor_core;
+    black_box.latency = c.mma_result_latency_cycles;
+    black_box.latency_from = "mma.result_latency_cycles; C at entry + tmem.port_depth + tmem.read_latency_cycles = " +
+        std::to_string(wait);
+    const std::string operands = "the MMA's operand latch and the port-B read pipeline's last stage (in the open)";
+    black_box.inputs = {BlackBoxPort{"A block (core_m x core_k fp16)", m * k * 16, operands},
+        BlackBoxPort{"B block (core_k x core_n fp16)", k * n * 16, operands},
+        BlackBoxPort{"C (core_m x core_n words), at entry + " + std::to_string(wait), m * n * 32,
+            "tensor memory's MMA read registers (the memory's)"},
+        BlackBoxPort{"C is zero (the tile's first step)", 1, "MMA core: step tags (in the open)"}};
+    black_box.outputs = {BlackBoxPort{"result block (core_m x core_n words)", m * n * 32 + 1,
+        mma_core_.name() + " (in the open)"}};
+    // The inner stages: entry + 1 .. entry + L - 1; those up to entry + W
+    // wait for C, the rest are after it.
+    const uint64_t inner = latency - 1;
+    const uint64_t before_c = std::min(wait, inner);
+    uint64_t after_c = 0;
+    uint64_t terms = k + 1;
+    bool summed = false; // an earlier stage held the one sum
+    for (uint64_t stage = 0; before_c + stage < inner; ++stage) {
+        uint64_t word = 32; // the packed result, delayed
+        if (!summed && terms > 1) {
+            word = (stage == 0 ? k * 28 + 27 : terms * (28 + stage)) + 8; // the tree
+        } else if (!summed) {
+            word = 28 + stage + 8; // the one sum and its exponent
+            summed = true;
+        }
+        after_c += m * n * word;
+        terms = (terms + 1) / 2;
+    }
+    black_box.cost.flip_flops = before_c * (m * k + k * n) * 16 + after_c;
+    black_box.cost.multipliers = m * n * k;
+    black_box.cost_function = "min(W, L - 1) x (core_m x core_k + core_k x core_n) x 16 + over the stages after C, "
+        "per result word: (k x 28 + 27 + 8), then terms x (28 + stage) + 8 with the terms halving, the one sum "
+        "(28 + stage) + 8, and 32 for each stage after it; core_m x core_n x core_k multipliers; core " +
+        std::to_string(m) + " x " + std::to_string(n) + " x " + std::to_string(k) + ", W " + std::to_string(wait) +
+        ", L " + std::to_string(latency);
+    if (latency <= wait) {
+        black_box.note = "AT THIS PROFILE THE LATENCY IS NOT A REGISTERED ONE: mma.result_latency_cycles (" +
+            std::to_string(latency) + ") equals tmem.port_depth + tmem.read_latency_cycles (" + std::to_string(wait) +
+            "), so C is at tmem's output in the cycle the result is due in the output register and no clock edge "
+            "is left for the arithmetic after C (the simulator computes at the C read, " +
+            std::to_string(c.tmem_read_latency_cycles) + " cycles earlier); the profile is accepted";
+    }
+    mma_core_.declare_output_bits(m * n * 32);
+    mma_core_.build(black_box, [](const std::deque<MmaCoreStep>& waiting) { return waiting.empty(); });
+    black_boxes_.push_back(std::move(black_box));
 }
 
 // The tmem writes at the RAM now: the MMA's result block through each fine
@@ -401,13 +501,13 @@ std::optional<std::vector<uint32_t>> Machine::tmem_region_words(
 
 // The tmem words of a matmul step's core_m x core_n result block, row-major:
 // rows m0.. and columns n0.. of the command's result region (rows of n words).
-std::vector<uint32_t> Machine::mma_block_words(const MmaStep& step) const {
+std::vector<uint32_t> Machine::mma_block_words(const MmaTag& tag) const {
     std::vector<uint32_t> words;
     words.reserve(config_.mma_core_m * config_.mma_core_n);
     for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
         for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
             words.push_back(static_cast<uint32_t>(tmem_index(
-                uint64_t{step.c_pointer} + uint64_t{step.m0 + mi} * step.shape.n + step.n0 + ni, step.shape.n)));
+                uint64_t{tag.c_pointer} + uint64_t{tag.m0 + mi} * tag.row_words + tag.n0 + ni, tag.row_words)));
     return words;
 }
 
@@ -669,12 +769,8 @@ void Machine::drive_mma(const Wires& w) {
         mma_reads_.replace(config_.shmem_port_a_depth - 1, w.mma_read_sampled, "drive_mma: the shmem RAM's elements");
     }
     if (w.mma_read_granted.has_value()) mma_reads_.push(*w.mma_read_granted, "drive_mma: the granted round");
-    if (w.mma_result_sampled.has_value()) {
-        mma_results_.replace(config_.tmem_port_depth - 1, w.mma_result_sampled, "drive_mma: the C sample");
-    }
-    if (w.mma_result_entering.has_value()) {
-        mma_results_.push(*w.mma_result_entering, "drive_mma: a step enters the core");
-    }
+    if (w.mma_tag_entering.has_value()) mma_tags_.push(*w.mma_tag_entering, "drive_mma: a step enters the core");
+    if (w.mma_write_entering.has_value()) mma_writes_.push(*w.mma_write_entering, "drive_mma: a result leaves the core");
 }
 
 // The two acc transfer engines: step_acc_transfers' result (acc.ld launches,

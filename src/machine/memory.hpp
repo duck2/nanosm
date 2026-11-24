@@ -78,14 +78,14 @@ struct MemoryShape {
 };
 
 template <typename T>
-class Memory final : public RegisterBase {
+class Memory final : public Clocked {
 public:
     static constexpr uint32_t any_port = ~uint32_t{0};
 
-    Memory(RegisterFile& file, Unit unit, std::string name) : RegisterBase(file, unit, std::move(name)) {
+    Memory(AllClocked& all, Unit unit, std::string name) : Clocked(all,unit, std::move(name)) {
         static_assert(FixedPayload<T>, "a memory's word must be a fixed bundle of bits (machine/state.hpp)");
     }
-    Memory(RegisterFile& file, std::string name) : Memory(file, Unit::none, std::move(name)) {}
+    Memory(AllClocked& all, std::string name) : Memory(all,Unit::none, std::move(name)) {}
 
     // The memory's shape, once, when the machine is built.
     void build(const MemoryShape& shape) {

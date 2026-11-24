@@ -6,7 +6,6 @@
 #include "machine/machine.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cstdio>
 #include <sstream>
 
@@ -25,11 +24,6 @@ namespace nanosm {
 // ===========================================================================
 
 namespace {
-
-// Bits to tell `n` things apart (0 for one or none).
-uint64_t bits_for(uint64_t n) { return n <= 1 ? 0 : static_cast<uint64_t>(std::bit_width(n - 1)); }
-// Bits to count from 0 to `n`.
-uint64_t count_bits(uint64_t n) { return static_cast<uint64_t>(std::bit_width(n)); }
 
 // A number with its thousands grouped: 1,442,878.
 std::string number(uint64_t value) {
@@ -115,6 +109,22 @@ void Machine::declare_state_bits() {
         bits_for(largest_k) + 4 * shared + bits_for(c.mma_shapes.size());
     const uint64_t operand_words = 4; // a round's vector registers (limits::round_reads)
     const uint64_t uniform_operands = 4; // an entry's uniform registers: two rounds of the URF's two ports
+    // A pipeline that carries what a memory read returns (the A-read and
+    // port-B read from shared memory, the store-data and acc.st reads from
+    // the RF, the TMA operand read from the URF): in hardware the words are
+    // inside the memory until its read delay has passed, in its own read
+    // registers (blackbox.hpp), so they count only in the stages after the one
+    // where they are at its output -- none where the pipeline ends there.
+    // `payload`: a stage's bits without the words; `at_output`: the stage the
+    // words are at the memory's output in.
+    const auto read_pipeline = [](auto& pipe, uint64_t payload, uint64_t word_bits, uint64_t at_output,
+                                   const std::string& memory) {
+        const uint64_t stages = pipe.stages();
+        const uint64_t past_delay = stages > at_output + 1 ? (stages - 1 - at_output) * word_bits : 0;
+        pipe.declare_total_bits(stages * (1 + payload) + past_delay);
+        pipe.declare_note("its words count only in stages past " + memory + "'s read delay: " + number(past_delay) +
+            " bits");
+    };
 
     // ---- front end ----
     // A warp's front end: its packets (two instruction words each) and their
@@ -153,7 +163,10 @@ void Machine::declare_state_bits() {
         1 + warp + 1 + lanes + slot_rounds + rf_register + depbar + lanes * 32 + count_bits(lanes) + 1);
     // A store slot: valid, warp, its access, the lanes' words, depbar.
     store_slots_.declare_member_bits(1 + warp + slot_rounds + lanes * 32 + depbar);
-    a_read_pipe_.declare_payload_bits(read_beat);
+    // A-read: its words are sampled at the RAM (stage D - 1) and at the port
+    // output Lb later, its last stage.
+    read_pipeline(a_read_pipe_, read_beat - uint64_t{c.shmem_banks} * 32, uint64_t{c.shmem_banks} * 32,
+        c.shmem_port_a_depth - 1 + c.shmem_read_latency_cycles, "shared memory");
     a_write_pipe_.declare_payload_bits(write_beat);
     b_write_pipe_.declare_payload_bits(write_beat);
     // A-read's pointer over the load slots, the probe and the TMA; A-write's
@@ -164,9 +177,10 @@ void Machine::declare_state_bits() {
     // distinct word per element.
     const uint64_t mma_elements = uint64_t{c.mma_core_m} * c.mma_core_k + uint64_t{c.mma_core_k} * c.mma_core_n;
     // A port-B round: its step, last round, which of the step's elements it
-    // reads, per bank a valid row and the word.
-    mma_reads_.declare_payload_bits(
-        mma_step + 1 + mma_elements + uint64_t{c.shmem_banks} * (1 + shmem_row + 32));
+    // reads, per bank a valid row and the word (sampled at the RAM, stage
+    // D - 1; at the port output, the last stage).
+    read_pipeline(mma_reads_, mma_step + 1 + mma_elements + uint64_t{c.shmem_banks} * (1 + shmem_row),
+        uint64_t{c.shmem_banks} * 32, c.shmem_port_a_depth - 1 + c.shmem_read_latency_cycles, "shared memory");
     // The MMA queue and pipeline. A command: commit, init, shape, warp, result
     // pointer, depbar, the operands' bases and row spacings, its barrier,
     // steps started and results outstanding (at most its steps), operands
@@ -185,20 +199,38 @@ void Machine::declare_state_bits() {
     mma_.declare_bits(uint64_t{c.mma_queue_commands} * (1 + mma_command) + count_bits(c.mma_queue_commands) + mma_slot +
         (1 + mma_step + 2 * count_bits(mma_elements) + mma_elements * bits_for(mma_elements)) + mma_elements * 16 +
         uint64_t{c.mma_core_m} * c.mma_core_k * 16);
-    // A step in the core: its command's slot, its result block's tmem words,
-    // init, the A and B blocks, C sampled, the result.
+    // A step's tag beside the core: its command's slot, its result block's
+    // place (the result pointer, m0, n0, the shape), C is zero. With the
+    // result on its way to tmem: the same place (C is not read again) and the
+    // block's words. (The core's output register is its black box's, tensor_core.cpp.)
     const uint64_t block = uint64_t{c.mma_core_m} * c.mma_core_n;
-    mma_results_.declare_payload_bits(mma_slot + block * tmem_word + 1 +
-        uint64_t{c.mma_core_m} * c.mma_core_k * 16 + uint64_t{c.mma_core_n} * c.mma_core_k * 16 + 1 + block * 32);
+    const uint64_t block_place = mma_slot + tmem_word + bits_for(largest_m) + bits_for(largest_n) +
+        bits_for(c.mma_shapes.size());
+    mma_tags_.declare_payload_bits(block_place + 1);
+    mma_writes_.declare_payload_bits(block_place + block * 32);
     // Each engine: valid, load, warp, register base, depbar, pointer, words
     // per row (its log2), width, columns launched, beats landed.
     acc_engines_.declare_bits(
         2 * (1 + 1 + warp + rf_register + depbar + tmem_word + tmem_row_words + 3 * vector_width));
-    // A beat: warp, register, address, words per row, sampled, the lanes'
-    // words, last, depbar.
-    acc_ld_pipe_.declare_payload_bits(warp + rf_register + tmem_word + tmem_row_words + 1 + lanes * 32 + 1 + depbar);
-    // A beat: its column (0 .. width - 1), the lanes' words.
-    acc_st_pipe_.declare_payload_bits(bits_for(c.tmem_max_vector_width) + lanes * 32);
+    // A beat: warp, register, address, words per row, sampled, last, depbar;
+    // and the lanes' words from the tmem RAM stage (port_depth - 1) on. Not
+    // the read-delay rule: the pipeline holds while its output waits for the
+    // RF, and a held beat keeps its words in flip-flops of its own (the read
+    // at the RAM in the cycle a hold begins replaces what tmem's read
+    // registers held), so every stage from the sample on counts them.
+    {
+        const uint64_t stages = acc_ld_pipe_.stages();
+        const uint64_t words = (stages - (c.tmem_port_depth - 1)) * lanes * 32;
+        acc_ld_pipe_.declare_total_bits(stages * (1 + warp + rf_register + tmem_word + tmem_row_words + 1 + 1 + depbar) +
+            words);
+        acc_ld_pipe_.declare_note("its words count from the tmem RAM stage on (a held beat keeps them): " +
+            number(words) + " bits");
+    }
+    // A beat: its column (0 .. width - 1), the lanes' words (read at its
+    // grant, at the RF's output in stage Lr - 1, then tmem.port_depth stages
+    // to the tmem RAM).
+    read_pipeline(acc_st_pipe_, bits_for(c.tmem_max_vector_width), lanes * 32, c.rf_read_latency_cycles - 1,
+        "the RF");
     // ---- TMA ----
     // A command: slot, direction, descriptor address, four coordinates, the
     // buffer and the barrier, state, logical bytes, pending placements and
@@ -226,8 +258,9 @@ void Machine::declare_state_bits() {
         count_bits(sector_words));
     tma_store_head_.declare_bits(bits_for(c.tma_store_sector_registers));
     // A pair: its round, last, round 0's header (valid + header), the two
-    // words and their count.
-    tma_read_pairs_.declare_payload_bits(2 + 1 + (1 + urf_header) + 2 * 32 + 2);
+    // words (sampled before stage 0, at the URF's output in the last stage)
+    // and their count.
+    read_pipeline(tma_read_pairs_, 2 + 1 + (1 + urf_header) + 2, 2 * 32, c.urf_read_latency_cycles - 1, "the URF");
     // The holding register: valid, header, buffer, barrier, four coordinates.
     tma_holding_.declare_bits(1 + urf_header + 32 + 32 + 4 * 32);
     tma_reads_.declare_entry_bits(tma_run);
@@ -235,9 +268,12 @@ void Machine::declare_state_bits() {
     // ---- uniform register file ----
     // The round counter: valid, header, the next round.
     urf_read_rounds_.declare_bits(1 + urf_header + bits_for(tma_operand_rounds(tma_max_coordinates)));
-    // A write: warp, lane mask, instruction word, its two operand latches and
-    // their count, the value (valid + 32).
-    urf_pipe_.declare_payload_bits(warp + lanes + word + 2 * 32 + 2 + (1 + 32));
+    // A write: warp, lane mask, instruction word, its operands' count, the
+    // value (valid + 32). Its two operand latches count zero: the uniform ALU
+    // takes its operands at the URF's output (stage Lu) and they go no
+    // further, and r2ur's lane 0 is its value from the sample on.
+    urf_pipe_.declare_payload_bits(warp + lanes + word + 2 + (1 + 32));
+    urf_pipe_.declare_note("its operands are taken at the URF's output: no latches");
     // ---- load / store unit ----
     // A command: slot, kind, warp, register, depbar, lanes, a sector address,
     // lane and word offset per lane and their count, requests total and
@@ -268,9 +304,11 @@ void Machine::declare_state_bits() {
     egress_requests_.declare_read_width(1);
     lsu_reads_.declare_entry_bits(2 + lsu_slot + bits_for(lanes) + bits_for(sector_words));
     lsu_read_received_.declare_bits(bits_for(c.gmem_sector_bytes));
-    // A store-data read: its command (valid + slot), buffer, the register's
-    // lanes, group, beat, the group's lanes.
-    lsu_read_pipe_.declare_payload_bits((1 + lsu_slot) + 1 + lanes * 32 + bits_for(lanes) + 3 + lanes);
+    // A store-data read: its command (valid + slot), buffer, group, beat, the
+    // group's lanes; and the register's lanes (read at its grant, at the RF's
+    // output in its last stage).
+    read_pipeline(lsu_read_pipe_, (1 + lsu_slot) + 1 + bits_for(lanes) + 3 + lanes, lanes * 32,
+        c.rf_read_latency_cycles - 1, "the RF");
     // ---- register file ----
     // Its policies: the owed bit and a cursor over the async writers (the
     // load slots, the LSU's two buffers, the acc.ld pipeline) or readers
@@ -338,19 +376,18 @@ void Machine::declare_state_bits() {
     }
     // A memory's read data in flight: every read port's word for each cycle
     // of the read delay.
-    for (auto* memory : {&rf_, &urf_}) {
-        const auto& shape = memory->shape();
-        memory->declare_note("read data in flight: at most " +
+    const auto in_flight = [](auto& memory) {
+        const auto& shape = memory.shape();
+        memory.declare_note("read data in flight: at most " +
             number(uint64_t{shape.banks} * shape.read_ports * shape.word_bits * shape.read_delay) +
-            " bits (banks x read ports x word bits x read delay), outside the flip-flops: the operand pipelines' "
-            "words inside the read delay are these");
-    }
-    // A result: warp, destination register, the lanes' words and their
-    // enables; the ALU's also says whether it is a setp's predicate.
-    for (std::size_t unit = 0; unit < arithmetic_units; ++unit) {
-        arithmetic_results_[unit].declare_payload_bits(warp + rf_register + lanes * 32 + lanes +
-            (static_cast<ArithmeticUnit>(unit) == ArithmeticUnit::alu ? 1 : 0));
-    }
+            " bits (banks x read ports x word bits x read delay), in its own read registers: the words its readers' "
+            "pipelines carry inside the read delay are these");
+    };
+    in_flight(rf_);
+    in_flight(urf_);
+    in_flight(shmem_);
+    in_flight(tmem_);
+    instruction_memory_.declare_note("the kernel's words (no profile size)");
     // ---- launch ----
     // The launch record: valid, the block's global and shared address and
     // bytes, and per launch flag a valid bit, its depbar (a kernel's .flag
@@ -359,37 +396,77 @@ void Machine::declare_state_bits() {
         1 + global + shared + shared_count + uint64_t{c.core_launch_flags} * (1 + depbar + shared_count));
 }
 
+// The black boxes (blackbox.hpp), each declared beside its black box: the
+// arithmetic units (arith.cpp), the tensor core's arithmetic
+// (tensor_core.cpp), and here the memories, whose cost is their words
+// (memory_blackbox), each with its own sign-off. Listed by unit.
+void Machine::declare_black_boxes() {
+    declare_arithmetic_black_boxes();
+    declare_mma_core_black_box();
+    black_boxes_.push_back(memory_blackbox(instruction_memory_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "a fetch's packet the next cycle", "the instruction memory read register (in the open)", ""));
+    black_boxes_.push_back(memory_blackbox(divergence_stack_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "a pop's new top the next cycle", "the divergence stack memory read register (in the open)",
+        "the issue register's branch (a push; in the open)"));
+    black_boxes_.push_back(memory_blackbox(rf_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "rf.read_latency_cycles", "the issue register's round, the acc.st and store-data readers (in the open)",
+        "the RF write pipelines' last stages (in the open)"));
+    black_boxes_.push_back(memory_blackbox(urf_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "urf.read_latency_cycles",
+        "the issue register's round, the round counter, the URF write pipeline's sample (in the open)",
+        "the URF write pipeline's last stage (in the open)"));
+    black_boxes_.push_back(memory_blackbox(shmem_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "shmem.read_latency_cycles", "the A-read and port-B read pipelines' RAM stage (in the open)",
+        "the A-write and port-B write pipelines' last stages (in the open)"));
+    black_boxes_.push_back(memory_blackbox(tmem_,
+        SignOff::not_signed, // sign-off: only the human changes this line
+        "tmem.read_latency_cycles",
+        "the MMA core's step tags and the acc.ld pipeline at their RAM stage (in the open)",
+        "the MMA result write and acc.st pipelines' last stages (in the open)"));
+    std::stable_sort(black_boxes_.begin(), black_boxes_.end(),
+        [](const BlackBoxDeclaration& a, const BlackBoxDeclaration& b) { return a.unit < b.unit; });
+}
+
 // The primitives whose payload cannot declare honest bits yet (the list at
 // the end of machine.hpp), each with what bounds it.
 // There is none: every payload is fixed.
-std::vector<std::pair<const RegisterBase*, std::string>> Machine::not_yet_declared() const {
+std::vector<std::pair<const Clocked*, std::string>> Machine::not_yet_declared() const {
     return {};
 }
 
 // ===========================================================================
-// The report: per unit its flip-flops (registers, groups, pipelines, a
-// FIFO's pointers), its memories (words x width, ports) and its FIFO storage,
-// then the totals. Not in the totals: what cannot declare its bits yet, and
-// plain state that is not a primitive.
+// The report. Per unit: what is in the open -- its flip-flops (registers,
+// groups, pipelines, a FIFO's pointers, the black boxes' output registers)
+// and its FIFO storage, counted -- and, apart, its black boxes (the memories
+// among them) with their declared costs. Then each black box's contract, and
+// the totals: counted, declared, and their sum. Not in the totals: what
+// cannot declare its bits yet, and plain state that is not a primitive.
 // ===========================================================================
 
 std::string Machine::state_report() const {
     std::ostringstream out;
-    const auto sizes = registers_.sizes();
+    const auto sizes = clocked_.sizes();
     const auto missing = not_yet_declared();
     out << "state report: " << config_.name << " (declared hardware bits)\n";
+    out << "In the open: registers, groups, pipelines, FIFOs and the black boxes' output registers, counted. Behind\n"
+           "walls: black boxes, the memories among them, each a contract with a declared cost that only the human\n"
+           "signs off.\n";
     uint64_t total_flops = 0;
-    uint64_t total_memory = 0;
     uint64_t total_fifo = 0;
     for (auto unit = static_cast<uint8_t>(Unit::front_end); unit <= static_cast<uint8_t>(last_unit); ++unit) {
         const auto which = static_cast<Unit>(unit);
         uint64_t flops = 0;
-        uint64_t memory = 0;
         uint64_t fifo = 0;
         out << "\n" << unit_name(which) << "\n";
         for (const auto& size : sizes) {
             if (size.unit != which) continue;
             const std::string kind = size.kind;
+            if (kind == "memory") continue; // a black box: below
             const auto bits = size.bits();
             char line[160];
             if (!bits.has_value()) {
@@ -398,16 +475,7 @@ std::string Machine::state_report() const {
                 continue;
             }
             std::string shape;
-            if (kind == "memory") {
-                const auto words = size.entries / size.banks;
-                shape = (size.banks > 1 ? std::to_string(size.banks) + " banks x " : std::string()) +
-                    std::to_string(words) + " words x " + std::to_string(*size.bits_per_entry) + " bits, " +
-                    std::to_string(size.read_ports) + "R " + std::to_string(size.write_ports) + "W" +
-                    (size.banks > 1 ? " per bank" : "") + ", read delay " + std::to_string(size.read_delay) + ", " +
-                    size.same_cycle;
-                if (size.name == instruction_memory_.name()) shape += "; the kernel's words (no profile size)";
-                memory += *bits;
-            } else if (kind == "FIFO") {
+            if (kind == "FIFO") {
                 shape = std::to_string(size.entries) + " x " + std::to_string(*size.bits_per_entry) + " bits, write " +
                     std::to_string(size.write_ports) + " / read " + std::to_string(size.read_ports) +
                     " entries wide, latency " + std::to_string(size.read_delay) + "; pointers " +
@@ -424,22 +492,78 @@ std::string Machine::state_report() const {
             std::snprintf(line, sizeof(line), "  %-9s %-52s %12s  ", size.kind, size.name.c_str(), number(*bits).c_str());
             out << line << shape << "\n";
         }
-        out << "  flip-flops " << number(flops) << ", memory " << number(memory) << ", FIFO " << number(fifo)
-            << ", total " << number(flops + memory + fifo) << "\n";
+        out << "  in the open: flip-flops " << number(flops) << ", FIFO " << number(fifo) << ", total "
+            << number(flops + fifo) << "\n";
+        BlackBoxCost walls;
+        bool any = false;
+        for (const auto& black_box : black_boxes_) {
+            if (black_box.unit != which) continue;
+            any = true;
+            char line[200];
+            std::snprintf(line, sizeof(line), "  %-9s %-52s %12s  declared; %s\n", "black box", black_box.name.c_str(),
+                number(black_box.cost.flip_flops + black_box.cost.memory_bits).c_str(),
+                black_box.signed_off() ? "signed off" : "not signed off");
+            out << line;
+            walls.flip_flops += black_box.cost.flip_flops;
+            walls.memory_bits += black_box.cost.memory_bits;
+            walls.multipliers += black_box.cost.multipliers;
+        }
+        if (any) {
+            out << "  behind walls: flip-flops " << number(walls.flip_flops) << ", memory " << number(walls.memory_bits)
+                << ", multipliers " << number(walls.multipliers) << " (declared)\n";
+        }
         total_flops += flops;
-        total_memory += memory;
         total_fifo += fifo;
+    }
+    // The black boxes: each one's contract, its declared cost and the
+    // function it comes from, and whether the human has signed it off.
+    BlackBoxCost declared;
+    std::size_t signed_off = 0;
+    out << "\nblack boxes (a contract outside, anything inside: the cost is declared, not counted)\n";
+    if (black_boxes_.empty()) out << "  none\n";
+    for (const auto& black_box : black_boxes_) {
+        out << "  " << black_box.name << " (" << unit_name(black_box.unit) << "): "
+            << (black_box.signed_off() ? "signed off" : "not signed off") << "\n    latency " << black_box.latency << " ("
+            << black_box.latency_from << ")";
+        if (black_box.interval > 1) out << ", a new input at most every " << black_box.interval << " cycles";
+        out << "\n";
+        for (const auto* ports : {&black_box.inputs, &black_box.outputs}) {
+            for (const auto& port : *ports) {
+                out << (ports == &black_box.inputs ? "    in   " : "    out  ") << port.name << ": " << number(port.bits)
+                    << (port.bits == 1 ? " bit, " : " bits, ") << port.held_in << "\n";
+            }
+        }
+        out << "    declared " << number(black_box.cost.flip_flops) << " flip-flops, "
+            << number(black_box.cost.memory_bits) << " memory bits, " << number(black_box.cost.multipliers)
+            << " multipliers: " << black_box.cost_function << "\n";
+        if (!black_box.note.empty()) out << "    " << black_box.note << "\n";
+        declared.flip_flops += black_box.cost.flip_flops;
+        declared.memory_bits += black_box.cost.memory_bits;
+        declared.multipliers += black_box.cost.multipliers;
+        if (black_box.signed_off()) ++signed_off;
     }
     const uint64_t bram18 = 18 * 1024;
     char line[160];
     out << "\ntotals\n";
-    out << "  flip-flops       " << number(total_flops) << "\n";
-    out << "  memory bits      " << number(total_memory) << "\n";
-    out << "  FIFO storage     " << number(total_fifo) << "\n";
-    out << "  total            " << number(total_flops + total_memory + total_fifo) << "\n";
+    out << "  in the open (counted)\n";
+    out << "    flip-flops       " << number(total_flops) << "\n";
+    out << "    FIFO storage     " << number(total_fifo) << "\n";
+    out << "    total            " << number(total_flops + total_fifo) << "\n";
+    out << "  behind walls (declared by " << black_boxes_.size() << " black boxes, " << signed_off << " signed off)\n";
+    out << "    flip-flops       " << number(declared.flip_flops) << "\n";
+    out << "    memory bits      " << number(declared.memory_bits) << "\n";
+    out << "    total            " << number(declared.flip_flops + declared.memory_bits) << "\n";
+    out << "    multipliers      " << number(declared.multipliers) << "\n";
+    const uint64_t all_flops = total_flops + declared.flip_flops;
+    out << "  sum\n";
+    out << "    flip-flops       " << number(all_flops) << "\n";
+    out << "    memory bits      " << number(declared.memory_bits) << "\n";
+    out << "    FIFO storage     " << number(total_fifo) << "\n";
+    out << "    total            " << number(all_flops + declared.memory_bits + total_fifo) << "\n";
+    out << "    multipliers      " << number(declared.multipliers) << "\n";
     std::snprintf(line, sizeof(line), "  memory + FIFO in 18-kilobit block RAMs: %s / %s = %.1f\n",
-        number(total_memory + total_fifo).c_str(), number(bram18).c_str(),
-        static_cast<double>(total_memory + total_fifo) / static_cast<double>(bram18));
+        number(declared.memory_bits + total_fifo).c_str(), number(bram18).c_str(),
+        static_cast<double>(declared.memory_bits + total_fifo) / static_cast<double>(bram18));
     out << line;
     out << "\nnot yet declared (not in the totals)\n";
     if (missing.empty()) out << "  none\n";
