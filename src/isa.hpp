@@ -257,7 +257,7 @@ struct DecodedInstruction {
     }
 };
 
-// A kernel's signature (docs/qtx.md "Launch"): the `.param` lines of its qtx, in
+// A kernel's signature (README "Launch"): the `.param` lines of its qtx, in
 // order. The launch passes one argument per parameter; nothing else crosses
 // between the host and the kernel.
 //   ptr   8 bytes: a 64-bit global byte address
@@ -287,7 +287,7 @@ inline const char* param_type_name(ParamType type) {
 }
 
 // One named piece of what a kernel declares in shared memory beside its code
-// (docs/qtx.md "Launch"), in the order the qtx declares it:
+// (README "Launch"), in the order the qtx declares it:
 //   .param TYPE NAME           an argument of the launch (the signature)
 //   .mbar  NAME, expect N      a barrier's initial state: phase 0, N arrivals
 //                              expected, none seen (8 bytes)
@@ -362,7 +362,7 @@ inline std::optional<LaunchBlock> launch_block(
     return block;
 }
 
-// A launch flag (docs/qtx.md "Launch"): depbar `bar` starts counted once in every
+// A launch flag (README "Launch"): depbar `bar` starts counted once in every
 // warp and is decremented in every warp when the first `bytes` bytes of the
 // launch block have landed in shared memory. A kernel's flags are written by
 // qtxc (the policy: default_launch_flags) and travel to the launch record;
@@ -421,7 +421,7 @@ struct RegisterName {
     bool predicate = false; // a predicate with a name (pN); then not a register
 };
 
-// A named piece of the kernel's own memory (docs/qtx.md "Memory"; qtx `.shmem` /
+// A named piece of the kernel's own memory (README "Memory"; qtx `.shmem` /
 // `.tmem`, placed by qtxc: src/qtxc/objects.cpp). It is the author's
 // bookkeeping and nothing else: no hardware reads it, the machine never sees
 // an object, only the addresses the instructions carry. Shared memory is in

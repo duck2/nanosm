@@ -720,7 +720,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     auto& counters = trace_->lsu_counters();
     auto command = plan_lsu_command(op);
-    command.id = next_lsu_command_id_++;
+    command.id = lsu_command_number_.cur();
     // The lowest slot free as this cycle's releases leave them (admission
     // secured one): drive_lsu_commands puts it there.
     const auto slot = lsu_commands_.cur().lowest_free(config_.lsu_active_commands, w.released_lsu_commands);
@@ -802,6 +802,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
         next.take(w.dispatch.lsu->command, config_.lsu_active_commands) != w.dispatch.lsu->command.slot) {
         throw SimError("internal: the LSU holds more than lsu.active_commands commands");
     }
+    if (w.dispatch.lsu.has_value()) lsu_command_number_.set_next(w.dispatch.lsu->command.id + 1, "drive_lsu_commands");
     if (w.lsu_rf_read.command.has_value()) {
         auto& reading = next.slots.at(*w.lsu_rf_read.command);
         if (!reading.has_value()) throw SimError("internal: a store-data read for an empty LSU command slot");

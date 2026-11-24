@@ -38,7 +38,7 @@ Machine::RequestChannel Machine::select_request_channel(const TmaRequests& tma, 
     RequestChannel channel;
     const auto outstanding = gmem_outstanding_sectors();
     const bool ready = outstanding < config_.gmem_queue_sectors;
-    const bool tma_turn = !(request_channel_last_ == GmemClient::tma && lsu.command.has_value());
+    const bool tma_turn = !(request_channel_last_.cur() == GmemClient::tma && lsu.command.has_value());
     const bool walker_reads = tma.walker.has_value() && tma.walker->sector == Sector::load;
     if (ready && tma_turn && tma.write_request) {
         channel.granted = GmemClient::tma;
@@ -84,6 +84,14 @@ void Machine::assign_channel_requests(RequestChannel& channel, const TmaRequests
         accept_tma_read(channel, *tma.walker);
     }
     if (channel.granted == GmemClient::lsu) accept_lsu_request(channel);
+}
+
+// The request channel's arbitration register: the client whose request the
+// channel accepts now (at most one a cycle); held when it accepts none.
+void Machine::drive_request_channel(const Wires& w) {
+    if (!w.channel.accepted.has_value()) return;
+    const auto client = *w.channel.granted;
+    if (client != request_channel_last_.cur()) request_channel_last_.set_next(client, "drive_request_channel");
 }
 
 // The TMA walker's sector read. Its run is its read record, at the TMA
@@ -200,7 +208,6 @@ void Machine::step_gmem_controller(Wires& w) {
         if (gmem_outstanding_sectors() >= config_.gmem_queue_sectors) {
             throw SimError("internal gmem request accepted without request-ready");
         }
-        request_channel_last_ = *w.channel.granted;
         gmem_queue_.push_back(*w.channel.accepted);
         trace_->gmem_sector_enqueue();
         trace_->gmem_queue_depth(cycle_, gmem_outstanding_sectors());

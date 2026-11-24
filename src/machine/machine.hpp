@@ -83,9 +83,6 @@ enum class LsuEdge : uint8_t {
     write_request,     // a write's request accepted by the controller. id = request, aux = slot
     bus_write_beat,    // egress FIFO -> bus. id = request, aux = byte offset in sector
     write_ack,         // the write's acknowledgement. id = request
-    // Not a movement: a zero fill found the placement tickets' write port
-    // taken by a sector the ingress completed, and waits. id = tma command
-    tma_zero_fill_wait,
 };
 
 struct LsuEdgeEvent {
@@ -199,9 +196,8 @@ public:
     // Test seams: whether each engine's one-entry mbar event register is full.
     [[nodiscard]] bool tma_mbar_event_held() const { return tma_mbar_event_.cur().has_value(); }
     [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.cur().has_value(); }
-    // Test seams (Q, between ticks): a warp's depbar counter; the MMA queue's depth.
+    // Test seam (Q, between ticks): a warp's depbar counter.
     [[nodiscard]] uint32_t depbar_value(uint32_t warp, uint8_t bar) const { return depbar_.cur().at(warp).at(bar); }
-    [[nodiscard]] std::size_t mma_queue_depth() const { return mma_.cur().slots.size(); }
     // Test seams (Q, between ticks): the owner of the load buffer (0) or the
     // store buffer (1) (an LSU command id: the buffer holds its slot), its
     // valid bits and their count.
@@ -216,10 +212,6 @@ public:
     [[nodiscard]] uint32_t lsu_buffer_valid_count(uint32_t index) const {
         return lsu_buffers_.at(index).cur().valid_count;
     }
-    [[nodiscard]] uint32_t lsu_buffer_group(uint32_t index) const { return lsu_buffers_.at(index).cur().group; }
-    [[nodiscard]] std::vector<uint32_t> lsu_buffer_words(uint32_t index) const {
-        return lsu_buffers_.at(index).cur().words;
-    }
     // What each piece of clocked state is (its kind, unit and size), in
     // declaration order.
     [[nodiscard]] std::vector<StateSize> state_sizes() const { return clocked_.sizes(); }
@@ -228,60 +220,11 @@ public:
     [[nodiscard]] std::string state_report() const;
     // Every black box's contract (src/machine/blackbox.hpp).
     [[nodiscard]] const std::vector<BlackBoxDeclaration>& black_boxes() const { return black_boxes_; }
-    // Test seams (Q, between ticks): whether load slot `index` is held, and
-    // whether its gathered vector is complete (a ready async RF writer);
-    // whether store slot `index` is held.
-    [[nodiscard]] bool load_slot_held(uint32_t index) const { return load_slots_.at(index).cur().has_value(); }
-    [[nodiscard]] bool load_slot_complete(uint32_t index) const {
-        const auto& slot = load_slots_.at(index).cur();
-        return slot.has_value() && slot->complete();
-    }
-    [[nodiscard]] bool store_slot_held(uint32_t index) const { return store_slots_.at(index).cur().has_value(); }
     // Test seams (Q, between ticks): a warp's active mask and its divergence
     // stack's depth. The mask is set only by
     // the machine (ssy / divergent bra / sync); there is no seam to set it.
     [[nodiscard]] uint64_t active_mask(uint32_t warp) const { return divergence_.cur().at(warp).active; }
     [[nodiscard]] uint32_t divergence_depth(uint32_t warp) const { return divergence_.cur().at(warp).depth; }
-    // Test seams (Q, between ticks): a warp's front end -- its buffer's valid
-    // packets, its pc (the next instruction's) and fetch pc (the next packet
-    // to read) -- and the warp whose packet is at the instruction memory's
-    // output now (a read in flight), if any.
-    [[nodiscard]] std::size_t instruction_fifo_packets(uint32_t warp) const { return front_end_.cur().at(warp).buffer.size(); }
-    [[nodiscard]] uint32_t warp_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
-    [[nodiscard]] uint32_t warp_fetch_pc(uint32_t warp) const { return front_end_.cur().at(warp).fetch_pc; }
-    [[nodiscard]] std::optional<uint32_t> fetch_in_flight() const {
-        const auto& read = fetch_read_.cur();
-        return read.has_value() ? std::optional<uint32_t>(read->warp) : std::nullopt;
-    }
-    // Test seam (between ticks): overwrite a warp's fetch pc, to show that the
-    // front end's consistency check (step_front_end) catches a broken state.
-    void test_set_fetch_pc(uint32_t warp, uint32_t pc);
-    // Test seams (Q, between ticks): the RF write decision's state per bank.
-    [[nodiscard]] bool rf_write_owed(uint32_t bank) const { return rf_write_policy_.cur().at(bank).owed != 0; }
-    [[nodiscard]] uint32_t rf_write_cursor(uint32_t bank) const { return rf_write_policy_.cur().at(bank).cursor; }
-    // Test seams (Q, between ticks): the RF read decision's state per bank,
-    // and the issue register's bank use (reads its round samples this cycle).
-    [[nodiscard]] bool rf_read_owed(uint32_t bank) const { return rf_read_policy_.cur().at(bank).owed != 0; }
-    [[nodiscard]] uint32_t rf_read_cursor(uint32_t bank) const { return rf_read_policy_.cur().at(bank).cursor; }
-    [[nodiscard]] uint32_t issue_read_bank_use(uint32_t bank) const { return issue_read_banks_.cur().at(bank); }
-    // Test seam (Q, between ticks): stage `stage` of the acc.ld engine's
-    // pipeline (tmem.port_depth stages to the tmem sample, then
-    // tmem.read_latency_cycles to the output, its last stage): (destination
-    // register, lane values -- empty until the beat's tmem sample -- last
-    // beat), or none when the stage is empty.
-    struct AccLdStageView {
-        uint8_t reg = 0;
-        std::vector<uint32_t> values;
-        bool last = false;
-    };
-    [[nodiscard]] std::optional<AccLdStageView> acc_ld_stage(uint32_t stage) const {
-        const auto& beat = acc_ld_pipe_.cur().at(stage);
-        if (!beat.has_value()) return std::nullopt;
-        return AccLdStageView{beat->reg, beat->values, beat->last};
-    }
-    [[nodiscard]] uint32_t acc_ld_pipeline_stages() const {
-        return config_.tmem_port_depth + config_.tmem_read_latency_cycles;
-    }
     // Test seam (between ticks): tmem word `word` (word w is in fine bank
     // w % tmem.fine_banks).
     [[nodiscard]] uint32_t tmem_word(uint32_t word) const {
@@ -663,7 +606,7 @@ private:
     };
 
     struct MmaCommand {
-        uint64_t id = 0;
+        uint64_t id = 0;         // the command's number (mma_command_number_): its steps' tags name it
         bool commit = false;
         bool init = false;
         MmaShape shape;          // from the opcode (m 32 or 64, n 64, k 8)
@@ -1070,7 +1013,7 @@ private:
     struct LsuCommand {
         static constexpr const char* unit = "LSU";                     // (CommandSlots' errors)
         static constexpr const char* capacity = "lsu.active_commands";
-        uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer, the wires' names
+        uint64_t id = 0;            // the command's number (lsu_command_number_): the wires' names, the trace, the sanitizer
         uint8_t slot = 0;           // the command slot it holds (chosen at its dispatch)
         LsuKind kind = LsuKind::vector_load;
         uint32_t warp = 0;
@@ -1285,7 +1228,7 @@ private:
     struct TmaCommand {
         static constexpr const char* unit = "TMA";                     // (CommandSlots' errors)
         static constexpr const char* capacity = "tma.queue_commands";
-        uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer
+        uint64_t id = 0;            // the command's number (tma_command_number_): the walker's front end, the transactions, the trace
         uint8_t slot = 0;           // the queue slot it holds (set when it takes one)
         // The instruction's operands: the opcode's direction, the descriptor
         // (a constant), the tile's coordinates c0..c3 (zero past the opcode's
@@ -2356,6 +2299,10 @@ private:
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{clocked_,Unit::barriers, "MMA mbar event register"};
     // MMA and accumulator transfers.
     Reg<MmaPipeline> mma_{clocked_,Unit::tensor_core, "MMA queue and pipeline"};
+    // The next MMA command's number (a commit's too): a result's tag and a
+    // step's last round find their command in the queue by it. dispatch_mma
+    // takes Q; drive_mma advances it when a command enters.
+    Reg<uint64_t> mma_command_number_{clocked_,Unit::tensor_core, "MMA command number", 1};
     // The port-B read pipeline: D stages to the shmem RAM (a round's elements
     // are sampled at stage D - 1), then Lb to the port output, the last stage.
     Pipe<MmaRead> mma_reads_{clocked_,Unit::tensor_core, "MMA port-B read pipeline"};
@@ -2377,6 +2324,11 @@ private:
     Pipe<AccStBeat> acc_st_pipe_{clocked_,Unit::tensor_core, "acc.st pipeline"};
     // TMA.
     Reg<TmaQueue> tma_{clocked_,Unit::tma, "TMA command queue"};
+    // The next TMA command's number: the queue's slots, the walker's front
+    // end and the port transactions name their command by it. The holding
+    // register's command takes Q (tma_command_from); drive_tma_queue
+    // advances it when the command enters. The launch copy takes 0 at reset.
+    Reg<uint64_t> tma_command_number_{clocked_,Unit::tma, "TMA command number"};
     Pipe<TmaWalkerStart> tma_walker_start_pipe_{clocked_,Unit::tma, "TMA walker start pipeline"};
     // The TMA's shmem transactions. Round 0 of each is granted in the cycle
     // tma_requests builds it (bypass (h) in tick()). The placement (port-B
@@ -2407,6 +2359,10 @@ private:
     // say, each built from the profile (a push past one is an internal
     // error); free-ID tags lsu.sectors_in_flight bits (16, fixed).
     Reg<LsuCommandSlots> lsu_commands_{clocked_,Unit::load_store, "LSU command slots"};
+    // The next LSU command's number: the slots' releases, the read records
+    // and the write acknowledgements name their command by it. dispatch_lsu
+    // takes Q; drive_lsu_commands advances it when the command enters.
+    Reg<uint64_t> lsu_command_number_{clocked_,Unit::load_store, "LSU command number"};
     Regs<LsuBuffer> lsu_buffers_{clocked_,Unit::load_store, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
     static constexpr uint32_t load_buffer = 0;
     static constexpr uint32_t store_buffer = 1;
@@ -2521,16 +2477,24 @@ private:
     bool gmem_last_beat_load_ = false;
     std::deque<WriteAck> pending_write_acks_;
     ControllerTestOrder controller_test_order_ = ControllerTestOrder::fifo;
-    // Request channel: TMA/LSU alternate (the client granted last yields a tie).
-    GmemClient request_channel_last_ = GmemClient::lsu;
+    // The request channel's arbitration register (the SM's, beside the
+    // controller it feeds): the client whose request the channel accepted
+    // last, which yields a tie (select_request_channel). One bit; the LSU at
+    // reset, so the TMA asks first. Driven from the channel's acceptance
+    // (drive_request_channel).
+    Reg<GmemClient> request_channel_last_{clocked_, Unit::load_store, "request channel: client accepted last",
+        GmemClient::lsu};
     std::optional<uint32_t> last_served_read_stream_; // interleave_ordered_streams test order
     uint64_t dram_tick_ = 0;
     uint64_t dram_phase_ = 0;
-    // Id counters, advanced only by the decisions that allocate (fixed order).
+    // (T) Running numbers no decision depends on, so not machine state: an
+    // egress slot's number (the simulator's check that writes leave in FIFO
+    // order, tick_gmem_controller, and the edge probe) and a gmem request's
+    // (the trace, the edge probe and the sanitizer's stream-order check). The
+    // decisions that allocate advance them in a fixed order; a gmem request
+    // number may be taken several times in one cycle.
     uint64_t next_egress_slot_id_ = 0;
-    uint64_t next_lsu_command_id_ = 0;
     uint64_t next_gmem_request_id_ = 0;
-    uint64_t next_tma_command_id_ = 0;
     // The launch record (src/image.hpp): the registers the host writes before
     // the first cycle, read-only after. None: nothing to copy.
     struct LaunchRegisters {
@@ -2540,7 +2504,6 @@ private:
         Bounded<LaunchFlag, 6> flags; // at most core.launch_flags, one per depbar
     };
     Reg<std::optional<LaunchRegisters>> launch_record_{clocked_,Unit::launch, "launch record"};
-    uint64_t next_mma_command_id_ = 1;
     // (T) trace-only per-command LSU phases.
     std::map<uint64_t, LsuCommandPhases> lsu_phases_;
     bool edge_probe_enabled_ = false;
@@ -2712,6 +2675,7 @@ private:
     void drive_egress(const Wires& w);
     void drive_read_records(const Wires& w);
     void drive_free_id_tags(const Wires& w);
+    void drive_request_channel(const Wires& w);
     void drive_rf_write_pipes(const Wires& w);
     void drive_store_completions(const Wires& w);
     void drive_predicates(const Wires& w);
@@ -2851,7 +2815,7 @@ private:
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
     void complete_tma_store_capture(TmaQueue& tma, uint8_t slot, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
-    // The launch copy (docs/qtx.md "Launch"): the TMA's first command and walker
+    // The launch copy (README "Launch"): the TMA's first command and walker
     // and the warps' launch flags, from the launch record; each landed
     // sector's bytes and the flags they clear.
     void start_launch_copy(const LaunchRecord& record);

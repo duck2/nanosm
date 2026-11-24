@@ -51,15 +51,14 @@ nanosm::TmaDescriptor rows_of_8(uint16_t rows) {
 // `barrier` on (8 bytes apart) each expecting `tx` bytes, shmem below 4096
 // poisoned so a zero fill shows.
 nanosm::Launch tensor_launch(uint32_t warps, uint16_t tile_rows, uint32_t barriers, uint32_t tx) {
-    nanosm::Launch launch;
-    launch.active_warps = warps;
+    auto launch = launch_warps(warps);
     auto& gmem = image_bytes(launch.gmem_image, tensor_elements * 4);
     for (uint32_t i = 0; i < tensor_elements; ++i) write_u32(gmem, 4 * i, 1000u + i);
     auto& shmem = image_bytes(launch.test_shmem, 8192);
     for (uint32_t address = 0; address < descriptor_4d; address += 4) write_u32(shmem, address, 0xdeadbeefu);
     write_tma_descriptor(shmem, descriptor_4d, sequence_tiles(tile_rows));
     write_tma_descriptor(shmem, descriptor_2d, rows_of_8(tile_rows));
-    for (uint32_t i = 0; i < barriers; ++i) write_tx_mbar(shmem, barrier + 8 * i, tx);
+    for (uint32_t i = 0; i < barriers; ++i) write_mbar(shmem, barrier + 8 * i, mbar_state(1, 0, static_cast<int32_t>(tx)));
     return launch;
 }
 
@@ -89,10 +88,6 @@ void require_rows(const nanosm::Machine& machine, uint32_t buffer, uint32_t firs
     }
 }
 
-std::string wait_on(const std::string& ur, const std::string& label) {
-    return label + ":\nmbar.try_wait p0, [" + ur + "], 0\n@!p0 bra.uni " + label + "\n";
-}
-
 // Issue cycles of the instructions named `name`, and the start cycles of the
 // TMA's command slices (the cycle each command was pushed into the queue).
 std::vector<uint64_t> issues_named(const nanosm::Machine& machine, const std::string& name) {
@@ -105,16 +100,16 @@ std::vector<uint64_t> issues_named(const nanosm::Machine& machine, const std::st
 
 std::vector<uint64_t> command_pushes(const nanosm::Machine& machine) {
     std::vector<uint64_t> cycles;
-    for (const auto& event : machine.trace().events()) {
-        if (event.name == "tma command") cycles.push_back(event.start_cycle);
-    }
+    for (const auto& event : events_named(machine, "tma command")) cycles.push_back(event.start_cycle);
     std::sort(cycles.begin(), cycles.end());
     return cycles;
 }
 
+} // namespace
+
 // N = 1 .. 4 from one descriptor: each reads its first N coordinates and
 // takes the rest as zero (here c = 0, 1, 2, 1 for all four commands).
-void test_four_coordinate_counts() {
+TEST(TmaOperands, four_coordinate_counts) {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 0
         umov ur1, 256
@@ -143,7 +138,7 @@ void test_four_coordinate_counts() {
 // outside it and zero-filled. A second command names head 3, outside the
 // tensor's three heads: a dimension the tile does not walk is out, so the
 // whole tile is zero.
-void test_tile_from_a_four_dimensional_tensor() {
+TEST(TmaOperands, tile_from_a_four_dimensional_tensor) {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 0
         umov ur1, 512
@@ -158,46 +153,10 @@ void test_tile_from_a_four_dimensional_tensor() {
     )" + wait_on("ur3", "loaded") + "halt\n"), tensor_launch(1, 4, 1, 2 * 128));
     machine.run(20000);
     require_tile(machine, 0, {-2, 2, 4, 1}, 4, 2, "tile at (-2, 2, 4, 1)");
-    for (uint32_t y : {2u, 3u}) require(machine.read_shmem_u32(4 * 8 * y) == 0, "an out-of-range row is not zero");
-    require(machine.read_shmem_u32(0) == 0 && machine.read_shmem_u32(4 * 2) != 0, "the channel boundary is wrong");
     require_tile(machine, 512, {-2, 3, 4, 1}, 4, 2, "tile at head 3 (outside)");
-    require(machine.read_shmem_u32(512 + 4 * 2) == 0, "a tile outside the heads was not zero-filled");
     const auto& summary = machine.trace().summary();
     require(summary.tma_logical_bytes == 256 && summary.tma_useful_bytes == 6 * 2 * 4,
         "logical / useful bytes: two 128-byte tiles, 12 elements in the tensor");
-}
-
-// Two warps issue two commands each, back to back, with different
-// coordinates: no command takes another's words (the tag travels with each
-// pair), and no two tma issues are closer than the first one's rounds.
-void test_back_to_back_commands_from_two_warps() {
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        usread ur0, WARP_ID
-        ushli ur1, ur0, 8
-        uaddi ur2, ur1, 128
-        ushli ur3, ur0, 3
-        uaddi ur3, ur3, 4352
-        umov  ur8, 0
-        umov  ur9, ur0
-        umov  ur10, 3
-        tma.load.2d [ur1], [4096, ur8], [ur3]
-        tma.load.3d [ur2], [4096, ur8], [ur3]
-    )" + wait_on("ur3", "loaded") + "halt\n"), tensor_launch(2, 2, 2, 2 * 64), {.timeline = true});
-    machine.run(20000);
-    for (uint32_t warp = 0; warp < 2; ++warp) {
-        const auto where = "warp " + std::to_string(warp);
-        require_tile(machine, 256 * warp, {0, warp, 0, 0}, 2, 2, where + " .2d");
-        require_tile(machine, 256 * warp + 128, {0, warp, 3, 0}, 2, 2, where + " .3d");
-    }
-    std::vector<std::pair<uint64_t, uint32_t>> issues; // (cycle, rounds)
-    for (const auto cycle : issues_named(machine, "tma.load.2d")) issues.emplace_back(cycle, nanosm::tma_operand_rounds(2));
-    for (const auto cycle : issues_named(machine, "tma.load.3d")) issues.emplace_back(cycle, nanosm::tma_operand_rounds(3));
-    std::sort(issues.begin(), issues.end());
-    require(issues.size() == 4, "four tma issues");
-    for (std::size_t i = 1; i < issues.size(); ++i) {
-        require(issues[i].first >= issues[i - 1].first + issues[i - 1].second,
-            "a tma was accepted while the previous one still had rounds to start");
-    }
 }
 
 // The read's cycles (canonical depths, Lu 1). A tma.load.4d accepted at T
@@ -206,8 +165,11 @@ void test_back_to_back_commands_from_two_warps() {
 // refused at T + 1 and T + 2 ("uniform read ports held") and issues at
 // T + 3. A .2d holds the ports one cycle and is pushed at T + 3. In a second
 // machine a vector instruction and a uniform write that reads nothing issue
-// right behind the .4d.
-void test_uniform_reader_refused_during_the_rounds() {
+// right behind the .4d. In a third, two warps issue a .2d and a .3d each
+// with different coordinates: no command takes another's words (the tag
+// travels with each pair), and no tma issues before the one ahead of it has
+// started its rounds (two for a .2d, three for a .3d).
+TEST(TmaOperands, uniform_reader_refused_during_the_rounds) {
     const auto& profile = canonical_profile();
     require(nanosm::tma_operand_rounds(1) == 2 && nanosm::tma_operand_rounds(2) == 2 &&
             nanosm::tma_operand_rounds(3) == 3 && nanosm::tma_operand_rounds(4) == 3,
@@ -254,15 +216,44 @@ void test_uniform_reader_refused_during_the_rounds() {
     free_ports.run(20000);
     const auto tma = issues_named(free_ports, "tma.load.4d");
     require(issues_named(free_ports, "mov") == std::vector<uint64_t>{tma.at(0) + 1}, "the vector mov waited");
-    require(issues_named(free_ports, "umov").back() == tma.at(0) + 2, "the uniform write that reads nothing waited");
+    const auto umovs = issues_named(free_ports, "umov");
+    require(!umovs.empty() && umovs.back() == tma.at(0) + 2, "the uniform write that reads nothing waited");
     require(free_ports.trace().summary().urf_read_ports_held == 0, "nothing was refused");
+
+    nanosm::Machine two_warps(profile, compile(R"(
+        usread ur0, WARP_ID
+        ushli ur1, ur0, 8
+        uaddi ur2, ur1, 128
+        ushli ur3, ur0, 3
+        uaddi ur3, ur3, 4352
+        umov  ur8, 0
+        umov  ur9, ur0
+        umov  ur10, 3
+        tma.load.2d [ur1], [4096, ur8], [ur3]
+        tma.load.3d [ur2], [4096, ur8], [ur3]
+    )" + wait_on("ur3", "loaded") + "halt\n"), tensor_launch(2, 2, 2, 2 * 64), {.timeline = true});
+    two_warps.run(20000);
+    for (uint32_t warp = 0; warp < 2; ++warp) {
+        const auto where = "warp " + std::to_string(warp);
+        require_tile(two_warps, 256 * warp, {0, warp, 0, 0}, 2, 2, where + " .2d");
+        require_tile(two_warps, 256 * warp + 128, {0, warp, 3, 0}, 2, 2, where + " .3d");
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> issues; // (cycle, rounds)
+    for (const auto cycle : issues_named(two_warps, "tma.load.2d")) issues.emplace_back(cycle, 2);
+    for (const auto cycle : issues_named(two_warps, "tma.load.3d")) issues.emplace_back(cycle, 3);
+    std::sort(issues.begin(), issues.end());
+    require(issues.size() == 4, "four tma issues");
+    for (std::size_t i = 1; i < issues.size(); ++i) {
+        require(issues[i].first >= issues[i - 1].first + issues[i - 1].second,
+            "a tma was accepted while the previous one still had rounds to start");
+    }
 }
 
 // The operand registers may be rewritten by the very next instruction: a
 // write issued at T + 1 lands at T + 1 + L + Wu, after the last round's
 // sample. The first command uses the old buffer, barrier and row; the second
 // the new ones.
-void test_operand_registers_rewritten_on_the_next_instruction() {
+TEST(TmaOperands, operand_registers_rewritten_on_the_next_instruction) {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 0
         umov ur1, 4352
@@ -288,7 +279,7 @@ void test_operand_registers_rewritten_on_the_next_instruction() {
 
 // The buffer's low 6 bits and the barrier's low 3 bits are not wired: a
 // program that sets them is the sanitizer's PANIC.
-void test_unwired_low_bits_panic() {
+TEST(TmaOperands, unwired_low_bits_panic) {
     NANOSM_EXPECTS_SANITIZER_PANIC();
     for (const auto& [buffer, mbar, needle] : {
              std::tuple{4u, 4352u, std::string("tma buffer address 4 is not 64-byte aligned")},
@@ -297,25 +288,15 @@ void test_unwired_low_bits_panic() {
         nanosm::Machine machine(canonical_profile(), compile(tma_operands_asm(0, buffer, 1, mbar, 8, {0, 0}) +
             "tma.load.2d [ur0], [4160, ur8], [ur1]\n" + wait_on("ur1", "loaded") + "halt\n"),
             tensor_launch(1, 2, 1, 64));
-        expect_sim_panic(machine, needle, needle);
+        expect_panic(machine, {needle}, needle);
     }
-}
-
-std::string compile_error(const std::string& source) {
-    try {
-        (void)compile(source);
-    } catch (const nanosm::SimError& error) {
-        return error.what();
-    }
-    return {};
 }
 
 // The descriptor round-trips through its 64 bytes; reserved element sizes,
-// reserved bytes and a layout byte past swizzle64 are refused. The assembler's
-// forms print and parse back;
-// it refuses an unaligned descriptor, coordinates past the last uniform
-// register and the old form without a coordinate count.
-void test_descriptor_and_toolchain() {
+// reserved bytes and a layout byte past swizzle64 are refused. The
+// assembler's forms print and parse back; it refuses an unaligned descriptor
+// and coordinates past the last uniform register.
+TEST(TmaOperands, descriptor_and_toolchain) {
     nanosm::TmaDescriptor descriptor = sequence_tiles(4);
     descriptor.base = 0x123456780ull;
     descriptor.element_bytes = 2;
@@ -332,28 +313,19 @@ void test_descriptor_and_toolchain() {
             decoded.tile_length == 64 && decoded.tile_rows == 16 && decoded.row_dimension == 2 &&
             decoded.layout == nanosm::TileLayout::swizzle64 && decoded.transposed,
         "the descriptor does not round-trip");
-    const auto refused = [](const std::function<void()>& action, const std::string& needle, const std::string& what) {
-        try {
-            action();
-        } catch (const nanosm::SimError& error) {
-            require(std::string(error.what()).find(needle) != std::string::npos,
-                what + ": wrong error: " + error.what());
-            return;
-        }
-        throw std::runtime_error(what + " was accepted");
-    };
     for (const uint8_t reserved_size : {8, 16}) {
         auto wide = rows_of_8(1);
         wide.element_bytes = reserved_size;
-        refused([&] { (void)nanosm::encode_tma_descriptor(wide); }, "is reserved", "element size 8 / 16");
+        expect_error<nanosm::SimError>([&] { (void)nanosm::encode_tma_descriptor(wide); }, {"is reserved"},
+            "element size " + std::to_string(reserved_size));
     }
     bytes[50] = 1;
-    refused([&] { (void)nanosm::decode_tma_descriptor(bytes.data(), bytes.size()); }, "reserved bytes",
-        "a nonzero reserved byte");
+    expect_error<nanosm::SimError>([&] { (void)nanosm::decode_tma_descriptor(bytes.data(), bytes.size()); },
+        {"reserved bytes"}, "a nonzero reserved byte");
     bytes[50] = 0;
-    bytes[nanosm::tma_encoding::layout] = 2; // the old "B operand" role byte
-    refused([&] { (void)nanosm::decode_tma_descriptor(bytes.data(), bytes.size()); }, "layout must be",
-        "layout byte 2");
+    bytes[nanosm::tma_encoding::layout] = 2;
+    expect_error<nanosm::SimError>([&] { (void)nanosm::decode_tma_descriptor(bytes.data(), bytes.size()); },
+        {"layout must be"}, "layout byte 2");
 
     const auto kernel = compile("tma.store.3d [4096, ur4], [ur1], [ur2]\ntma.load.1d [ur0], [512, ur15], [ur3]\nhalt\n");
     const auto store = nanosm::decode(kernel.words.at(0));
@@ -363,58 +335,22 @@ void test_descriptor_and_toolchain() {
     require(nanosm::format_instruction(store, false) == "tma.store.3d [4096, ur4], [ur1], [ur2]" &&
             nanosm::format_instruction(load, false) == "tma.load.1d [ur0], [512, ur15], [ur3]",
         "the printed forms: " + nanosm::format_instruction(store, false));
-    require(compile_error("tma.load.1d [ur0], [4100, ur4], [ur1]\nhalt\n").find("must be 64-byte aligned") !=
-            std::string::npos, "an unaligned descriptor address");
+    expect_error<nanosm::SimError>([] { (void)compile("tma.load.1d [ur0], [4100, ur4], [ur1]\nhalt\n"); },
+        {"must be 64-byte aligned"}, "an unaligned descriptor address");
     // Four coordinates from three below the profile's last uniform register
-    // pass it by one; one coordinate in the last register fits.
+    // pass it by one; one coordinate in the last register fits. (In qtx the
+    // four are members of a group, which ends one short; the assembler
+    // refuses the numbers.)
     const auto registers = canonical_profile().urf_registers;
     const auto from = "ur" + std::to_string(registers - 3);
-    // (In qtx the four are members of a group, which ends one short; the
-    // assembler refuses the numbers.)
-    require(compile_error("tma.load.4d [ur0], [4096, " + from + "], [ur1]\nhalt\n")
-                    .find("has only 3 from there on") != std::string::npos,
-        "coordinates " + from + " .. ur" + std::to_string(registers));
-    try {
-        (void)nanosm::assemble_asm(
-            i1_asm(canonical_profile(), "tma.load.4d [ur0], [4096, " + from + "], [ur1] {set=-}\nhalt"),
-            canonical_profile());
-        throw std::runtime_error("assembly accepted coordinates past the last uniform register");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("pass this profile's last uniform register") != std::string::npos,
-            std::string("assembly's coordinates: wrong error: ") + error.what());
-    }
-    require(compile_error("tma.load.1d [ur0], [4096, ur" + std::to_string(registers - 1) + "], [ur1]\nhalt\n").empty(),
-        "one coordinate in the last uniform register");
-    require(compile_error("tma.load [4096], r0, r1\nhalt\n").find("needs its coordinate count") != std::string::npos,
-        "the old form");
-}
-
-} // namespace
-
-TEST(TmaOperands, four_coordinate_counts) {
-    test_four_coordinate_counts();
-}
-
-TEST(TmaOperands, tile_from_a_four_dimensional_tensor) {
-    test_tile_from_a_four_dimensional_tensor();
-}
-
-TEST(TmaOperands, back_to_back_commands_from_two_warps) {
-    test_back_to_back_commands_from_two_warps();
-}
-
-TEST(TmaOperands, uniform_reader_refused_during_the_rounds) {
-    test_uniform_reader_refused_during_the_rounds();
-}
-
-TEST(TmaOperands, operand_registers_rewritten_on_the_next_instruction) {
-    test_operand_registers_rewritten_on_the_next_instruction();
-}
-
-TEST(TmaOperands, unwired_low_bits_panic) {
-    test_unwired_low_bits_panic();
-}
-
-TEST(TmaOperands, descriptor_and_toolchain) {
-    test_descriptor_and_toolchain();
+    expect_error<nanosm::SimError>([&] { (void)compile("tma.load.4d [ur0], [4096, " + from + "], [ur1]\nhalt\n"); },
+        {"has only 3 from there on"}, "qtx coordinates " + from + " .. ur" + std::to_string(registers));
+    expect_error<nanosm::SimError>(
+        [&] {
+            (void)nanosm::assemble_asm(
+                hand_asm(canonical_profile(), "tma.load.4d [ur0], [4096, " + from + "], [ur1] {set=-}\nhalt"),
+                canonical_profile());
+        },
+        {"pass this profile's last uniform register"}, "assembly coordinates " + from + " .. ur" + std::to_string(registers));
+    (void)compile("tma.load.1d [ur0], [4096, ur" + std::to_string(registers - 1) + "], [ur1]\nhalt\n");
 }

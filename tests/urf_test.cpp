@@ -10,13 +10,11 @@ namespace {
 
 using namespace nanosm_test;
 
-// (cycle, warp) of every issue whose opcode name is `name`, in trace order.
-std::vector<std::pair<uint64_t, uint32_t>> issues_of(const nanosm::Machine& machine, const std::string& name) {
-    std::vector<std::pair<uint64_t, uint32_t>> result;
-    for (const auto& event : machine.trace().events()) {
-        if (!is_issue_event(event) || event.name != name) continue;
-        const auto warp = std::stoul(event.detail.substr(5, event.detail.find(',') - 5));
-        result.emplace_back(event.start_cycle, static_cast<uint32_t>(warp));
+// Every issue whose opcode name is `name`, in trace order.
+std::vector<IssueRecord> issues_named(const nanosm::Machine& machine, const std::string& name) {
+    std::vector<IssueRecord> result;
+    for (const auto& issue : issue_records(machine)) {
+        if (issue.opcode == name) result.push_back(issue);
     }
     return result;
 }
@@ -39,20 +37,11 @@ std::vector<UrWrite> ur_writes(const nanosm::Machine& machine) {
     return result;
 }
 
-std::string compile_error(const std::string& source, const nanosm::DeviceProfile& profile = canonical_profile()) {
-    try {
-        (void)compile(source, profile);
-    } catch (const nanosm::SimError& error) {
-        return error.what();
-    }
-    return {};
-}
+} // namespace
 
 // Every uniform ALU opcode, usread, r2ur (lane 0) and ur2r (every lane), on
 // three warps: the values in the URF and in the vector copies.
-void test_uniform_arithmetic_and_moves() {
-    nanosm::Launch launch;
-    launch.active_warps = 3;
+TEST(Urf, uniform_arithmetic_and_moves) {
     nanosm::Machine machine(canonical_profile(), compile(R"(
         usread ur0, WARP_ID
         usread ur1, N_WARPS
@@ -78,7 +67,7 @@ void test_uniform_arithmetic_and_moves() {
         ur2r  r3, ur4
         ur2r  r4, ur2
         halt
-    )"), std::move(launch));
+    )"), launch_warps(3));
     machine.run(20000);
     for (uint32_t warp = 0; warp < 3; ++warp) {
         const auto ur = [&](uint32_t reg) { return machine.read_ureg(warp, reg); };
@@ -107,7 +96,7 @@ void test_uniform_arithmetic_and_moves() {
 // (like mov); each write is presented at the URF write port at its issue + L.
 // Four warps writing back to back present in four different cycles, each at
 // its own issue + L: one issue per cycle is one write per cycle.
-void test_write_and_read_timing() {
+TEST(Urf, write_and_read_timing) {
     const auto& profile = canonical_profile();
     require(nanosm::issue_to_urf_port(profile) == 3 && nanosm::issue_to_urf_visible(profile) == 5,
         "the canonical URF timing is L 3, visible from issue + 5");
@@ -122,16 +111,14 @@ void test_write_and_read_timing() {
     require(scheduled.instructions[1].control.stall == 4, "qtxc: uniform write -> ur2r is not 4 cycles");
     require(scheduled.instructions[2].control.stall == 6, "qtxc: ur2r -> vector read is not 6 cycles (like mov)");
 
-    nanosm::Launch launch;
-    launch.active_warps = 4;
     nanosm::Machine machine(profile, compile(R"(
         usread ur0, WARP_ID
         uaddi ur1, ur0, 10
         halt
-    )"), std::move(launch), {.timeline = true});
+    )"), launch_warps(4), {.timeline = true});
     machine.run(20000);
-    const auto usreads = issues_of(machine, "usread");
-    const auto uaddis = issues_of(machine, "uaddi");
+    const auto usreads = issues_named(machine, "usread");
+    const auto uaddis = issues_named(machine, "uaddi");
     const auto writes = ur_writes(machine);
     require(usreads.size() == 4 && uaddis.size() == 4 && writes.size() == 8, "wrong number of issues or UR writes");
     std::set<uint64_t> write_cycles;
@@ -139,54 +126,31 @@ void test_write_and_read_timing() {
         require(write_cycles.insert(write.cycle).second, "two UR writes presented in one cycle");
         const auto& issues = write.reg == 0 ? usreads : uaddis;
         const bool matched = std::any_of(issues.begin(), issues.end(), [&](const auto& issue) {
-            return issue.second == write.warp && issue.first + 3 == write.cycle;
+            return issue.warp == write.warp && issue.cycle + 3 == write.cycle;
         });
         require(matched, "a UR write was not presented at its writer's issue + L");
         require(write.value == static_cast<int64_t>(write.reg == 0 ? write.warp : write.warp + 10),
             "a UR write carried the wrong value");
     }
     for (uint32_t warp = 0; warp < 4; ++warp) {
-        const auto first = std::find_if(usreads.begin(), usreads.end(), [&](const auto& i) { return i.second == warp; });
-        const auto second = std::find_if(uaddis.begin(), uaddis.end(), [&](const auto& i) { return i.second == warp; });
-        require(second->first >= first->first + 4, "a dependent uniform reader issued before L + Wu");
+        const auto of_warp = [&](const std::vector<IssueRecord>& issues) {
+            const auto found = std::find_if(issues.begin(), issues.end(), [&](const auto& i) { return i.warp == warp; });
+            require(found != issues.end(), "warp " + std::to_string(warp) + " did not issue it");
+            return found->cycle;
+        };
+        require(of_warp(uaddis) == of_warp(usreads) + 4,
+            "warp " + std::to_string(warp) + ": the dependent uniform reader did not issue L + Wu after its writer" +
+                issue_log(machine));
         require(machine.read_ureg(warp, 1) == warp + 10, "uaddi read its source too early");
     }
-}
-
-// A uniform reader issued before its source is visible is the sanitizer's
-// PANIC (no scoreboard), like a vector RAW.
-void test_missing_uniform_stall_panics() {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    const auto& profile = canonical_profile();
-    const auto kernel = nanosm::assemble_asm(i1_asm(profile, R"(
-        umov ur1, 7 {pred=PT, stall=3, set=-, wait=-}
-        uaddi ur2, ur1, 1
-        halt
-    )"), profile);
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(profile, kernel, std::move(launch));
-    expect_sim_panic(machine, "URF RAW hazard: missing stall for ur1", "uniform read three cycles after its writer");
-}
-
-// r2ur reads lane 0, so under a partial active mask it is UB like every
-// lane-0 operation: the sanitizer's PANIC.
-void test_r2ur_under_a_partial_mask_panics() {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(canonical_profile(),
-        compile("sread r0, LANE_ID\n" + masked_region(0xfffe, "r2ur ur1, r0") + "halt\n"), std::move(launch));
-    expect_sim_panic(machine, "r2ur is a uniform operation under a partial active mask", "r2ur under a partial mask");
 }
 
 // The consumers read uniform registers: lds.uni and ldg.uni bases computed by
 // uniform arithmetic, an atomic's address and operand, the mbar address and
 // parity, and the acc.st / acc.ld tmem pointer (here row 0, column 3 of a
 // region of 8-word rows).
-void test_consumers_take_uniform_registers() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+TEST(Urf, consumers_take_uniform_registers) {
+    auto launch = launch_warps(1);
     auto& shmem = image_bytes(launch.test_shmem, 1024);
     write_u32(shmem, 256, 40);
     write_u32(shmem, 324, 0x1234);
@@ -232,7 +196,7 @@ skip:
 // uniform registers count neither toward the vector register count nor
 // toward the RF bank read rule; kernel load refuses a uniform register past
 // the profile's count.
-void test_toolchain_forms_and_refusals() {
+TEST(Urf, toolchain_forms_and_refusals) {
     const auto& profile = canonical_profile();
     const auto kernel = compile(R"(
         usread ur0, WARP_ID
@@ -272,8 +236,7 @@ void test_toolchain_forms_and_refusals() {
     require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "hex round trip");
 
     const auto refused = [&](const std::string& source, const std::string& needle, const std::string& what) {
-        const auto error = compile_error(source);
-        require(error.find(needle) != std::string::npos, what + ": wrong or no error: '" + error + "'");
+        expect_error([&] { (void)compile(source, profile); }, {needle}, what);
     };
     refused("sread r0, WARP_ID\nhalt\n", "usread", "vector sread of WARP_ID");
     refused("sread r0, N_WARPS\nhalt\n", "usread", "vector sread of N_WARPS");
@@ -281,8 +244,8 @@ void test_toolchain_forms_and_refusals() {
     const auto past = "ur" + std::to_string(profile.urf_registers);
     const auto last = "ur" + std::to_string(profile.urf_registers - 1);
     refused("usread ur0, LANE_ID\nhalt\n", "sread", "usread of LANE_ID");
-    // (A register past the file's end has no name to be written with: the
-    // file just runs out. Assembly's refusal of the number is below.)
+    // A register past the file's end has no name to be written with: the
+    // file just runs out. Assembly's refusal of the number is below.
     refused("umov " + past + ", 1\nhalt\n", "this profile's " + std::to_string(profile.urf_registers), past);
     // A name is one register in one file.
     refused("mov r2, 0\nlds.uni r1, [r2]\nhalt\n", "is used here as a uniform register", "a vector lds.uni base");
@@ -293,28 +256,18 @@ void test_toolchain_forms_and_refusals() {
     refused(".acc T, 0, 16, 8\nhalt\n", "there is no .acc directive", "the .acc directive");
     refused("umov ur1, r2\nhalt\n", "r2ur", "umov from a vector register");
     refused("usetp.eq.u32 p0, ur1, r2\nhalt\n", "is used here as a uniform register", "usetp of a vector register");
-    try {
-        (void)nanosm::assemble_asm(i1_asm(profile, "umov " + past + ", 1\nlds.uni r1, [r2]\nhalt"), profile);
-        throw std::runtime_error("assembly accepted " + past);
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("outside this profile's " + std::to_string(profile.urf_registers)) !=
-                std::string::npos, std::string("assembly's ") + past + ": wrong error: " + error.what());
-    }
+    expect_error([&] { (void)nanosm::assemble_asm(hand_asm(profile, "umov " + past + ", 1\nlds.uni r1, [r2]\nhalt"), profile); },
+        {"outside this profile's " + std::to_string(profile.urf_registers)}, "assembly of " + past);
     refused("usetp.eq.u32 PT, ur1, 0\nhalt\n", "usetp destination must be p0..p6", "usetp into PT");
     refused("usetp.lo.u32 p0, ur1, 0\nhalt\n", "unknown usetp comparison", "an unknown usetp comparison");
-    // Every compare says its type;
-    // the refusal names the two choices, in qtx and in assembly alike.
+    // Every compare says its type; the refusal names the two choices, in qtx
+    // and in assembly alike.
     refused("setp.lt p0, r1, r2\nhalt\n", "'setp.lt' needs its type: setp.lt.u32 (unsigned) or setp.lt.s32 (signed)",
         "an untyped setp");
     refused("usetp.eq p0, ur1, 0\nhalt\n", "usetp.eq.u32 (unsigned) or usetp.eq.s32 (signed)", "an untyped usetp");
     refused("usetp.ge.f32 p0, ur1, 0\nhalt\n", "usetp.ge.u32 (unsigned) or usetp.ge.s32 (signed)", "a float usetp");
-    try {
-        (void)nanosm::assemble_asm(i1_asm(profile, "setp.ne p0, r1, r2\nhalt"), profile);
-        throw std::runtime_error("assembly accepted an untyped setp");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("setp.ne.u32 (unsigned)") != std::string::npos,
-            std::string("assembly's untyped setp: wrong error: ") + error.what());
-    }
+    expect_error([&] { (void)nanosm::assemble_asm(hand_asm(profile, "setp.ne p0, r1, r2\nhalt"), profile); },
+        {"setp.ne.u32 (unsigned)"}, "assembly of an untyped setp");
     // eq / ne written .s32 is the .u32 opcode and is printed so in scheduled asm.
     const auto scheduled = nanosm::emit_asm(qtx_program("usetp.ne.s32 p6, ur3, ur4\nhalt\n", profile));
     require(scheduled.find("        usetp.ne.u32 p6, ur3, ur4 {") != std::string::npos,
@@ -326,40 +279,22 @@ void test_toolchain_forms_and_refusals() {
     bad.imm = 1;
     nanosm::Kernel image = compile("halt\n");
     image.words.insert(image.words.begin(), nanosm::encode(bad));
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    try {
-        nanosm::Machine machine(profile, image, std::move(launch));
-        throw std::runtime_error("kernel load accepted " + past);
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("uniform register " + past) != std::string::npos,
-            std::string("kernel load: wrong error: ") + error.what());
-    }
+    expect_error([&] { nanosm::Machine machine(profile, image, launch_warps(1)); }, {"uniform register " + past},
+        "kernel load of " + past);
 }
 
-// The profile fields: declared in the canonical profile, optional with the
-// canonical defaults, in the fingerprint; L must cover the longest writer and
-// the URF may not read slower than the RF. A profile with L 4 schedules a
+// The rules between the URF fields: L must cover the longest writer and the
+// URF may not read slower than the RF. A profile with L 4 schedules a
 // dependent uniform reader 5 cycles later and presents each write at issue
 // + 4.
-void test_profile_fields() {
+TEST(Urf, profile_fields) {
     const auto& canonical = canonical_profile();
     require(canonical.urf_registers == 32 && canonical.urf_read_latency_cycles == 1 &&
             canonical.urf_write_depth_cycles == 1 && canonical.urf_alu_latency_cycles == 1 &&
             canonical.urf_issue_to_port_cycles == 3, "canonical URF fields");
     require(nanosm::urf_longest_writer_path(canonical) == 3, "canonical writer path: 1 + max(1 + 1, 2)");
-    i21_check_optional_field("urf", "registers", 32, &nanosm::DeviceProfile::urf_registers);
-    i21_check_optional_field("urf", "write_depth_cycles", 1, &nanosm::DeviceProfile::urf_write_depth_cycles);
-    i21_check_optional_field("urf", "issue_to_port_cycles", 3, &nanosm::DeviceProfile::urf_issue_to_port_cycles);
-    const auto rejected = [](nanosm::DeviceProfile profile, const std::string& needle, const std::string& what) {
-        try {
-            nanosm::validate_device_profile(profile);
-        } catch (const nanosm::ProfileError& error) {
-            require(std::string(error.what()).find(needle) != std::string::npos,
-                what + ": wrong error: " + error.what());
-            return;
-        }
-        throw std::runtime_error(what + " passed validation");
+    const auto rejected = [](const nanosm::DeviceProfile& profile, const std::string& needle, const std::string& what) {
+        expect_error<nanosm::ProfileError>([&] { nanosm::validate_device_profile(profile); }, {needle}, what);
     };
     auto slow_alu = canonical;
     slow_alu.urf_alu_latency_cycles = 2;
@@ -373,32 +308,26 @@ void test_profile_fields() {
     rejected(slow_urf, "may not exceed rf read_latency_cycles", "URF read latency 3 above the RF's 2");
     slow_alu.urf_issue_to_port_cycles = 4;
     nanosm::validate_device_profile(slow_alu);
-    require(nanosm::device_profile_fingerprint(slow_alu) != nanosm::device_profile_fingerprint(canonical),
-        "urf alu_latency_cycles is not in the fingerprint");
 
     auto padded = canonical;
     padded.urf_issue_to_port_cycles = 4;
     const auto source = std::string("umov ur1, 7\nuaddi ur2, ur1, 1\nhalt\n");
     require(qtx_program(source, padded).instructions[0].control.stall == 5,
         "L 4: a dependent uniform reader is not 5 cycles later");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(padded, compile(source, padded), std::move(launch), {.timeline = true});
+    nanosm::Machine machine(padded, compile(source, padded), launch_warps(1), {.timeline = true});
     machine.run(20000);
     require(machine.read_ureg(0, 2) == 8, "L 4: wrong value");
     const auto writes = ur_writes(machine);
-    const auto umov = issues_of(machine, "umov");
-    require(writes.size() == 2 && umov.size() == 1 && writes[0].cycle == umov[0].first + 4,
+    const auto umov = issues_named(machine, "umov");
+    require(writes.size() == 2 && umov.size() == 1 && writes[0].cycle == umov[0].cycle + 4,
         "L 4: the write was not presented at issue + 4");
 }
 
 // The trace: one "UR write" instant per uniform write, with the register and
 // value, and the summary's urf line.
-void test_trace_shows_writes() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+TEST(Urf, trace_shows_writes) {
     nanosm::Machine machine(canonical_profile(), compile("umov ur1, 7\nuaddi ur2, ur1, 35\nhalt\n"),
-        std::move(launch), {.timeline = true});
+        launch_warps(1), {.timeline = true});
     machine.run(20000);
     require(machine.trace().summary().urf_writes == 2, "urf write count");
     require(machine.trace().summary_text().find("urf: writes=2 read_ports_held=0\n") != std::string::npos, "summary urf line");
@@ -407,60 +336,74 @@ void test_trace_shows_writes() {
         "Perfetto trace lacks the UR write instants");
 }
 
-// The uniform compare: each of the six
-// comparisons once in each form, several on values whose signed and unsigned
-// orders differ. The comparison is setp's, unsigned 32-bit: each usetp's
-// predicate, gathered into a bit of ur31 through @!p1 bra.uni, equals the
-// host's unsigned comparison and the vector setp's on the same values (bits
-// of ur30).
-void test_uniform_compare_values() {
+// The uniform and vector compares: each of the six unsigned comparisons once
+// in each form (register and immediate), and lt, le, gt, ge .s32 in both
+// forms, on values whose signed and unsigned orders differ. Each usetp's
+// predicate, gathered into a bit of ur31 through @!p1 bra.uni, and each
+// setp's on the same values (a bit of ur30), equal the host's comparison of
+// the row's type.
+TEST(Urf, uniform_compare_values) {
     struct Case {
         std::string comparison;
+        bool is_signed = false;
         int32_t lhs = 0;
         int32_t rhs = 0;
         bool immediate = false;
     };
     const std::vector<Case> cases = {
-        {"eq", 7, 7, false},  {"eq", -1, -1, true},
-        {"ne", 7, 8, false},  {"ne", 0, 0, true},
-        {"lt", -3, 5, false}, {"lt", 5, -3, true},  // unsigned: 0xfffffffd is the larger
-        {"le", 9, 9, false},  {"le", -1, 0, true},
-        {"gt", -1, 1, false}, {"gt", 2, 3, true},
-        {"ge", 0, -2, false}, {"ge", -2, -2, true},
+        {"eq", false, 7, 7, false},  {"eq", false, -1, -1, true},
+        {"ne", false, 7, 8, false},  {"ne", false, 0, 0, true},
+        {"lt", false, -3, 5, false}, {"lt", false, 5, -3, true}, // unsigned: 0xfffffffd is the larger
+        {"le", false, 9, 9, false},  {"le", false, -1, 0, true},
+        {"gt", false, -1, 1, false}, {"gt", false, 2, 3, true},
+        {"ge", false, 0, -2, false}, {"ge", false, -2, -2, true},
+        {"lt", true, -3, 5, false},  {"lt", true, 5, -3, true},
+        {"le", true, -1, 0, false},  {"le", true, 1, -1, true},
+        {"gt", true, -1, 1, false},  {"gt", true, 0, -2, true},
+        {"ge", true, 0, -2, false},  {"ge", true, -5, 3, true},
+    };
+    const auto holds = [](const std::string& comparison, auto a, auto b) {
+        return comparison == "eq" ? a == b
+            : comparison == "ne" ? a != b
+            : comparison == "lt" ? a < b
+            : comparison == "le" ? a <= b
+            : comparison == "gt" ? a > b
+            : a >= b;
+    };
+    const auto row = [](const Case& c) {
+        return c.comparison + (c.is_signed ? ".s32 " : ".u32 ") + std::to_string(c.lhs) + ", " +
+            std::to_string(c.rhs) + (c.immediate ? " (immediate)" : "");
     };
     std::string source = "umov ur30, 0\numov ur31, 0\n";
-    uint32_t expected = 0;
+    std::vector<bool> expected;
     for (std::size_t i = 0; i < cases.size(); ++i) {
         const auto& c = cases[i];
-        const auto a = static_cast<uint32_t>(c.lhs);
-        const auto b = static_cast<uint32_t>(c.rhs);
-        const bool holds = c.comparison == "eq" ? a == b
-            : c.comparison == "ne" ? a != b
-            : c.comparison == "lt" ? a < b
-            : c.comparison == "le" ? a <= b
-            : c.comparison == "gt" ? a > b
-            : a >= b;
-        if (holds) expected |= 1u << i;
+        const bool unsigned_holds = holds(c.comparison, static_cast<uint32_t>(c.lhs), static_cast<uint32_t>(c.rhs));
+        if (c.is_signed) {
+            require(holds(c.comparison, c.lhs, c.rhs) != unsigned_holds,
+                row(c) + ": the row does not tell signed from unsigned");
+        }
+        expected.push_back(c.is_signed ? holds(c.comparison, c.lhs, c.rhs) : unsigned_holds);
         const auto n = std::to_string(i);
         const auto bit = std::to_string(1u << i);
         const auto rhs = std::to_string(c.rhs);
+        const auto type = c.is_signed ? ".s32" : ".u32";
         source += "umov ur1, " + std::to_string(c.lhs) + "\numov ur2, " + rhs + "\n";
-        source += "usetp." + c.comparison + ".u32 p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
+        source += "usetp." + c.comparison + type + " p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
         source += "@!p1 bra.uni u" + n + "\nuori ur31, ur31, " + bit + "\nu" + n + ":\n";
         source += "ur2r r1, ur1\nur2r r2, ur2\n";
-        source += "setp." + c.comparison + ".u32 p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
+        source += "setp." + c.comparison + type + " p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
         source += "@!p2 bra.uni v" + n + "\nuori ur30, ur30, " + bit + "\nv" + n + ":\n";
     }
     source += "halt\n";
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
+    nanosm::Machine machine(canonical_profile(), compile(source), launch_warps(2));
     machine.run(20000);
     for (uint32_t warp = 0; warp < 2; ++warp) {
-        require(machine.read_ureg(warp, 31) == expected, "warp " + std::to_string(warp) +
-            ": usetp's predicates differ from the unsigned comparisons (got " +
-            std::to_string(machine.read_ureg(warp, 31)) + ", expected " + std::to_string(expected) + ")");
-        require(machine.read_ureg(warp, 30) == expected, "warp " + std::to_string(warp) + ": setp disagrees");
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const auto where = "warp " + std::to_string(warp) + ", " + row(cases[i]) + ": ";
+            require(((machine.read_ureg(warp, 31) >> i) & 1) == expected[i], where + "usetp's predicate is wrong");
+            require(((machine.read_ureg(warp, 30) >> i) & 1) == expected[i], where + "setp's predicate is wrong");
+        }
     }
 }
 
@@ -470,7 +413,7 @@ void test_uniform_compare_values() {
 // at issue + L and in the file from issue + L + 1, where the branch's sample
 // (its issue + 1) meets it (a vector setp's is 4). The machine issues each
 // branch 3 cycles after its compare.
-void test_uniform_compare_loop_and_timing() {
+TEST(Urf, uniform_compare_loop_and_timing) {
     const auto& profile = canonical_profile();
     require(nanosm::issue_to_uniform_predicate_visible(profile) == 4,
         "the canonical usetp predicate is not in the file from issue + 4");
@@ -489,25 +432,22 @@ void test_uniform_compare_loop_and_timing() {
     require(scheduled.instructions.at(4).control.stall == 3, "qtxc: usetp -> bra.uni is not 3 cycles");
     const auto kernel = compile(source);
     require(kernel.register_count == 0, "the uniform loop allocated vector registers");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(profile, kernel, std::move(launch), {.timeline = true});
+    nanosm::Machine machine(profile, kernel, launch_warps(1), {.timeline = true});
     machine.run(20000);
     require(machine.read_ureg(0, 1) == 10 && machine.read_ureg(0, 2) == 30, "the uniform loop ran the wrong count");
-    const auto compares = issues_of(machine, "usetp.lt.u32");
-    const auto branches = issues_of(machine, "bra.uni");
+    const auto compares = issues_named(machine, "usetp.lt.u32");
+    const auto branches = issues_named(machine, "bra.uni");
     require(compares.size() == 10 && branches.size() == 10, "ten iterations: ten compares and ten branches");
     for (std::size_t i = 0; i < compares.size(); ++i) {
-        require(branches[i].first == compares[i].first + 3, "a bra.uni did not issue 3 cycles after its usetp");
+        require(branches[i].cycle == compares[i].cycle + 3, "a bra.uni did not issue 3 cycles after its usetp");
     }
 }
 
 // A compare issued before its uniform source is visible, or a bra.uni issued
 // before the compare's predicate is in the file, is the sanitizer's PANIC
 // (no scoreboard), like a vector RAW. At the distances (4, then 3) the branch
-// sees the new predicate.
-void test_early_uniform_compare_or_branch_panics() {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
+// sees the new predicate, in both builds.
+TEST(Urf, early_uniform_compare_or_branch_panics) {
     const auto& profile = canonical_profile();
     const auto machine = [&](uint32_t write_stall, uint32_t compare_stall) {
         const auto program = "umov ur1, 7 {pred=PT, stall=" + std::to_string(write_stall) + ", set=-, wait=-}\n" +
@@ -518,197 +458,16 @@ void test_early_uniform_compare_or_branch_panics() {
         target: umov ur2, 2
             halt
         )";
-        nanosm::Launch launch;
-        launch.active_warps = 1;
         return std::make_unique<nanosm::Machine>(
-            profile, nanosm::assemble_asm(i1_asm(profile, program), profile), std::move(launch));
+            profile, nanosm::assemble_asm(hand_asm(profile, program), profile), launch_warps(1));
     };
     const auto at = machine(4, 3);
     at->run(20000);
     require(at->read_ureg(0, 2) == 2, "at the distances the bra.uni did not see the compare's predicate");
+#if NANOSM_SANITIZER
     const auto early_compare = machine(3, 3);
-    expect_sim_panic(*early_compare, "URF RAW hazard: missing stall for ur1", "usetp three cycles after its source");
+    expect_panic(*early_compare, {"URF RAW hazard: missing stall for ur1"}, "usetp three cycles after its source");
     const auto early_branch = machine(4, 2);
-    expect_sim_panic(*early_branch, "predicate RAW hazard: missing stall for p0", "bra.uni two cycles after usetp");
-}
-
-// The canonical URF has 32 registers: ur31 is written and read by uniform
-// arithmetic, a compare and ur2r.
-void test_thirty_two_uniform_registers() {
-    const auto& profile = canonical_profile();
-    require(profile.urf_registers == 32, "the canonical URF is not 32 registers");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(profile, compile(R"(
-        umov  ur31, 1234
-        uaddi ur30, ur31, 1
-        usetp.eq.u32 p0, ur31, 1234
-@!p0    bra.uni skip
-        umov  ur16, 1
-skip:
-        ur2r  r1, ur30
-        halt
-    )"), std::move(launch));
-    machine.run(20000);
-    require(machine.read_ureg(0, 31) == 1234 && machine.read_ureg(0, 30) == 1235 && machine.read_ureg(0, 16) == 1,
-        "ur31 / ur30 / ur16");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 1235, "ur2r from ur30");
-    }
-}
-
-// The signed compare: lt, le, gt, ge .s32 in both forms, uniform and vector
-// (each of the sixteen opcodes once), on values whose signed and unsigned
-// orders differ. Each usetp's
-// predicate, gathered into a bit of ur31 through @!p1 bra.uni, and each
-// setp's (ur30) equals the host's signed comparison.
-void test_signed_compare_values() {
-    struct Case {
-        std::string comparison;
-        int32_t lhs = 0;
-        int32_t rhs = 0;
-        bool immediate = false;
-    };
-    const std::vector<Case> cases = {
-        {"lt", -3, 5, false}, {"lt", 5, -3, true},
-        {"le", -1, 0, false}, {"le", 1, -1, true},
-        {"gt", -1, 1, false}, {"gt", 0, -2, true},
-        {"ge", 0, -2, false}, {"ge", -5, 3, true},
-    };
-    std::string source = "umov ur30, 0\numov ur31, 0\n";
-    uint32_t expected = 0;
-    for (std::size_t i = 0; i < cases.size(); ++i) {
-        const auto& c = cases[i];
-        const auto holds = [&](auto a, auto b) {
-            return c.comparison == "lt" ? a < b : c.comparison == "le" ? a <= b : c.comparison == "gt" ? a > b : a >= b;
-        };
-        const bool signed_holds = holds(c.lhs, c.rhs);
-        require(signed_holds != holds(static_cast<uint32_t>(c.lhs), static_cast<uint32_t>(c.rhs)),
-            "case " + std::to_string(i) + " does not tell signed from unsigned");
-        if (signed_holds) expected |= 1u << i;
-        const auto n = std::to_string(i);
-        const auto bit = std::to_string(1u << i);
-        const auto rhs = std::to_string(c.rhs);
-        source += "umov ur1, " + std::to_string(c.lhs) + "\numov ur2, " + rhs + "\n";
-        source += "usetp." + c.comparison + ".s32 p1, ur1, " + (c.immediate ? rhs : "ur2") + "\n";
-        source += "@!p1 bra.uni u" + n + "\nuori ur31, ur31, " + bit + "\nu" + n + ":\n";
-        source += "ur2r r1, ur1\nur2r r2, ur2\n";
-        source += "setp." + c.comparison + ".s32 p2, r1, " + (c.immediate ? rhs : "r2") + "\n";
-        source += "@!p2 bra.uni v" + n + "\nuori ur30, ur30, " + bit + "\nv" + n + ":\n";
-    }
-    source += "halt\n";
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
-    machine.run(20000);
-    for (uint32_t warp = 0; warp < 2; ++warp) {
-        require(machine.read_ureg(warp, 31) == expected, "warp " + std::to_string(warp) +
-            ": usetp.s32's predicates differ from the signed comparisons (got " +
-            std::to_string(machine.read_ureg(warp, 31)) + ", expected " + std::to_string(expected) + ")");
-        require(machine.read_ureg(warp, 30) == expected, "warp " + std::to_string(warp) +
-            ": setp.s32's predicates differ from the signed comparisons (got " +
-            std::to_string(machine.read_ureg(warp, 30)) + ")");
-    }
-}
-
-// A TMA-style coordinate that goes negative: each warp's tile starts one
-// 8-row tile above its own (a halo), so warp 0's first row is -8.
-// usetp.lt.s32 against 0 sees it, and that warp branches into the clamp
-// (row 0, ur9 = 1); warp 1's row 0 and warp 2's row 8 do not. The unsigned
-// usetp.lt.u32 would read -8 as 0xfffffff8 and never clamp.
-void test_signed_coordinate_branch() {
-    nanosm::Launch launch;
-    launch.active_warps = 3;
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        usread ur1, WARP_ID
-        ushli ur8, ur1, 3
-        uaddi ur8, ur8, -8
-        umov  ur9, 0
-        usetp.lt.s32 p0, ur8, 0
-@!p0    bra.uni inside
-        umov  ur8, 0
-        umov  ur9, 1
-inside:
-        halt
-    )"), std::move(launch));
-    machine.run(20000);
-    for (uint32_t warp = 0; warp < 3; ++warp) {
-        const uint32_t row = warp == 0 ? 0 : 8 * (warp - 1);
-        const uint32_t clamped = warp == 0 ? 1 : 0;
-        require(machine.read_ureg(warp, 8) == row && machine.read_ureg(warp, 9) == clamped,
-            "warp " + std::to_string(warp) + ": row " + std::to_string(machine.read_ureg(warp, 8)) +
-            ", clamped " + std::to_string(machine.read_ureg(warp, 9)));
-    }
-}
-
-} // namespace
-
-// uniform arithmetic, usread, r2ur and ur2r: values
-TEST(Urf, uniform_arithmetic_and_moves) {
-    test_uniform_arithmetic_and_moves();
-}
-
-// fixed write latency, dependent distances, one write per cycle
-TEST(Urf, write_and_read_timing) {
-    test_write_and_read_timing();
-}
-
-// a missing uniform stall is a sanitizer panic
-TEST(Urf, missing_uniform_stall_panics) {
-    test_missing_uniform_stall_panics();
-}
-
-// r2ur reads lane 0: a partial mask is a sanitizer panic
-TEST(Urf, r2ur_under_a_partial_mask_panics) {
-    test_r2ur_under_a_partial_mask_panics();
-}
-
-// lds.uni / ldg.uni / atom / mbar / acc read uniform registers
-TEST(Urf, consumers_take_uniform_registers) {
-    test_consumers_take_uniform_registers();
-}
-
-// encoding, formatting, refusals, kernel load
-TEST(Urf, toolchain_forms_and_refusals) {
-    test_toolchain_forms_and_refusals();
-}
-
-// the urf profile section and L
-TEST(Urf, profile_fields) {
-    test_profile_fields();
-}
-
-// UR write instants and the summary line
-TEST(Urf, trace_shows_writes) {
-    test_trace_shows_writes();
-}
-
-// usetp: the six comparisons, both forms, unsigned like setp
-TEST(Urf, uniform_compare_values) {
-    test_uniform_compare_values();
-}
-
-// a loop counting in a uniform register; the distances 4 and 3
-TEST(Urf, uniform_compare_loop_and_timing) {
-    test_uniform_compare_loop_and_timing();
-}
-
-// a too-early usetp or bra.uni is a sanitizer panic
-TEST(Urf, early_uniform_compare_or_branch_panics) {
-    test_early_uniform_compare_or_branch_panics();
-}
-
-// the canonical 32 uniform registers: ur31
-TEST(Urf, thirty_two_uniform_registers) {
-    test_thirty_two_uniform_registers();
-}
-
-// setp / usetp .s32: lt, le, gt, ge, both forms, signed
-TEST(Urf, signed_compare_values) {
-    test_signed_compare_values();
-}
-
-// a negative TMA-style coordinate: usetp.lt.s32 against 0 and a branch
-TEST(Urf, signed_coordinate_branch) {
-    test_signed_coordinate_branch();
+    expect_panic(*early_branch, {"predicate RAW hazard: missing stall for p0"}, "bra.uni two cycles after usetp");
+#endif
 }

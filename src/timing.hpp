@@ -35,8 +35,13 @@
 // readers (acc.st beats, the LSU's store data) take the ports it leaves free.
 // No future read is booked anywhere. An instruction whose distinct source
 // registers need more of one bank's read ports than the bank has is
-// MALFORMED for this machine (rf_read_port_conflict): qtxc, the hand
-// assembler and kernel load reject it; nothing serializes it.
+// MALFORMED for this machine (rf_read_port_conflict); nothing serializes it.
+// The hand assembler and kernel load reject one. qtxc does not write one
+// (src/qtxc/registers.cpp): it picks register numbers that spread each
+// instruction's sources over the banks and, where no numbers fit, copies a
+// source into a register of a free bank just before the instruction and
+// warns; it refuses only an instruction that reads more registers than all
+// the banks' read ports together serve.
 //
 // Fixed arithmetic (the "arithmetic pipeline"): all its operands are at the
 // RF output Lr after the sample, when execution starts; its result reaches

@@ -282,7 +282,6 @@ void Machine::apply_tma_walker(TmaQueue& tma, Wires& w) {
     const bool emits = plan.sector == Sector::store ? store_read_granted
         : plan.sector == Sector::load ? w.channel.walker_proceeds
         : plan.sector == Sector::zero_fill && !w.ingress.tma_ticket.has_value();
-    if (plan.sector == Sector::zero_fill && !emits) probe(LsuEdge::tma_zero_fill_wait, plan.run.command, 0, 0);
     if (plan.sector == Sector::skip || emits) {
         tma.walker = plan.walker_after;
         if (plan.done_after) command.walker_done = true;
@@ -599,7 +598,7 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     sanitizer_.check_uniform_mask(where, header.active_mask, full_mask());
     sanitizer_.check_tma_operand_alignment(where, holding.buffer, holding.barrier);
     TmaCommand command;
-    command.id = next_tma_command_id_++;
+    command.id = tma_command_number_.cur();
     command.direction = is_tma_store(inst.opcode) ? TmaDirection::store : TmaDirection::load;
     command.descriptor_address = static_cast<uint32_t>(inst.imm);
     command.coordinates = holding.coordinates;
@@ -654,7 +653,10 @@ void Machine::drive_tma_event(const Wires& w) {
 // The TMA command queue: step_tma's result, plus issue's new command.
 void Machine::drive_tma_queue(const Wires& w) {
     auto next = w.tma_next;
-    if (w.tma_pushed.has_value()) next.commands.take(*w.tma_pushed, config_.tma_queue_commands);
+    if (w.tma_pushed.has_value()) {
+        next.commands.take(*w.tma_pushed, config_.tma_queue_commands);
+        tma_command_number_.set_next(w.tma_pushed->id + 1, "drive_tma_queue");
+    }
     // The hardware sizes (TmaQueue, machine.hpp): issue's admission and the
     // credits keep them; exceeding one is a machine bug.
     if (next.commands.size() > config_.tma_queue_commands) {

@@ -9,7 +9,7 @@
 
 namespace nanosm {
 
-// The launch copy (docs/qtx.md "Launch"). The
+// The launch copy (README "Launch"). The
 // host wrote the kernel's launch block into global memory and the launch
 // record says where it is, where it goes in shared memory and how long it
 // is. Nothing of it is in shared memory at the first cycle. The copy is the
@@ -40,7 +40,8 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
     launch_record_.poke(LaunchRegisters{record.global_address, record.shared_address, record.bytes, record.flags});
     auto tma = tma_.cur();
     TmaCommand command;
-    command.id = next_tma_command_id_++;
+    command.id = tma_command_number_.cur();
+    tma_command_number_.poke(command.id + 1);
     command.launch = true;
     command.direction = TmaDirection::load;
     command.shmem_address = record.shared_address;

@@ -1,5 +1,5 @@
-// Machine-level basics: nonblocking lds, depbars, bank rounds, profile and allocation errors, the trace.
-// Each test's TEST wrapper is at the end.
+// Machine-level basics: nonblocking lds, bank rounds, the device profile (validation, its optional fields, the
+// stamp a kernel carries), the trace.
 #include "test_support.hpp"
 
 namespace {
@@ -35,11 +35,19 @@ private:
     std::filesystem::path path_;
 };
 
-void test_lds_is_nonblocking_and_depbar_waits() {
-    // Not `mov r0, 0`: all sixteen lanes on one word are sixteen
-    // rounds (sixteen lanes on bank 0), which holds port A and would block the
-    // second lds structurally. Lane-strided addresses keep each lds at one
-    // round (one lane per bank), the premise of this test.
+nlohmann::json canonical_document() {
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    return document;
+}
+
+} // namespace
+
+// Lane-strided addresses keep each lds at one round (one lane per bank), so
+// port A does not block the second lds: it issues the cycle after the first,
+// and the consumer waits on its depbar.
+TEST(Machine, lds_is_nonblocking_and_depbar_waits) {
     const auto program = qtx_program(R"(
         sread r0, LANE_ID
         shli r0, r0, 2
@@ -48,155 +56,154 @@ void test_lds_is_nonblocking_and_depbar_waits() {
         fadd r4, r1, r2
         halt
     )", canonical_profile());
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+    auto launch = launch_warps(1);
     auto& shmem = image_bytes(launch.test_shmem, 128);
     write_u32(shmem, 0, nanosm::float_bits(2.0f));
     write_u32(shmem, 64, nanosm::float_bits(3.0f));
-    nanosm::Machine machine(
-        canonical_profile(),
-        nanosm::assemble_asm(nanosm::emit_asm(program), canonical_profile()),
-        std::move(launch),
-        {.timeline = true});
+    nanosm::Machine machine(canonical_profile(),
+        nanosm::assemble_asm(nanosm::emit_asm(program), canonical_profile()), std::move(launch), {.timeline = true});
     machine.run();
-
     std::vector<uint64_t> load_issue_cycles;
-    bool saw_depbar_wait = false;
-    for (const auto& event : machine.trace().events()) {
-        if (event.category == nanosm::TraceCategory::instruction && event.name == "lds") {
-            load_issue_cycles.push_back(event.start_cycle);
-        }
+    for (const auto& event : events_named(machine, "lds")) {
+        if (event.category == nanosm::TraceCategory::instruction) load_issue_cycles.push_back(event.start_cycle);
     }
-    saw_depbar_wait = machine.trace().summary().warp_cycles[
-        static_cast<std::size_t>(nanosm::WarpState::depbar)] != 0;
     require(load_issue_cycles.size() == 2, "did not issue two loads");
     require(load_issue_cycles[1] == load_issue_cycles[0] + 1, "lds blocked the warp instead of retiring");
-    require(saw_depbar_wait, "consumer never stalled on its depbar mask");
+    require(machine.trace().summary().warp_cycles[static_cast<std::size_t>(nanosm::WarpState::depbar)] != 0,
+        "consumer never stalled on its depbar mask");
 }
 
-void test_missing_wait_panics_instead_of_scoreboarding() {
-    const auto& profile = canonical_profile();
-    const auto assembly =
-        ".profile " + profile.name + ", 0x" +
-        nanosm::format_profile_fingerprint(nanosm::device_profile_fingerprint(profile)) + R"(
-        mov  r0, 0 {pred=PT, stall=1, set=-, wait=-}
-        lds  r1, [r0] {pred=PT, stall=0, set=sb0, wait=-}
-        fadd r4, r1, r2 {pred=PT, stall=4, set=-, wait=-}
-        halt {pred=PT, stall=0, set=-, wait=sb0}
-    )";
-    const auto kernel = nanosm::assemble_asm(assembly, profile);
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.test_shmem, 64);
-    nanosm::Machine machine(canonical_profile(), kernel, std::move(launch));
-    try {
+// Sixteen lanes on one bank take sixteen rounds, one lane a round, whether
+// they read one word (uniformity is declared with lds.uni, never detected) or
+// sixteen words 64 bytes apart; every lane gets its word.
+TEST(Machine, bank_conflict_serializes) {
+    struct Row {
+        std::string what;
+        std::string kernel;
+        uint32_t stride; // bytes between the lanes' words (0: one word)
+    };
+    const std::vector<Row> rows = {
+        {"sixteen lanes on one word", "mov r0, 0\nlds r1, [r0]\nhalt\n", 0},
+        {"sixteen words on one bank", "sread r0, LANE_ID\nshli r0, r0, 6\nlds r1, [r0]\nhalt\n", 64},
+    };
+    for (const auto& row : rows) {
+        auto launch = launch_warps(1);
+        auto& shmem = image_bytes(launch.test_shmem, 16 * 64);
+        const auto word = [&](uint32_t lane) { return row.stride == 0 ? 0x12345678u : 10 + lane; };
+        for (uint32_t lane = 0; lane < 16; ++lane) write_u32(shmem, lane * row.stride, word(lane));
+        nanosm::Machine machine(canonical_profile(), compile(row.kernel), std::move(launch));
         machine.run();
-        throw std::runtime_error("missing depbar wait was silently scoreboard-stalled");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("RF RAW hazard") != std::string::npos,
-            "missing wait produced the wrong panic");
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            require(machine.read_reg(0, lane, 1) == word(lane),
+                row.what + ": lane " + std::to_string(lane) + " has the wrong word");
+        }
+        require(machine.trace().summary().shmem_rounds == 16, row.what + ": not sixteen bank rounds");
     }
 }
 
-// Sixteen lanes reading one word are not merged into one round.
-// Uniformity is declared, never detected:
-// they are sixteen lanes on bank 0, served one per round, 16 rounds. Every
-// lane still gets the word. The one-round broadcast is lds.uni.
-void test_plain_lds_of_one_word_is_sixteen_rounds() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 4);
-    write_u32(shmem, 0, 0x12345678u);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        mov  r0, 0
-        lds  r1, [r0]
-        halt
-    )"), std::move(launch));
-    machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 0x12345678u, "broadcast value mismatch");
-    }
-    require(machine.trace().summary().shmem_rounds == 16,
-        "sixteen lanes on one word did not take sixteen bank rounds");
-}
+// A default-constructed profile carries no ISA timing and is refused; an
+// invalid profile is refused before the machine allocates anything; an
+// allocation the host cannot make is a PANIC; a key the parser does not read
+// is refused by name.
+TEST(Machine, profile_is_validated_before_machine_allocation) {
+    nanosm::DeviceProfile defaults;
+    require(defaults.timing.alu == 0 && defaults.timing.fadd == 0, "profile inherited ISA timing defaults");
+    (void)error_of<nanosm::ProfileError>(
+        [&] { nanosm::validate_device_profile(defaults); }, "a default-constructed profile");
 
-void test_bank_conflict_serializes() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 16 * 64);
-    for (uint32_t lane = 0; lane < 16; ++lane) write_u32(shmem, lane * 64, lane + 10);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        sread r0, LANE_ID
-        shli  r0, r0, 6
-        lds   r1, [r0]
-        halt
-    )"), std::move(launch));
-    machine.run();
-    require(
-        machine.trace().summary().shmem_rounds == 16,
-        "sixteen-way bank conflict did not serialize to sixteen rounds");
-}
+    auto invalid = canonical_profile();
+    invalid.timing.alu = 0;
+    invalid.timing.fadd = 0;
+    invalid.gmem_bytes = std::numeric_limits<uint64_t>::max();
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(invalid, compile("halt"), launch_warps(1)); },
+        {"device profile"}, "an invalid profile at machine allocation");
 
-void test_profile_defaults_are_invalid() {
-    nanosm::DeviceProfile profile;
-    require(profile.timing.alu == 0 && profile.timing.fadd == 0, "profile inherited ISA timing defaults");
-    try {
-        nanosm::validate_device_profile(profile);
-        throw std::runtime_error("default-constructed profile passed validation");
-    } catch (const nanosm::ProfileError&) {
-    }
-}
+    auto huge = canonical_profile();
+    huge.gmem_bytes = std::numeric_limits<uint64_t>::max();
+    const auto kernel = compile("halt", huge);
+    const auto message = error_of<nanosm::SimError>(
+        [&] { nanosm::Machine machine(huge, kernel, launch_warps(1)); }, "an impossible machine allocation");
+    require(message.find("host memory") != std::string::npos || message.find("host container limits") != std::string::npos,
+        "host allocation failure escaped deterministic PANIC conversion: " + message);
 
-void test_profile_is_validated_before_machine_allocation() {
-    auto profile = canonical_profile();
-    profile.timing.alu = 0;
-    profile.timing.fadd = 0;
-    profile.gmem_bytes = std::numeric_limits<uint64_t>::max();
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    try {
-        nanosm::Machine machine(profile, compile("halt"), std::move(launch));
-        throw std::runtime_error("invalid profile reached machine allocation");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("device profile") != std::string::npos,
-            "invalid profile did not produce deterministic profile PANIC");
+    auto top = canonical_document();
+    top["bogus"] = 1;
+    expect_error<nanosm::ProfileError>([&] { (void)nanosm::parse_device_profile(top.dump()); },
+        {"unknown key 'bogus' at the top level"}, "an unknown top-level key");
+    auto inner = canonical_document();
+    inner["shmem"]["bogus_field"] = 1;
+    expect_error<nanosm::ProfileError>([&] { (void)nanosm::parse_device_profile(inner.dump()); },
+        {"unknown key 'bogus_field' in section 'shmem'"}, "an unknown key in a section");
+    // A section present as anything but an object is refused by name, an
+    // optional one (urf) as much as a required one (sfu).
+    const std::vector<std::pair<const char*, nlohmann::json>> not_objects = {
+        {"urf", nullptr},
+        {"urf", 42},
+        {"urf", nlohmann::json::parse(R"([{"registers": 4}])")},
+        {"sfu", 42},
+    };
+    for (const auto& [section, value] : not_objects) {
+        auto document = canonical_document();
+        document[section] = value;
+        expect_error<nanosm::ProfileError>([&] { (void)nanosm::parse_device_profile(document.dump()); },
+            {std::string("section '") + section + "' must be an object"},
+            std::string("section ") + section + " = " + value.dump());
     }
 }
 
-void test_host_allocation_failure_is_a_panic() {
-    auto profile = canonical_profile();
-    profile.gmem_bytes = std::numeric_limits<uint64_t>::max();
-    const auto kernel = compile("halt", profile);
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    try {
-        nanosm::Machine machine(profile, kernel, std::move(launch));
-        throw std::runtime_error("impossible machine allocation unexpectedly succeeded");
-    } catch (const nanosm::SimError& error) {
-        const std::string message = error.what();
-        require(
-            message.find("host memory") != std::string::npos ||
-                message.find("host container limits") != std::string::npos,
-            "host allocation failure escaped deterministic PANIC conversion");
-    }
+// Every optional profile field: the canonical JSON declares it, its default is
+// the canonical value, its range is enforced, and it is in the fingerprint.
+TEST(Machine, optional_profile_fields) {
+    using P = nanosm::DeviceProfile;
+    // A slower RF or URF read, or a slower uniform ALU, needs a longer urf
+    // issue_to_port_cycles (the uniform write port's offset covers every writer).
+    const auto later_uniform_port = [](P& profile) { profile.urf_issue_to_port_cycles = 4; };
+    check_optional_field("rf", "read_latency_cycles", 2, &P::rf_read_latency_cycles, 1, 8, later_uniform_port);
+    check_optional_field("rf", "write_depth_cycles", 2, &P::rf_write_depth_cycles, 1, 8);
+    check_optional_field("urf", "registers", 32, &P::urf_registers, 1, 64);
+    check_optional_field("urf", "read_latency_cycles", 1, &P::urf_read_latency_cycles, 1, 8, later_uniform_port);
+    check_optional_field("urf", "write_depth_cycles", 1, &P::urf_write_depth_cycles, 1, 8);
+    check_optional_field("urf", "alu_latency_cycles", 1, &P::urf_alu_latency_cycles, 1, 8, later_uniform_port);
+    check_optional_field("urf", "issue_to_port_cycles", 3, &P::urf_issue_to_port_cycles, 1, 30);
+    check_optional_field("shmem", "load_slots", 2, &P::shmem_load_slots, 1, 1024);
+    check_optional_field("shmem", "store_slots", 2, &P::shmem_store_slots, 1, 1024);
+    check_optional_field("shmem", "port_a_depth", 2, &P::shmem_port_a_depth, 1, 64);
+    check_optional_field("shmem", "read_latency_cycles", 2, &P::shmem_read_latency_cycles, 1, 64);
+    check_optional_field("shmem", "rmw_compute_cycles", 2, &P::shmem_rmw_compute_cycles, 1, 64);
+    check_optional_field("tmem", "port_depth", 2, &P::tmem_port_depth, 1, 64);
+    check_optional_field("tmem", "read_latency_cycles", 2, &P::tmem_read_latency_cycles, 1, 64);
+    check_optional_field("tma", "store_sector_registers", 1, &P::tma_store_sector_registers, 1, 64);
+    check_optional_field("tma", "walker_start_cycles", 2, &P::tma_walker_start_cycles, 0, 8);
+    check_optional_field("core", "warps", 16, &P::core_warps, 1, 64);
+    check_optional_field("core", "instruction_buffer_packets", 2, &P::core_instruction_buffer_packets, 1, 16);
+    check_optional_field("core", "divergence_stack_entries", 8, &P::core_divergence_stack_entries, 0, 64);
+    check_optional_field("core", "launch_flags", 4, &P::core_launch_flags, 1, 6);
 }
 
-void test_trace_attribution_and_limit() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(
-        canonical_profile(),
-        compile("mov r0, 1\nhalt"),
-        std::move(launch),
+// A kernel carries the name and fingerprint of the profile it was scheduled
+// for; the assembler and the machine refuse it under another profile.
+TEST(Machine, profile_stamp_rejects_mismatch) {
+    const auto& profile = canonical_profile();
+    const auto assembly = nanosm::emit_asm(qtx_program("mov r0, 1\nhalt", profile));
+    const auto kernel = nanosm::assemble_asm(assembly, profile);
+    require(kernel.profile_name == profile.name, "profile name was not stamped into kernel");
+    require(kernel.profile_fingerprint == nanosm::device_profile_fingerprint(profile),
+        "profile fingerprint was not stamped into kernel");
+    auto other = profile;
+    ++other.timing.fadd;
+    expect_error<nanosm::SimError>([&] { (void)nanosm::assemble_asm(assembly, other); }, {"does not match"},
+        "assembly scheduled for another profile");
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(other, kernel, launch_warps(1)); },
+        {"does not match simulator"}, "a kernel for another profile in the simulator");
+}
+
+TEST(Machine, trace_attribution_and_limit) {
+    nanosm::Machine machine(canonical_profile(), compile("mov r0, 1\nhalt"), launch_warps(1),
         {.timeline = true, .max_events = 1});
     machine.run();
     const auto& trace = machine.trace();
     const auto& summary = trace.summary();
-    require(
-        summary.scheduler_issued_cycles + summary.scheduler_idle_cycles +
-                summary.scheduler_draining_cycles ==
+    require(summary.scheduler_issued_cycles + summary.scheduler_idle_cycles + summary.scheduler_draining_cycles ==
             summary.cycles,
         "scheduler attribution does not sum to total cycles");
     uint64_t warp_cycles = 0;
@@ -206,9 +213,11 @@ void test_trace_attribution_and_limit() {
     require(trace.truncated(), "timeline limit did not report truncation");
 }
 
-void test_perfetto_overlapping_commands_are_async() {
-    nanosm::Launch launch;
-    launch.active_warps = 2;
+// Complete 'X' slices that partially overlap on one tid are ambiguous to nest
+// and trigger Perfetto's slice_spill_overlapping_complete_event; overlapping
+// lifetimes ship as async begin/end pairs instead.
+TEST(Machine, perfetto_overlapping_commands_are_async) {
+    auto launch = launch_warps(2);
     image_bytes(launch.gmem_image, 128);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         sread r0, THREAD_ID
@@ -219,17 +228,12 @@ void test_perfetto_overlapping_commands_are_async() {
     machine.run();
     const ScratchFile file("async_trace");
     machine.trace().write_perfetto(file.string());
-
     nlohmann::json document;
     {
         std::ifstream input(file.string());
         require(static_cast<bool>(input), "trace file was not written");
         input >> document;
     }
-
-    // Complete 'X' slices that partially overlap on one tid are ambiguous to nest and
-    // trigger Perfetto's slice_spill_overlapping_complete_event; overlapping lifetimes
-    // must ship as async begin/end pairs instead.
     std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> spans;
     std::size_t begins = 0;
     std::size_t ends = 0;
@@ -238,8 +242,8 @@ void test_perfetto_overlapping_commands_are_async() {
         if (ph == "b") ++begins;
         if (ph == "e") ++ends;
         if (ph != "X") continue;
-        // Compare the exact cycle integers from args: recomputing spans from the
-        // floating-point ts/dur pair manufactures 1-ULP overlaps that do not exist.
+        // The exact cycle integers from args: spans recomputed from the
+        // floating-point ts/dur pair show 1-ULP overlaps that do not exist.
         const auto start = event.at("args").at("start_cycle").get<uint64_t>();
         const auto duration = event.at("args").at("duration_cycles").get<uint64_t>();
         spans[event.at("tid").get<uint64_t>()].emplace_back(start, start + duration);
@@ -247,81 +251,8 @@ void test_perfetto_overlapping_commands_are_async() {
     for (auto& [tid, intervals] : spans) {
         std::sort(intervals.begin(), intervals.end());
         for (std::size_t i = 1; i < intervals.size(); ++i) {
-            require(
-                intervals[i].first >= intervals[i - 1].second,
-                "overlapping complete slices on tid " + std::to_string(tid));
+            require(intervals[i].first >= intervals[i - 1].second, "overlapping complete slices on tid " + std::to_string(tid));
         }
     }
     require(begins >= 2 && begins == ends, "concurrent gmem commands did not emit async pairs");
-}
-
-// Every instruction reads its operands in ONE
-// round, sampled at issue + issue_to_sample, so the profile has no read
-// window; the canonical profile holds about as much RF as shmem (352 rows
-// per bank). A round reads each distinct source once, in source order.
-void test_rf_read_profile_and_round() {
-    const auto& profile = canonical_profile();
-    require(profile.rf_rows_per_bank == 352 &&
-            uint64_t{profile.rf_banks} * profile.rf_rows_per_bank * profile.lanes * 4 == 66 * 1024,
-        "the canonical RF is not 3 x 352 rows of 64 B (66 KiB)");
-    require(nanosm::rf_read_round({0, 3}) == std::vector<uint8_t>{0, 3}, "a round lost a source");
-    require(nanosm::rf_read_round({4, 4}) == std::vector<uint8_t>{4}, "a repeated register was read twice");
-    require(nanosm::rf_read_round({5, 2, 5, 8}) == std::vector<uint8_t>{5, 2, 8}, "a round's order or broadcast");
-    require(nanosm::issue_to_sample == nanosm::issue_register_stages &&
-            nanosm::issue_to_operands(profile) == nanosm::issue_to_sample + profile.rf_read_latency_cycles &&
-            nanosm::issue_to_dispatch(profile) == nanosm::issue_to_operands(profile),
-        "every instruction's operands are not at the RF output issue + 1 + Lr");
-}
-
-} // namespace
-
-// RF read profile and one round
-TEST(Machine, rf_read_profile_and_round) {
-    test_rf_read_profile_and_round();
-}
-
-// nonblocking lds
-TEST(Machine, lds_is_nonblocking_and_depbar_waits) {
-    test_lds_is_nonblocking_and_depbar_waits();
-}
-
-// missing wait panic
-TEST(Machine, missing_wait_panics_instead_of_scoreboarding) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_missing_wait_panics_instead_of_scoreboarding();
-}
-
-// plain lds of one word: 16 rounds
-TEST(Machine, plain_lds_of_one_word_is_sixteen_rounds) {
-    test_plain_lds_of_one_word_is_sixteen_rounds();
-}
-
-// bank conflict
-TEST(Machine, bank_conflict_serializes) {
-    test_bank_conflict_serializes();
-}
-
-// invalid profile defaults
-TEST(Machine, profile_defaults_are_invalid) {
-    test_profile_defaults_are_invalid();
-}
-
-// validate before allocation
-TEST(Machine, profile_is_validated_before_machine_allocation) {
-    test_profile_is_validated_before_machine_allocation();
-}
-
-// allocation failure PANIC
-TEST(Machine, host_allocation_failure_is_a_panic) {
-    test_host_allocation_failure_is_a_panic();
-}
-
-// trace attribution and limit
-TEST(Machine, trace_attribution_and_limit) {
-    test_trace_attribution_and_limit();
-}
-
-// perfetto async commands
-TEST(Machine, perfetto_overlapping_commands_are_async) {
-    test_perfetto_overlapping_commands_are_async();
 }

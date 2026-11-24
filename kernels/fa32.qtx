@@ -39,7 +39,7 @@
 ;   while O(t,0) may still be reading P(t,0).
 ; - The output staging area lies over Q and K block 0 (see OSTAGE below).
 
-; The kernel's own memory, by name (docs/qtx.md "Memory"): qtxc places each object,
+; The kernel's own memory, by name (README "Memory"): qtxc places each object,
 ; one after another from address 0, and the code below uses the names, their
 ; elements (QBUF[1]) and their properties (.row_bytes, .stride, .bytes).
 ;
@@ -81,7 +81,7 @@
 ;
 ; All of these lines together, in the order written, are the launch block:
 ; copied from global memory when the kernel starts, the first declared
-; arriving first (docs/qtx.md "Launch"). So they are written in the order the
+; arriving first (README "Launch"). So they are written in the order the
 ; kernel first needs them: the producer's first act is an arrive on Q_LANDED
 ; and a load through QDESC; the other descriptors are needed only after 4 KiB
 ; of Q has crossed the bus. Descriptors are 64-byte aligned, so the three

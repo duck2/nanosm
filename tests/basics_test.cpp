@@ -1,628 +1,16 @@
 // Encoding, the compiler's controls, branches, mbar basics, launch images.
-// Each test's TEST wrapper is at the end.
 #include "test_support.hpp"
-
-namespace {
 
 using namespace nanosm_test;
 
-void test_encoding_round_trip() {
-    nanosm::Instruction inst;
-    inst.opcode = nanosm::Opcode::add;
-    inst.control.stall = 21; // needs the fifth stall bit
-    inst.control.set_depbar = 4;
-    inst.control.wait_mask = 0b100101;
-    inst.dst = 200;
-    inst.src0 = 129;
-    inst.src1 = 255;
-    const auto decoded = nanosm::decode(nanosm::encode(inst));
-    require(decoded.opcode == inst.opcode, "opcode encoding mismatch");
-    require(decoded.control.stall == 21, "stall encoding mismatch");
-    require(decoded.control.set_depbar == 4, "set-depbar encoding mismatch");
-    require(decoded.control.wait_mask == 0b100101, "wait-mask encoding mismatch");
-    require(
-        decoded.dst == 200 && decoded.src0 == 129 && decoded.src1 == 255,
-        "eight-bit register encoding mismatch");
+namespace {
 
-    inst.opcode = nanosm::Opcode::addi;
-    inst.imm = -1234567;
-    const auto immediate_decoded = nanosm::decode(nanosm::encode(inst));
-    require(immediate_decoded.dst == 200 && immediate_decoded.src0 == 129, "RRI register mismatch");
-    require(immediate_decoded.imm == -1234567, "signed 22-bit immediate mismatch");
+// Hand assembly (controls default; fixed stalls raised).
+nanosm::Kernel assemble(const std::string& body) {
+    return hand_assemble(hand_asm(canonical_profile(), body), canonical_profile());
 }
 
-void test_fnv1a_64_vectors() {
-    require(nanosm::fnv1a_64("") == 0xcbf29ce484222325ull, "FNV-1a empty vector mismatch");
-    require(nanosm::fnv1a_64("hello") == 0xa430d84680aabd0bull, "FNV-1a hello vector mismatch");
-}
-
-void test_mbar_word_encoding() {
-    nanosm::MbarState state;
-    state.phase = true;
-    state.valid = true;
-    state.expected = 0x1234;
-    state.remaining = 0x2345;
-    // The tx field is a signed 32-bit count (two's
-    // complement), same bits 32-63: 0x89abcdef is a negative count.
-    state.tx_bytes = static_cast<int32_t>(0x89abcdefu);
-    const auto word = nanosm::encode_mbar_state(state);
-    require(
-        word == 0x89abcdef468a48d3ull,
-        "mbar word layout changed without updating its architectural encoding test");
-    const auto decoded = nanosm::decode_mbar_state(word);
-    require(
-        decoded.phase == state.phase && decoded.valid == state.valid &&
-            decoded.expected == state.expected && decoded.remaining == state.remaining &&
-            decoded.tx_bytes == state.tx_bytes && decoded.tx_bytes < 0,
-        "mbar word encoding did not round trip");
-    state.tx_bytes = -128; // complete_tx ran 128 bytes ahead of its expect_tx
-    require(nanosm::encode_mbar_state(state) >> 32 == 0xffffff80u &&
-            nanosm::decode_mbar_state(nanosm::encode_mbar_state(state)).tx_bytes == -128,
-        "a negative tx count did not round trip");
-}
-
-void test_high_register_kernel_metadata() {
-    const auto kernel = compile("mov r128, 7\nhalt");
-    require(kernel.register_count == 129, "qtxas did not derive the contiguous RF allocation");
-    require(nanosm::decode(kernel.words.front()).dst == 128, "r128 did not survive assembly");
-    const auto loaded = nanosm::load_hex(nanosm::emit_hex(kernel));
-    require(loaded.register_count == 129, "hex lost the kernel register count");
-}
-
-void test_rf_capacity_determines_residency() {
-    auto profile = canonical_profile();
-    profile.rf_rows_per_bank = 1;
-    const auto kernel = compile("mov r0, 1\nhalt", profile);
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    try {
-        nanosm::Machine machine(profile, kernel, std::move(launch));
-        throw std::runtime_error("launch ignored physical RF capacity");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("RF allocation cannot fit") != std::string::npos,
-            "RF residency failure produced the wrong error");
-    }
-}
-
-void test_compiler_controls() {
-    const auto program = qtx_program(R"(
-        mov  r0, 0
-        lds  r1, [r0]
-        lds  r2, [r0 + 64]
-        fadd r4, r1, r2
-        sts  [r0 + 128], r4
-        halt
-    )", canonical_profile());
-    // src/timing.hpp: a fixed result is visible issue_to_visible after its
-    // issue; its consumer samples issue_to_sample (1, the issue register)
-    // after its own. The mov's result feeds the very next lds (7 - 1 = 6 at
-    // canonical); the fadd's the sts after it (10 - 1 = 9).
-    const auto& profile = canonical_profile();
-    const auto distance = [&](const nanosm::Instruction& producer) {
-        return nanosm::issue_to_visible(producer, profile) - nanosm::issue_register_stages;
-    };
-    require(program.instructions[0].control.stall == distance(program.instructions[0]),
-        "mov did not cover the lds right after it");
-    require(program.instructions[1].control.set_depbar == 0, "first load did not allocate sb0");
-    require(program.instructions[2].control.set_depbar == 1, "second load did not allocate sb1");
-    require(program.instructions[3].control.wait_mask == 0b000011, "fadd did not wait for both loads");
-    require(program.instructions[3].control.stall == distance(program.instructions[3]),
-        "fadd did not cover its one-away consumer");
-    require(program.instructions[4].control.set_depbar == 0, "store did not reuse a released depbar");
-    require(program.instructions[5].control.wait_mask == 0b000001, "halt did not wait for store completion");
-}
-
-// With all six depbars live, the instruction that needs a seventh waits for
-// the oldest live one and reuses it.
-void test_seventh_depbar_reuses_the_oldest() {
-    const auto program = qtx_program(R"(
-        mov r0, 0
-        lds r1, [r0]
-        lds r2, [r0+4]
-        lds r3, [r0+8]
-        lds r4, [r0+12]
-        lds r5, [r0+16]
-        lds r6, [r0+20]
-        lds r7, [r0+24]
-        halt
-    )", canonical_profile());
-    for (unsigned load = 0; load < 6; ++load) {
-        require(program.instructions[1 + load].control.set_depbar == load, "the first six loads take sb0..sb5");
-        require(program.instructions[1 + load].control.wait_mask == 0, "the first six loads wait for nothing");
-    }
-    require(program.instructions[7].control.wait_mask == 0b000001, "the seventh load did not wait for the oldest depbar");
-    require(program.instructions[7].control.set_depbar == 0, "the seventh load did not reuse the oldest depbar");
-    require(program.instructions[8].control.wait_mask == 0b111111, "halt did not wait for every live depbar");
-}
-
-void test_stalls_track_consumer_distance() {
-    // fadd's result is consumed three instructions later, so only what its
-    // distance (src/timing.hpp: issue_to_visible - the consumer's issue_to_sample)
-    // exceeds those three issues is bought with a stall, and it lands just
-    // before the consumer. The mov feeding the fadd stalls the full distance.
-    const auto& profile = canonical_profile();
-    const auto program = qtx_program(R"(
-        mov  r0, 1
-        fadd r1, r0, r0
-        mov  r2, 5
-        mov  r3, 6
-        add  r4, r1, r2
-        halt
-    )", profile);
-    const auto& fadd = program.instructions[1];
-    const auto fadd_distance = nanosm::issue_to_visible(fadd, profile) - nanosm::issue_register_stages;
-    require(program.instructions[0].control.stall ==
-            nanosm::issue_to_visible(program.instructions[0], profile) - nanosm::issue_register_stages,
-        "mov did not cover the fadd right after it");
-    require(fadd.control.stall == 0, "fadd stalled its own latency");
-    require(program.instructions[2].control.stall == 0, "independent mov stalled");
-    require(program.instructions[3].control.stall == fadd_distance - 2, "pre-consumer stall wrong");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.test_shmem, 4);
-    nanosm::Machine machine(
-        canonical_profile(),
-        nanosm::assemble_asm(nanosm::emit_asm(program), canonical_profile()),
-        std::move(launch));
-    machine.run(); // the hazard sanitizer accepts the minimal schedule
-}
-
-void test_counted_loop_and_label_relocation() {
-    const auto program = qtx_program(R"(
-        mov r0, 0
-        mov r1, 4
-    loop:
-        addi r0, r0, 1
-        setp.lt.u32 p0, r0, r1
-        @p0 bra.uni loop
-        halt
-    )", canonical_profile());
-    require(program.instructions[4].imm == -24, "backedge relocation is not relative to the next PC");
-    require(program.instructions[4].control.predicate == 0, "branch lost its qtx predicate");
-    const auto assembly = nanosm::emit_asm(program);
-    require(assembly.find("loop:") != std::string::npos, "scheduled assembly lost its label");
-
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(
-        canonical_profile(),
-        nanosm::assemble_asm(assembly, canonical_profile()),
-        std::move(launch));
-    machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 0) == 4, "counted loop produced the wrong trip count");
-    }
-}
-
-void test_uniform_role_dispatch() {
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        usread ur0, WARP_ID
-        ur2r r0, ur0
-        setp.eq.u32 p0, r0, 0
-        @p0 bra.uni warp_zero
-        mov r1, 11
-        bra done
-    warp_zero:
-        mov r1, 22
-    done:
-        halt
-    )"), std::move(launch));
-    machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 22, "warp-zero role branch was not taken");
-        require(machine.read_reg(1, lane, 1) == 11, "nonzero warp did not take fallthrough");
-    }
-}
-
-void test_nonuniform_bra_uni_panics() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        sread r0, LANE_ID
-        setp.lt.u32 p0, r0, 8
-        @p0 bra.uni split
-        halt
-    split:
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("nonuniform bra.uni executed without divergence support");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("bra.uni predicate is not warp-uniform") != std::string::npos,
-            "nonuniform bra.uni produced the wrong PANIC");
-    }
-}
-
-void test_branch_boundary_drains_async_work() {
-    const auto program = qtx_program(R"(
-        mov r0, 0
-        ldg r1, [r0]
-        bra done
-    done:
-        halt
-    )", canonical_profile());
-    require(program.instructions[2].control.wait_mask == 1, "branch did not drain its live load depbar");
-
-    const auto fixed = qtx_program(R"(
-        mov r0, 1
-        fadd r1, r0, r0
-        bra done
-    done:
-        halt
-    )", canonical_profile());
-    // The fadd issued one cycle before the branch; the block after it must
-    // issue no earlier than one cycle before the fadd's result is visible (its
-    // first sample is after the issue register): issue_to_visible - 1 cycles
-    // after the fadd, issue_to_visible - 2 after the branch (src/timing.hpp).
-    require(fixed.instructions[2].control.stall ==
-            nanosm::issue_to_visible(fixed.instructions[1], canonical_profile()) -
-                nanosm::issue_register_stages - 1,
-        "branch did not drain a live fadd writeback");
-}
-
-// qtx's wait is a nop that waits
-// for every live depbar, here the matmul's operand-consumed one. The sts
-// after it overwrites the A operand the matmul was reading: ordered by the
-// wait, so the sanitizer stays quiet and the store lands.
-void test_wait_on_matmul_operands() {
-    const auto& profile = canonical_profile();
-    const std::string source = R"(
-        umov ur0, 0
-        umov ur1, 1024
-        umov ur4, 8192
-        umov ur2, 0
-        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
-        mma.commit [ur4]
-        wait
-        sread r20, LANE_ID
-        shli r20, r20, 2
-        mov r21, 7
-        sts [r20], r21
-        halt
-    )";
-    const auto program = qtx_program(source, profile);
-    const auto& matmul = program.instructions.at(4);
-    const auto& wait = program.instructions.at(6);
-    require(wait.opcode == nanosm::Opcode::nop && wait.text == "nop", "wait was not emitted as a nop");
-    require(matmul.control.set_depbar < 6 && wait.control.wait_mask == 1u << matmul.control.set_depbar,
-        "wait does not wait for the matmul's depbar");
-    require(nanosm::emit_asm(program).find("        nop {pred=PT, stall=0, set=-, wait=sb") != std::string::npos,
-        "the scheduled asm does not show the nop");
-
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 8192 + 8);
-    write_count_mbar(shmem, 8192, 1);
-    nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
-    machine.run(20000);
-    require(machine.read_shmem_u32(0) == 7, "the sts after the wait did not land");
-}
-
-// wait with a live load depbar: the load's register is used right after it
-// with no second wait, and a fixed-latency result still in flight (the fadd)
-// costs the nop no drain stall, as it would cost a branch.
-void test_wait_on_load_then_use() {
-    const auto& profile = canonical_profile();
-    const std::string source = R"(
-        mov r0, 0
-        ldg r1, [r0]
-        fadd r2, r0, r0
-        wait
-        add r3, r1, r1
-        halt
-    )";
-    const auto program = qtx_program(source, profile);
-    const auto& load = program.instructions.at(1);
-    const auto& wait = program.instructions.at(3);
-    const auto& use = program.instructions.at(4);
-    require(wait.opcode == nanosm::Opcode::nop && wait.control.wait_mask == 1u << load.control.set_depbar,
-        "wait does not wait for the load's depbar");
-    require(use.control.wait_mask == 0, "the use after wait waited again");
-    require(wait.control.stall == 0, "wait drained the fadd like a branch");
-
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 64);
-    write_u32(gmem, 0, 21);
-    nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
-    machine.run(20000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-        require(machine.read_reg(0, lane, 3) == 42, "lane " + std::to_string(lane) + ": wrong sum after the wait");
-    }
-}
-
-// nop in hand assembly: it carries a wait and a stall like any instruction
-// and nothing else. Its word round-trips; a load's register is read after
-// the nop's wait for it; qtx's wait and assembly's nop are each refused on
-// the other side.
-void test_nop_in_hand_assembly() {
-    const auto& profile = canonical_profile();
-    const auto kernel = nanosm::assemble_asm(i1_asm(profile, R"(
-        mov r0, 0
-        ldg r1, [r0] {pred=PT, stall=0, set=sb2, wait=-}
-        nop {pred=PT, stall=3, set=-, wait=sb2}
-        add r3, r1, r1
-        halt
-    )"), profile);
-    const auto nop = nanosm::decode(kernel.words.at(2));
-    require(nop.opcode == nanosm::Opcode::nop && static_cast<uint8_t>(nop.opcode) == 0xfe, "nop is not opcode 0xfe");
-    require(nanosm::format_instruction(nop) == "nop {pred=PT, stall=3, set=-, wait=sb2}",
-        "nop formats as '" + nanosm::format_instruction(nop) + "'");
-    require(nanosm::encode(nop) == kernel.words.at(2), "nop encode / decode");
-    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "nop hex round trip");
-
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& gmem = image_bytes(launch.gmem_image, 64);
-    write_u32(gmem, 0, 5);
-    nanosm::Machine machine(profile, nanosm::schedule_fixed_stalls(kernel, profile), std::move(launch));
-    machine.run(20000);
-    require(machine.read_reg(0, 0, 3) == 10, "wrong sum after the nop's wait");
-
-    const auto refused = [](const std::function<void()>& build, const std::string& needle, const std::string& what) {
-        try {
-            build();
-        } catch (const nanosm::SimError& error) {
-            require(std::string(error.what()).find(needle) != std::string::npos,
-                what + ": wrong error: " + error.what());
-            return;
-        }
-        throw std::runtime_error(what + " was accepted");
-    };
-    refused([&] { nanosm::assemble_asm(i1_asm(profile, "nop r1\nhalt"), profile); }, "expected 0 operands",
-        "nop with an operand");
-    refused([&] { nanosm::assemble_asm(i1_asm(profile, "nop {pred=PT, stall=0, set=sb0, wait=-}\nhalt"), profile); },
-        "cannot set a depbar", "nop setting a depbar");
-    refused([&] { nanosm::assemble_asm(i1_asm(profile, "wait\nhalt"), profile); }, "nop {wait=", "wait in assembly");
-    refused([&] { qtx_program("nop\nhalt\n", profile); }, "qtx has no nop", "nop in qtx");
-}
-
-void test_mbar_try_wait_sleeps_and_engine_completion_wakes() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.test_shmem, 128);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        umov ur0, 64
-        mbar.init [ur0], 1
-        mbar.arrive.expect_tx [ur0], 8
-    wait:
-        mbar.try_wait p0, [ur0], 0
-        @!p0 bra.uni wait
-        mov r1, 9
-        halt
-    )"), std::move(launch), {.timeline = true});
-
-    // A bound only: the warp parks once its init, arrive and probe have
-    // crossed issue, dispatch and the RMW engine.
-    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 200) machine.tick();
-    require(machine.trace().summary().mbar_sleeps == 1, "mbar.try_wait never parked the warp");
-    machine.complete_mbar_tx(64, 8, 0);
-    machine.run();
-
-    const auto state = machine.read_mbar_state(64);
-    require(state.valid, "mbar lost its valid bit");
-    require(state.phase, "complete_tx did not flip the mbar phase");
-    require(state.expected == 1 && state.remaining == 1, "mbar did not reload its arrival count");
-    require(state.tx_bytes == 0, "complete_tx did not consume transaction bytes");
-    require(machine.read_reg(0, 0, 1) == 9, "woken warp did not resume after mbar.try_wait");
-    require(machine.trace().summary().mbar_rmw_requests == 3, "wrong number of mbar RMW requests");
-    require(machine.trace().summary().mbar_phase_changes == 1, "phase transition was not traced");
-    require(machine.trace().summary().mbar_wakes == 1, "phase broadcast did not wake the warp");
-    require(machine.trace().summary().mbar_timeouts == 0, "exact wake incorrectly timed out");
-    std::size_t rmw_slices = 0;
-    for (const auto& event : machine.trace().events()) {
-        if (event.name != "mbar RMW") continue;
-        ++rmw_slices;
-        // Read grant to write grant, D + Lb + C + 1 cycles.
-        require(event.duration_cycles == rmw_busy_cycles(), "mbar RMW did not hold A for D + Lb + C + 1 cycles");
-    }
-    require(rmw_slices == 3, "trace did not contain every mbar RMW service interval");
-}
-
-void test_mbar_test_wait_broadcasts_predicate() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.phase = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        umov ur0, 64
-        mbar.test_wait p0, [ur0], 0
-        @p0 bra.uni complete
-        mov r1, 1
-        halt
-    complete:
-        mov r1, 2
-        halt
-    )"), std::move(launch));
-    machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 2, "mbar.test_wait did not broadcast true");
-    }
-}
-
-void test_mbar_try_wait_immediate_success() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.phase = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        umov ur0, 64
-        umov ur2, 0
-        mbar.try_wait p0, [ur0], ur2
-        @p0 bra.uni complete
-        mov r1, 1
-        halt
-    complete:
-        mov r1, 2
-        halt
-    )"), std::move(launch));
-    machine.run();
-    require(machine.read_reg(0, 0, 1) == 2, "immediate try_wait did not write true");
-    const auto& summary = machine.trace().summary();
-    require(summary.mbar_initial_probes == 1, "try_wait initial probe was not traced");
-    require(summary.mbar_immediate_successes == 1, "immediate try_wait was not counted");
-    require(summary.mbar_sleeps == 0, "complete try_wait incorrectly parked");
-}
-
-void test_mbar_try_wait_times_out_false() {
-    auto profile = canonical_profile();
-    profile.mbar_try_wait_timeout_cycles = 3;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(profile, compile(R"(
-        umov ur0, 64
-        mbar.try_wait p0, [ur0], 0
-        @p0 bra.uni unexpected
-        mov r1, 7
-        halt
-    unexpected:
-        mov r1, 9
-        halt
-    )", profile), std::move(launch));
-    machine.run();
-    require(machine.read_reg(0, 0, 1) == 7, "timed-out try_wait did not write false");
-    require(machine.trace().summary().mbar_timeouts == 1, "try_wait timeout was not traced");
-    require(machine.trace().summary().mbar_wakes == 0, "timeout was counted as exact wake");
-}
-
-// The wake comes when the RMW's write reaches the RAM,
-// 2D + Lb (+ C) cycles after the event's claim, which is the cycle after
-// the park. The timeout puts the deadline in that cycle.
-void test_mbar_phase_flip_wins_on_try_wait_deadline() {
-    auto profile = canonical_profile();
-    // The wake lands exactly on the deadline: the claim is the cycle after the
-    // park, the wake the RMW write's commit, D + Lb + C + D later (+ C,
-    // the RMW's ALU stages).
-    profile.mbar_try_wait_timeout_cycles = 2 * profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
-        profile.shmem_rmw_compute_cycles + 1;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 0;
-    initial.tx_bytes = 8;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(profile, compile(R"(
-        umov ur0, 64
-        mbar.try_wait p0, [ur0], 0
-        @p0 bra.uni complete
-        mov r1, 1
-        halt
-    complete:
-        mov r1, 2
-        halt
-    )", profile), std::move(launch));
-
-    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 32) machine.tick();
-    require(machine.trace().summary().mbar_sleeps == 1, "deadline test never parked");
-    machine.complete_mbar_tx(64, 8, 0);
-    machine.run();
-    require(machine.read_reg(0, 0, 1) == 2, "phase flip on deadline did not return true");
-    require(machine.trace().summary().mbar_wakes == 1, "deadline phase flip was not an exact wake");
-    require(machine.trace().summary().mbar_timeouts == 0, "deadline phase flip lost to timeout");
-}
-
-void test_mbar_try_wait_slots_limit_parked_warps() {
-    auto profile = canonical_profile();
-    profile.mbar_wait_slots = 1;
-    profile.mbar_try_wait_timeout_cycles = 4;
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(profile, compile(R"(
-        umov ur0, 64
-        mbar.try_wait p0, [ur0], 0
-        halt
-    )", profile), std::move(launch));
-    machine.run();
-    const auto& summary = machine.trace().summary();
-    require(summary.mbar_initial_probes == 2, "not every warp eventually obtained a wait slot");
-    require(summary.mbar_timeouts == 2, "parked warps did not release their wait slots");
-    require(summary.mbar_slot_full_stalls != 0, "wait-slot exhaustion was not attributed");
-    require(
-        summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait_slot)] != 0,
-        "slot-full cycles were not a distinct warp state");
-}
-
-void test_staged_pipeline_kernel() {
-    // The everything-so-far kernel: warp 0 stages gmem tiles into double-buffered shmem
-    // through the RF, warp 1 consumes and stores back; full/empty barrier pairs, try_wait
-    // retry loops with uxori parity toggling, counted loops, role dispatch.
-    constexpr uint32_t tiles = 8;
-    constexpr uint32_t elements = tiles * 16; // one lane-width tile per pass
-    // The launch gives only the kernel's arguments (ptr A, ptr B, ptr C); its
-    // two warps and its four barriers are the qtx's own (.warps, .mbar).
-    nanosm::Launch launch;
-    launch.args = {{"A", uint64_t{0}}, {"B", uint64_t{4096}}, {"C", uint64_t{8192}}};
-    auto& gmem = image_bytes(launch.gmem_image, 8192 + elements * 4);
-    for (uint32_t i = 0; i < elements; ++i) {
-        write_u32(gmem, i * 4, nanosm::float_bits(static_cast<float>(i)));
-        write_u32(gmem, 4096 + i * 4, nanosm::float_bits(static_cast<float>(2 * i)));
-    }
-    nanosm::LaunchImage input{
-        nanosm::compile_and_assemble_file("kernels/pipeline.qtx", canonical_profile()),
-        std::move(launch),
-    };
-    const auto serialized = nanosm::emit_launch_image(input);
-    auto loaded = nanosm::load_launch_image(serialized);
-    require(loaded.kernel.warps == 2 && loaded.launch.active_warps == 0,
-        "launch image lost the kernel's warp count");
-    // Three pointers and two pairs of barriers, each pair one array section.
-    require(loaded.kernel.sections.size() == 5 && loaded.kernel.sections[3].count == 2 &&
-            loaded.launch.args.size() == 3 && loaded.kernel.flags.size() == 4,
-        "launch image lost the kernel's signature, its barriers, its launch flags or the arguments");
-    require(loaded.launch.gmem_image.size() == 1, "launch image lost its gmem segment");
-    require(
-        nanosm::emit_launch_image(loaded) == serialized,
-        "launch image serialization is not canonical");
-    nanosm::Machine machine(
-        canonical_profile(), std::move(loaded.kernel), std::move(loaded.launch));
-    machine.run();
-    for (uint32_t i = 0; i < elements; ++i) {
-        require(
-            nanosm::bits_float(machine.read_gmem_u32(8192 + i * 4)) == static_cast<float>(3 * i),
-            "pipeline output mismatch at " + std::to_string(i));
-    }
-    const auto& summary = machine.trace().summary();
-    require(summary.mbar_sleeps != 0, "pipeline never parked a warp");
-    require(summary.mbar_wakes != 0, "pipeline never took an exact wake");
-    // (The canonical timeout is long, a safety net: no wait here reaches it. The
-    // timeout path has its own tests with short timeouts, above.)
-    require(summary.gmem_commands == 3 * tiles, "wrong gmem command count for the pipeline");
-    uint64_t warp_cycles = 0;
-    for (const auto cycles : summary.warp_cycles) warp_cycles += cycles;
-    require(warp_cycles == summary.cycles * 2, "pipeline warp attribution does not sum");
-}
-
-// The launch (docs/qtx.md "Launch"): the kernel's `.param` lines are its signature,
+// The launch (README "Launch"): the kernel's `.param` lines are its signature,
 // and with its `.mbar` and `.data` they are the launch block, in declaration
 // order at the top of shared memory. The host writes the block into global
 // memory; the launch copy brings it into shared memory from the first cycle,
@@ -659,11 +47,6 @@ const char* const argument_kernel = R"(
         halt
 )";
 
-// Hand assembly for the tests below (controls default; fixed stalls raised).
-nanosm::Kernel assemble(const std::string& body) {
-    return hand_assemble(i1_asm(canonical_profile(), body), canonical_profile());
-}
-
 nanosm::Launch argument_launch() {
     nanosm::TmaDescriptor descriptor;
     descriptor.base = 0x1122334455667788ull;
@@ -682,7 +65,516 @@ nanosm::Launch argument_launch() {
     return launch;
 }
 
-void test_launch_arguments_reach_the_kernel() {
+} // namespace
+
+TEST(Basics, encoding_round_trip) {
+    nanosm::Instruction inst;
+    inst.opcode = nanosm::Opcode::add;
+    inst.control.stall = 21; // needs the fifth stall bit
+    inst.control.set_depbar = 4;
+    inst.control.wait_mask = 0b100101;
+    inst.dst = 200;
+    inst.src0 = 129;
+    inst.src1 = 255;
+    const auto decoded = nanosm::decode(nanosm::encode(inst));
+    require(decoded.opcode == inst.opcode, "opcode encoding mismatch");
+    require(decoded.control.stall == 21, "stall encoding mismatch");
+    require(decoded.control.set_depbar == 4, "set-depbar encoding mismatch");
+    require(decoded.control.wait_mask == 0b100101, "wait-mask encoding mismatch");
+    require(
+        decoded.dst == 200 && decoded.src0 == 129 && decoded.src1 == 255,
+        "eight-bit register encoding mismatch");
+
+    inst.opcode = nanosm::Opcode::addi;
+    inst.imm = -1234567;
+    const auto immediate_decoded = nanosm::decode(nanosm::encode(inst));
+    require(immediate_decoded.dst == 200 && immediate_decoded.src0 == 129, "RRI register mismatch");
+    require(immediate_decoded.imm == -1234567, "signed 22-bit immediate mismatch");
+
+    // A high register: the kernel's register count is the contiguous
+    // allocation up to it, and it survives the hex text.
+    const auto high = compile("mov r128, 7\nhalt");
+    require(high.register_count == 129, "qtxas did not derive the contiguous RF allocation");
+    require(nanosm::decode(high.words.front()).dst == 128, "r128 did not survive assembly");
+    require(nanosm::load_hex(nanosm::emit_hex(high)).register_count == 129, "hex lost the kernel register count");
+
+    // The divergence forms parse, encode and print; an ssy's label may name
+    // any instruction; bssy is not a mnemonic.
+    const auto kernel = compile("ssy J\n@!p3 bra J\nJ: sync\nhalt\n");
+    const auto ssy = nanosm::decode(kernel.words.at(0));
+    const auto bra = nanosm::decode(kernel.words.at(1));
+    const auto sync = nanosm::decode(kernel.words.at(2));
+    require(ssy.opcode == nanosm::Opcode::ssy && ssy.imm == 8 && nanosm::format_instruction(ssy, false) == "ssy +8",
+        "ssy: " + nanosm::format_instruction(ssy));
+    require(bra.opcode == nanosm::Opcode::bra && bra.control.predicate == 3 && bra.control.predicate_invert &&
+            bra.imm == 0 && nanosm::is_divergent_branch(bra), "@!p3 bra: " + nanosm::format_instruction(bra));
+    require(sync.opcode == nanosm::Opcode::sync && nanosm::format_instruction(sync, false) == "sync",
+        "sync: " + nanosm::format_instruction(sync));
+    require(static_cast<unsigned>(nanosm::Opcode::ssy) == 0x2e && static_cast<unsigned>(nanosm::Opcode::sync) == 0x2f,
+        "opcodes");
+    const auto any = compile("ssy J\nJ: mov r1, 1\nhalt\n");
+    require(nanosm::decode(any.words.at(0)).opcode == nanosm::Opcode::ssy, "ssy naming a mov");
+    expect_error([] { (void)compile("bssy J\nJ: halt\n"); }, {"unknown opcode 'bssy'"}, "bssy");
+}
+
+TEST(Basics, fnv1a_64_vectors) {
+    require(nanosm::fnv1a_64("") == 0xcbf29ce484222325ull, "FNV-1a empty vector mismatch");
+    require(nanosm::fnv1a_64("hello") == 0xa430d84680aabd0bull, "FNV-1a hello vector mismatch");
+}
+
+TEST(Basics, mbar_word_encoding) {
+    nanosm::MbarState state;
+    state.phase = true;
+    state.valid = true;
+    state.expected = 0x1234;
+    state.remaining = 0x2345;
+    // The tx field is a signed 32-bit count (two's complement), bits 32-63:
+    // 0x89abcdef is a negative count.
+    state.tx_bytes = static_cast<int32_t>(0x89abcdefu);
+    const auto word = nanosm::encode_mbar_state(state);
+    require(
+        word == 0x89abcdef468a48d3ull,
+        "mbar word layout changed without updating its architectural encoding test");
+    const auto decoded = nanosm::decode_mbar_state(word);
+    require(
+        decoded.phase == state.phase && decoded.valid == state.valid &&
+            decoded.expected == state.expected && decoded.remaining == state.remaining &&
+            decoded.tx_bytes == state.tx_bytes && decoded.tx_bytes < 0,
+        "mbar word encoding did not round trip");
+    state.tx_bytes = -128; // complete_tx ran 128 bytes ahead of its expect_tx
+    require(nanosm::encode_mbar_state(state) >> 32 == 0xffffff80u &&
+            nanosm::decode_mbar_state(nanosm::encode_mbar_state(state)).tx_bytes == -128,
+        "a negative tx count did not round trip");
+}
+
+TEST(Basics, rf_capacity_determines_residency) {
+    auto profile = canonical_profile();
+    profile.rf_rows_per_bank = 1;
+    const auto kernel = compile("mov r0, 1\nhalt", profile);
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(profile, kernel, launch_warps(2)); },
+        {"RF allocation cannot fit"}, "two warps in one RF row per bank");
+}
+
+TEST(Basics, compiler_controls) {
+    const auto& profile = canonical_profile();
+    // src/timing.hpp: a fixed result is visible issue_to_visible after its
+    // issue; its consumer samples it issue_register_stages after its own.
+    const auto distance = [&](const nanosm::Instruction& producer) {
+        return nanosm::issue_to_visible(producer, profile) - nanosm::issue_register_stages;
+    };
+
+    // The loads take sb0 and sb1, their consumer waits for both, the store
+    // reuses a released depbar and the halt waits for it. A producer right
+    // before its consumer stalls its full distance.
+    const auto program = qtx_program(R"(
+        mov  r0, 0
+        lds  r1, [r0]
+        lds  r2, [r0 + 64]
+        fadd r4, r1, r2
+        sts  [r0 + 128], r4
+        halt
+    )", profile);
+    require(program.instructions[0].control.stall == distance(program.instructions[0]),
+        "mov did not cover the lds right after it");
+    require(program.instructions[1].control.set_depbar == 0, "first load did not allocate sb0");
+    require(program.instructions[2].control.set_depbar == 1, "second load did not allocate sb1");
+    require(program.instructions[3].control.wait_mask == 0b000011, "fadd did not wait for both loads");
+    require(program.instructions[3].control.stall == distance(program.instructions[3]),
+        "fadd did not cover its one-away consumer");
+    require(program.instructions[4].control.set_depbar == 0, "store did not reuse a released depbar");
+    require(program.instructions[5].control.wait_mask == 0b000001, "halt did not wait for store completion");
+
+    // With all six depbars live, the instruction that needs a seventh waits
+    // for the oldest live one and reuses it.
+    const auto seven = qtx_program(R"(
+        mov r0, 0
+        lds r1, [r0]
+        lds r2, [r0+4]
+        lds r3, [r0+8]
+        lds r4, [r0+12]
+        lds r5, [r0+16]
+        lds r6, [r0+20]
+        lds r7, [r0+24]
+        halt
+    )", profile);
+    for (unsigned load = 0; load < 6; ++load) {
+        require(seven.instructions[1 + load].control.set_depbar == load, "the first six loads take sb0..sb5");
+        require(seven.instructions[1 + load].control.wait_mask == 0, "the first six loads wait for nothing");
+    }
+    require(seven.instructions[7].control.wait_mask == 0b000001, "the seventh load did not wait for the oldest depbar");
+    require(seven.instructions[7].control.set_depbar == 0, "the seventh load did not reuse the oldest depbar");
+    require(seven.instructions[8].control.wait_mask == 0b111111, "halt did not wait for every live depbar");
+
+    // A result consumed three instructions later: only what its distance
+    // exceeds those issues is a stall, on the instruction just before the
+    // consumer. The minimal schedule runs clean under the hazard sanitizer.
+    const auto spaced = qtx_program(R"(
+        mov  r0, 1
+        fadd r1, r0, r0
+        mov  r2, 5
+        mov  r3, 6
+        add  r4, r1, r2
+        halt
+    )", profile);
+    require(spaced.instructions[0].control.stall == distance(spaced.instructions[0]),
+        "mov did not cover the fadd right after it");
+    require(spaced.instructions[1].control.stall == 0, "fadd stalled its own latency");
+    require(spaced.instructions[2].control.stall == 0, "independent mov stalled");
+    require(spaced.instructions[3].control.stall == distance(spaced.instructions[1]) - 2, "pre-consumer stall wrong");
+    auto launch = launch_warps(1);
+    image_bytes(launch.test_shmem, 4);
+    nanosm::Machine machine(profile, nanosm::assemble_asm(nanosm::emit_asm(spaced), profile), std::move(launch));
+    machine.run();
+}
+
+// A loop head (src/qtxc/schedule.cpp LoopEntry): what the code before a loop
+// leaves pending is paid once, by the instruction before the head, not by a
+// stall inside the loop on every iteration. The body reads the ex2's result
+// on the first pass, so the sanitizer checks the fall-through edge.
+TEST(Basics, loop_head_pays_the_entry_once) {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+            umov ur1, 0
+            ex2 r2, r1
+        LOOP:
+        @p3 bra.uni SKIP
+            fadd r3, r2, r2
+        SKIP:
+            uaddi ur1, ur1, 1
+            usetp.lt.u32 p2, ur1, 4
+        @p2 bra.uni LOOP
+            halt
+    )";
+    const auto qtx = qtx_program(source, profile);
+    require(qtx.instructions[1].control.stall > 1, "qtxc did not pay the ex2 before the loop head");
+    require(qtx.instructions[2].control.stall == 0, "qtxc's branch at the loop head still carries the ex2");
+    const auto hand = hand_assemble(hand_asm(profile, R"(
+            umov ur1, 0
+            ex2 r2, r1
+        loop: bra.uni skip {pred=p3, stall=0, set=-, wait=-}
+            fadd r3, r2, r2
+        skip: uaddi ur1, ur1, 1
+            usetp.lt.u32 p2, ur1, 4
+            bra.uni loop {pred=p2, stall=0, set=-, wait=-}
+            halt
+    )"), profile);
+    require(nanosm::decode(hand.words[1]).control.stall == qtx.instructions[1].control.stall &&
+            nanosm::decode(hand.words[2]).control.stall == 0,
+        "the hand assembler's stall scheduling does not pay the ex2 before the loop head as qtxc does");
+    for (const auto& kernel : {compile(source, profile), hand}) {
+        nanosm::Machine machine(profile, kernel, launch_warps(1));
+        machine.run();
+        require(machine.read_reg(0, 0, 3) == 0x40000000u, "the loop did not compute ex2(0) + ex2(0) = 2");
+    }
+}
+
+TEST(Basics, counted_loop_and_label_relocation) {
+    const auto program = qtx_program(R"(
+        mov r0, 0
+        mov r1, 4
+    loop:
+        addi r0, r0, 1
+        setp.lt.u32 p0, r0, r1
+        @p0 bra.uni loop
+        halt
+    )", canonical_profile());
+    require(program.instructions[4].imm == -24, "backedge relocation is not relative to the next PC");
+    require(program.instructions[4].control.predicate == 0, "branch lost its qtx predicate");
+    const auto assembly = nanosm::emit_asm(program);
+    require(assembly.find("loop:") != std::string::npos, "scheduled assembly lost its label");
+
+    nanosm::Machine machine(canonical_profile(), nanosm::assemble_asm(assembly, canonical_profile()), launch_warps(1));
+    machine.run();
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine.read_reg(0, lane, 0) == 4, "counted loop produced the wrong trip count");
+    }
+}
+
+// bra.uni reads its predicate from lane 0 (src/machine/branch.cpp); one that
+// differs across lanes is the sanitizer's PANIC. With the sanitizer compiled
+// out, every lane follows lane 0, which takes the branch here.
+TEST(Basics, nonuniform_bra_uni_panics) {
+    nanosm::Machine machine(canonical_profile(), compile(
+        "sread r0, LANE_ID\nsetp.lt.u32 p0, r0, 8\n@p0 bra.uni taken\nmov r5, 1\nhalt\ntaken:\nmov r5, 2\nhalt\n"),
+        launch_warps(1));
+#if NANOSM_SANITIZER
+    expect_panic(machine, {"bra.uni predicate is not warp-uniform"}, "a non-uniform bra.uni predicate");
+#else
+    machine.run();
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine.read_reg(0, lane, 5) == 2, "bra.uni (lane 0 takes it): lane " + std::to_string(lane));
+    }
+#endif
+}
+
+TEST(Basics, branch_boundary_drains_async_work) {
+    const auto program = qtx_program(R"(
+        mov r0, 0
+        ldg r1, [r0]
+        bra done
+    done:
+        halt
+    )", canonical_profile());
+    require(program.instructions[2].control.wait_mask == 1, "branch did not drain its live load depbar");
+
+    const auto fixed = qtx_program(R"(
+        mov r0, 1
+        fadd r1, r0, r0
+        bra done
+    done:
+        halt
+    )", canonical_profile());
+    // The fadd issued one cycle before the branch; the block after it must
+    // issue no earlier than one cycle before the fadd's result is visible (its
+    // first sample is after the issue register): issue_to_visible - 1 cycles
+    // after the fadd, issue_to_visible - 2 after the branch (src/timing.hpp).
+    require(fixed.instructions[2].control.stall ==
+            nanosm::issue_to_visible(fixed.instructions[1], canonical_profile()) -
+                nanosm::issue_register_stages - 1,
+        "branch did not drain a live fadd writeback");
+}
+
+// qtx's wait is a nop that waits for every live depbar (no drain).
+TEST(Basics, wait_on_matmul_operands) {
+    const auto& profile = canonical_profile();
+    // Here the matmul's operand-consumed depbar: the sts after the wait
+    // overwrites the A operand the matmul was reading, ordered by the wait, so
+    // the sanitizer stays quiet and the store lands.
+    const std::string source = R"(
+        umov ur0, 0
+        umov ur1, 1024
+        umov ur4, 8192
+        umov ur2, 0
+        mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
+        mma.commit [ur4]
+        wait
+        sread r20, LANE_ID
+        shli r20, r20, 2
+        mov r21, 7
+        sts [r20], r21
+        halt
+    )";
+    const auto program = qtx_program(source, profile);
+    const auto& matmul = program.instructions.at(4);
+    const auto& wait = program.instructions.at(6);
+    require(wait.opcode == nanosm::Opcode::nop && wait.text == "nop", "wait was not emitted as a nop");
+    require(matmul.control.set_depbar < 6 && wait.control.wait_mask == 1u << matmul.control.set_depbar,
+        "wait does not wait for the matmul's depbar");
+    require(nanosm::emit_asm(program).find("        nop {pred=PT, stall=0, set=-, wait=sb") != std::string::npos,
+        "the scheduled asm does not show the nop");
+    auto launch = launch_warps(1);
+    auto& shmem = image_bytes(launch.test_shmem, 8192 + 8);
+    write_mbar(shmem, 8192, mbar_state(1, 1));
+    nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
+    machine.run(20000);
+    require(machine.read_shmem_u32(0) == 7, "the sts after the wait did not land");
+
+    // A live load depbar: the load's register is used right after the wait
+    // with no second wait, and a fixed-latency result still in flight (the
+    // fadd) costs the nop no drain stall, as it would cost a branch.
+    const std::string load_source = R"(
+        mov r0, 0
+        ldg r1, [r0]
+        fadd r2, r0, r0
+        wait
+        add r3, r1, r1
+        halt
+    )";
+    const auto loads = qtx_program(load_source, profile);
+    const auto& load = loads.instructions.at(1);
+    const auto& load_wait = loads.instructions.at(3);
+    require(load_wait.opcode == nanosm::Opcode::nop && load_wait.control.wait_mask == 1u << load.control.set_depbar,
+        "wait does not wait for the load's depbar");
+    require(loads.instructions.at(4).control.wait_mask == 0, "the use after wait waited again");
+    require(load_wait.control.stall == 0, "wait drained the fadd like a branch");
+    auto load_launch = launch_warps(1);
+    write_u32(image_bytes(load_launch.gmem_image, 64), 0, 21);
+    nanosm::Machine load_machine(profile, compile(load_source, profile), std::move(load_launch));
+    load_machine.run(20000);
+    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
+        require(load_machine.read_reg(0, lane, 3) == 42, "lane " + std::to_string(lane) + ": wrong sum after the wait");
+    }
+}
+
+// nop in hand assembly: it carries a wait and a stall like any instruction
+// and nothing else. Its word round-trips; a load's register is read after
+// the nop's wait for it; qtx's wait and assembly's nop are each refused on
+// the other side.
+TEST(Basics, nop_in_hand_assembly) {
+    const auto& profile = canonical_profile();
+    const auto kernel = nanosm::assemble_asm(hand_asm(profile, R"(
+        mov r0, 0
+        ldg r1, [r0] {pred=PT, stall=0, set=sb2, wait=-}
+        nop {pred=PT, stall=3, set=-, wait=sb2}
+        add r3, r1, r1
+        halt
+    )"), profile);
+    const auto nop = nanosm::decode(kernel.words.at(2));
+    require(nop.opcode == nanosm::Opcode::nop && static_cast<uint8_t>(nop.opcode) == 0xfe, "nop is not opcode 0xfe");
+    require(nanosm::format_instruction(nop) == "nop {pred=PT, stall=3, set=-, wait=sb2}",
+        "nop formats as '" + nanosm::format_instruction(nop) + "'");
+    require(nanosm::encode(nop) == kernel.words.at(2), "nop encode / decode");
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "nop hex round trip");
+
+    auto launch = launch_warps(1);
+    write_u32(image_bytes(launch.gmem_image, 64), 0, 5);
+    nanosm::Machine machine(profile, nanosm::schedule_fixed_stalls(kernel, profile), std::move(launch));
+    machine.run(20000);
+    require(machine.read_reg(0, 0, 3) == 10, "wrong sum after the nop's wait");
+
+    expect_error([&] { (void)nanosm::assemble_asm(hand_asm(profile, "nop r1\nhalt"), profile); },
+        {"expected 0 operands"}, "nop with an operand");
+    expect_error(
+        [&] { (void)nanosm::assemble_asm(hand_asm(profile, "nop {pred=PT, stall=0, set=sb0, wait=-}\nhalt"), profile); },
+        {"cannot set a depbar"}, "nop setting a depbar");
+    expect_error([&] { (void)nanosm::assemble_asm(hand_asm(profile, "wait\nhalt"), profile); }, {"nop {wait="},
+        "wait in assembly");
+    expect_error([&] { (void)qtx_program("nop\nhalt\n", profile); }, {"qtx has no nop"}, "nop in qtx");
+}
+
+TEST(Basics, mbar_try_wait_sleeps_and_engine_completion_wakes) {
+    auto launch = launch_warps(1);
+    image_bytes(launch.test_shmem, 128);
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        umov ur0, 64
+        mbar.init [ur0], 1
+        mbar.arrive.expect_tx [ur0], 8
+    wait:
+        mbar.try_wait p0, [ur0], 0
+        @!p0 bra.uni wait
+        mov r1, 9
+        halt
+    )"), std::move(launch), {.timeline = true});
+
+    // A bound only: the warp parks once its init, arrive and probe have
+    // crossed issue, dispatch and the RMW engine.
+    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 200) machine.tick();
+    require(machine.trace().summary().mbar_sleeps == 1, "mbar.try_wait never parked the warp");
+    machine.complete_mbar_tx(64, 8, 0);
+    machine.run();
+
+    const auto state = machine.read_mbar_state(64);
+    require(state.valid, "mbar lost its valid bit");
+    require(state.phase, "complete_tx did not flip the mbar phase");
+    require(state.expected == 1 && state.remaining == 1, "mbar did not reload its arrival count");
+    require(state.tx_bytes == 0, "complete_tx did not consume transaction bytes");
+    require(machine.read_reg(0, 0, 1) == 9, "woken warp did not resume after mbar.try_wait");
+    const auto& summary = machine.trace().summary();
+    require(summary.mbar_rmw_requests == 3, "wrong number of mbar RMW requests");
+    require(summary.mbar_phase_changes == 1, "phase transition was not traced");
+    require(summary.mbar_wakes == 1, "phase broadcast did not wake the warp");
+    require(summary.mbar_timeouts == 0, "exact wake incorrectly timed out");
+    const auto services = events_named(machine, "mbar RMW");
+    require(services.size() == 3, "trace did not contain every mbar RMW service interval");
+    for (const auto& event : services) {
+        // Read grant to write grant, D + Lb + C + 1 cycles.
+        require(event.duration_cycles == rmw_busy_cycles(), "mbar RMW did not hold A for D + Lb + C + 1 cycles");
+    }
+}
+
+// A probe of the mbar at 64 (one arrival expected and pending, in phase
+// `phase`): a test_wait or try_wait for phase 0 when phase 0 has completed
+// answers true at once, in every lane; a try_wait on a phase that never
+// completes times out false; with one wait slot a second warp waits for the
+// slot (a warp state of its own) and both time out.
+TEST(Basics, mbar_try_wait_immediate_success) {
+    struct Row {
+        std::string name;
+        bool phase;
+        uint32_t warps;
+        uint32_t wait_slots; // 0: the canonical profile's
+        uint32_t timeout;    // 0: the canonical profile's
+        std::string probe;
+        bool answer;
+        int64_t probes, immediate, sleeps, timeouts, wakes; // the trace summary's counts; -1: not checked
+        bool slot_full;
+    };
+    const std::vector<Row> rows = {
+        {"test_wait on a completed phase", true, 1, 0, 0, "mbar.test_wait p0, [ur0], 0", true, -1, -1, -1, -1, -1,
+            false},
+        {"try_wait on a completed phase", true, 1, 0, 0, "umov ur2, 0\nmbar.try_wait p0, [ur0], ur2", true, 1, 1, 0,
+            -1, -1, false},
+        {"try_wait timing out", false, 1, 0, 3, "mbar.try_wait p0, [ur0], 0", false, -1, -1, -1, 1, 0, false},
+        {"two warps, one wait slot", false, 2, 1, 4, "mbar.try_wait p0, [ur0], 0", false, 2, -1, -1, 2, -1, true},
+    };
+    for (const auto& row : rows) {
+        auto profile = canonical_profile();
+        if (row.wait_slots != 0) profile.mbar_wait_slots = row.wait_slots;
+        if (row.timeout != 0) profile.mbar_try_wait_timeout_cycles = row.timeout;
+        auto launch = launch_warps(row.warps);
+        write_mbar(image_bytes(launch.test_shmem, 128), 64, mbar_state(1, 1, 0, row.phase));
+        nanosm::Machine machine(profile, compile("umov ur0, 64\n" + row.probe +
+            "\n@p0 bra.uni complete\nmov r1, 1\nhalt\ncomplete:\nmov r1, 2\nhalt\n", profile), std::move(launch));
+        machine.run();
+        for (uint32_t warp = 0; warp < row.warps; ++warp) {
+            for (uint32_t lane = 0; lane < 16; ++lane) {
+                require(machine.read_reg(warp, lane, 1) == (row.answer ? 2u : 1u), row.name + ": warp " +
+                    std::to_string(warp) + " lane " + std::to_string(lane) + " did not see " +
+                    (row.answer ? "true" : "false"));
+            }
+        }
+        const auto& summary = machine.trace().summary();
+        const auto pin = [&](int64_t want, uint64_t got, const std::string& what) {
+            require(want < 0 || got == static_cast<uint64_t>(want),
+                row.name + ": " + what + " " + std::to_string(got) + ", want " + std::to_string(want));
+        };
+        pin(row.probes, summary.mbar_initial_probes, "initial probes");
+        pin(row.immediate, summary.mbar_immediate_successes, "immediate successes");
+        pin(row.sleeps, summary.mbar_sleeps, "sleeps");
+        pin(row.timeouts, summary.mbar_timeouts, "timeouts");
+        pin(row.wakes, summary.mbar_wakes, "exact wakes");
+        if (row.slot_full) {
+            require(summary.mbar_slot_full_stalls != 0, row.name + ": wait-slot exhaustion was not attributed");
+            require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait_slot)] != 0,
+                row.name + ": slot-full cycles were not a distinct warp state");
+        }
+    }
+}
+
+// A phase flip that lands in the cycle of a try_wait's deadline wins: the
+// probe answers true, an exact wake, not a timeout. The wake comes when the
+// RMW's write reaches the RAM, 2D + Lb + C cycles after the event's claim,
+// which is the cycle after the park; the timeout puts the deadline there.
+TEST(Basics, mbar_phase_flip_wins_on_try_wait_deadline) {
+    auto profile = canonical_profile();
+    profile.mbar_try_wait_timeout_cycles = 2 * profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
+        profile.shmem_rmw_compute_cycles + 1;
+    auto launch = launch_warps(1);
+    write_mbar(image_bytes(launch.test_shmem, 128), 64, mbar_state(1, 0, 8));
+    nanosm::Machine machine(profile, compile(R"(
+        umov ur0, 64
+        mbar.try_wait p0, [ur0], 0
+        @p0 bra.uni complete
+        mov r1, 1
+        halt
+    complete:
+        mov r1, 2
+        halt
+    )", profile), std::move(launch));
+
+    while (machine.trace().summary().mbar_sleeps == 0 && machine.cycle() < 32) machine.tick();
+    require(machine.trace().summary().mbar_sleeps == 1, "deadline test never parked");
+    machine.complete_mbar_tx(64, 8, 0);
+    machine.run();
+    require(machine.read_reg(0, 0, 1) == 2, "phase flip on deadline did not return true");
+    require(machine.trace().summary().mbar_wakes == 1, "deadline phase flip was not an exact wake");
+    require(machine.trace().summary().mbar_timeouts == 0, "deadline phase flip lost to timeout");
+}
+
+TEST(Basics, mbar_arrival_underflow_panics) {
+    auto launch = launch_warps(1);
+    image_bytes(launch.test_shmem, 128);
+    nanosm::Machine machine(canonical_profile(), compile(R"(
+        umov ur0, 64
+        mbar.init [ur0], 1
+        mbar.arrive.expect_tx [ur0], 8
+        mbar.arrive [ur0]
+        halt
+    )"), std::move(launch));
+    expect_panic(machine, {"arrival count underflow"}, "mbar arrival underflow");
+}
+
+TEST(Basics, launch_arguments_reach_the_kernel) {
     const auto& profile = canonical_profile();
     const auto kernel = compile(argument_kernel);
     // Declaration order, each aligned to its own size: OUT 0, N 8, X 12, D 64,
@@ -706,23 +598,6 @@ void test_launch_arguments_reach_the_kernel() {
             nanosm::load_hex(nanosm::emit_hex(kernel)).flags.size() == 4,
         "the hex text lost what the kernel declares");
 
-    const auto check = [&](nanosm::Machine& machine, const std::string& what) {
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine.read_gmem_u32(4096 + 4 * lane) == 41, what + ": the u32 argument did not reach the kernel");
-            require(machine.read_gmem_u32(4160 + 4 * lane) == nanosm::float_bits(2.5f),
-                what + ": the f32 argument did not reach the kernel");
-            require(machine.read_gmem_u32(4224 + 4 * lane) == nanosm::float_bits(1.5f),
-                what + ": the kernel's .data did not reach it");
-            require(machine.read_gmem_u32(4288 + 4 * lane) == 7, what + ": a .data word named by an .equ is wrong");
-        }
-        require(machine.read_shmem_u32(start + 140) == 0xff800000u && machine.read_shmem_u32(start + 148) == 9,
-            what + ": .data words are not where the block puts them");
-        const auto barrier = nanosm::decode_mbar_state(machine.read_shmem_u32(start + 128) |
-            (static_cast<uint64_t>(machine.read_shmem_u32(start + 132)) << 32));
-        require(barrier.valid && !barrier.phase && barrier.expected == 3 && barrier.remaining == 3,
-            what + ": the kernel's .mbar did not start in phase 0 expecting 3");
-    };
-
     nanosm::LaunchImage input{kernel, argument_launch()};
     const auto serialized = nanosm::emit_launch_image(input);
     auto loaded = nanosm::load_launch_image(serialized);
@@ -736,7 +611,19 @@ void test_launch_arguments_reach_the_kernel() {
         profile.gmem_sector_bytes;
     require(machine.read_gmem_u32(global + 8) == 41, "the host did not write the block into global memory");
     machine.run();
-    check(machine, "timed copy");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine.read_gmem_u32(4096 + 4 * lane) == 41, "the u32 argument did not reach the kernel");
+        require(machine.read_gmem_u32(4160 + 4 * lane) == nanosm::float_bits(2.5f),
+            "the f32 argument did not reach the kernel");
+        require(machine.read_gmem_u32(4224 + 4 * lane) == nanosm::float_bits(1.5f), "the kernel's .data did not reach it");
+        require(machine.read_gmem_u32(4288 + 4 * lane) == 7, "a .data word named by an .equ is wrong");
+    }
+    require(machine.read_shmem_u32(start + 140) == 0xff800000u && machine.read_shmem_u32(start + 148) == 9,
+        ".data words are not where the block puts them");
+    const auto barrier = nanosm::decode_mbar_state(machine.read_shmem_u32(start + 128) |
+        (static_cast<uint64_t>(machine.read_shmem_u32(start + 132)) << 32));
+    require(barrier.valid && !barrier.phase && barrier.expected == 3 && barrier.remaining == 3,
+        "the kernel's .mbar did not start in phase 0 expecting 3");
     // The copy pays global memory's latency, and the flags clear in order as
     // the block's sectors land (152 bytes: five sectors).
     const auto& summary = machine.trace().summary();
@@ -752,13 +639,8 @@ void test_launch_arguments_reach_the_kernel() {
     // must reserve at least one launch flag.
     auto untimed = profile;
     untimed.core_launch_flags = 0;
-    try {
-        nanosm::validate_device_profile(untimed);
-        throw std::runtime_error("a profile with no launch flags was accepted");
-    } catch (const nanosm::ProfileError& error) {
-        require(std::string(error.what()).find("launch_flags must be in 1..6") != std::string::npos,
-            std::string("no launch flags: wrong refusal: ") + error.what());
-    }
+    expect_error<nanosm::ProfileError>([&] { nanosm::validate_device_profile(untimed); },
+        {"launch_flags must be in 1..6"}, "a profile with no launch flags");
 
     // The declared order is the delivery order, and it survives scheduled
     // assembly, the hex text and a saved image (so a replay has the same
@@ -782,229 +664,13 @@ void test_launch_arguments_reach_the_kernel() {
     same_block(nanosm::load_launch_image(serialized).kernel, "a saved image");
 }
 
-// `.equ XX, X` is another name for section X: an instruction that names XX
-// waits on X's launch flag like one that names X (with no wait it would read
-// zeros when the sanitizer is off). A chain of such lines too.
-void test_section_alias_waits_on_its_flag() {
-    const auto run = [](const std::string& name) {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        launch.args = {{"X", uint64_t{0x12345678}}};
-        nanosm::Machine machine(canonical_profile(), compile(
-            ".param u32 X\n.equ XX, X\n.equ XXX, XX\n"
-            "umov ur1, " + name + "\nlds.uni r1, [ur1]\nsread r2, LANE_ID\nshli r2, r2, 2\nsts [r2], r1\nhalt\n"),
-            std::move(launch));
-        machine.run();
-        return machine.read_shmem_u32(0);
-    };
-    // Sanitizer on or off, the value is the argument.
-    for (const std::string name : {"X", "XX", "XXX"}) {
-        require(run(name) == 0x12345678u, "umov ur1, " + name + " read its parameter before it landed");
-    }
-    const auto scheduled = nanosm::emit_asm(qtx_program(
-        ".param u32 X\n.equ XX, X\n.equ XXX, XX\numov ur1, XXX\nhalt\n", canonical_profile()));
-    require(scheduled.find("wait=sb5") != std::string::npos, "an alias of a section got no launch-flag wait");
-}
-
-// `.mbar NAME[C]` is one section of C barriers, element i at NAME + 8 i and
-// written NAME[i]; naming any of it waits for the whole array, and an index
-// past its end is refused.
-void test_mbar_array() {
-    const auto& profile = canonical_profile();
-    const char* const source = R"(
-.warps 1
-.param u32 A
-.mbar PAIR[2], expect 3
-.mbar ONE, expect 1
-        umov ur1, PAIR
-        umov ur2, PAIR[1]
-        umov ur3, ONE
-        mbar.arrive [ur2]
-        halt
-)";
-    const auto kernel = compile(source);
-    require(kernel.sections.size() == 3 && kernel.sections[1].count == 2 &&
-            nanosm::section_bytes(kernel.sections[1]) == 16 &&
-            kernel.sections[2].address == kernel.sections[1].address + 16,
-        "an mbar array is not one section of 8 bytes per barrier");
-    const auto text = nanosm::emit_hex(kernel);
-    require(text.find(".mbar PAIR[2], ") != std::string::npos &&
-            nanosm::load_hex(text).sections[1].count == 2, "the hex text lost the array");
-    nanosm::LaunchImage image{kernel, {}};
-    image.launch.args = {{"A", uint64_t{1}}};
-    auto loaded = nanosm::load_launch_image(nanosm::emit_launch_image(image));
-    require(loaded.kernel.sections[1].count == 2, "a saved image lost the array");
-    nanosm::Machine machine(profile, std::move(loaded.kernel), std::move(loaded.launch));
-    machine.run();
-    const auto state = [&](uint32_t address) {
-        return nanosm::decode_mbar_state(machine.read_shmem_u32(address) |
-            (static_cast<uint64_t>(machine.read_shmem_u32(address + 4)) << 32));
-    };
-    const auto pair = kernel.sections[1].address;
-    require(state(pair).valid && state(pair).expected == 3 && state(pair).remaining == 3,
-        "element 0 of the array did not start expecting 3");
-    require(state(pair + 8).valid && state(pair + 8).expected == 3 && state(pair + 8).remaining == 2,
-        "element 1 of the array is not where NAME[1] says (the arrive went elsewhere)");
-    for (const char* bad : {"umov ur1, PAIR[2]\nhalt\n", ".equ P, PAIR[7]\nhalt\n", "umov ur1, ONE[1]\nhalt\n"}) {
-        try {
-            compile(std::string(".mbar PAIR[2], expect 1\n.mbar ONE, expect 1\n") + bad);
-            throw std::runtime_error(std::string("accepted an index past an mbar array's end: ") + bad);
-        } catch (const nanosm::SimError& error) {
-            require(std::string(error.what()).find("is past the end of .mbar") != std::string::npos,
-                std::string("an index past an array's end: wrong refusal: ") + error.what());
-        }
-    }
-    try {
-        compile(".mbar PAIR[0], expect 1\nhalt\n");
-        throw std::runtime_error("accepted an empty mbar array");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("an array has 1..") != std::string::npos,
-            std::string("an empty mbar array: wrong refusal: ") + error.what());
-    }
-}
-
-// umov urD, imm takes any 32-bit word (dst[6] imm[32]): a float literal is its
-// IEEE bits, with no memory behind the constant; it survives the encoding,
-// scheduled assembly and the hex text.
-void test_umov_takes_a_32_bit_word() {
-    const auto& profile = canonical_profile();
-    const char* const source =
-        "umov ur1, 0.180336878\numov ur2, -inf\numov ur3, 0xdeadbeef\numov ur4, -1\numov ur5, 4294967295\n"
-        "umov ur31, 1e-3\numov ur6, 70000\numov ur7, 2147483648\nur2r r1, ur1\nhalt\n";
-    const std::vector<std::pair<uint32_t, uint32_t>> expected{
-        {1, nanosm::float_bits(0.180336878f)}, {2, 0xff800000u}, {3, 0xdeadbeefu}, {4, 0xffffffffu},
-        {5, 0xffffffffu}, {31, nanosm::float_bits(1e-3f)}, {6, 70000u}, {7, 0x80000000u}};
-    const auto check = [&](const nanosm::Kernel& kernel, const std::string& what) {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        nanosm::Machine machine(profile, kernel, std::move(launch));
-        machine.run();
-        for (const auto& [reg, value] : expected) {
-            require(machine.read_ureg(0, reg) == value, what + ": umov did not write its 32-bit word to ur" +
-                std::to_string(reg));
-        }
-        require(machine.read_reg(0, 9, 1) == nanosm::float_bits(0.180336878f), what + ": ur2r lost the constant");
-    };
-    const auto kernel = compile(source);
-    check(kernel, "qtx");
-    const auto scheduled = nanosm::emit_asm(qtx_program(source, profile));
-    check(nanosm::assemble_asm(scheduled, profile), "scheduled assembly");
-    check(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
-    // A word outside the old 22-bit immediate prints as its 32 bits in hex; a
-    // small one as a number.
-    nanosm::Instruction inst;
-    inst.opcode = nanosm::Opcode::umovi;
-    inst.dst = 63;
-    inst.imm = static_cast<int32_t>(0xff800000u);
-    const auto decoded = nanosm::decode(nanosm::encode(inst));
-    require(decoded.dst == 63 && static_cast<uint32_t>(decoded.imm) == 0xff800000u,
-        "umov's dst[6] imm[32] payload does not round-trip");
-    require(nanosm::format_instruction(decoded, false) == "umov ur63, 0xff800000",
-        "a large umov word is not printed as hex: " + nanosm::format_instruction(decoded, false));
-    inst.imm = -4;
-    require(nanosm::format_instruction(nanosm::decode(nanosm::encode(inst)), false) == "umov ur63, -4",
-        "a small umov word is not printed as a number");
-    for (const char* bad : {"umov ur1, 4294967296\nhalt\n", "umov ur1, -2147483649\nhalt\n", "umov ur1, 1.5f\nhalt\n",
-                            "umov ur1, 0x1p3\nhalt\n", "uaddi ur1, ur1, 1.5\nhalt\n", "mov r1, 4194304\nhalt\n"}) {
-        try {
-            compile(bad);
-            throw std::runtime_error(std::string("accepted: ") + bad);
-        } catch (const nanosm::SimError& error) {
-            require(std::string(error.what()).find("immediate") != std::string::npos,
-                std::string("a bad immediate: wrong refusal: ") + error.what());
-        }
-    }
-}
-
-// A test's untimed preload of shared memory (Launch::test_shmem) is reported
-// in the run's summary and may not stand in for the launch block.
-void test_test_preload_is_reported_and_kept_off_the_block() {
-    const auto& profile = canonical_profile();
-    const auto preloaded_bytes = [&](bool preload) {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        if (preload) launch.test_shmem.push_back({64, std::vector<uint8_t>(12, 0xa5)});
-        nanosm::Machine machine(profile, compile("halt\n"), std::move(launch));
-        machine.run();
-        return machine.trace().summary().test_preload_bytes;
-    };
-    require(preloaded_bytes(true) == 12, "a test's preload is not in the run summary");
-    require(preloaded_bytes(false) == 0, "a launch with no preload reports one");
-    const auto kernel = compile(".param u32 A\nhalt\n");
-    try {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        launch.args = {{"A", uint64_t{7}}};
-        launch.test_shmem.push_back({kernel.sections[0].address, {7, 0, 0, 0}});
-        nanosm::Machine machine(profile, kernel, std::move(launch));
-        throw std::runtime_error("a test preload over the launch block was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("touches the kernel's launch block") != std::string::npos,
-            std::string("a preload over the launch block: wrong refusal: ") + error.what());
-    }
-}
-
-// A hand-written kernel that reads its parameter without waiting on the
-// launch flag reads bytes that are still on their way: the sanitizer names
-// the launch copy.
-void test_early_launch_read_panics() {
-    const auto kernel = assemble(R"(
-        .param ptr OUT
-        .flag sb5, 8
-        umov ur1, OUT
-        lds.uni r1, [ur1] {set=sb0}
-        halt {wait=sb0}
-    )");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    launch.args = {{"OUT", uint64_t{4096}}};
-    nanosm::Machine machine(canonical_profile(), kernel, std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("a read of launch bytes that had not landed ran");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("the launch copy") != std::string::npos,
-            std::string("an early launch read produced the wrong PANIC: ") + error.what());
-    }
-    // The same for a barrier of the block probed before it is there; waiting
-    // on its launch flag first is what makes it legal.
-    const auto probe = [](const char* wait) {
-        nanosm::Launch one;
-        one.active_warps = 1;
-        nanosm::Machine probing(canonical_profile(), assemble(std::string(R"(
-            .mbar B, expect 1
-            .flag sb5, 8
-            umov ur1, B )") + wait + R"(
-            mbar.test_wait p0, [ur1], 1
-            halt
-        )"), std::move(one));
-        probing.run();
-    };
-    try {
-        probe("");
-        throw std::runtime_error("a probe of a barrier that had not landed ran");
-    } catch (const nanosm::SimError& error) {
-        require(std::string(error.what()).find("the launch copy") != std::string::npos,
-            std::string("an early barrier probe produced the wrong PANIC: ") + error.what());
-    }
-    probe("{wait=sb5}");
-}
-
-void test_launch_refusals() {
+TEST(Basics, launch_refusals) {
     const auto refused = [](const std::function<void()>& attempt, const std::string& needle) {
-        try {
-            attempt();
-        } catch (const nanosm::SimError& error) {
-            require(std::string(error.what()).find(needle) != std::string::npos,
-                "wrong refusal (wanted '" + needle + "'): " + error.what());
-            return;
-        }
-        throw std::runtime_error("accepted; wanted a refusal with '" + needle + "'");
+        expect_error(attempt, {needle}, "a refusal with '" + needle + "'");
     };
     const auto launch_with = [](const char* source, uint32_t warps, std::vector<nanosm::LaunchArgument> args) {
         return [=] {
-            nanosm::Launch launch;
-            launch.active_warps = warps;
+            auto launch = launch_warps(warps);
             launch.args = args;
             nanosm::Machine machine(canonical_profile(), compile(source), std::move(launch));
         };
@@ -1022,8 +688,7 @@ void test_launch_refusals() {
     // The launch block's global address: inside global memory, and not over
     // the launch's own global bytes.
     refused([] {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
+        auto launch = launch_warps(1);
         launch.args = {{"P", uint64_t{0}}, {"N", uint64_t{2}}};
         launch.block_address = 64;
         launch.gmem_image.push_back({64, {1, 2, 3, 4}});
@@ -1048,316 +713,166 @@ void test_launch_refusals() {
         nanosm::validate_device_profile(profile);
         nanosm::compile_and_assemble(".param ptr A\nhalt\n", profile);
     }, "no TMA to copy");
-}
 
-void test_launch_image_rejects_bad_segment_hex() {
+    // The launch formats. A launch declares the mbars a test initialized in
+    // its shmem image (Launch::mbars): the "mbars" field, absent when there is
+    // none; the machine refuses one that is not an 8-byte aligned shmem slot.
     nanosm::LaunchImage input;
     input.kernel = compile("halt");
-    input.launch.active_warps = 1;
-    input.launch.test_shmem.push_back({0, {0xab}});
-    auto serialized = nanosm::emit_launch_image(input);
-    const auto field = serialized.find("\"bytes\": \"ab\"");
-    const auto byte = serialized.find("ab", field);
+    input.launch = launch_warps(1);
+    input.launch.test_shmem.push_back({4160, std::vector<uint8_t>(8, 0)});
+    require(nanosm::emit_launch_image(input).find("mbars") == std::string::npos,
+        "a launch with no declared mbar emitted an mbars field");
+    input.launch.mbars = {4160, 4168};
+    const auto declared = nanosm::emit_launch_image(input);
+    const auto state_text = nanosm::emit_launch_state(input.launch);
+    require(nanosm::load_launch_image(declared).launch.mbars == input.launch.mbars &&
+            nanosm::load_launch_state(state_text).mbars == input.launch.mbars,
+        "the launch formats lost the declared mbars");
+    for (const uint32_t bad : {4161u, 65536u}) {
+        refused([&] {
+            auto launch = input.launch;
+            launch.mbars = {bad};
+            nanosm::Machine machine(canonical_profile(), input.kernel, std::move(launch));
+        }, "launch declares an mbar at " + std::to_string(bad));
+    }
+    // An integer that is not what its field holds is refused before it is
+    // narrowed: 4294967296 is not address 0, 4160.9 not 4160, -8 not
+    // 0xfffffff8.
+    const auto reload = [](bool image, const std::string& text) {
+        return [=] {
+            if (image) {
+                (void)nanosm::emit_launch_image(nanosm::load_launch_image(text));
+            } else {
+                (void)nanosm::emit_launch_state(nanosm::load_launch_state(text));
+            }
+        };
+    };
+    for (const auto& bad : {nlohmann::json(4294967296ull), nlohmann::json(4160.9), nlohmann::json(-8),
+             nlohmann::json("64")}) {
+        for (const bool image : {false, true}) {
+            auto document = nlohmann::json::parse(image ? declared : state_text);
+            document["mbars"] = {4160, bad};
+            refused(reload(image, document.dump()), "launch: mbars[1] is not a shmem address");
+        }
+    }
+    for (const auto& bad : {nlohmann::json(4294967297ull), nlohmann::json(1.5), nlohmann::json(-1)}) {
+        for (const bool image : {false, true}) {
+            auto document = nlohmann::json::parse(image ? declared : state_text);
+            document["active_warps"] = bad;
+            refused(reload(image, document.dump()), std::string(image ? "launch image" : "launch state") +
+                ": active warp count is not an unsigned 32-bit integer");
+        }
+    }
+    for (const auto& bad : {nlohmann::json(1.5), nlohmann::json(-1)}) {
+        auto document = nlohmann::json::parse(declared);
+        document["kernel"]["register_count"] = bad;
+        refused(reload(true, document.dump()), "launch image: kernel.register_count is not an unsigned 32-bit integer");
+        document = nlohmann::json::parse(declared);
+        document["test_shmem"][0]["address"] = bad;
+        refused(reload(true, document.dump()), "launch image: test_shmem[0].address is not an unsigned integer");
+    }
+    // A segment's bytes are hex.
+    nanosm::LaunchImage segment;
+    segment.kernel = compile("halt");
+    segment.launch = launch_warps(1);
+    segment.launch.test_shmem.push_back({0, {0xab}});
+    auto serialized = nanosm::emit_launch_image(segment);
+    const auto byte = serialized.find("ab", serialized.find("\"bytes\": \"ab\""));
     require(byte != std::string::npos, "launch test could not find its byte payload");
     serialized[byte] = 'z';
-    try {
-        nanosm::load_launch_image(serialized);
-        throw std::runtime_error("launch image accepted malformed segment hex");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("non-hex") != std::string::npos,
-            "malformed segment produced the wrong launch-image error");
-    }
+    refused([&] { (void)nanosm::load_launch_image(serialized); }, "non-hex");
 }
 
-void test_profile_can_disable_mbar_try_wait() {
-    auto profile = canonical_profile();
-    profile.mbar_wait_slots = 0;
-    profile.mbar_try_wait_timeout_cycles = 0;
-    nanosm::validate_device_profile(profile);
-    try {
-        qtx_program("umov ur0, 64\nmbar.try_wait p0, [ur0], 0\nhalt", profile);
-        throw std::runtime_error("qtxc accepted try_wait with no wait slots");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("unsupported") != std::string::npos,
-            "disabled try_wait produced the wrong error");
-    }
-
-    profile.mbar_wait_slots = 1;
-    try {
-        nanosm::validate_device_profile(profile);
-        throw std::runtime_error("profile accepted wait slots without a timeout");
-    } catch (const nanosm::ProfileError&) {
-    }
-}
-
-void test_warp_handoff_through_mbar() {
-    // The slice's acceptance kernel: producer writes a tile, arrives; consumer sleeps,
-    // wakes on the producer's arrival, reads, transforms, writes back. The barrier is a
-    // launch-time object (poked via the image) because runtime init has a use-before-init
-    // race between warps -- exactly why design.md makes barriers launch-time.
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& shmem = image_bytes(launch.test_shmem, 512);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.expected = 1;
-    initial.remaining = 1;
-    write_u64(shmem, 256, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        usread ur0, WARP_ID
-        ur2r r0, ur0
-        setp.eq.u32 p0, r0, 0
-        @p0 bra.uni producer
-        umov ur1, 256
-    consume_wait:
-        mbar.try_wait p1, [ur1], 0
-        @!p1 bra.uni consume_wait
-        sread r2, LANE_ID
-        shli r2, r2, 2
-        lds r3, [r2]
-        addi r3, r3, 100
-        sts [r2 + 320], r3
-        halt
-    producer:
-        sread r2, LANE_ID
-        shli r2, r2, 2
-        sread r4, LANE_ID
-        addi r4, r4, 7
-        sts [r2], r4
-        umov ur1, 256
-        mbar.arrive [ur1]
-        halt
-    )"), std::move(launch));
-    machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(
-            machine.read_shmem_u32(320 + lane * 4) == lane + 107,
-            "handoff produced wrong data at lane " + std::to_string(lane));
-    }
-    const auto& summary = machine.trace().summary();
-    require(summary.mbar_sleeps == 1, "consumer never slept on the barrier");
-    require(summary.mbar_wakes == 1, "producer's arrival did not wake the consumer");
-    require(
-        summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait)] != 0,
-        "sleeping consumer cycles were not attributed to mbar wait");
-    uint64_t warp_cycles = 0;
-    for (const auto cycles : summary.warp_cycles) warp_cycles += cycles;
-    require(
-        warp_cycles == summary.cycles * 2,
-        "warp attribution does not sum to total with a sleeping warp");
-}
-
-void test_mbar_arrival_underflow_panics() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    image_bytes(launch.test_shmem, 128);
-    nanosm::Machine machine(canonical_profile(), compile(R"(
-        umov ur0, 64
-        mbar.init [ur0], 1
-        mbar.arrive.expect_tx [ur0], 8
-        mbar.arrive [ur0]
-        halt
-    )"), std::move(launch));
-    try {
-        machine.run();
-        throw std::runtime_error("mbar arrival underflow was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("arrival count underflow") != std::string::npos,
-            "mbar arrival underflow produced the wrong PANIC");
-    }
-}
-
-// Complete_tx carries no phase in hardware; the phase
-// a sender meant (here the host's stated parity) is sanitizer metadata, so
-// this is now a sanitizer PANIC (listed in expects_sanitizer_panic).
-void test_mbar_complete_wrong_phase_panics() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 128);
-    nanosm::MbarState initial;
-    initial.valid = true;
-    initial.phase = true;
-    initial.expected = 1;
-    initial.remaining = 0;
-    initial.tx_bytes = 8;
-    write_u64(shmem, 64, nanosm::encode_mbar_state(initial));
-    nanosm::Machine machine(canonical_profile(), compile("halt"), std::move(launch));
-    machine.complete_mbar_tx(64, 8, 0);
-    try {
-        machine.run();
-        throw std::runtime_error("complete_tx against the wrong phase was accepted");
-    } catch (const nanosm::SimError& error) {
-        require(
-            std::string(error.what()).find("wrong phase") != std::string::npos,
-            "wrong-phase complete_tx produced the wrong PANIC");
-    }
-}
-
-} // namespace
-
-// encoding round trip
-TEST(Basics, encoding_round_trip) {
-    test_encoding_round_trip();
-}
-
-// FNV-1a vectors
-TEST(Basics, fnv1a_64_vectors) {
-    test_fnv1a_64_vectors();
-}
-
-// mbar word encoding
-TEST(Basics, mbar_word_encoding) {
-    test_mbar_word_encoding();
-}
-
-// high register metadata
-TEST(Basics, high_register_kernel_metadata) {
-    test_high_register_kernel_metadata();
-}
-
-// RF-derived residency
-TEST(Basics, rf_capacity_determines_residency) {
-    test_rf_capacity_determines_residency();
-}
-
-// compiler controls
-TEST(Basics, compiler_controls) {
-    test_compiler_controls();
-}
-
-// consumer-distance stalls
-TEST(Basics, stalls_track_consumer_distance) {
-    test_stalls_track_consumer_distance();
-}
-
-// counted loop and relocation
-TEST(Basics, counted_loop_and_label_relocation) {
-    test_counted_loop_and_label_relocation();
-}
-
-// uniform role dispatch
-TEST(Basics, uniform_role_dispatch) {
-    test_uniform_role_dispatch();
-}
-
-// nonuniform bra.uni PANIC
-TEST(Basics, nonuniform_bra_uni_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_nonuniform_bra_uni_panics();
-}
-
-// branch drains async work
-TEST(Basics, branch_boundary_drains_async_work) {
-    test_branch_boundary_drains_async_work();
-}
-
-// qtx wait / nop
-TEST(Basics, wait_on_matmul_operands) {
-    test_wait_on_matmul_operands();
-}
-
-TEST(Basics, wait_on_load_then_use) {
-    test_wait_on_load_then_use();
-}
-
-TEST(Basics, nop_in_hand_assembly) {
-    test_nop_in_hand_assembly();
-}
-
-// mbar sleep and wake
-TEST(Basics, mbar_try_wait_sleeps_and_engine_completion_wakes) {
-    test_mbar_try_wait_sleeps_and_engine_completion_wakes();
-}
-
-// mbar test_wait predicate
-TEST(Basics, mbar_test_wait_broadcasts_predicate) {
-    test_mbar_test_wait_broadcasts_predicate();
-}
-
-// mbar try_wait immediate
-TEST(Basics, mbar_try_wait_immediate_success) {
-    test_mbar_try_wait_immediate_success();
-}
-
-// mbar try_wait timeout
-TEST(Basics, mbar_try_wait_times_out_false) {
-    test_mbar_try_wait_times_out_false();
-}
-
-// mbar deadline phase priority
-TEST(Basics, mbar_phase_flip_wins_on_try_wait_deadline) {
-    test_mbar_phase_flip_wins_on_try_wait_deadline();
-}
-
-// mbar try_wait slots
-TEST(Basics, mbar_try_wait_slots_limit_parked_warps) {
-    test_mbar_try_wait_slots_limit_parked_warps();
-}
-
-// profile disables try_wait
-TEST(Basics, profile_can_disable_mbar_try_wait) {
-    test_profile_can_disable_mbar_try_wait();
-}
-
-// staged pipeline kernel
-TEST(Basics, staged_pipeline_kernel) {
-    test_staged_pipeline_kernel();
-}
-
-// launch image validation
-TEST(Basics, launch_image_rejects_bad_segment_hex) {
-    test_launch_image_rejects_bad_segment_hex();
-}
-
-// the launch passes arguments; the kernel declares the rest
-TEST(Basics, launch_arguments_reach_the_kernel) {
-    test_launch_arguments_reach_the_kernel();
-}
-
-TEST(Basics, launch_refusals) {
-    test_launch_refusals();
-}
-
-TEST(Basics, section_alias_waits_on_its_flag) {
-    test_section_alias_waits_on_its_flag();
-}
-
-TEST(Basics, mbar_array) {
-    test_mbar_array();
-}
-
+// umov urD, imm takes any 32-bit word (dst[6] imm[32]): a float literal is its
+// IEEE bits, with no memory behind the constant; it survives the encoding,
+// scheduled assembly and the hex text.
 TEST(Basics, umov_takes_a_32_bit_word) {
-    test_umov_takes_a_32_bit_word();
+    const auto& profile = canonical_profile();
+    const char* const source =
+        "umov ur1, 0.180336878\numov ur2, -inf\numov ur3, 0xdeadbeef\numov ur4, -1\numov ur5, 4294967295\n"
+        "umov ur31, 1e-3\numov ur6, 70000\numov ur7, 2147483648\nur2r r1, ur1\nhalt\n";
+    const std::vector<std::pair<uint32_t, uint32_t>> expected{
+        {1, nanosm::float_bits(0.180336878f)}, {2, 0xff800000u}, {3, 0xdeadbeefu}, {4, 0xffffffffu},
+        {5, 0xffffffffu}, {31, nanosm::float_bits(1e-3f)}, {6, 70000u}, {7, 0x80000000u}};
+    const auto check = [&](const nanosm::Kernel& kernel, const std::string& what) {
+        nanosm::Machine machine(profile, kernel, launch_warps(1));
+        machine.run();
+        for (const auto& [reg, value] : expected) {
+            require(machine.read_ureg(0, reg) == value, what + ": umov did not write its 32-bit word to ur" +
+                std::to_string(reg));
+        }
+        require(machine.read_reg(0, 9, 1) == nanosm::float_bits(0.180336878f), what + ": ur2r lost the constant");
+    };
+    const auto kernel = compile(source);
+    check(kernel, "qtx");
+    const auto scheduled = nanosm::emit_asm(qtx_program(source, profile));
+    check(nanosm::assemble_asm(scheduled, profile), "scheduled assembly");
+    check(nanosm::load_hex(nanosm::emit_hex(kernel)), "the hex text");
+    // A large word prints as its 32 bits in hex, a small one as a number.
+    nanosm::Instruction inst;
+    inst.opcode = nanosm::Opcode::umovi;
+    inst.dst = 63;
+    inst.imm = static_cast<int32_t>(0xff800000u);
+    const auto decoded = nanosm::decode(nanosm::encode(inst));
+    require(decoded.dst == 63 && static_cast<uint32_t>(decoded.imm) == 0xff800000u,
+        "umov's dst[6] imm[32] payload does not round-trip");
+    require(nanosm::format_instruction(decoded, false) == "umov ur63, 0xff800000",
+        "a large umov word is not printed as hex: " + nanosm::format_instruction(decoded, false));
+    inst.imm = -4;
+    require(nanosm::format_instruction(nanosm::decode(nanosm::encode(inst)), false) == "umov ur63, -4",
+        "a small umov word is not printed as a number");
+    for (const char* bad : {"umov ur1, 4294967296\nhalt\n", "umov ur1, -2147483649\nhalt\n", "umov ur1, 1.5f\nhalt\n",
+                            "umov ur1, 0x1p3\nhalt\n", "uaddi ur1, ur1, 1.5\nhalt\n", "mov r1, 4194304\nhalt\n"}) {
+        expect_error([&] { (void)compile(bad); }, {"immediate"}, std::string("a bad immediate: ") + bad);
+    }
 }
 
+// A test's untimed preload of shared memory (Launch::test_shmem) is reported
+// in the run's summary and may not stand in for the launch block.
 TEST(Basics, test_preload_is_reported_and_kept_off_the_block) {
-    test_test_preload_is_reported_and_kept_off_the_block();
+    const auto& profile = canonical_profile();
+    const auto preloaded_bytes = [&](bool preload) {
+        auto launch = launch_warps(1);
+        if (preload) launch.test_shmem.push_back({64, std::vector<uint8_t>(12, 0xa5)});
+        nanosm::Machine machine(profile, compile("halt\n"), std::move(launch));
+        machine.run();
+        return machine.trace().summary().test_preload_bytes;
+    };
+    require(preloaded_bytes(true) == 12, "a test's preload is not in the run summary");
+    require(preloaded_bytes(false) == 0, "a launch with no preload reports one");
+    const auto kernel = compile(".param u32 A\nhalt\n");
+    expect_error([&] {
+        auto launch = launch_warps(1);
+        launch.args = {{"A", uint64_t{7}}};
+        launch.test_shmem.push_back({kernel.sections[0].address, {7, 0, 0, 0}});
+        nanosm::Machine machine(profile, kernel, std::move(launch));
+    }, {"touches the kernel's launch block"}, "a test preload over the launch block");
 }
 
+// A hand-written kernel that reads its parameter, or probes a barrier of the
+// block, without waiting on the launch flag reads bytes that are still on
+// their way: the sanitizer names the launch copy. Waiting on the flag first
+// is what makes it legal.
 TEST(Basics, early_launch_read_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_early_launch_read_panics();
-}
-
-// mbar warp handoff
-TEST(Basics, seventh_depbar_reuses_the_oldest) {
-    test_seventh_depbar_reuses_the_oldest();
-}
-
-TEST(Basics, warp_handoff_through_mbar) {
-    test_warp_handoff_through_mbar();
-}
-
-// mbar arrival underflow
-TEST(Basics, mbar_arrival_underflow_panics) {
-    test_mbar_arrival_underflow_panics();
-}
-
-// mbar wrong-phase completion
-TEST(Basics, mbar_complete_wrong_phase_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_mbar_complete_wrong_phase_panics();
+    const auto probe = [](const std::string& wait) {
+        return assemble(".mbar B, expect 1\n.flag sb5, 8\numov ur1, B " + wait +
+            "\nmbar.test_wait p0, [ur1], 1\nhalt\n");
+    };
+    nanosm::Machine waiting(canonical_profile(), probe("{wait=sb5}"), launch_warps(1));
+    waiting.run();
+#if NANOSM_SANITIZER
+    auto launch = launch_warps(1);
+    launch.args = {{"OUT", uint64_t{4096}}};
+    nanosm::Machine machine(canonical_profile(), assemble(R"(
+        .param ptr OUT
+        .flag sb5, 8
+        umov ur1, OUT
+        lds.uni r1, [ur1] {set=sb0}
+        halt {wait=sb0}
+    )"), std::move(launch));
+    expect_panic(machine, {"the launch copy"}, "an early launch read");
+    nanosm::Machine probing(canonical_profile(), probe(""), launch_warps(1));
+    expect_panic(probing, {"the launch copy"}, "an early barrier probe");
+#endif
 }

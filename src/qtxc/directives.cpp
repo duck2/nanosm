@@ -1,7 +1,7 @@
 // What a source declares beside its code (src/qtxc/): `.warps`, and the
 // sections of the launch block -- the `.param` signature, `.mbar` and `.data`
 // -- with the launch flags over them, `.flag` (src/isa.hpp Kernel;
-// docs/qtx.md "Launch"). qtx, assembly and the hex text all write these lines, so their
+// README "Launch"). qtx, assembly and the hex text all write these lines, so their
 // parsers and formatters are here once; parse.cpp and hex.cpp call them, and
 // the rule that needs the whole kernel (the block fits, every section is
 // where the block rule puts it, the flags cover it) is check_kernel_image at

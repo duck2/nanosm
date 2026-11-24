@@ -1,9 +1,11 @@
 # The sanitizer-OFF configuration in its own build dir (build_nosan):
 # NANOSM_SANITIZER=OFF compiles src/machine/sanitizer.hpp's Sanitizer to no-ops.
-# Its ctest runs the ordinary targets against the OFF library; the unit tests
-# that expect a sanitizer panic are skipped (GTEST_SKIP). The default
-# build (scripts/build.ps1) already builds an OFF twin and proves it
-# byte-identical; this script exists to exercise the option itself.
+# Its ctest runs the ordinary targets against the OFF library, every unit test
+# its own entry; the unit tests that expect a sanitizer panic are skipped
+# (GTEST_SKIP). The default build (scripts/build.ps1) builds an OFF twin too,
+# but only to prove it byte-identical (scripts/sanitizer_off_check.py, a slow
+# entry): this script is where the unit tests run one by one with the
+# sanitizer compiled out.
 
 # -Fast: run only the fast tests (ctest -LE slow) for iteration inside a
 # task. The default runs every test: it is the verification gate.

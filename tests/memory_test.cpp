@@ -1,4 +1,4 @@
-// qtx's memory objects (src/qtxc/objects.cpp, expressions.cpp; docs/qtx.md
+// qtx's memory objects (src/qtxc/objects.cpp, expressions.cpp; README
 // "Memory"): `.shmem` / `.tmem` name a piece of the kernel's own memory and
 // qtxc places it; constants are expressions; ld.param reads a parameter.
 // Smoke tests: objects land where the rule says and the code reaches them
@@ -7,9 +7,9 @@
 
 #include "image.hpp"
 
-namespace {
-
 using namespace nanosm_test;
+
+namespace {
 
 const nanosm::MemoryObject& object_of(const std::vector<nanosm::MemoryObject>& objects, const std::string& name) {
     for (const auto& object : objects) {
@@ -18,27 +18,28 @@ const nanosm::MemoryObject& object_of(const std::vector<nanosm::MemoryObject>& o
     throw std::runtime_error("no memory object named " + name);
 }
 
-uint8_t number_of(const std::vector<nanosm::RegisterName>& names, const std::string& name) {
-    for (const auto& entry : names) {
-        if (entry.name == name) return entry.number;
-    }
-    throw std::runtime_error("no register named %" + name);
+void asm_refused(const std::string& text, const std::string& needle, const std::string& what) {
+    expect_error([&] { (void)nanosm::assemble_asm(text, canonical_profile()); }, {needle}, what);
 }
 
-void refused(const std::string& source, const std::string& needle, const std::string& what) {
-    std::string error;
-    try {
-        (void)nanosm::compile_qtx(source, canonical_profile());
-    } catch (const nanosm::SimError& caught) {
-        error = caught.what();
-    }
-    require(error.find(needle) != std::string::npos, what + ": wrong or no error: '" + error + "'");
+std::string replaced(std::string text, const std::string& from, const std::string& to) {
+    const auto found = text.find(from);
+    require(found != std::string::npos, "the assembly has no '" + from + "':\n" + text);
+    return text.replace(found, from.size(), to);
 }
+
+// An mbar's state, read from shared memory.
+nanosm::MbarState mbar_at(const nanosm::Machine& machine, uint32_t address) {
+    return nanosm::decode_mbar_state(machine.read_shmem_u32(address) |
+        (static_cast<uint64_t>(machine.read_shmem_u32(address + 4)) << 32));
+}
+
+} // namespace
 
 // Objects are placed one after another, each on its alignment; the code
 // reaches them by name, element and property; a parameter is read with
 // ld.param; assembly carries the objects with their addresses.
-void test_objects_place_and_compute() {
+TEST(Memory, objects_place_and_compute) {
     const auto& profile = canonical_profile();
     const std::string source = R"(
         .param u32 BIAS
@@ -85,8 +86,7 @@ void test_objects_place_and_compute() {
         "the assembled kernel lost its objects");
     require(nanosm::emit_kernel_info(kernel).find("\"name\": \"BUF\"") != std::string::npos,
         "the kernel info does not list the objects");
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+    auto launch = launch_warps(1);
     launch.args = {{"BIAS", uint64_t{1000}}};
     nanosm::Machine machine(profile, kernel, std::move(launch));
     machine.run();
@@ -103,7 +103,7 @@ void test_objects_place_and_compute() {
 
 // over= lays an object on the ones it lists; the first of them takes the
 // overlay's alignment before anything is placed.
-void test_overlay() {
+TEST(Memory, overlay) {
     const auto& profile = canonical_profile();
     const std::string objects = R"(
         .shmem A, bytes=64
@@ -118,49 +118,49 @@ void test_overlay() {
         "the first object under an overlay did not take its alignment");
     const auto& stage = object_of(program.objects, "STAGE");
     require(stage.address == 256 && stage.stride == 256 && stage.over.size() == 2, "the overlay is not on what it lists");
-    refused(objects + ".shmem STAGE[2], rows=1, cols=64, elem=4, over=K, Q\nhalt\n",
+    qtx_refused(objects + ".shmem STAGE[2], rows=1, cols=64, elem=4, over=K, Q\nhalt\n",
         "Q (at 64) does not follow K (which ends at 768)", "an overlay over objects out of order");
-    refused(objects + ".shmem STAGE[2], rows=1, cols=64, elem=4, over=Q\nhalt\n",
+    qtx_refused(objects + ".shmem STAGE[2], rows=1, cols=64, elem=4, over=Q\nhalt\n",
         "it needs 512 bytes and the objects it lies over have 256", "an overlay larger than what it lies on");
-    refused(objects + ".shmem STAGE, bytes=64, over=Q[2]\nhalt\n",
+    qtx_refused(objects + ".shmem STAGE, bytes=64, over=Q[2]\nhalt\n",
         "over=Q[2] is past the end of .shmem Q, which has 2 elements", "an overlay over an element that is not there");
-    refused(objects + ".shmem STAGE, bytes=64, over=NOPE\nhalt\n", "there is no .shmem object 'NOPE'",
+    qtx_refused(objects + ".shmem STAGE, bytes=64, over=NOPE\nhalt\n", "there is no .shmem object 'NOPE'",
         "an overlay over nothing");
-    refused(objects + ".tmem T, rows=4, cols=8\n.shmem STAGE, bytes=16, over=T\nhalt\n",
+    qtx_refused(objects + ".tmem T, rows=4, cols=8\n.shmem STAGE, bytes=16, over=T\nhalt\n",
         "T is in tensor memory, not in shared memory", "an overlay across memories");
 }
 
-void test_refusals() {
+TEST(Memory, refusals) {
     const std::string tile = ".shmem QBUF[2], rows=32, cols=64, elem=2\n";
-    refused(tile + "umov %a, QBUF[2]\nhalt\n", "QBUF[2] is past the end of .shmem QBUF, which has 2 elements",
+    qtx_refused(tile + "umov %a, QBUF[2]\nhalt\n", "QBUF[2] is past the end of .shmem QBUF, which has 2 elements",
         "an element past the end");
-    refused(tile + "umov %a, QBUF.rows\nhalt\n", ".shmem QBUF has .bytes (QBUF[i].bytes for one element), .stride and .row_bytes",
+    qtx_refused(tile + "umov %a, QBUF.rows\nhalt\n", ".shmem QBUF has .bytes (QBUF[i].bytes for one element), .stride and .row_bytes",
         "an unknown property");
-    refused(".shmem B, bytes=64, layout=dense\nhalt\n", "an object has no layout", "layout= on an object");
-    refused(".shmem B, bytes=64, at=128\nhalt\n", "qtxc places objects", "at= in qtx");
-    refused(".shmem B, rows=4, cols=16\nhalt\n", "expected .shmem NAME[COUNT], rows=R, cols=C, elem=BYTES",
+    qtx_refused(".shmem B, bytes=64, layout=dense\nhalt\n", "an object has no layout", "layout= on an object");
+    qtx_refused(".shmem B, bytes=64, at=128\nhalt\n", "qtxc places objects", "at= in qtx");
+    qtx_refused(".shmem B, rows=4, cols=16\nhalt\n", "expected .shmem NAME[COUNT], rows=R, cols=C, elem=BYTES",
         "a tile without its element size");
-    refused(".tmem T, rows=4, cols=24\nhalt\n", "a tmem row is a power of two of words, 4 or more", "a tmem row of 24 words");
-    refused(".tmem T, rows=4, cols=8, align=8\nhalt\n", "a multiple of four of its rows (32 words)",
+    qtx_refused(".tmem T, rows=4, cols=24\nhalt\n", "a tmem row is a power of two of words, 4 or more", "a tmem row of 24 words");
+    qtx_refused(".tmem T, rows=4, cols=8, align=8\nhalt\n", "a multiple of four of its rows (32 words)",
         "a tmem object off its bands of four rows");
-    refused(".shmem BIG[3], bytes=32768\nhalt\n",
+    qtx_refused(".shmem BIG[3], bytes=32768\nhalt\n",
         ".shmem BIG does not fit: it needs 98304 bytes at 0", "an object larger than shared memory");
-    refused(".param desc D\n.shmem BIG, bytes=65536 - 32\nhalt\n",
+    qtx_refused(".param desc D\n.shmem BIG, bytes=65536 - 32\nhalt\n",
         "shared memory below the launch block (.param / .mbar / .data, at the top) ends at 65472",
         "an object that reaches the launch block");
-    refused(".equ B, 4\n.shmem B, bytes=64\nhalt\n", "duplicate constant 'B'", "an object named like a constant");
-    refused(".shmem B, bytes=64\nB: halt\n", "duplicate symbol 'B'", "a label named like an object");
-    refused("umov %a, log2(48)\nhalt\n", "log2(48): not a power of two", "log2 of 48");
-    refused("umov %a, 8 / (4 - 4)\nhalt\n", "division by zero", "a zero divisor");
-    refused(".equ N, 4\numov %a, N.bytes\nhalt\n", "only a .shmem or .tmem object has properties", "a property of a constant");
-    refused(".equ N, 4\numov %a, N[1]\nhalt\n", "N is not an array", "an element of a constant");
-    refused("mov %a, 1 << 30\nhalt\n", "does not fit the immediate field", "an expression too large for its field");
+    qtx_refused(".equ B, 4\n.shmem B, bytes=64\nhalt\n", "duplicate constant 'B'", "an object named like a constant");
+    qtx_refused(".shmem B, bytes=64\nB: halt\n", "duplicate symbol 'B'", "a label named like an object");
+    qtx_refused("umov %a, log2(48)\nhalt\n", "log2(48): not a power of two", "log2 of 48");
+    qtx_refused("umov %a, 8 / (4 - 4)\nhalt\n", "division by zero", "a zero divisor");
+    qtx_refused(".equ N, 4\numov %a, N.bytes\nhalt\n", "only a .shmem or .tmem object has properties", "a property of a constant");
+    qtx_refused(".equ N, 4\numov %a, N[1]\nhalt\n", "N is not an array", "an element of a constant");
+    qtx_refused("mov %a, 1 << 30\nhalt\n", "does not fit the immediate field", "an expression too large for its field");
     // ld.param: a parameter of the right type, and nothing else.
-    refused(".param u32 N\nld.param.f32 %x, [N]\nhalt\n", "N is a .param u32 (read it with ld.param.u32",
+    qtx_refused(".param u32 N\nld.param.f32 %x, [N]\nhalt\n", "N is a .param u32 (read it with ld.param.u32",
         "ld.param.f32 of a u32");
-    refused(".param desc D\nld.param.u32 %x, [D]\nhalt\n", "a descriptor is named in a tma instruction's tile operand",
+    qtx_refused(".param desc D\nld.param.u32 %x, [D]\nhalt\n", "a descriptor is named in a tma instruction's tile operand",
         "ld.param of a descriptor");
-    refused(".shmem B, bytes=64\nld.param.u32 %x, [B]\nhalt\n", "with NAME a .param of this kernel", "ld.param of an object");
+    qtx_refused(".shmem B, bytes=64\nld.param.u32 %x, [B]\nhalt\n", "with NAME a .param of this kernel", "ld.param of an object");
     // An `.equ` that names a section is an address in it: its users wait.
     const auto program = nanosm::compile_qtx(
         ".param u32 P\n.mbar M[2], expect 1\n.equ SECOND, M[1]\n.equ PLUS, P + 0\n.equ PLAIN, 4 * 2\n"
@@ -169,31 +169,15 @@ void test_refusals() {
         "a constant made from a section's address lost (or a plain constant gained) its launch-flag wait");
 }
 
-void asm_refused(const std::string& text, const std::string& needle, const std::string& what) {
-    std::string error;
-    try {
-        (void)nanosm::assemble_asm(text, canonical_profile());
-    } catch (const nanosm::SimError& caught) {
-        error = caught.what();
-    }
-    require(error.find(needle) != std::string::npos, what + ": wrong or no error: '" + error + "'");
-}
-
-std::string replaced(std::string text, const std::string& from, const std::string& to) {
-    const auto found = text.find(from);
-    require(found != std::string::npos, "the assembly has no '" + from + "':\n" + text);
-    return text.replace(found, from.size(), to);
-}
-
 // Edge cases of placement, names and constant expressions.
-void test_placement_and_name_edge_cases() {
+TEST(Memory, placement_and_name_edge_cases) {
     const auto& profile = canonical_profile();
     // 1. An overlay may use its targets up to the last one's own size, not its
     // stride: the padding after an object belongs to whoever is declared next.
-    refused(".shmem A, bytes=4\n.shmem B, bytes=4, align=4\n.shmem V, bytes=8, align=4, over=A\nhalt\n",
+    qtx_refused(".shmem A, bytes=4\n.shmem B, bytes=4, align=4\n.shmem V, bytes=8, align=4, over=A\nhalt\n",
         "it needs 8 bytes and the objects it lies over have 4", "an overlay reaching into the next object");
     const std::string padded = ".shmem A, bytes=100, align=64\n.shmem B, bytes=64, align=4\n";
-    refused(padded + ".shmem X, bytes=128, align=64, over=A\nhalt\n",
+    qtx_refused(padded + ".shmem X, bytes=128, align=64, over=A\nhalt\n",
         "it needs 128 bytes and the objects it lies over have 100", "an overlay as large as its target's stride");
     {
         const auto program = nanosm::compile_qtx(
@@ -207,16 +191,16 @@ void test_placement_and_name_edge_cases() {
     }
     // 2. Names beginning qtxc_ are the compiler's (ld.param's register, its
     // copies): a writer's use is refused (it would share the register).
-    refused(".param u32 VALUE\numov %qtxc_param, 123\nld.param.u32 %x, [VALUE]\nhalt\n",
+    qtx_refused(".param u32 VALUE\numov %qtxc_param, 123\nld.param.u32 %x, [VALUE]\nhalt\n",
         "%qtxc_param: names beginning %qtxc_ are qtxc's own", "a writer's register named like ld.param's");
-    refused(".reg %qtxc_copy<8>\nhalt\n", "names beginning %qtxc_ are qtxc's own", "a group named like qtxc's copies");
-    refused("mov %a, 1\nsetp.ne.u32 %qtxc_p, %a, 0\nhalt\n", "names beginning %qtxc_ are qtxc's own",
+    qtx_refused(".reg %qtxc_copy<8>\nhalt\n", "names beginning %qtxc_ are qtxc's own", "a group named like qtxc's copies");
+    qtx_refused("mov %a, 1\nsetp.ne.u32 %qtxc_p, %a, 0\nhalt\n", "names beginning %qtxc_ are qtxc's own",
         "a predicate with qtxc's prefix");
     // 3. Nothing wraps: a product is checked before it is made, and an
     // array's extent is 64 bits wide until it has been checked to fit.
-    refused(".equ N, (1 << 32) * (1 << 32)\nhalt\n", "the value is out of range", "a product past 64 bits");
-    refused("umov %a, (1 << 32) << 32\nhalt\n", "the value is out of range", "a shift past 64 bits");
-    refused(".shmem BIG[1024], bytes=1 << 22\n.shmem NEXT, bytes=64\nhalt\n",
+    qtx_refused(".equ N, (1 << 32) * (1 << 32)\nhalt\n", "the value is out of range", "a product past 64 bits");
+    qtx_refused("umov %a, (1 << 32) << 32\nhalt\n", "the value is out of range", "a shift past 64 bits");
+    qtx_refused(".shmem BIG[1024], bytes=1 << 22\n.shmem NEXT, bytes=64\nhalt\n",
         ".shmem BIG does not fit: it needs 4294967296 bytes at 0", "an array whose extent wraps 32 bits");
     // 4. An address written in assembly (at=) gets the checks placement gives.
     const auto text = nanosm::emit_asm(nanosm::compile_qtx(".shmem A, bytes=64\n.shmem B, bytes=4, align=4\nhalt\n", profile));
@@ -247,14 +231,66 @@ void test_placement_and_name_edge_cases() {
         require(barriers == 2 && object_of(program.objects, "BUF").count == 2,
             "an .mbar array and a .shmem array counted by one constant");
     }
-    refused(".mbar FULL[STAGES], expect 1\nhalt\n", ".mbar FULL[STAGES]: bad barrier count (unknown name 'STAGES')",
+    qtx_refused(".mbar FULL[STAGES], expect 1\nhalt\n", ".mbar FULL[STAGES]: bad barrier count (unknown name 'STAGES')",
         "an .mbar count that is no constant");
-    refused(".reg %v<N>\nhalt\n", ".reg %v<N>: bad count (unknown name 'N')", "a group count that is no constant");
+    qtx_refused(".reg %v<N>\nhalt\n", ".reg %v<N>: bad count (unknown name 'N')", "a group count that is no constant");
 }
 
-} // namespace
+// `.equ XX, X` is another name for section X: an instruction that names XX
+// waits on X's launch flag like one that names X (with no wait it would read
+// zeros when the sanitizer is off, and PANIC when it is on). A chain of such
+// lines too.
+TEST(Memory, section_alias_waits_on_its_flag) {
+    for (const std::string name : {"X", "XX", "XXX"}) {
+        auto launch = launch_warps(1);
+        launch.args = {{"X", uint64_t{0x12345678}}};
+        nanosm::Machine machine(canonical_profile(), compile(
+            ".param u32 X\n.equ XX, X\n.equ XXX, XX\n"
+            "umov ur1, " + name + "\nlds.uni r1, [ur1]\nsread r2, LANE_ID\nshli r2, r2, 2\nsts [r2], r1\nhalt\n"),
+            std::move(launch));
+        machine.run();
+        require(machine.read_shmem_u32(0) == 0x12345678u, "umov ur1, " + name + " read its parameter before it landed");
+    }
+}
 
-TEST(Memory, objects_place_and_compute) { test_objects_place_and_compute(); }
-TEST(Memory, placement_and_name_edge_cases) { test_placement_and_name_edge_cases(); }
-TEST(Memory, overlay) { test_overlay(); }
-TEST(Memory, refusals) { test_refusals(); }
+// `.mbar NAME[C]` is one section of C barriers, element i at NAME + 8 i and
+// written NAME[i]; naming any of it waits for the whole array, and an index
+// past its end is refused.
+TEST(Memory, mbar_array) {
+    const auto& profile = canonical_profile();
+    const auto kernel = compile(R"(
+.warps 1
+.param u32 A
+.mbar PAIR[2], expect 3
+.mbar ONE, expect 1
+        umov ur1, PAIR
+        umov ur2, PAIR[1]
+        umov ur3, ONE
+        mbar.arrive [ur2]
+        halt
+)");
+    require(kernel.sections.size() == 3 && kernel.sections[1].count == 2 &&
+            nanosm::section_bytes(kernel.sections[1]) == 16 &&
+            kernel.sections[2].address == kernel.sections[1].address + 16,
+        "an mbar array is not one section of 8 bytes per barrier");
+    const auto text = nanosm::emit_hex(kernel);
+    require(text.find(".mbar PAIR[2], ") != std::string::npos &&
+            nanosm::load_hex(text).sections[1].count == 2, "the hex text lost the array");
+    nanosm::LaunchImage image{kernel, {}};
+    image.launch.args = {{"A", uint64_t{1}}};
+    auto loaded = nanosm::load_launch_image(nanosm::emit_launch_image(image));
+    require(loaded.kernel.sections[1].count == 2, "a saved image lost the array");
+    nanosm::Machine machine(profile, std::move(loaded.kernel), std::move(loaded.launch));
+    machine.run();
+    const auto pair = kernel.sections[1].address;
+    const auto first = mbar_at(machine, pair);
+    const auto second = mbar_at(machine, pair + 8);
+    require(first.valid && first.expected == 3 && first.remaining == 3, "element 0 of the array did not start expecting 3");
+    require(second.valid && second.expected == 3 && second.remaining == 2,
+        "element 1 of the array is not where NAME[1] says (the arrive went elsewhere)");
+    for (const char* bad : {"umov ur1, PAIR[2]\nhalt\n", ".equ P, PAIR[7]\nhalt\n", "umov ur1, ONE[1]\nhalt\n"}) {
+        expect_error([&] { (void)compile(std::string(".mbar PAIR[2], expect 1\n.mbar ONE, expect 1\n") + bad); },
+            {"is past the end of .mbar"}, std::string("an index past an mbar array's end: ") + bad);
+    }
+    expect_error([] { (void)compile(".mbar PAIR[0], expect 1\nhalt\n"); }, {"an array has 1.."}, "an empty mbar array");
+}

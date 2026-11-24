@@ -5,7 +5,7 @@ Options: --profile PATH, --trace PATH (Perfetto output).
 
 The same inputs and check as kernels/diverge.launch.py; only the kernel
 differs: each step's odd / even choice is two masked arms in straight-line
-code (docs/qtx.md, "Masks") instead of ssy / @p bra / sync / sync. The
+code (README, "Masks") instead of ssy / @p bra / sync / sync. The
 loop still sheds lanes with the divergence stack. Reports the cycle count
 (not pinned).
 """

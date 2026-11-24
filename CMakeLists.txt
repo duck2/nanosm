@@ -255,9 +255,9 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 if(NANOSM_SANITIZER)
-    # Sanitizer OFF: every test that does not expect a sanitizer panic passes
-    # (those are skipped: GTEST_SKIP, reported by ctest as not run).
-    discover_nanosm_tests(nanosm_tests_nosan "nosan.")
+    # The OFF twin's unit tests are not ctest entries here: scripts/build_nosan.ps1
+    # runs every one of them as its own entry, and the check below runs the
+    # whole twin executable against the ON one.
     if(Python3_Interpreter_FOUND)
         # Sanitizer ON vs OFF: every launch's stdout and Perfetto trace and the
         # unit-test output must be byte-identical. Computation that depends on

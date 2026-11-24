@@ -281,7 +281,7 @@ public:
     void record_tma_descriptor_read(
         uint64_t command, const TmaDescriptor& decoded, uint32_t shmem_address, bool load);
     void record_tma_data_complete(uint64_t command);
-    // ---- the launch copy (docs/qtx.md "Launch") ----
+    // ---- the launch copy (README "Launch") ----
     // The launch block's bytes [begin, end) in shared memory are on their way
     // from global memory: until they land they are write-owned by the launch
     // copy, so an lds, an sts, an mbar operation or a TMA or tensor-core

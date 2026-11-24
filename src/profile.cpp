@@ -155,6 +155,32 @@ void optional_field(
     if (object.contains(name)) out = ranged_field(object.at(name), section, name, low, high);
 }
 
+// Every key a profile carries must be one the parser reads. The document the
+// fingerprint hashes (profile_json) names each of them once, so a key outside
+// it is a misspelt field or a section nothing reads: refused by name, never
+// ignored. A section given as anything but an object (null, a number, an
+// array) is refused by name too; an optional section left out keeps its
+// defaults.
+void refuse_unknown_keys(const json& document) {
+    if (!document.is_object()) return; // the fields' own errors say what is wrong
+    const auto known = profile_json(DeviceProfile{});
+    for (const auto& [section, value] : document.items()) {
+        if (!known.contains(section)) {
+            throw ProfileError("device profile: unknown key '" + section + "' at the top level");
+        }
+        if (!known.at(section).is_object()) continue;
+        if (!value.is_object()) {
+            throw ProfileError("device profile: section '" + section + "' must be an object (got " +
+                value.dump() + ")");
+        }
+        for (const auto& [key, ignored] : value.items()) {
+            if (!known.at(section).contains(key)) {
+                throw ProfileError("device profile: unknown key '" + key + "' in section '" + section + "'");
+            }
+        }
+    }
+}
+
 } // namespace
 
 void validate_device_profile(const DeviceProfile& p) {
@@ -478,6 +504,7 @@ DeviceProfile parse_device_profile(std::string_view source) {
     } catch (const json::exception& error) {
         throw ProfileError(std::string("cannot parse device profile: ") + error.what());
     }
+    refuse_unknown_keys(document);
 
     DeviceProfile p;
     p.name = field<std::string>(document, "name");

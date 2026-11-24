@@ -597,12 +597,6 @@ void Machine::complete_mbar_tx(uint32_t byte_address, uint32_t bytes, uint8_t pa
     tma_mbar_event_.poke(std::move(request)); // between ticks: held from the next cycle on
 }
 
-void Machine::test_set_fetch_pc(uint32_t warp, uint32_t pc) {
-    auto front_end = front_end_.cur().at(warp);
-    front_end.fetch_pc = pc;
-    front_end_.poke(warp, front_end);
-}
-
 uint32_t Machine::read_reg(
     uint32_t warp, uint32_t lane, uint32_t reg) const {
     if (warp >= warps_.size() || lane >= config_.lanes || reg >= kernel_.register_count) {
@@ -631,7 +625,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 45> canonical = {
+    static constexpr std::array<Driver, 46> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -666,6 +660,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_egress,
         &Machine::drive_read_records,
         &Machine::drive_free_id_tags,
+        &Machine::drive_request_channel,
         &Machine::drive_rf_write_pipes,
         &Machine::drive_store_completions,
         &Machine::drive_predicates,

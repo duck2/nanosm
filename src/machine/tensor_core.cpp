@@ -578,7 +578,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     if (inst.opcode == Opcode::mma_commit) {
         MmaCommand command;
-        command.id = next_mma_command_id_++;
+        command.id = mma_command_number_.cur();
         command.commit = true;
         command.warp = op.warp;
         command.mbar_address = mbar_address_operand(op);
@@ -624,7 +624,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
         sanitizer_.check_swizzle64_operand(site(op), "B", b, b_spacing, 2 * shape.k);
     }
     MmaCommand command;
-    command.id = next_mma_command_id_++;
+    command.id = mma_command_number_.cur();
     command.init = is_mma_init(inst.opcode);
     command.shape = shape;
     command.warp = op.warp;
@@ -717,7 +717,10 @@ void Machine::drive_mma_event(const Wires& w) {
 // The MMA queue and pipeline: step_mma's result, plus issue's new command.
 void Machine::drive_mma(const Wires& w) {
     auto next = w.mma_next;
-    if (w.dispatch.mma.has_value()) next.slots.push_back(*w.dispatch.mma);
+    if (w.dispatch.mma.has_value()) {
+        next.slots.push_back(*w.dispatch.mma);
+        mma_command_number_.set_next(w.dispatch.mma->id + 1, "drive_mma");
+    }
     if (next.slots.size() > config_.mma_queue_commands) {
         throw SimError("internal: the tensor core holds more than mma.queue_commands commands");
     }

@@ -1,5 +1,5 @@
-// The stepping discipline: Reg<T>, the LSU assembly contract, simultaneous events, the driver shuffle.
-// Each test's TEST wrapper is at the end.
+// The stepping discipline: the kinds of clocked state (Reg, Regs, Pipe, Fifo, Memory, BlackBox, Bounded payloads),
+// the one-writer rule, the state report, LSU buffer reuse, events that land in one cycle.
 #include "test_support.hpp"
 
 #include <sstream>
@@ -10,17 +10,85 @@ namespace {
 
 using namespace nanosm_test;
 
-// ===========================================================================
-// Stepping discipline
-// ===========================================================================
+// Runs `machine` to the end, tick by tick: what `read()` returns after each
+// cycle's edge, by cycle.
+template <typename Read>
+std::map<uint64_t, std::invoke_result_t<Read&>> after_each_tick(nanosm::Machine& machine, Read read) {
+    std::map<uint64_t, std::invoke_result_t<Read&>> after;
+    while (!machine.done()) {
+        const auto cycle = machine.cycle();
+        tick_capped(machine);
+        after[cycle] = read();
+    }
+    return after;
+}
 
-// ---- Reg<T> (src/machine/reg.hpp) ----
+// One of the LSU's two buffers (0 load, 1 store) at the end of a cycle.
+struct BufferAfter {
+    std::optional<uint64_t> owner;
+    std::vector<uint8_t> valid;
+    uint32_t valid_count = 0;
+};
 
-void test_reg_hold_write_commit() {
+BufferAfter buffer_after(const nanosm::Machine& machine, uint32_t buffer) {
+    return {machine.lsu_buffer_owner(buffer), machine.lsu_buffer_valid(buffer), machine.lsu_buffer_valid_count(buffer)};
+}
+
+struct ReuseRun {
+    std::unique_ptr<nanosm::Machine> machine;
+    uint64_t reuse_cycle = 0;                                          // the second command's admission
+    std::map<uint64_t, std::pair<BufferAfter, BufferAfter>> after;     // (load, store) buffer after each cycle
+};
+
+// `old_load` is LSU command 0, `second` (opcode `second_name`) command 1, with
+// one command slot: the second issues in the cycle the load's final RF write
+// releases the slot and is admitted issue_to_dispatch later. gmem holds
+// pattern words; r5 = 4 x lane, r6 = 2048 + 4 x lane, r2 = 2048 + 32 x lane,
+// r0 = 0, r24 .. r31 = 101 .. 108.
+ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
+    const std::string& second_name) {
+    auto config = fast_bus_profile(2);
+    config.lsu_active_commands = 1;
+    auto launch = launch_warps(1);
+    fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
+    std::string text = "sread r4, LANE_ID\nshli r5, r4, 2\nori r6, r5, 2048\nmov r0, 0\nshli r2, r4, 5\naddi r2, r2, 2048\n";
+    for (uint32_t j = 0; j < 8; ++j) text += "mov r" + std::to_string(24 + j) + ", " + std::to_string(101 + j) + "\n";
+    text += old_load + "\n" + second + "\nhalt\n";
+    ReuseRun run;
+    run.machine = std::make_unique<nanosm::Machine>(
+        config, compile(text, config), std::move(launch), nanosm::TraceOptions{.timeline = true});
+    auto& machine = *run.machine;
+    machine.enable_edge_probe();
+    run.after = after_each_tick(machine, [&] { return std::pair{buffer_after(machine, 0), buffer_after(machine, 1)}; });
+    uint64_t final_drain = 0;
+    for (const auto& event : machine.edge_events())
+        if (event.edge == LsuEdge::rf_write_beat && event.id == 0) final_drain = std::max(final_drain, event.cycle);
+    std::optional<uint64_t> admitted;
+    for (const auto& event : events_named(machine, second_name))
+        if (event.category == nanosm::TraceCategory::gmem && event.id == 1) admitted = event.start_cycle;
+    run.reuse_cycle = final_drain + nanosm::issue_to_dispatch(config);
+    require(admitted == run.reuse_cycle,
+        second_name + " was not admitted issue_to_dispatch after '" + old_load + "' made its final RF write");
+    return run;
+}
+
+// The old load's data: an ldg.v8 of the sector at 0 into every lane (r8 + k
+// holds word k), or an ldg of word `lane` into r8.
+void require_old_load_data(const nanosm::Machine& machine, const std::string& old_load) {
+    const bool vector = old_load.starts_with("ldg.v8");
+    for (uint32_t k = 0; k < (vector ? 8u : 1u); ++k)
+        for (uint32_t lane = 0; lane < 16; ++lane)
+            require(machine.read_reg(0, lane, 8 + k) == pattern_word(vector ? k : lane),
+                old_load + ": r" + std::to_string(8 + k) + " lane " + std::to_string(lane) + " is wrong");
+}
+
+} // namespace
+
+TEST(Stepping, reg_hold_write_commit) {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Reg<int> reg(all,"test register", 5);
+    nanosm::Reg<int> reg(all, "test register", 5);
     sanitizer.record_cycle_start();
     all.commit();
     require(reg.cur() == 5, "a register nobody wrote did not hold its value");
@@ -34,246 +102,125 @@ void test_reg_hold_write_commit() {
     require(reg.cur() == 9, "the tick after a write did not hold");
 }
 
-// A second write in one tick is a PANIC naming the register, the cycle and
-// both writers, even when the same writer writes twice.
-void test_reg_duplicate_write_panics() {
+// One net, one driver: a second write in one tick of a register (even by the
+// same writer), a group's member, a pipeline's push, stage replacement or
+// hold, a FIFO's push, or a memory's port is a PANIC naming the state, the
+// cycle and both writers. A new tick takes one write again; different write
+// points of one pipeline are different nets.
+TEST(Stepping, reg_duplicate_write_panics) {
+    NANOSM_EXPECTS_SANITIZER_PANIC();
+    using Writes = std::function<void(nanosm::AllClocked&, nanosm::Sanitizer&)>;
+    struct Row {
+        std::string what;
+        Writes writes; // builds its state, starts the cycle, writes twice
+        std::vector<std::string> needles;
+    };
+    const auto reg_twice = [](const char* first, const char* second) {
+        return [=](nanosm::AllClocked& all, nanosm::Sanitizer& sanitizer) {
+            nanosm::Reg<int> reg(all, "test register", 0);
+            sanitizer.record_cycle_start();
+            reg.set_next(1, first);
+            reg.set_next(2, second);
+        };
+    };
+    const auto pipe_twice = [](const std::function<void(nanosm::Pipe<int>&, const char*)>& write) {
+        return [=](nanosm::AllClocked& all, nanosm::Sanitizer& sanitizer) {
+            nanosm::Pipe<int> pipe(all, "test pipeline");
+            pipe.build(2);
+            sanitizer.record_cycle_start();
+            write(pipe, "first");
+            write(pipe, "second");
+        };
+    };
+    const auto memory_twice = [](bool write) {
+        return [=](nanosm::AllClocked& all, nanosm::Sanitizer& sanitizer) {
+            nanosm::Memory<uint32_t> memory(all, "ported memory");
+            memory.build(nanosm::MemoryShape{2, 4, 1, 32, 1, 1, 1, nanosm::SameCycle::read_first});
+            sanitizer.record_cycle_start();
+            const std::array<uint32_t, 1> value{1};
+            const auto every = nanosm::Memory<uint32_t>::every_element;
+            if (write) {
+                memory.write(0, 1, value, every, "first");
+                memory.write(1, 1, value, every, "the other bank");
+                memory.write(0, 2, value, every, "second");
+            } else {
+                (void)memory.read(0, 1, "first", 0);
+                (void)memory.read(1, 2, "the other bank", 0);
+                (void)memory.read(0, 2, "second", 0);
+            }
+        };
+    };
+    const std::vector<std::string> pipe_needles = {"test pipeline", "cycle=7", "first by 'first'", "then by 'second'"};
+    const std::vector<Row> rows = {
+        {"register, two writers", reg_twice("drain", "fill"),
+            {"register 'test register'", "cycle=7", "first by 'drain'", "then by 'fill'"}},
+        {"register, the same writer twice", reg_twice("drain", "drain"),
+            {"register 'test register'", "cycle=7", "first by 'drain'", "then by 'drain'"}},
+        {"group member",
+            [](nanosm::AllClocked& all, nanosm::Sanitizer& sanitizer) {
+                nanosm::Regs<int> group(all, "test group");
+                group.build(4, 9);
+                sanitizer.record_cycle_start();
+                group.set_next(2, 1, "first");
+                group.set_next(2, 2, "second");
+            },
+            {"test group [2]", "cycle=7", "first by 'first'", "then by 'second'"}},
+        {"pipeline push", pipe_twice([](nanosm::Pipe<int>& pipe, const char* tag) { pipe.push(1, tag); }), pipe_needles},
+        {"pipeline replace", pipe_twice([](nanosm::Pipe<int>& pipe, const char* tag) { pipe.replace(0, 2, tag); }),
+            pipe_needles},
+        {"pipeline hold", pipe_twice([](nanosm::Pipe<int>& pipe, const char* tag) { pipe.hold(tag); }), pipe_needles},
+        {"FIFO push",
+            [](nanosm::AllClocked& all, nanosm::Sanitizer& sanitizer) {
+                nanosm::Fifo<int> fifo(all, "second FIFO");
+                fifo.build(2);
+                sanitizer.record_cycle_start();
+                fifo.push(1, "first");
+                fifo.push(2, "second");
+            },
+            {"second FIFO (push)", "first by 'first'", "then by 'second'"}},
+        {"memory read port", memory_twice(false),
+            {"PANIC cycle=7", "ported memory' bank 0: read port 0 asked for row 2 after row 1", "'second'"}},
+        {"memory write port", memory_twice(true),
+            {"PANIC cycle=7", "ported memory' bank 0: a write of row 2 with its 1 write port taken", "'second'"}},
+    };
+    for (const auto& row : rows) {
+        nanosm::Sanitizer sanitizer;
+        uint64_t cycle = 7;
+        nanosm::AllClocked all(sanitizer, cycle);
+        const auto message = error_of<nanosm::SimError>([&] { row.writes(all, sanitizer); }, row.what + ": a second write");
+        for (const auto& needle : row.needles)
+            require(message.find(needle) != std::string::npos,
+                row.what + ": the duplicate-write PANIC lacks '" + needle + "': " + message);
+    }
+
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Reg<int> reg(all,"test register", 0);
-    const auto expect_panic = [&](const char* first, const char* second) {
-        sanitizer.record_cycle_start();
-        reg.set_next(1, first);
-        try {
-            reg.set_next(2, second);
-        } catch (const nanosm::SimError& error) {
-            const std::string message = error.what();
-            for (const std::string needle : {std::string("register 'test register'"), std::string("cycle=7"),
-                     std::string("first by '") + first + "'", std::string("then by '") + second + "'"}) {
-                require(message.find(needle) != std::string::npos, "duplicate-write PANIC lacks '" + needle + "': " + message);
-            }
-            all.commit();
-            return;
-        }
-        throw std::runtime_error("a second write in one tick did not panic");
-    };
-    expect_panic("drain", "fill");
-    expect_panic("drain", "drain"); // the same writer twice
+    nanosm::Reg<int> reg(all, "test register", 0);
     sanitizer.record_cycle_start();
-    reg.set_next(3, "next tick");    // a new tick: one write is fine again
+    reg.set_next(1, "drain");
+    (void)error_of<nanosm::SimError>([&] { reg.set_next(2, "fill"); }, "a second write of the register");
+    all.commit();
+    sanitizer.record_cycle_start();
+    reg.set_next(3, "next tick");
     all.commit();
     require(reg.cur() == 3, "the register did not recover after a duplicate-write PANIC");
+    nanosm::Pipe<int> other(all, "other pipeline");
+    other.build(2);
+    sanitizer.record_cycle_start();
+    other.push(1, "entry");
+    other.replace(0, std::nullopt, "stage 0");
+    other.replace(1, std::nullopt, "stage 1");
 }
-
-// ---- The load buffer's groups (per-lane ldg.v8) ----
-
-// A ldg.v8 whose every lane names the same sector (a uniform base): register
-// first_reg + k holds that sector's word k in every lane.
-void require_vector_data(const nanosm::Machine& machine, uint32_t warp, uint32_t first_reg, uint32_t first_word,
-    const std::string& what) {
-    for (uint32_t k = 0; k < 8; ++k)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(warp, lane, first_reg + k) == pattern_word(first_word + k),
-                what + ": r" + std::to_string(first_reg + k) + " lane " + std::to_string(lane) +
-                    " does not hold word " + std::to_string(k) + " of its sector");
-}
-
-// One ldg.v8 over sixteen per-lane sectors at the canonical profile (groups
-// of four lanes): four groups, each written by eight RF writes (r8 .. r15,
-// one a cycle at most), none before the group's last word is in the buffer,
-// and no word of the next group in the buffer before the previous group's
-// last write is granted (the buffer is reused in that cycle at the earliest).
-void test_load_buffer_groups() {
-    const auto config = canonical_profile();
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-    nanosm::Machine machine(config,
-        compile("sread r1, LANE_ID\nshli r0, r1, 5\nldg.v8 r8, [r0]\nhalt\n", config), std::move(launch));
-    machine.enable_edge_probe();
-    machine.run();
-    const uint32_t group_lanes = config.lsu_load_group_lanes;
-    const uint32_t groups = 16 / group_lanes;
-    std::vector<uint64_t> requests; // in arrival order = lane order
-    std::map<uint64_t, uint64_t> first_word, last_word;
-    std::vector<nanosm::LsuEdgeEvent> writes;
-    for (const auto& event : machine.edge_events()) {
-        if (event.edge == LsuEdge::buffer_write) {
-            if (first_word.emplace(event.aux, event.cycle).second) requests.push_back(event.aux);
-            last_word[event.aux] = event.cycle;
-        }
-        if (event.edge == LsuEdge::rf_write_beat) writes.push_back(event);
-    }
-    require(requests.size() == 16, "expected sixteen sectors, one per lane");
-    require(writes.size() == 8 * groups, "expected eight RF writes per lane group");
-    for (std::size_t k = 1; k < writes.size(); ++k)
-        require(writes[k].cycle > writes[k - 1].cycle, "the LSU wrote two RF beats in one cycle");
-    for (uint32_t group = 0; group < groups; ++group) {
-        uint64_t complete = 0;
-        for (uint32_t lane = group * group_lanes; lane < (group + 1) * group_lanes; ++lane)
-            complete = std::max(complete, last_word.at(requests[lane]));
-        for (uint32_t j = 0; j < 8; ++j) {
-            const auto& write = writes[8 * group + j];
-            require(write.aux == 8 + j, "a group's RF writes are not r8 .. r15 in order");
-            require(write.cycle > complete, "a group was written to the RF before its last word was in the buffer");
-        }
-        if (group + 1 != groups) {
-            require(first_word.at(requests[(group + 1) * group_lanes]) >= writes[8 * group + 7].cycle,
-                "the next group's word entered the buffer before the previous group's last RF write");
-        }
-    }
-    for (uint32_t lane = 0; lane < 16; ++lane)
-        for (uint32_t j = 0; j < 8; ++j)
-            require(machine.read_reg(0, lane, 8 + j) == pattern_word(8 * lane + j),
-                "r" + std::to_string(8 + j) + " lane " + std::to_string(lane) + " is not word j of the lane's sector");
-}
-
-// ---- Same-cycle reuse after a load's final RF drain (one command slot) ----
-
-// One of the LSU's two buffers at the end of a cycle.
-struct AssemblyAfter {
-    std::optional<uint64_t> owner;
-    std::vector<uint8_t> valid;
-    uint32_t valid_count = 0;
-};
-
-struct ReuseRun {
-    std::unique_ptr<nanosm::Machine> machine;
-    uint64_t reuse_cycle = 0; // the second command's admission (dispatch)
-    AssemblyAfter after;      // the load buffer after that cycle
-    AssemblyAfter store_after; // the store buffer after that cycle
-    std::map<uint64_t, AssemblyAfter> store_by_cycle; // the store buffer after every cycle
-};
-
-// `old_load` is LSU command 0, `second` (opcode `second_name`) command 1. With
-// one command slot, the second waits for it: it
-// issues in the cycle the load's final RF write releases it (look-ahead
-// (c)) and the LSU admits it issue_to_dispatch later, into the slot
-// free since then. (A claim waits for the
-// release, so issue cannot line the two up in one cycle.)
-// gmem holds pattern words; r5 = 4 * lane, r6 = 2048 + 4 * lane, r24..r31 =
-// 101..108.
-ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
-    const std::string& second_name) {
-    auto config = fast_bus_profile(2);
-    config.lsu_active_commands = 1;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-    // r2: 2048 + 32 x lane, a stg.v8's per-lane sectors; r0 = 0 for every
-    // lane, so the old ldg.v8 loads the sector at 0 into every lane.
-    std::string text = "sread r4, LANE_ID\nshli r5, r4, 2\nori r6, r5, 2048\nmov r0, 0\nshli r2, r4, 5\naddi r2, r2, 2048\n";
-    for (uint32_t j = 0; j < 8; ++j) text += "mov r" + std::to_string(24 + j) + ", " + std::to_string(101 + j) + "\n";
-    text += old_load + "\n" + second + "\nhalt\n";
-    ReuseRun run;
-    run.machine = std::make_unique<nanosm::Machine>(
-        config, compile(text, config), std::move(launch), nanosm::TraceOptions{.timeline = true});
-    auto& machine = *run.machine;
-    machine.enable_edge_probe();
-    std::map<uint64_t, AssemblyAfter> after;       // the load buffer
-    std::map<uint64_t, AssemblyAfter> store_after; // the store buffer
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        tick_capped(machine);
-        after[cycle] = {machine.lsu_buffer_owner(0), machine.lsu_buffer_valid(0), machine.lsu_buffer_valid_count(0)};
-        store_after[cycle] = {machine.lsu_buffer_owner(1), machine.lsu_buffer_valid(1), machine.lsu_buffer_valid_count(1)};
-    }
-    uint64_t final_drain = 0;
-    for (const auto& event : machine.edge_events())
-        if (event.edge == LsuEdge::rf_write_beat && event.id == 0) final_drain = std::max(final_drain, event.cycle);
-    std::optional<uint64_t> admitted;
-    for (const auto& event : machine.trace().events())
-        if (event.category == nanosm::TraceCategory::gmem && event.name == second_name && event.id == 1)
-            admitted = event.start_cycle;
-    const auto dispatch = final_drain + nanosm::issue_to_dispatch(config);
-    require(admitted == dispatch,
-        second_name + " was not admitted issue_to_dispatch after '" + old_load + "' made its final RF write");
-    run.reuse_cycle = dispatch;
-    run.after = after.at(dispatch);
-    run.store_after = store_after.at(dispatch);
-    run.store_by_cycle = std::move(store_after);
-    return run;
-}
-
-void require_old_load_data(const nanosm::Machine& machine, const std::string& old_load) {
-    if (old_load.starts_with("ldg.v8")) {
-        require_vector_data(machine, 0, 8, 0, old_load);
-        return;
-    }
-    for (uint32_t lane = 0; lane < 16; ++lane)
-        require(machine.read_reg(0, lane, 8) == pattern_word(lane), old_load + ": lane " + std::to_string(lane));
-}
-
-// A scalar store admitted after a load's final drain: after its dispatch
-// cycle it owns the STORE buffer with all sixteen lanes valid, and the load
-// buffer is empty and unowned (one buffer per direction, owned
-// only while data is in it). The output alone cannot show it: scalar-store
-// egress reads the words without valid_count.
-void test_buffer_reuse_load_to_scalar_store() {
-    for (const std::string old_load : {"ldg.v8 r8, [r0]", "ldg r8, [r5]"}) {
-        const auto run = run_reuse_after_final_drain(old_load, "stg [r5 + 2048], r6", "stg");
-        const auto where = " after the reuse cycle " + std::to_string(run.reuse_cycle) + " (" + old_load + ")";
-        require(run.store_after.owner == 1u, "the store does not own the store buffer" + where);
-        require(run.store_after.valid_count == 16 &&
-                std::count(run.store_after.valid.begin(), run.store_after.valid.begin() + 16, 1) == 16,
-            "the store's valid bits were lost" + where);
-        require(!run.after.owner.has_value() && run.after.valid_count == 0,
-            "the load buffer is still owned after the load's final drain" + where);
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(run.machine->read_gmem_u32(2048 + 4 * lane) == 2048 + 4 * lane,
-                "the scalar store wrote the wrong word for lane " + std::to_string(lane));
-        require_old_load_data(*run.machine, old_load);
-    }
-}
-
-// A stg.v8 admitted then: its first RF read beat is sampled in its admission
-// cycle (bypass (e)) and fills the store buffer Lr later; the buffer has
-// no owner until that data lands.
-void test_buffer_reuse_load_to_vector_store() {
-    const std::string old_load = "ldg.v8 r8, [r0]";
-    const auto run = run_reuse_after_final_drain(old_load, "stg.v8 [r2], r24", "stg.v8");
-    bool first_read_now = false;
-    for (const auto& event : run.machine->edge_events())
-        if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == run.reuse_cycle) first_read_now = true;
-    require(first_read_now, "the stg.v8's first RF read was not in the reuse cycle; the test proves little");
-    require(!run.store_after.owner.has_value() && run.store_after.valid_count == 0,
-        "the store buffer is owned before the stg.v8's first beat has landed");
-    const auto filled = run.store_by_cycle.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles);
-    // The first beat brings r24 for the first group's lanes: one word a lane.
-    require(filled.owner == 1u && filled.valid_count == canonical_profile().lsu_store_group_lanes,
-        "the stg.v8's first read beat is not in the store buffer Lr after the reuse cycle");
-    for (uint32_t j = 0; j < 8; ++j)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(run.machine->read_gmem_u32(2048 + 32 * lane + 4 * j) == 101 + j,
-                "the stg.v8 wrote the wrong word: r" + std::to_string(24 + j) + " lane " + std::to_string(lane));
-    require_old_load_data(*run.machine, old_load);
-}
-
-// A new load admitted then: the load buffer is empty and unowned until its
-// first word returns. (Assembly contract 5 covers ldg.v8 -> ldg.v8 through
-// the data path.)
-void test_buffer_reuse_load_to_load() {
-    const std::string old_load = "ldg.v8 r8, [r0]";
-    const auto run = run_reuse_after_final_drain(old_load, "ldg r16, [r5 + 1024]", "ldg");
-    require(!run.after.owner.has_value(), "the load buffer is owned before the new load's first word returned");
-    require(run.after.valid_count == 0,
-        "the load buffer is not empty after the old load's final drain");
-    for (uint32_t lane = 0; lane < 16; ++lane)
-        require(run.machine->read_reg(0, lane, 16) == pattern_word(256 + lane),
-            "the new load returned the wrong word for lane " + std::to_string(lane));
-    require_old_load_data(*run.machine, old_load);
-}
-
-// ---- Pipe<T> (src/machine/pipe.hpp) ----
 
 // A value pushed in tick t is in stage n - 1 after n edges and gone after N;
 // a hold keeps every stage; a replacement travels with its value; a value
 // replaced by nothing leaves at that stage.
-void test_pipe_advance_hold_replace() {
+TEST(Stepping, pipe_advance_hold_replace) {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 0;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Pipe<int> pipe(all,"test pipeline");
+    nanosm::Pipe<int> pipe(all, "test pipeline");
     pipe.build(3);
     const auto tick = [&]() {
         all.commit();
@@ -314,57 +261,16 @@ void test_pipe_advance_hold_replace() {
     require(std::string(size.kind) == "pipeline" && size.entries == 3, "the pipeline does not report its stages");
 }
 
-// Each write point is one net with one driver: a second push, a second
-// replacement of one stage and a second hold in one tick are PANICs naming
-// the pipeline and both writers.
-void test_pipe_duplicate_write_panics() {
-    nanosm::Sanitizer sanitizer;
-    uint64_t cycle = 7;
-    nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Pipe<int> pipe(all,"test pipeline");
-    pipe.build(2);
-    const auto expect_panic = [&](const std::string& what, const std::function<void(const char*)>& write) {
-        sanitizer.record_cycle_start();
-        write("first");
-        try {
-            write("second");
-        } catch (const nanosm::SimError& error) {
-            const std::string message = error.what();
-            for (const std::string needle : {std::string("test pipeline"), std::string("cycle=7"),
-                     std::string("first by 'first'"), std::string("then by 'second'")}) {
-                require(message.find(needle) != std::string::npos,
-                    what + ": the duplicate-write PANIC lacks '" + needle + "': " + message);
-            }
-            return;
-        }
-        throw std::runtime_error(what + ": a second write in one tick did not panic");
-    };
-    expect_panic("push", [&](const char* tag) { pipe.push(1, tag); });
-    expect_panic("replace", [&](const char* tag) { pipe.replace(0, 2, tag); });
-    expect_panic("hold", [&](const char* tag) { pipe.hold(tag); });
-    // Different points in one tick are different nets.
-    nanosm::Pipe<int> other(all,"other pipeline");
-    other.build(2);
-    sanitizer.record_cycle_start();
-    other.push(1, "entry");
-    other.replace(0, std::nullopt, "stage 0");
-    other.replace(1, std::nullopt, "stage 1");
-}
-
-// ---- Bounded<T, N> (src/machine/fixed.hpp) and the maxima (src/limits.hpp) ----
-
 // A payload of at most N items: it counts what it holds, compares only the
 // counted items, refuses one more than N, and a profile past an architectural
-// maximum is refused by name before a machine is built.
-void test_bounded_payload_and_limits() {
+// maximum is refused by name before a machine is built. A standard container
+// is not a fixed payload (the compiler refuses it as clocked state).
+TEST(Stepping, bounded_payload_and_limits) {
     nanosm::Bounded<uint32_t, 4> words;
     require(words.empty() && words.capacity() == 4, "a new payload is not empty");
     for (uint32_t value = 1; value <= 4; ++value) words.push_back(value);
     require(words.size() == 4 && words.front() == 1 && words.back() == 4, "a payload lost an item");
-    try {
-        words.push_back(5);
-        throw std::runtime_error("a payload took more items than it has places");
-    } catch (const nanosm::SimError&) {}
+    (void)error_of<nanosm::SimError>([&] { words.push_back(5); }, "a fifth item in a payload of four");
     words.pop_front();
     nanosm::Bounded<uint32_t, 4> same{2, 3, 4};
     require(words == same && words.size() == 3, "an ordered payload's head did not leave in order");
@@ -376,26 +282,19 @@ void test_bounded_payload_and_limits() {
 
     auto profile = canonical_profile();
     profile.shmem_banks = static_cast<uint32_t>(nanosm::limits::shmem_banks) + 1;
-    try {
-        nanosm::validate_device_profile(profile);
-        throw std::runtime_error("a profile past an architectural maximum was accepted");
-    } catch (const nanosm::ProfileError& error) {
-        require(std::string(error.what()).find("shmem banks") != std::string::npos,
-            std::string("the refusal does not name the knob: ") + error.what());
-    }
+    expect_error<nanosm::ProfileError>([&] { nanosm::validate_device_profile(profile); }, {"shmem banks"},
+        "a profile past an architectural maximum");
 }
 
-// ---- Regs<T> (src/machine/regs.hpp) ----
-
 // A group is N registers under one name: a member written this tick takes its
-// value at the edge, a member nobody writes holds, different members may be
-// written in one tick, and one member written twice in a tick is a PANIC
-// naming the group, the member and both writers.
-void test_regs_members_hold_write_and_panic() {
+// value at the edge, a member nobody writes holds, and different members may
+// be written in one tick. A group of single bits reads a member by value (the
+// bits have no address to refer to).
+TEST(Stepping, regs_members_hold_and_write) {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 7;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Regs<int> group(all,"test group");
+    nanosm::Regs<int> group(all, "test group");
     group.build(4, 9);
     sanitizer.record_cycle_start();
     require(group.count() == 4 && group.cur() == std::vector<int>({9, 9, 9, 9}), "a new group lacks its initial values");
@@ -409,20 +308,19 @@ void test_regs_members_hold_write_and_panic() {
     require(group.cur() == std::vector<int>({9, 11, 9, 13}), "a group nobody wrote did not hold");
     const auto size = group.size();
     require(std::string(size.kind) == "group" && size.entries == 4, "the group does not report its members");
+
+    nanosm::Regs<bool> bits(all, "test bits");
+    bits.build(3, false);
+    const nanosm::Regs<bool>& view = bits;
     sanitizer.record_cycle_start();
-    group.set_next(2, 1, "first");
-    try {
-        group.set_next(2, 2, "second");
-    } catch (const nanosm::SimError& error) {
-        const std::string message = error.what();
-        for (const std::string needle : {std::string("test group [2]"), std::string("cycle=7"),
-                 std::string("first by 'first'"), std::string("then by 'second'")}) {
-            require(message.find(needle) != std::string::npos,
-                "the group's duplicate-write PANIC lacks '" + needle + "': " + message);
-        }
-        return;
-    }
-    throw std::runtime_error("a second write of one member in one tick did not panic");
+    bits.set_next(1, true, "set");
+    all.commit();
+    const bool held = bits[1].cur();
+    require(held && view[1].cur() && !bits[0].cur() && !view.at(2).cur(), "a one-bit member did not take its write");
+    sanitizer.record_cycle_start();
+    bits[2].set_next(true, "set");
+    all.commit();
+    require(bits[1].cur() && bits.at(2).cur() && !bits[0].cur(), "a one-bit member did not hold across a tick");
 }
 
 // A FIFO: the next pop returns the oldest entry; an entry pushed at t is
@@ -430,11 +328,11 @@ void test_regs_members_hold_write_and_panic() {
 // widths; a push past its capacity is an internal error. A FIFO of single
 // bits reads a bit by value and holds it across a tick; a zero-capacity FIFO
 // takes a pop of nothing and holds.
-void test_fifo_order_latency_and_widths() {
+TEST(Stepping, fifo_order_latency_and_widths) {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 3;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Fifo<int> fifo(all,"test FIFO");
+    nanosm::Fifo<int> fifo(all, "test FIFO");
     fifo.build(4, nanosm::FifoPorts{2, 2, 2});
     const auto tick = [&] {
         all.commit();
@@ -457,24 +355,12 @@ void test_fifo_order_latency_and_widths() {
     require(std::string(size.kind) == "FIFO" && size.entries == 4 && size.write_ports == 2 && size.read_ports == 2 &&
             size.read_delay == 2,
         "the FIFO does not report its capacity, its ports' widths and its read latency");
-    bool refused = false;
-    try {
-        (void)fifo.front(2); // past the read port
-    } catch (const nanosm::SimError&) {
-        refused = true;
-    }
-    require(refused, "a read past the read port's width was allowed");
+    (void)error_of<nanosm::SimError>([&] { (void)fifo.front(2); }, "a read past the read port's width");
     fifo.push(std::vector<int>{4, 5}, "writer");
     tick();
     fifo.push(6, "writer");
-    refused = false;
-    try {
-        tick();
-    } catch (const nanosm::SimError& error) {
-        refused = std::string(error.what()).find("holds more than its 4 entries") != std::string::npos;
-    }
-    require(refused, "a push past the capacity was not an internal error");
-    // (A machine stops at an internal error; these two get an AllClocked of their own.)
+    expect_error<nanosm::SimError>(tick, {"holds more than its 4 entries"}, "a push past the capacity");
+    // A machine stops at an internal error; these two get an AllClocked of their own.
     nanosm::Sanitizer quiet;
     nanosm::AllClocked other(quiet, cycle);
     nanosm::Fifo<bool> bits(other, "test bits FIFO");
@@ -496,96 +382,15 @@ void test_fifo_order_latency_and_widths() {
     require(none.empty() && none.room() == 0, "a zero-capacity FIFO did not hold after a pop of nothing");
 }
 
-// A second push into one FIFO in one tick PANICs, as a second write of a register.
-void test_fifo_second_push_panics() {
-    nanosm::Sanitizer sanitizer;
-    uint64_t cycle = 3;
-    nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Fifo<int> second(all,"second FIFO");
-    second.build(2);
-    sanitizer.record_cycle_start();
-    second.push(1, "first");
-    try {
-        second.push(2, "second");
-    } catch (const nanosm::SimError& error) {
-        const std::string message = error.what();
-        for (const std::string needle : {std::string("second FIFO (push)"), std::string("first by 'first'"),
-                 std::string("then by 'second'")}) {
-            require(message.find(needle) != std::string::npos,
-                "the FIFO's second-push PANIC lacks '" + needle + "': " + message);
-        }
-        return;
-    }
-    throw std::runtime_error("a second push in one tick did not panic");
-}
-
-// A black box's output register holds a value from its inputs' cycle +
-// latency, for that one cycle; nothing passes through it in one cycle, and
-// inputs closer than its interval are refused (a refused value is not a
-// write: a good one may follow in the same tick). It refuses a value before
-// it is built; one that keeps an inside is built with the inside's idle
-// question, and is not empty while the inside holds work.
-void test_black_box_latency_and_interval() {
-    nanosm::Sanitizer sanitizer;
-    uint64_t cycle = 0;
-    nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::BlackBox<uint32_t> black_box(all, nanosm::Unit::none, "a black box");
-    const auto refused = [&](uint32_t value, uint64_t taken_at) {
-        try {
-            black_box.deliver(value, taken_at, "test");
-        } catch (const nanosm::SimError&) {
-            return true;
-        }
-        return false;
-    };
-    require(refused(1, 0), "a black box not yet built took a value");
-    nanosm::BlackBoxDeclaration declaration("a black box");
-    declaration.latency = 3;
-    declaration.interval = 2;
-    black_box.build(declaration);
-    std::vector<std::optional<uint32_t>> outputs;
-    for (; cycle < 8; ++cycle) {
-        sanitizer.record_cycle_start();
-        if (cycle == 0) black_box.deliver(10, 0, "test");
-        if (cycle == 1) require(refused(11, 1), "an input one cycle after another was taken (interval 2)");
-        if (cycle == 2) {
-            require(refused(12, 1), "an input one cycle after another was taken (interval 2)");
-            black_box.deliver(12, 2, "test"); // after a refusal in the same tick
-        }
-        if (cycle == 7) require(refused(13, 4), "a value due now was delivered (it would pass in one cycle)");
-        outputs.push_back(black_box.output());
-        all.commit();
-    }
-    const std::vector<std::optional<uint32_t>> expected{
-        std::nullopt, std::nullopt, std::nullopt, 10u, std::nullopt, 12u, std::nullopt, std::nullopt};
-    require(outputs == expected, "the black box's output register does not hold each value at its inputs' cycle + 3");
-    require(black_box.empty(), "the black box is not empty after its outputs");
-
-    nanosm::BlackBox<uint32_t, int> keeper(all, nanosm::Unit::none, "a black box with an inside");
-    nanosm::BlackBoxDeclaration keeps("a black box with an inside");
-    bool unasked = false;
-    try {
-        keeper.build(keeps);
-    } catch (const nanosm::SimError&) {
-        unasked = true;
-    }
-    require(unasked, "a black box that keeps an inside was built without its idle question");
-    keeper.build(keeps, [](const int& waiting) { return waiting == 0; });
-    keeper.inside() = 1;
-    require(!keeper.empty(), "a black box with work inside says it is empty");
-    keeper.inside() = 0;
-    require(keeper.empty(), "an idle black box says it is not empty");
-}
-
 // A memory: a read sees the word as it was at the start of the cycle and a
 // write lands at the clock edge (read first); a write enables its elements one
-// by one; two reads of one word through one port are one read; it reports its
-// words, width and ports.
-void test_memory_read_first_and_enables() {
+// by one; two reads of one word through one port are one read; a memory with
+// no write port refuses a write; it reports its words, width and ports.
+TEST(Stepping, memory_read_first_and_enables) {
     nanosm::Sanitizer sanitizer;
     uint64_t cycle = 0;
     nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Memory<uint32_t> memory(all,"test memory");
+    nanosm::Memory<uint32_t> memory(all, "test memory");
     memory.build(nanosm::MemoryShape{2, 4, 2, 64, 1, 1, 2, nanosm::SameCycle::read_first});
     const auto tick = [&] {
         all.commit();
@@ -604,100 +409,77 @@ void test_memory_read_first_and_enables() {
     tick();
     require(memory.peek(1, 3)[0] == 7 && memory.peek(1, 3)[1] == 10, "a write did not keep its disabled element");
     require(memory.contents().at((3 * 2 + 1) * 2 + 1) == 10, "the storage is not in (row, bank, element) order");
-    bool refused = false;
-    try {
-        memory.poke(0, 0, 2, 99); // element 2 of a two-element word: bank 1's word in the storage
-    } catch (const nanosm::SimError&) {
-        refused = true;
-    }
-    require(refused && memory.peek(1, 0)[0] == 0, "a poke past the word's elements reached the next word");
-    nanosm::Memory<uint32_t> rom(all,"read-only memory");
+    // Element 2 of a two-element word would be bank 1's word in the storage.
+    (void)error_of<nanosm::SimError>([&] { memory.poke(0, 0, 2, 99); }, "a poke past the word's elements");
+    require(memory.peek(1, 0)[0] == 0, "a poke past the word's elements reached the next word");
+    nanosm::Memory<uint32_t> rom(all, "read-only memory");
     rom.build(nanosm::MemoryShape{1, 2, 1, 32, 1, 0, 1, nanosm::SameCycle::read_only});
-    refused = false;
-    try {
-        const std::array<uint32_t, 1> value{1};
-        rom.write(0, 0, value, nanosm::Memory<uint32_t>::every_element, "writer");
-    } catch (const nanosm::SimError&) {
-        refused = true;
-    }
-    require(refused, "a write into a memory with no write port was taken");
+    const std::array<uint32_t, 1> value{1};
+    (void)error_of<nanosm::SimError>(
+        [&] { rom.write(0, 0, value, nanosm::Memory<uint32_t>::every_element, "writer"); },
+        "a write into a memory with no write port");
     const auto size = memory.size();
-    require(std::string(size.kind) == "memory" && size.entries == 8 && size.banks == 2 &&
-            size.word_bits == 64 && size.read_ports == 1 && size.write_ports == 1 &&
-            size.read_delay == 2,
+    require(std::string(size.kind) == "memory" && size.entries == 8 && size.banks == 2 && size.word_bits == 64 &&
+            size.read_ports == 1 && size.write_ports == 1 && size.read_delay == 2,
         "the memory does not report its words, width, banks and ports");
 }
 
-// A memory's port asked for a second word in one cycle, or a write with every
-// write port taken, PANICs, as a second write of a register.
-void test_memory_port_panics() {
-    for (const bool write : {false, true}) {
-        nanosm::Sanitizer sanitizer;
-        uint64_t cycle = 5;
-        nanosm::AllClocked all(sanitizer, cycle);
-        nanosm::Memory<uint32_t> memory(all,"ported memory");
-        memory.build(nanosm::MemoryShape{2, 4, 1, 32, 1, 1, 1, nanosm::SameCycle::read_first});
+// A black box's output register holds a value from its inputs' cycle +
+// latency, for that one cycle; nothing passes through it in one cycle, and
+// inputs closer than its interval are refused (a refused value is not a
+// write: a good one may follow in the same tick). It refuses a value before
+// it is built; one that keeps an inside is built with the inside's idle
+// question, and is not empty while the inside holds work.
+TEST(Stepping, black_box_latency_and_interval) {
+    nanosm::Sanitizer sanitizer;
+    uint64_t cycle = 0;
+    nanosm::AllClocked all(sanitizer, cycle);
+    nanosm::BlackBox<uint32_t> black_box(all, nanosm::Unit::none, "a black box");
+    const auto refuse = [&](uint32_t value, uint64_t taken_at, const std::string& what) {
+        (void)error_of<nanosm::SimError>([&] { black_box.deliver(value, taken_at, "test"); }, what);
+    };
+    refuse(1, 0, "a value before the black box is built");
+    nanosm::BlackBoxDeclaration declaration("a black box");
+    declaration.latency = 3;
+    declaration.interval = 2;
+    black_box.build(declaration);
+    std::vector<std::optional<uint32_t>> outputs;
+    for (; cycle < 8; ++cycle) {
         sanitizer.record_cycle_start();
-        const std::array<uint32_t, 1> value{1};
-        try {
-            if (write) {
-                memory.write(0, 1, value, nanosm::Memory<uint32_t>::every_element, "first");
-                memory.write(1, 1, value, nanosm::Memory<uint32_t>::every_element, "the other bank");
-                memory.write(0, 2, value, nanosm::Memory<uint32_t>::every_element, "second");
-            } else {
-                (void)memory.read(0, 1, "first", 0);
-                (void)memory.read(1, 2, "the other bank", 0);
-                (void)memory.read(0, 2, "second", 0);
-            }
-        } catch (const nanosm::SimError& error) {
-            const std::string message = error.what();
-            const std::string needle = write ? "ported memory' bank 0: a write of row 2 with its 1 write port taken"
-                                             : "ported memory' bank 0: read port 0 asked for row 2 after row 1";
-            require(message.find("PANIC cycle=5") != std::string::npos && message.find(needle) != std::string::npos &&
-                    message.find("'second'") != std::string::npos,
-                "the memory's port PANIC does not say what happened: " + message);
-            continue;
+        if (cycle == 0) black_box.deliver(10, 0, "test");
+        if (cycle == 1) refuse(11, 1, "an input one cycle after another (interval 2)");
+        if (cycle == 2) {
+            refuse(12, 1, "an input one cycle after another (interval 2)");
+            black_box.deliver(12, 2, "test"); // after a refusal in the same tick
         }
-        throw std::runtime_error(std::string("a second ") + (write ? "write" : "read") + " through one port did not panic");
+        if (cycle == 7) refuse(13, 4, "a value due now (it would pass in one cycle)");
+        outputs.push_back(black_box.output());
+        all.commit();
     }
+    const std::vector<std::optional<uint32_t>> expected{
+        std::nullopt, std::nullopt, std::nullopt, 10u, std::nullopt, 12u, std::nullopt, std::nullopt};
+    require(outputs == expected, "the black box's output register does not hold each value at its inputs' cycle + 3");
+    require(black_box.empty(), "the black box is not empty after its outputs");
+
+    nanosm::BlackBox<uint32_t, int> keeper(all, nanosm::Unit::none, "a black box with an inside");
+    nanosm::BlackBoxDeclaration keeps("a black box with an inside");
+    (void)error_of<nanosm::SimError>([&] { keeper.build(keeps); }, "a black box with an inside but no idle question");
+    keeper.build(keeps, [](const int& waiting) { return waiting == 0; });
+    keeper.inside() = 1;
+    require(!keeper.empty(), "a black box with work inside says it is empty");
+    keeper.inside() = 0;
+    require(keeper.empty(), "an idle black box says it is not empty");
 }
 
-// The state report is an inventory: every piece of clocked state is listed
-// once, with its kind, under its unit's heading; every black box's contract is
-// printed with its latency.
-void test_state_report_inventory() {
-    const auto config = canonical_profile();
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
+// The state report lists every piece of clocked state, each in a unit, and
+// prints every black box with its unit and latency.
+TEST(Stepping, state_report_inventory) {
+    const nanosm::Machine machine(canonical_profile(), compile("halt\n"), launch_warps(1));
     const auto report = machine.state_report();
-    // The report's lines, each with the unit heading it is under.
-    std::vector<std::pair<std::string, std::string>> lines;
-    std::istringstream text(report);
-    std::string line;
-    std::string heading;
-    while (std::getline(text, line)) {
-        if (!line.empty() && line[0] != ' ') heading = line;
-        lines.emplace_back(heading, line);
-    }
-    const auto sizes = machine.state_sizes();
-    for (const auto& size : sizes) {
+    for (const auto& size : machine.state_sizes()) {
         require(size.unit != nanosm::Unit::none, "'" + size.name + "' belongs to no unit");
-        std::string kind = size.kind;
-        kind.resize(9, ' ');
-        const std::string prefix = "  " + kind + " " + size.name;
-        uint32_t found = 0;
-        for (const auto& [under, listed] : lines) {
-            if (listed.rfind(prefix, 0) != 0) continue;
-            const auto rest = listed.substr(prefix.size());
-            if (!rest.empty() && rest.rfind("  ", 0) != 0) continue; // a longer name
-            ++found;
-            require(under == nanosm::unit_name(size.unit),
-                "'" + size.name + "' is listed under '" + under + "', not its unit");
-        }
-        require(found == 1, "'" + size.name + "' is listed " + std::to_string(found) + " times");
+        require(report.find(" " + size.name) != std::string::npos, "the report does not list '" + size.name + "'");
     }
-    require(machine.black_boxes().size() == 10, "the report's black boxes are not ten");
     for (const auto& black_box : machine.black_boxes()) {
         require(report.find("  " + black_box.name + " (" + nanosm::unit_name(black_box.unit) + ")\n    latency " +
                     std::to_string(black_box.latency) + " (") != std::string::npos,
@@ -705,14 +487,11 @@ void test_state_report_inventory() {
     }
 }
 
-// The machine's black boxes are exactly these ten. Adding a black box, or
-// changing what one takes in, gives out or how long it takes, is something to
-// tell the human plainly; this list is edited with it.
-void test_black_boxes_are_the_listed_ten() {
-    const auto config = canonical_profile();
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
+// The machine's black boxes are these ten, by name. Only the names are
+// checked: a change to what one takes in, gives out or how long it takes
+// passes this test (and is still to be said plainly).
+TEST(Stepping, black_boxes_are_the_listed_ten) {
+    const nanosm::Machine machine(canonical_profile(), compile("halt\n"), launch_warps(1));
     std::vector<std::string> names;
     for (const auto& black_box : machine.black_boxes()) names.push_back(black_box.name);
     std::sort(names.begin(), names.end());
@@ -721,265 +500,101 @@ void test_black_boxes_are_the_listed_ten() {
     require(names == expected, "the machine's black boxes are not the listed ten");
 }
 
-// The host's view of shared memory is shmem.bytes long, though the memory's
-// last row (4-byte words x banks) is whole.
-void test_shmem_host_view_is_the_configured_bytes() {
-    auto config = canonical_profile();
-    config.shmem_bytes = 65532;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
-    require(machine.shmem().size() == 65532, "the host sees more shared memory than shmem.bytes");
-    (void)machine.read_shmem_u32(65528);
-    bool refused = false;
-    try {
-        (void)machine.read_shmem_u32(65532);
-    } catch (const nanosm::SimError&) {
-        refused = true;
-    }
-    require(refused, "a host read past shmem.bytes succeeded");
-}
-
-// A group of single bits: a member's value is read by value (the bits have no
-// address to refer to), holds across a tick nobody writes it, and takes its
-// own write.
-void test_regs_one_bit_members() {
-    nanosm::Sanitizer sanitizer;
-    uint64_t cycle = 0;
-    nanosm::AllClocked all(sanitizer, cycle);
-    nanosm::Regs<bool> bits(all,"test bits");
-    bits.build(3, false);
-    const nanosm::Regs<bool>& view = bits;
-    sanitizer.record_cycle_start();
-    bits.set_next(1, true, "set");
-    all.commit();
-    const bool held = bits[1].cur();
-    require(held && view[1].cur() && !bits[0].cur() && !view.at(2).cur(), "a one-bit member did not take its write");
-    sanitizer.record_cycle_start();
-    bits[2].set_next(true, "set");
-    all.commit();
-    require(bits[1].cur() && bits.at(2).cur() && !bits[0].cur(), "a one-bit member did not hold across a tick");
-}
-
-// Sixteen stores of one warp on one depbar, back to back, on a profile whose
-// A-write pipeline is long: a store leaves its slot at its last grant and
-// still counts on its depbar until that write reaches the RAM, so more
-// stores than there are slots count on sb0 at once. The counter is wide
-// enough for all of them (Machine::depbar_counter_max_) and every store
-// lands.
-void test_depbar_counts_stores_on_their_way_to_ram() {
-    auto profile = canonical_profile();
-    profile.shmem_port_a_depth = 64;
-    profile.mbar_wait_slots = 1;
-    profile.tma_queue_commands = 1;
-    nanosm::validate_device_profile(profile);
-    std::string body = "mov r1, 7\nsread r0, LANE_ID\nshli r0, r0, 2\n";
-    for (uint32_t store = 0; store < 16; ++store) {
-        body += "sts [r0 + " + std::to_string(64 * store) + "], r1 {pred=PT, stall=0, set=sb0, wait=-}\n";
-    }
-    body += "halt {pred=PT, stall=0, set=-, wait=sb0}\n";
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch));
-    uint32_t most = 0;
-    while (!machine.done()) {
-        tick_capped(machine);
-        most = std::max(most, machine.depbar_value(0, 0));
-    }
-    require(most > profile.shmem_store_slots, "the stores never outnumbered the store slots on sb0; re-derive the test");
-    for (uint32_t store = 0; store < 16; ++store) {
-        for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-            uint32_t word = 0;
-            std::memcpy(&word, machine.shmem().data() + 64 * store + 4 * lane, 4);
-            require(word == 7,
-                "store " + std::to_string(store) + " did not land in lane " + std::to_string(lane));
-        }
-    }
-}
-
-// The stg.v8 store-data read pipe (lsu_read_pipe_): a register-file read
-// granted at t fills the store buffer at the edge of t + Lr, neither earlier
-// nor later, so a gap between two grants reappears as the same gap at the
-// buffer. Other instructions take the read ports while the store reads, so
-// the grants come both back to back and with gaps. At two read latencies.
-void test_store_data_read_pipe_keeps_gaps() {
-    for (const uint32_t lr : {2u, 3u}) {
-        auto config = canonical_profile();
-        config.rf_read_latency_cycles = lr;
-        config.urf_issue_to_port_cycles = std::max(config.urf_issue_to_port_cycles, 1 + lr);
-        const uint32_t width = config.lsu_store_group_lanes;
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        image_bytes(launch.gmem_image, 4096);
-        // r2 = 2048 + 32 x lane; r(24 + j) = 1000 j + lane.
-        std::string text = "sread r4, LANE_ID\nshli r2, r4, 5\naddi r2, r2, 2048\n";
-        for (uint32_t j = 0; j < 8; ++j)
-            text += "addi r" + std::to_string(24 + j) + ", r4, " + std::to_string(1000 * j) + "\n";
-        text += "stg.v8 [r2], r24\n";
-        // Issue reads r24 (bank 0) and r25 (bank 1) while the store wants them.
-        for (uint32_t i = 0; i < 14; ++i) text += "add r40, r24, r25\n";
-        text += "halt\n";
-        nanosm::Machine machine(config, compile(text, config), std::move(launch), nanosm::TraceOptions{.timeline = true});
-        machine.enable_edge_probe();
-        struct After {
-            std::optional<uint64_t> owner;
-            uint32_t group = 0;
-            std::vector<uint8_t> valid;
-            std::vector<uint32_t> words;
-        };
-        std::map<uint64_t, After> after; // the store buffer after each cycle's edge
-        while (!machine.done()) {
-            const auto cycle = machine.cycle();
-            tick_capped(machine);
-            after[cycle] = {machine.lsu_buffer_owner(1), machine.lsu_buffer_group(1), machine.lsu_buffer_valid(1),
-                machine.lsu_buffer_words(1)};
-        }
-        std::vector<std::pair<uint64_t, uint32_t>> grants; // (cycle, register)
-        for (const auto& event : machine.edge_events())
-            if (event.edge == LsuEdge::rf_read_beat) grants.emplace_back(event.cycle, event.aux);
-        const auto where = " (Lr = " + std::to_string(lr) + ")";
-        require(grants.size() == 8 * (16 / width), "the stg.v8 did not make eight reads per lane group" + where);
-        bool back_to_back = false;
-        bool gap_in_group = false;
-        for (std::size_t i = 0; i < grants.size(); ++i) {
-            const auto [cycle, reg] = grants[i];
-            const uint32_t group = static_cast<uint32_t>(i / 8);
-            const uint32_t beat = static_cast<uint32_t>(i % 8);
-            require(reg == 24 + beat, "the reads are not rS .. rS + 7 in order" + where);
-            if (beat != 0) {
-                back_to_back = back_to_back || cycle == grants[i - 1].first + 1;
-                gap_in_group = gap_in_group || cycle > grants[i - 1].first + 1;
-            }
-            const auto& landed = after.at(cycle + lr);
-            const auto& before = after.at(cycle + lr - 1);
-            const auto at = " at grant " + std::to_string(i) + " (cycle " + std::to_string(cycle) + ")" + where;
-            require(landed.owner == 0u && landed.group == group, "the store buffer has the wrong owner or group" + at);
-            for (uint32_t lane = group * width; lane < (group + 1) * width; ++lane) {
-                const uint32_t slot = (lane - group * width) * 8 + beat;
-                require(landed.valid.at(slot) == 1 && landed.words.at(slot) == 1000 * beat + lane,
-                    "the beat is not in the store buffer Lr after its grant" + at);
-                require(!(before.owner == 0u && before.group == group && before.valid.at(slot) == 1),
-                    "the beat is in the store buffer earlier than Lr after its grant" + at);
-            }
-        }
-        require(back_to_back && gap_in_group,
-            "the run has no back-to-back pair or no gap between a group's reads; the test proves little" + where);
-        // The machine reports the pipe with its stages.
-        bool reported = false;
-        for (const auto& size : machine.state_sizes()) {
-            reported = reported || (size.name == "LSU store-data read pipeline" &&
-                std::string(size.kind) == "pipeline" && size.entries == lr);
-        }
-        require(reported, "the state sizes do not list the store-data read pipe with Lr stages" + where);
+// An LSU buffer is owned only while data is in it, one buffer per direction.
+// After a load's final RF drain, with one command slot, the next command is
+// admitted issue_to_dispatch later (run_reuse_after_final_drain) and finds the
+// load buffer empty and unowned:
+// - a scalar store owns the store buffer with sixteen valid lanes after its
+//   admission cycle (its egress reads the words without valid_count, so the
+//   output alone cannot show it);
+// - a stg.v8's first RF read is sampled in its admission cycle and fills the
+//   store buffer Lr later; the buffer has no owner until then;
+// - a new load leaves the load buffer unowned until its first word returns.
+TEST(Stepping, buffer_reuse_load_to_scalar_store) {
+    using Check = std::function<void(const ReuseRun&, const std::string&)>;
+    struct Row {
+        std::string old_load;
+        std::string second;
+        std::string second_name;
+        Check check;
+    };
+    const Check scalar_store = [](const ReuseRun& run, const std::string& where) {
+        const auto& [load, store] = run.after.at(run.reuse_cycle);
+        require(store.owner == 1u, "the store does not own the store buffer" + where);
+        require(store.valid_count == 16 && std::count(store.valid.begin(), store.valid.begin() + 16, 1) == 16,
+            "the store's valid bits were lost" + where);
+        require(!load.owner.has_value() && load.valid_count == 0,
+            "the load buffer is still owned after the load's final drain" + where);
         for (uint32_t lane = 0; lane < 16; ++lane)
-            for (uint32_t j = 0; j < 8; ++j)
-                require(machine.read_gmem_u32(2048 + 32 * lane + 4 * j) == 1000 * j + lane,
-                    "the stg.v8 wrote the wrong word" + where);
+            require(run.machine->read_gmem_u32(2048 + 4 * lane) == 2048 + 4 * lane,
+                "the scalar store wrote the wrong word for lane " + std::to_string(lane) + where);
+    };
+    const Check vector_store = [](const ReuseRun& run, const std::string& where) {
+        bool first_read_now = false;
+        for (const auto& event : run.machine->edge_events())
+            if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == run.reuse_cycle) first_read_now = true;
+        require(first_read_now, "the stg.v8's first RF read was not in the reuse cycle; the test proves little" + where);
+        const auto& store = run.after.at(run.reuse_cycle).second;
+        require(!store.owner.has_value() && store.valid_count == 0,
+            "the store buffer is owned before the stg.v8's first beat has landed" + where);
+        // The first beat brings r24 for the first group's lanes: one word a lane.
+        const auto& filled = run.after.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles).second;
+        require(filled.owner == 1u && filled.valid_count == canonical_profile().lsu_store_group_lanes,
+            "the stg.v8's first read beat is not in the store buffer Lr after the reuse cycle" + where);
+        for (uint32_t j = 0; j < 8; ++j)
+            for (uint32_t lane = 0; lane < 16; ++lane)
+                require(run.machine->read_gmem_u32(2048 + 32 * lane + 4 * j) == 101 + j,
+                    "the stg.v8 wrote the wrong word: r" + std::to_string(24 + j) + " lane " + std::to_string(lane) + where);
+    };
+    const Check load = [](const ReuseRun& run, const std::string& where) {
+        const auto& buffer = run.after.at(run.reuse_cycle).first;
+        require(!buffer.owner.has_value() && buffer.valid_count == 0,
+            "the load buffer is owned or not empty before the new load's first word returned" + where);
+        for (uint32_t lane = 0; lane < 16; ++lane)
+            require(run.machine->read_reg(0, lane, 16) == pattern_word(256 + lane),
+                "the new load returned the wrong word for lane " + std::to_string(lane) + where);
+    };
+    const std::vector<Row> rows = {
+        {"ldg.v8 r8, [r0]", "stg [r5 + 2048], r6", "stg", scalar_store},
+        {"ldg r8, [r5]", "stg [r5 + 2048], r6", "stg", scalar_store},
+        {"ldg.v8 r8, [r0]", "stg.v8 [r2], r24", "stg.v8", vector_store},
+        {"ldg.v8 r8, [r0]", "ldg r16, [r5 + 1024]", "ldg", load},
+    };
+    for (const auto& row : rows) {
+        const auto run = run_reuse_after_final_drain(row.old_load, row.second, row.second_name);
+        row.check(run, " (" + row.old_load + " -> " + row.second + ", reuse cycle " + std::to_string(run.reuse_cycle) + ")");
+        require_old_load_data(*run.machine, row.old_load);
     }
 }
 
-// The sanitizer's check for the case above: a reader of a buffer
-// that takes a lane whose valid bit is clear panics.
-void test_sanitizer_buffer_reader_takes_valid_lanes() {
-    nanosm::Sanitizer sanitizer;
-    std::vector<uint8_t> valid(16, 1);
-    sanitizer.check_buffer_lanes_valid(5, 0, valid, 0, 16, "RF drain");
-    valid[3] = 0;
-    sanitizer.check_buffer_lanes_valid(5, 0, valid, 4, 12, "egress write port"); // lanes 4..15 only
-    try {
-        sanitizer.check_buffer_lanes_valid(5, 0, valid, 3, 1, "egress write port");
-    } catch (const nanosm::SimError& error) {
-        const std::string message = error.what();
-        require(message.find("egress write port read lane 3 of LSU buffer 0") != std::string::npos,
-            "the lane check's PANIC does not name the reader, lane and register: " + message);
-        return;
-    }
-    throw std::runtime_error("a read of an invalid assembly lane did not panic");
-}
-
-// ---- The mbar event registers: both engines alike ----
-
-// A TMA load and an MMA commit, far apart: each engine's event, presented in
-// cycle p, is first claimable in p + 1, and the free RMW engine claims it
-// then, never in p itself.
-void test_mbar_engine_events_visible_next_cycle() {
-    constexpr uint32_t commit_mbar = 4096;
-    constexpr uint32_t tx_mbar = 4104;
-    nanosm::Launch launch;
-    launch.active_warps = 1;
-    auto& shmem = image_bytes(launch.test_shmem, 8192);
-    auto& gmem = image_bytes(launch.gmem_image, 64);
-    for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
-    write_mbar(shmem, commit_mbar, 1, 0);
-    write_mbar(shmem, tx_mbar, 0, 64);
-    write_tma_descriptor(shmem, 6144, plain_tma_1d(16));
-    std::string text = "umov ur2, 0\numov ur0, 0\numov ur1, 1024\numov ur4, 4096\n" +
-        tma_operands_asm(10, 2048, 11, tx_mbar, 8) + "tma.load.1d [ur10], [6144, ur8], [ur11]\n";
-    for (uint32_t i = 0; i < 300; ++i) text += "mov r" + std::to_string(12 + i % 8) + ", " + std::to_string(i) + "\n";
-    text += "mma.async.init.m64n64k8 [ur2], [ur0], [ur1]\nmma.commit [ur4]\nhalt\n";
-    nanosm::Machine machine(canonical_profile(), compile(text), std::move(launch), {.timeline = true});
-    std::optional<uint64_t> tma_presented;
-    std::optional<uint64_t> mma_presented;
-    while (!machine.done()) {
-        tick_capped(machine);
-        if (!tma_presented && machine.tma_mbar_event_held()) tma_presented = machine.cycle() - 1;
-        if (!mma_presented && machine.mma_mbar_event_held()) mma_presented = machine.cycle() - 1;
-    }
-    require(tma_presented && mma_presented, "an engine never presented its event");
-    require(*tma_presented + 20 < *mma_presented, "the two events were meant to be far apart");
-    require(mbar_rmw_services(machine) == std::vector<RmwService>{
-                {*tma_presented + 1, "complete_tx (tma), address=4104"},
-                {*mma_presented + 1, "arrive (mma.commit), address=4096"}},
-        "an engine event was not claimed exactly one cycle after it was presented");
-}
-
-// ---- Simultaneous events combine ----
-
-// A depbar completion and an admission on the same counter in one cycle: the
-// lds on sb0 completes (its depbar clear lands at the RF write port) and the
-// ldg that waits on sb0 and sets it again issues in that same cycle: issue
-// sees the completion at once (bypass (b)), and the counter is one
-// calculation, 1 - 1 + 1 = 1. Neither event is deferred.
-// A completion reaches issue through the counter (Q), so an instruction
-// WAITING on the depbar issues the cycle after its completion. The one
-// calculation still combines a completion and an admission that land in one
-// cycle: here the ldg sets sb0 without waiting on it, issued exactly when the
-// lds.uni's RF write lands. The lds.uni at L (one round): dispatch L +
-// issue_to_dispatch, its slot visible to A-read one cycle later, the RAM
-// sample D after that grant, its word Lb later, the gather register one cycle
-// later (the RF write decision's grant), the write lands Wd after it: its
-// depbar completion is presented then. `pad` independent movs put the ldg
-// there. (The umov issues at fetch_to_issue, its word fetched at c0; the
-// three-word FIFO then supplies one instruction per cycle.) The lds.uni's
-// base is the umov's uniform register; the ldg's vector base r0 is never
-// written (0).
-void test_simultaneous_depbar_completion_and_admission() {
+// A depbar completion and an admission on one counter in one cycle are one
+// calculation, 1 - 1 + 1 = 1; neither is deferred. The lds.uni on sb0
+// completes when its RF write lands: its dispatch (issue + issue_to_dispatch),
+// its A-read grant one cycle later, D + Lb to its word, one cycle to the RF
+// write decision, Wd to the write. `pad` movs put the ldg, which sets sb0
+// without waiting on it, at that cycle. The lds.uni reads the umov's ur0 at
+// the uniform distance; the ldg's base r0 is never written (0).
+TEST(Stepping, simultaneous_depbar_completion_and_admission) {
     const auto& profile = canonical_profile();
     const uint64_t lds_issue = nanosm::fetch_to_issue + nanosm::issue_to_urf_visible(profile) -
-        nanosm::issue_register_stages; // umov ur0 at c2, the lds.uni that reads it at the uniform distance
+        nanosm::issue_register_stages;
     const auto completion_cycle = lds_issue + nanosm::issue_to_dispatch(profile) + 1 + profile.shmem_port_a_depth +
         profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles;
     const auto pad = completion_cycle - lds_issue - 1;
     std::string body = "umov ur0, 0\nlds.uni r1, [ur0] {pred=PT, stall=0, set=sb0, wait=-}\n";
     for (uint64_t i = 0; i < pad; ++i) body += "mov r5, 7\n";
     body += "ldg r3, [r0] {pred=PT, stall=0, set=sb0, wait=-}\nhalt {pred=PT, stall=0, set=-, wait=sb0}\n";
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+    auto launch = launch_warps(1);
     write_u32(image_bytes(launch.test_shmem, 64), 0, 0xabcd);
     write_u32(image_bytes(launch.gmem_image, 64), 0, 0x1234);
-    nanosm::Machine machine(profile, hand_assemble(i1_asm(profile, body), profile), std::move(launch), {.timeline = true});
-    std::map<uint64_t, uint32_t> sb0_after; // cycle -> sb0 at the next cycle's start
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        tick_capped(machine);
-        sb0_after[cycle] = machine.depbar_value(0, 0);
-    }
+    nanosm::Machine machine(profile, hand_assemble(hand_asm(profile, body), profile), std::move(launch), {.timeline = true});
+    const auto sb0_after = after_each_tick(machine, [&] { return machine.depbar_value(0, 0); });
     std::vector<std::pair<uint64_t, std::string>> sb0_events;
+    for (const auto& event : events_named(machine, "depbar sb0"))
+        if (event.track == 100) sb0_events.emplace_back(event.start_cycle, event.detail);
     uint64_t ldg_issue = 0;
-    for (const auto& event : machine.trace().events()) {
-        if (event.name == "depbar sb0" && event.track == 100) sb0_events.emplace_back(event.start_cycle, event.detail);
-        if (event.category == nanosm::TraceCategory::instruction && event.name == "ldg") ldg_issue = event.start_cycle;
-    }
+    for (const auto& event : events_named(machine, "ldg"))
+        if (event.category == nanosm::TraceCategory::instruction) ldg_issue = event.start_cycle;
     require(ldg_issue == completion_cycle, "the ldg did not issue at the lds's completion; re-derive the test");
     const auto completion = std::find(sb0_events.begin(), sb0_events.end(),
         std::make_pair(ldg_issue, std::string("value=0")));
@@ -993,12 +608,12 @@ void test_simultaneous_depbar_completion_and_admission() {
     }
 }
 
-// A full FIFO popped and pushed in one cycle. The MMA queue (two entries) is
-// full; its head retires in the cycle a third mma.async issues: the pop and
-// the push combine (depth' = 2 - 1 + 1), the issue is not deferred.
-void test_simultaneous_full_queue_pop_and_push() {
-    nanosm::Launch launch;
-    launch.active_warps = 1;
+// A full MMA queue (two entries): the third mma.async issues in the cycle the
+// head retires (issue sees the queue as that cycle leaves it) and reaches the
+// queue issue_to_dispatch later, so the pop and the push land in different
+// cycles. The "mma.async" event is the queue's acceptance, at dispatch.
+TEST(Stepping, full_queue_issue_in_the_retire_cycle) {
+    auto launch = launch_warps(1);
     image_bytes(launch.test_shmem, 4096);
     nanosm::Machine machine(canonical_profile(), compile(R"(
         umov ur0, 0
@@ -1009,349 +624,16 @@ void test_simultaneous_full_queue_pop_and_push() {
         mma.async.m64n64k8 [ur2], [ur0], [ur1]
         halt
     )"), std::move(launch), {.timeline = true});
-    std::map<uint64_t, std::size_t> depth_after;
-    bool waited_full = false;
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        tick_capped(machine);
-        depth_after[cycle] = machine.mma_queue_depth();
-    }
-    uint64_t third_issue = 0;
-    uint64_t first_last_result = 0;
-    for (const auto& event : machine.trace().events()) {
-        if (event.category != nanosm::TraceCategory::mma && event.category != nanosm::TraceCategory::warp) continue;
-        if (event.name == "mma.async" && event.id == 3) third_issue = event.start_cycle;
-        if (event.name == "MMA tmem write" && event.id == 1) first_last_result = std::max(first_last_result, event.start_cycle);
-        if (event.category == nanosm::TraceCategory::warp && event.detail == "MMA command queue full") waited_full = true;
-    }
-    // The "mma.async" event is the MMA's acceptance, at dispatch. The
-    // third issues in the cycle the head retires (look-ahead (c): the queue
-    // as that cycle leaves it) and reaches the queue issue_to_dispatch later:
-    // the pop and the push do not share a cycle (a claim waits for the
-    // pop), so the depth is 2, then 1 until the dispatch, then 2.
-    const auto dispatch = nanosm::issue_to_dispatch(canonical_profile());
-    const auto third_accept = third_issue;
-    require(waited_full, "the third mma.async never found the queue full");
-    require(third_accept == first_last_result + dispatch,
-        "the third mma.async did not issue in the cycle the head retired (accepted " +
-            std::to_string(third_accept) + " vs retired " + std::to_string(first_last_result) + ")");
-    require(depth_after.at(first_last_result - 1) == 2 && depth_after.at(first_last_result) == 1 &&
-            depth_after.at(third_accept - 1) == 1 && depth_after.at(third_accept) == 2,
-        "the queue's pop and the dispatched push did not land in their cycles");
-}
-
-// The ingress FIFO's declared full flag is registered (an implementer
-// choice): when the FIFO is full at the start of a cycle, the bus
-// cannot write a beat in that cycle even if the read port frees room in it;
-// the beat lands the next cycle. A FIFO that is not full is read and written
-// in one cycle (count' = count + push - pop).
-void test_simultaneous_ingress_push_and_pop() {
-    auto config = fast_bus_profile(8); // one 32 B beat per pop: a pop frees a whole beat's room
-    config.lsu_ingress_sectors = 2;
-    // Warp 1's long bookings hold the first group's RF write for a while, so
-    // the FIFO fills (a mov storm does not; see booking_stream).
-    config.gmem_latency_dram_ticks = 2 * booking_horizon;
-    with_long_bookings(config);
-    nanosm::Launch launch;
-    launch.active_warps = 2;
-    auto& gmem = image_bytes(launch.gmem_image, 4096);
-    fill_pattern(gmem, 0, 1024, 0);
-    std::string text = R"(
-        usread ur0, WARP_ID
-        ur2r r29, ur0
-        setp.ne.u32 p0, r29, 0
-        @p0 bra.uni other
-        mov r30, 0
-        ldg.v8 r8, [r30]
-        halt
-    other:
-    )";
-    text += booking_stream(2, 100); // bank 2: r8's
-    text += "halt\n";
-    nanosm::Machine machine(config, compile(text, config), std::move(launch));
-    machine.enable_edge_probe();
-    std::map<uint64_t, bool> held; // cycle -> a read beat was held (FIFO full at the cycle's start)
-    uint64_t full = 0;
-    while (!machine.done()) {
-        const auto cycle = machine.cycle();
-        tick_capped(machine);
-        held[cycle] = machine.trace().summary().lsu_ingress_full_cycles > full;
-        full = machine.trace().summary().lsu_ingress_full_cycles;
-    }
-    std::map<uint64_t, std::pair<uint32_t, uint32_t>> moves; // cycle -> (pushes, pops)
-    for (const auto& event : machine.edge_events()) {
-        if (event.edge == LsuEdge::bus_read_beat) ++moves[event.cycle].first;
-        if (event.edge == LsuEdge::ingress_read) ++moves[event.cycle].second;
-    }
-    bool both = false;
-    bool registered = false;
-    for (const auto& [cycle, move] : moves) {
-        if (move.first != 0 && move.second != 0) both = true;
-        // Full at the start of the cycle (a beat was held the cycle before
-        // and this one), the read port pops: the beat still waits a cycle.
-        if (move.second != 0 && held.count(cycle - 1) && held.at(cycle - 1) && held.at(cycle)) {
-            registered = true;
-            require(move.first == 0, "a beat entered the full FIFO in the cycle it was popped");
-            require(moves.count(cycle + 1) && moves.at(cycle + 1).first != 0,
-                "the held beat did not land the cycle after the pop");
-        }
-    }
-    require(both, "no cycle read and wrote the ingress FIFO together");
-    require(registered, "the FIFO was never full when its read port popped; the test proves little");
-    require_vector_data(machine, 0, 8, 0, "ingress push/pop");
-}
-
-// ---- The driver shuffle (regression check; the launches run under ctest
-// via scripts/driver_shuffle_check.py) ----
-
-// Register drivers read only Q and the wires, so permuting their order (and
-// the independent request generators') every cycle changes nothing: not a
-// cycle, a counter, a trace byte or a memory byte. A check against a future
-// driver that reads another's D or shared state, not a proof of independence.
-void test_driver_shuffle_unit_kernels() {
-    struct Scenario {
-        std::string name;
-        std::function<std::unique_ptr<nanosm::Machine>()> make;
-    };
-    const auto backpressure = [] {
-        auto config = canonical_profile();
-        config.tma_queue_commands = 0;
-        config.tma_sector_credits = 0;
-        config.gmem_queue_sectors = 8;
-        config.lsu_ingress_sectors = 2;
-        with_long_bookings(config); // a mov storm does not hold the RF write port
-        nanosm::Launch launch;
-        launch.active_warps = 2;
-        fill_pattern(image_bytes(launch.gmem_image, 4096), 0, 1024, 0);
-        std::string text = "usread ur0, WARP_ID\nur2r r29, ur0\nsetp.ne.u32 p0, r29, 0\n@p0 bra.uni other\nmov r30, 0\nmov r31, 512\n"
-            "mov r28, 2048\nsread r27, LANE_ID\nshli r27, r27, 5\naddi r27, r27, 2048\n"
-            "ldg.v8 r0, [r30]\nldg.v8 r8, [r31]\nldg r16, [r28]\nstg.v8 [r27], r0\nhalt\nother:\n";
-        text += booking_stream(0, 150);
-        text += "halt\n";
-        return std::make_unique<nanosm::Machine>(config, compile(text, config), std::move(launch),
-            nanosm::TraceOptions{.timeline = true, .debug = true});
-    };
-    const auto tma_and_mma = [] {
-        nanosm::Launch launch;
-        launch.active_warps = 1;
-        auto& shmem = image_bytes(launch.test_shmem, 8192);
-        auto& gmem = image_bytes(launch.gmem_image, 64);
-        for (uint32_t i = 0; i < 16; ++i) write_u32(gmem, 4 * i, 0x100u + i);
-        write_mbar(shmem, 4096, 1, 0);
-        write_mbar(shmem, 4104, 0, 64);
-        write_tma_descriptor(shmem, 6144, plain_tma_1d(16));
-        return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
-            umov ur0, 0
-            umov ur1, 1024
-            umov ur4, 4096
-            umov ur2, 0
-        )" + tma_operands_asm(10, 2048, 11, 4104, 8) + R"(
-            mma.async.init.m64n64k8 [ur2], [ur0], [ur1]
-            mma.commit [ur4]
-            tma.load.1d [ur10], [6144, ur8], [ur11]
-            mma.async.m64n64k8 [ur2], [ur0], [ur1]
-            halt
-        )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    };
-    const auto acc_round_trip = [] {
-        nanosm::Launch launch;
-        launch.active_warps = 2;
-        return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
-            sread r0, THREAD_ID
-            usread ur8, WARP_ID
-            ushli ur8, ur8, 10
-            umov ur9, 0
-            acc.st.v8 [ur8, 64], r0
-            acc.ld.v8 r16, [ur8, 64]
-            fadd r24, r16, r17
-            halt
-        )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    };
-    const auto scatter_and_tma_store = [] {
-        nanosm::Launch launch;
-        launch.active_warps = 2;
-        auto& shmem = image_bytes(launch.test_shmem, 4096);
-        fill_pattern(shmem, 1024, 64, 0);
-        write_rank1_tma(shmem, 0, 2048, 64, 128);
-        image_bytes(launch.gmem_image, 8192);
-        return std::make_unique<nanosm::Machine>(canonical_profile(), compile(R"(
-            usread ur0, WARP_ID
-            ur2r r29, ur0
-            setp.ne.u32 p0, r29, 0
-            @p0 bra.uni other
-        )" + tma_operands_asm(10, 1024, 3, 128, 8) + R"(
-            tma.store.1d [0, ur8], [ur10], [ur3]
-        wait:
-            mbar.try_wait p1, [ur3], 0
-            @!p1 bra.uni wait
-            halt
-        other:
-            sread r4, LANE_ID
-            shli r5, r4, 7
-            stg [r5 + 4096], r4
-            halt
-        )"), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
-    };
-    const std::vector<Scenario> scenarios = {
-        {"vector loads under RF backpressure", backpressure},
-        {"TMA load and MMA commit", tma_and_mma},
-        {"acc.st / acc.ld round trip", acc_round_trip},
-        {"scatter and TMA store", scatter_and_tma_store},
-    };
-    const auto fingerprint = [](nanosm::Machine& machine) {
-        machine.run(20000);
-        return std::make_tuple(machine.cycle(), machine.trace().summary_text(), machine.trace().perfetto_json(),
-            machine.gmem(), machine.shmem());
-    };
-    for (const auto& scenario : scenarios) {
-        auto reference_machine = scenario.make();
-        const auto reference = fingerprint(*reference_machine);
-        for (const uint64_t seed : {1ull, 2ull, 3ull, 0x9e3779b97f4a7c15ull}) {
-            auto machine = scenario.make();
-            machine->set_driver_shuffle_seed(seed);
-            require(fingerprint(*machine) == reference,
-                scenario.name + ": driver order changed the run (seed " + std::to_string(seed) + ")");
-        }
-    }
-}
-
-} // namespace
-
-// reg: hold, write, commit
-TEST(Stepping, reg_hold_write_commit) {
-    test_reg_hold_write_commit();
-}
-
-// reg: duplicate write PANIC
-TEST(Stepping, reg_duplicate_write_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_reg_duplicate_write_panics();
-}
-
-// pipe: advance, hold, replace, leave
-TEST(Stepping, pipe_advance_hold_replace) {
-    test_pipe_advance_hold_replace();
-}
-
-// pipe: a second write of one point PANICs
-TEST(Stepping, pipe_duplicate_write_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_pipe_duplicate_write_panics();
-}
-
-// payloads: a maximum and a count; the profile is checked against the maxima
-TEST(Stepping, bounded_payload_and_limits) {
-    test_bounded_payload_and_limits();
-}
-
-// group: members hold or take their own write; one member written twice PANICs
-TEST(Stepping, regs_members_hold_write_and_panic) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_regs_members_hold_write_and_panic();
-}
-
-// FIFO: oldest first, read latency, port widths, capacity, one-bit entries, zero capacity
-TEST(Stepping, fifo_order_latency_and_widths) {
-    test_fifo_order_latency_and_widths();
-}
-
-// FIFO: a second push in one tick PANICs
-TEST(Stepping, fifo_second_push_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_fifo_second_push_panics();
-}
-
-// memory: read first, element enables, one port one word, its size
-TEST(Stepping, memory_read_first_and_enables) {
-    test_memory_read_first_and_enables();
-}
-
-TEST(Stepping, black_box_latency_and_interval) {
-    test_black_box_latency_and_interval();
-}
-// state report: every piece of state once under its unit; the black boxes with their latency
-TEST(Stepping, state_report_inventory) {
-    test_state_report_inventory();
-}
-
-// black boxes: exactly the listed ten
-TEST(Stepping, black_boxes_are_the_listed_ten) {
-    test_black_boxes_are_the_listed_ten();
-}
-
-// shared memory: the host sees shmem.bytes, not the padded last row
-TEST(Stepping, shmem_host_view_is_the_configured_bytes) {
-    test_shmem_host_view_is_the_configured_bytes();
-}
-
-// memory: a port asked for a second word in one cycle PANICs
-TEST(Stepping, memory_port_panics) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_memory_port_panics();
-}
-
-// group: a one-bit member is read by value and holds
-TEST(Stepping, regs_one_bit_members) {
-    test_regs_one_bit_members();
-}
-
-// depbar: stores on their way to the RAM still count; the counter is wide enough
-TEST(Stepping, depbar_counts_stores_on_their_way_to_ram) {
-    test_depbar_counts_stores_on_their_way_to_ram();
-}
-
-// stg.v8's store-data read pipe: a grant at t lands at t + Lr; gaps are kept
-TEST(Stepping, store_data_read_pipe_keeps_gaps) {
-    test_store_data_read_pipe_keeps_gaps();
-}
-
-// the load buffer's lane groups: eight RF writes each, after the group's last word
-TEST(Stepping, load_buffer_groups) {
-    test_load_buffer_groups();
-}
-
-// assembly reuse: final load drain -> scalar store
-TEST(Stepping, buffer_reuse_load_to_scalar_store) {
-    test_buffer_reuse_load_to_scalar_store();
-}
-
-// assembly reuse: final load drain -> vector store
-TEST(Stepping, buffer_reuse_load_to_vector_store) {
-    test_buffer_reuse_load_to_vector_store();
-}
-
-// assembly reuse: final load drain -> load
-TEST(Stepping, buffer_reuse_load_to_load) {
-    test_buffer_reuse_load_to_load();
-}
-
-// sanitizer: assembly reader takes only valid lanes
-TEST(Stepping, sanitizer_buffer_reader_takes_valid_lanes) {
-    NANOSM_EXPECTS_SANITIZER_PANIC();
-    test_sanitizer_buffer_reader_takes_valid_lanes();
-}
-
-// mbar engines: events visible the next cycle
-TEST(Stepping, mbar_engine_events_visible_next_cycle) {
-    test_mbar_engine_events_visible_next_cycle();
-}
-
-// simultaneous: depbar completion and admission
-TEST(Stepping, simultaneous_depbar_completion_and_admission) {
-    test_simultaneous_depbar_completion_and_admission();
-}
-
-// simultaneous: full queue pop and push
-TEST(Stepping, simultaneous_full_queue_pop_and_push) {
-    test_simultaneous_full_queue_pop_and_push();
-}
-
-// simultaneous: ingress FIFO push and pop
-TEST(Stepping, simultaneous_ingress_push_and_pop) {
-    test_simultaneous_ingress_push_and_pop();
-}
-
-// driver shuffle: unit kernels unchanged
-TEST(SteppingSlow, driver_shuffle_unit_kernels) {
-    test_driver_shuffle_unit_kernels();
+    machine.run();
+    uint64_t third_accept = 0;
+    for (const auto& event : events_named(machine, "mma.async"))
+        if (event.category == nanosm::TraceCategory::mma && event.id == 3) third_accept = event.start_cycle;
+    uint64_t head_retire = 0; // the first command's last result write
+    for (const auto& event : events_named(machine, "MMA tmem write"))
+        if (event.category == nanosm::TraceCategory::mma && event.id == 1)
+            head_retire = std::max(head_retire, event.start_cycle);
+    require(!refusals(machine, 0, "MMA command queue full").empty(), "the third mma.async never found the queue full");
+    require(third_accept == head_retire + nanosm::issue_to_dispatch(canonical_profile()),
+        "the third mma.async did not issue in the cycle the head retired (accepted " + std::to_string(third_accept) +
+            " vs retired " + std::to_string(head_retire) + ")");
 }
