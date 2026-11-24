@@ -27,22 +27,20 @@ IssueSite Machine::site(const DispatchEntry& op) const {
     return IssueSite{cycle_, op.warp, op.pc, op.instruction, &config_.mma_shapes};
 }
 
-std::vector<uint32_t> Machine::access_addresses(
-    const std::vector<std::vector<LaneAccess>>& rounds) {
-    std::vector<uint32_t> addresses;
-    for (const auto& round : rounds) {
-        for (const auto& access : round) addresses.push_back(static_cast<uint32_t>(access.byte_address));
+// Each bank round's word addresses, round by round in bank order (the
+// sanitizer's shadow of an access), and all of them in that order.
+std::vector<std::vector<uint32_t>> Machine::round_addresses(const SlotRounds& access) const {
+    std::vector<std::vector<uint32_t>> addresses;
+    for (uint32_t round = 0; round < access.rounds; ++round) {
+        auto& words = addresses.emplace_back();
+        for (const auto lane : round_lanes(access, round)) words.push_back(access.address[lane]);
     }
     return addresses;
 }
 
-// Each bank round's word addresses (the sanitizer's shadow of an access).
-std::vector<std::vector<uint32_t>> Machine::round_addresses(const std::vector<std::vector<LaneAccess>>& rounds) {
-    std::vector<std::vector<uint32_t>> addresses;
-    for (const auto& round : rounds) {
-        auto& words = addresses.emplace_back();
-        for (const auto& access : round) words.push_back(static_cast<uint32_t>(access.byte_address));
-    }
+std::vector<uint32_t> Machine::access_addresses(const SlotRounds& access) const {
+    std::vector<uint32_t> addresses;
+    for (const auto& round : round_addresses(access)) addresses.insert(addresses.end(), round.begin(), round.end());
     return addresses;
 }
 
@@ -101,9 +99,12 @@ std::optional<uint64_t> Machine::pending_tma_completion_mbar(uint32_t mbar, cons
     }
     overlay_beat(w.shmem.a_write_beat);
     overlay_beat(w.shmem.b_write_beat);
+    const auto overlay_update = [&](const std::optional<RmwUpdate>& update) {
+        if (update.has_value()) overlay_beat(rmw_write_round(*update));
+    };
     const auto& alu = rmw_alu_.cur();
-    for (std::size_t stage = alu.size(); stage-- > 0;) overlay_beat(alu[stage]);
-    overlay_beat(w.shmem.rmw_update);
+    for (std::size_t stage = alu.size(); stage-- > 0;) overlay_update(alu[stage]);
+    overlay_update(w.shmem.rmw_update);
     uint64_t word = 0;
     std::memcpy(&word, bytes.data(), sizeof(word));
     return word;

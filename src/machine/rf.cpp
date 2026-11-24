@@ -1,5 +1,5 @@
 // The vector register file: the write calendar, the read and write port decisions, the
-// RAM stages, and writebacks.
+// write ports' pipelines and the RAM stage.
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
@@ -162,13 +162,14 @@ Machine::RfWriteDecision Machine::decide_rf_writes() const {
 // The payload and completion context a granted async holder hands to the RF
 // write path: presented at the port now, landing Wd cycles later. Its
 // depbar (if it ends its operation) clears as it lands; the sanitizer marks
-// its registers visible then.
-Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
-    Writeback writeback;
-    writeback.port_cycle = cycle_;
-    writeback.land_cycle = cycle_ + config_.rf_write_depth_cycles;
+// its registers visible then. A write that ends an LSU command names it: the
+// command's slot is released now (from the grant on, the write pipeline owns
+// the data).
+Machine::RfWrite Machine::async_rf_write(const AsyncWrite& write, std::optional<uint64_t>& ends_command) {
+    RfWrite writeback;
     writeback.warp = write.warp;
-    writeback.dst = write.reg;
+    writeback.reg = write.reg;
+    writeback.lane_enables = full_mask();
     trace_->rf_async_write();
     switch (write.writer) {
     case AsyncWriter::load_slot: {
@@ -208,7 +209,7 @@ Machine::Writeback Machine::async_writeback(const AsyncWrite& write) {
             const uint32_t registers = vector ? 8 : 1;
             for (uint32_t j = 0; j < registers; ++j) writeback.visible_regs.push_back(static_cast<uint8_t>(command.reg + j));
             writeback.clear_depbar = command.depbar;
-            writeback.release_lsu_command = command.id;
+            ends_command = command.id;
         }
         // The bytes written: the group's enabled lanes (every lane for ldg.uni).
         probe(LsuEdge::rf_write_beat, command.id, write.reg,
@@ -244,27 +245,39 @@ void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
     }
 }
 
-// The RF write port at this cycle: every fixed result booked for it, then
-// the async holders the RF write decision granted (never on a booked port),
-// enter the write pipeline. A write that ends an LSU command releases it now
-// (the write pipeline owns its data from here); a store's last-ack
-// completion due now does too. A load slot granted now is free for dispatch
-// now (d).
+// The RF write port at this cycle: every fixed result booked for it (at its
+// unit's output now), then the async holders the RF write decision granted
+// (never on a booked port), are presented, each on the next free write port
+// of its bank, and enter that port's write pipeline. A write that ends an LSU
+// command releases it now (the write pipeline owns its data from here); so
+// does a store whose last acknowledgement came last cycle. A load slot
+// granted now is free for dispatch now (d).
 void Machine::rf_write_port(Wires& w) {
+    w.rf_port_writes.assign(rf_write_pipes_.size(), std::nullopt);
     std::vector<uint32_t> port_uses(config_.rf_banks, 0);
-    const auto use_port = [&](const Writeback& writeback) {
-        if (!writeback.dst.has_value()) return;
-        const auto bank = *writeback.dst % config_.rf_banks;
-        if (++port_uses[bank] > config_.rf_write_ports_per_bank) {
+    const auto present = [&](RfWrite write) {
+        const auto bank = write.reg % config_.rf_banks;
+        if (port_uses[bank] == config_.rf_write_ports_per_bank) {
             throw SimError("internal: more RF writes than write ports in bank " +
                 std::to_string(bank) + " at cycle " + std::to_string(cycle_));
         }
-        trace_->rf_write(cycle_, writeback.warp, *writeback.dst, bank);
+        trace_->rf_write(cycle_, write.warp, write.reg, bank);
+        w.rf_port_writes[std::size_t{bank} * config_.rf_write_ports_per_bank + port_uses[bank]++] = std::move(write);
     };
-    for (const auto& writeback : writebacks_.cur()) {
-        if (writeback.port_cycle != cycle_) continue;
-        use_port(writeback);
-        if (writeback.release_lsu_command.has_value()) release_lsu_command(w, *writeback.release_lsu_command);
+    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
+        if (store_completions_.cur()[slot] != 0) release_lsu_command(w, lsu_commands_.cur().in_slot(slot).id);
+    }
+    for (const auto unit : units_slowest_first_) {
+        const auto& result = arithmetic_results_[static_cast<std::size_t>(unit)].last();
+        if (!result.has_value() || result->predicate) continue;
+        present(RfWrite{result->warp, result->dst, result->values, result->lane_enables, std::nullopt, {}});
+    }
+    for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        if (port_uses[bank] != writes_booked_now(bank)) {
+            throw SimError("internal: RF bank " + std::to_string(bank) + " was booked for " +
+                std::to_string(writes_booked_now(bank)) + " fixed writes and got " + std::to_string(port_uses[bank]) +
+                " at cycle " + std::to_string(cycle_));
+        }
     }
     const auto& decision = w.rf_write;
     uint32_t lsu_writes = 0;
@@ -273,41 +286,57 @@ void Machine::rf_write_port(Wires& w) {
         if (decision.holders[holder]->writer == AsyncWriter::lsu_buffer && ++lsu_writes > 1) {
             throw SimError("internal: more than one LSU RF write at cycle " + std::to_string(cycle_));
         }
-        auto writeback = async_writeback(*decision.holders[holder]);
-        use_port(writeback);
-        if (writeback.release_lsu_command.has_value()) release_lsu_command(w, *writeback.release_lsu_command);
-        w.new_writebacks.push_back(std::move(writeback));
+        std::optional<uint64_t> ends_command;
+        present(async_rf_write(*decision.holders[holder], ends_command));
+        if (ends_command.has_value()) release_lsu_command(w, *ends_command);
     }
     count_rf_write_waits(decision);
 }
 
-// The write pipeline's RAM stage: the writes at the RAM now. They land at
-// this cycle's clock edge (land_rf_writes, after every read of the cycle).
-// Their completions are presented now: a cleared depbar counter is 0 in Q
-// from the next cycle -- the write's visibility -- so the waiting warp issues
-// then at the earliest; an async result is visible to the sanitizer from the
-// next cycle.
+// The RAM stage: each write port's last stage holds the write at the RAM now.
+// It lands at this cycle's clock edge (land_rf_writes, after every read of
+// the cycle). Its completion is presented now: a cleared depbar counter is 0
+// in Q from the next cycle -- the write's visibility -- so the waiting warp
+// issues then at the earliest; an async result is visible to the sanitizer
+// from the next cycle. A store whose last acknowledgement came last cycle
+// counts its depbar down now too, and a setp's predicate at the ALU's output
+// goes to the predicate file.
 void Machine::rf_ram_stage(Wires& w) {
-    for (const auto& writeback : writebacks_.cur()) {
-        if (writeback.land_cycle != cycle_) continue;
-        if (writeback.clear_depbar.has_value()) {
-            record_depbar_completion(w, writeback.warp, *writeback.clear_depbar,
-                "depbar underflow on sb" + std::to_string(*writeback.clear_depbar));
+    for (const auto& pipe : rf_write_pipes_) {
+        const auto& write = pipe.last();
+        if (!write.has_value()) continue;
+        if (write->clear_depbar.has_value()) {
+            record_depbar_completion(w, write->warp, *write->clear_depbar,
+                "depbar underflow on sb" + std::to_string(*write->clear_depbar));
         }
-        for (const auto reg : writeback.visible_regs) sanitizer_.record_reg_ready(writeback.warp, reg, cycle_ + 1);
-        if (writeback.dst.has_value() || writeback.predicate_dst.has_value()) w.rf_landings.push_back(writeback);
+        for (const auto reg : write->visible_regs) sanitizer_.record_reg_ready(write->warp, reg, cycle_ + 1);
+    }
+    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
+        if (store_completions_.cur()[slot] == 0) continue;
+        const auto& command = lsu_commands_.cur().in_slot(slot);
+        record_depbar_completion(w, command.warp, command.depbar, "depbar underflow on sb" + std::to_string(command.depbar));
+    }
+    const auto& alu = arithmetic_results_[static_cast<std::size_t>(ArithmeticUnit::alu)].last();
+    if (alu.has_value() && alu->predicate) {
+        uint64_t bits = 0;
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if (alu->values[lane] != 0) bits |= uint64_t{1} << lane;
+        }
+        w.predicate_writes.push_back(PredicateWrite{alu->warp, alu->dst, bits, alu->lane_enables});
     }
 }
 
-// The RF writes at their RAM now: each goes through a write port of its bank,
-// its lanes enabled one by one, and lands at the clock edge.
-void Machine::land_rf_writes(const Wires& w) {
-    for (const auto& writeback : w.rf_landings) {
-        if (!writeback.dst.has_value()) continue;
-        if (writeback.values.size() != config_.lanes) throw SimError("internal writeback lane count mismatch");
-        const auto address = rf_address(writeback.warp, *writeback.dst);
-        rf_.write(address.bank, address.row, writeback.values, writeback.lane_enables.value_or(full_mask()),
-            "RF write port");
+// The RF writes at their RAM now (each write port's last stage): each goes
+// through its own port, its lanes enabled one by one, and lands at the clock
+// edge.
+void Machine::land_rf_writes(const Wires&) {
+    for (std::size_t port = 0; port < rf_write_pipes_.size(); ++port) {
+        const auto& write = rf_write_pipes_[port].last();
+        if (!write.has_value()) continue;
+        if (write->values.size() != config_.lanes) throw SimError("internal: an RF write of the wrong lane count");
+        const auto address = rf_address(write->warp, write->reg);
+        rf_.write(address.bank, address.row, write->values, write->lane_enables, "RF write port",
+            static_cast<uint32_t>(port % config_.rf_write_ports_per_bank));
     }
 }
 
@@ -316,18 +345,11 @@ void Machine::land_rf_writes(const Wires& w) {
 // next cycle, in its enabled lanes. One write per predicate is ever in flight
 // (src/timing.hpp), so each register takes at most one.
 void Machine::drive_predicates(const Wires& w) {
-    for (const auto& writeback : w.rf_landings) {
-        if (!writeback.predicate_dst.has_value()) continue;
-        if (writeback.values.size() != config_.lanes || *writeback.predicate_dst >= predicates_per_warp) {
-            throw SimError("internal: a predicate write of the wrong shape");
-        }
-        const auto index = predicate_index(writeback.warp, *writeback.predicate_dst);
-        const uint64_t enables = writeback.lane_enables.value_or(full_mask());
-        uint64_t bits = 0;
-        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            if (writeback.values[lane] != 0) bits |= uint64_t{1} << lane;
-        }
-        const uint64_t next = (predicates_.cur()[index] & ~enables) | (bits & enables);
+    for (const auto& write : w.predicate_writes) {
+        if (write.predicate >= predicates_per_warp) throw SimError("internal: a write of predicate p" +
+            std::to_string(write.predicate));
+        const auto index = predicate_index(write.warp, write.predicate);
+        const uint64_t next = (predicates_.cur()[index] & ~write.lane_enables) | (write.bits & write.lane_enables);
         predicates_.set_next(index, next, "drive_predicates");
     }
 }
@@ -604,21 +626,21 @@ void Machine::drive_issue_read_banks(const Wires& w) {
     }
 }
 
-// The RF write schedule: the writes executed now leave it; this cycle's new
-// bookings join it in wire order.
-// The RF write pipeline: the writes landed now leave; the results booked
-// now (executed arithmetic) and the async writes granted now join.
-void Machine::drive_writebacks(const Wires& w) {
-    const auto& cur = writebacks_.cur();
-    const bool landed = std::any_of(cur.begin(), cur.end(),
-        [&](const Writeback& writeback) { return writeback.land_cycle <= cycle_; });
-    if (!landed && w.new_writebacks.empty()) return;
-    std::deque<Writeback> next;
-    for (const auto& writeback : cur) {
-        if (writeback.land_cycle > cycle_) next.push_back(writeback);
+// The write ports' pipelines: each takes the write presented on it now.
+void Machine::drive_rf_write_pipes(const Wires& w) {
+    for (std::size_t port = 0; port < w.rf_port_writes.size(); ++port) {
+        if (w.rf_port_writes[port].has_value()) rf_write_pipes_[port].push(*w.rf_port_writes[port], "drive_rf_write_pipes");
     }
-    for (const auto& writeback : w.new_writebacks) next.push_back(writeback);
-    writebacks_.set_next(std::move(next), "drive_writebacks");
+}
+
+// A store whose last acknowledgement came now completes in the next cycle;
+// one that completed now is done.
+void Machine::drive_store_completions(const Wires& w) {
+    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
+        const auto& now = w.store_completions;
+        const uint8_t next = std::find(now.begin(), now.end(), slot) != now.end() ? 1 : 0;
+        if (next != store_completions_.cur()[slot]) store_completions_.set_next(slot, next, "drive_store_completions");
+    }
 }
 
 // A masked instruction's write mask as lanes, read from the predicate
@@ -647,38 +669,6 @@ std::vector<uint32_t> Machine::read_rf(uint32_t warp, uint8_t reg, const char* t
     const auto address = rf_address(warp, reg);
     const auto word = rf_.read(address.bank, address.row, tag);
     return std::vector<uint32_t>(word.begin(), word.end());
-}
-
-// A fixed result on its way to the RF write port it booked (port_cycle),
-// landing Wd later. Its visibility was recorded at issue.
-Machine::Writeback Machine::register_writeback(
-    const Warp& warp,
-    uint8_t dst,
-    uint64_t port_cycle,
-    std::vector<uint32_t> values) const {
-    Writeback writeback;
-    writeback.port_cycle = port_cycle;
-    writeback.land_cycle = port_cycle + config_.rf_write_depth_cycles;
-    writeback.warp = warp.id;
-    writeback.dst = dst;
-    writeback.values = std::move(values);
-    return writeback;
-}
-
-// A setp result: the predicate file (flip-flops) takes it at the edge of its
-// port cycle.
-Machine::Writeback Machine::predicate_writeback(
-    const Warp& warp,
-    uint8_t dst,
-    uint64_t port_cycle,
-    std::vector<uint32_t> values) const {
-    Writeback writeback;
-    writeback.port_cycle = port_cycle;
-    writeback.land_cycle = port_cycle;
-    writeback.warp = warp.id;
-    writeback.predicate_dst = dst;
-    writeback.values = std::move(values);
-    return writeback;
 }
 
 } // namespace nanosm

@@ -359,9 +359,9 @@ void Machine::finish_gmem_write(GmemSectorRequest request) {
 }
 
 // Acks due now. A TMA ack returns its sector credit; an LSU ack its scatter
-// tag, and the command's last ack completes it: the depbar clears and its
-// slot is released at the next cycle's RF write port
-// (a completion with no destination: its port and landing are that cycle).
+// tag, and the command's last ack completes it in the next cycle
+// (store_completions_): its slot is released at that cycle's RF write port
+// and its depbar counts down at its RAM stage.
 void Machine::deliver_write_acks(Wires& w) {
     while (!pending_write_acks_.empty() && pending_write_acks_.front().dram_tick <= dram_tick_) {
         const auto ack = pending_write_acks_.front();
@@ -380,13 +380,7 @@ void Machine::deliver_write_acks(Wires& w) {
         }
         const auto acks = command->acks + ++w.controller.lsu_acks[ack.command];
         if (acks != command->requests_total) continue;
-        Writeback completion;
-        completion.port_cycle = cycle_ + 1;
-        completion.land_cycle = cycle_ + 1;
-        completion.warp = command->warp;
-        completion.clear_depbar = command->depbar;
-        completion.release_lsu_command = command->id;
-        w.new_writebacks.push_back(std::move(completion));
+        w.store_completions.push_back(ack.lsu_slot);
     }
 }
 

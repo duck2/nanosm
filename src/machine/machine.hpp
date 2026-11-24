@@ -324,12 +324,6 @@ private:
 
     // One register's words, a word per lane (core.lanes of them).
     using LaneWords = Bounded<uint32_t, limits::lanes>;
-    // An fp16 value with the shared-memory byte address it was read from.
-    struct Fp16At {
-        uint32_t first = 0;  // the byte address
-        uint16_t second = 0; // the bits
-        bool operator==(const Fp16At&) const = default;
-    };
 
     struct MbarWaitSlot {
         uint32_t warp = 0;
@@ -458,32 +452,51 @@ private:
         bool operator==(const DivergenceRefill&) const = default;
     };
 
-    // One write through the RF write port (src/timing.hpp): PRESENTED at
-    // port_cycle -- a fixed result's booked cycle, an async holder's grant --
-    // and at the RAM at land_cycle, where it lands at the clock edge: port +
-    // Wd for an RF register, the port cycle itself for the predicate file
-    // (flip-flops). A completion with no destination (a store's last ack)
-    // happens at its port_cycle == land_cycle.
-    struct Writeback {
-        uint64_t port_cycle = 0;
-        uint64_t land_cycle = 0;
+    // The fixed-latency units (src/timing.hpp): an instruction executes at
+    // issue + issue_to_operands and its result is at its unit's output E
+    // cycles later, the cycle of the RF write port it booked (a setp's: the
+    // predicate file's input). Each unit has one E -- the ALU
+    // core.alu_latency_cycles (setp, mov, sread and ur2r included), the FPU
+    // core.fadd_latency_cycles, the special-function unit its occupancy - 1 +
+    // sfu.latency_cycles -- so each is a pipeline of E stages that a result
+    // enters when it executes and leaves from its last stage, at its port.
+    enum class ArithmeticUnit : uint8_t { alu, fpu, sfu };
+    static constexpr std::size_t arithmetic_units = 3;
+    struct ArithmeticResult {
         uint32_t warp = 0;
-        std::optional<uint8_t> dst;
-        std::optional<uint8_t> predicate_dst;
-        std::vector<uint32_t> values;
-        // The writer's active lanes (its issue cycle's mask): only they are
-        // written. None: every lane (the LSU's vector and uniform loads, acc.ld).
-        std::optional<uint64_t> lane_enables;
-        // Cleared as the write lands: the waiting warp's counter is 0 from
-        // its visibility (land + 1) on.
+        uint8_t dst = 0;           // its register, or a setp's predicate
+        bool predicate = false;    // a setp: the predicate file takes it; no RF write port
+        LaneWords values;
+        uint64_t lane_enables = 0; // the issue cycle's active mask AND the write mask
+    };
+
+    // One write in an RF write port's pipeline (one pipeline per write port:
+    // rf.banks x rf.write_ports_per_bank of them, rf.write_depth_cycles
+    // stages). It enters when it is PRESENTED at the port -- a fixed result
+    // at the cycle it booked, an async holder at its grant -- and is at the
+    // RAM in the last stage, where it lands at the clock edge (src/timing.hpp).
+    // A load's last write counts its depbar down there (the waiting warp sees
+    // it from the next cycle, the write's visibility); an async result's
+    // registers become visible to the sanitizer then too (a fixed result's
+    // visibility is known at its issue).
+    struct RfWrite {
+        uint32_t warp = 0;
+        uint8_t reg = 0;
+        LaneWords values;
+        uint64_t lane_enables = 0;
         std::optional<uint8_t> clear_depbar;
-        // The final LSU RF write / last-ack completion ends its command: the
-        // command slot and its buffer are released at the port
-        // (from the grant on, the write pipeline owns the data).
-        std::optional<uint64_t> release_lsu_command;
-        // An async result's registers: the sanitizer marks them visible as
-        // the write lands (a fixed result's visibility is known at issue).
-        std::vector<uint8_t> visible_regs;
+        Bounded<uint8_t, limits::v8_registers> visible_regs; // (S)
+    };
+
+    // A predicate at the predicate file's input now (a setp at its port
+    // cycle, a usetp at the URF write port's, a probe's or a try-wait's
+    // result): the file is flip-flops and has it from the next cycle, in its
+    // enabled lanes.
+    struct PredicateWrite {
+        uint32_t warp = 0;
+        uint8_t predicate = 0;
+        uint64_t bits = 0;
+        uint64_t lane_enables = 0;
     };
 
     // A fixed-latency instruction in the arithmetic pipeline, from accepted
@@ -559,23 +572,23 @@ private:
         std::optional<uint32_t> value;    // the result, from its execution on
     };
 
-    struct LaneAccess {
-        uint32_t lane = 0;
-        uint8_t word = 0;
-        uint64_t byte_address = 0;
-        uint32_t value = 0;
-    };
-
-    // A SIMT shmem access's bank rounds: its ACTIVE
-    // lanes only, by bank decode (round r serves every bank's r-th active
-    // lane, in lane order), and how many rounds A-read / A-write has granted.
-    // The lanes' addresses (and a store's data) are the slot's address
-    // registers and 64 B data register.
+    // A SIMT shmem access's lanes and its bank rounds, in the slot's
+    // registers: the lanes that access (the ACTIVE lanes of an lds / sts; an
+    // lds.uni's one access is lane 0's), each one's byte address and the round
+    // it is in, set once when the slot is filled (round r serves, in every
+    // bank, that bank's r-th accessing lane in ascending lane order: the
+    // rounds are the most lanes on any one bank), the number of rounds and how
+    // many A-read / A-write has granted. A round's lanes are on different
+    // banks, so a round is at most one word per bank.
     struct SlotRounds {
-        std::vector<std::vector<LaneAccess>> rounds;
-        std::size_t granted = 0;
+        uint64_t lanes = 0;
+        std::array<uint32_t, limits::lanes> address{};
+        std::array<uint8_t, limits::lanes> round{};
+        uint32_t rounds = 0;
+        uint32_t granted = 0;
         [[nodiscard]] bool started() const { return granted != 0; }
-        [[nodiscard]] bool serviced() const { return granted == rounds.size(); }
+        [[nodiscard]] bool serviced() const { return granted == rounds; }
+        [[nodiscard]] bool in_round(uint32_t lane, uint32_t r) const { return (lanes >> lane & 1) != 0 && round[lane] == r; }
     };
 
     // A load slot: one lds / lds.uni from admission until
@@ -598,17 +611,19 @@ private:
         uint8_t dst = 0;
         uint8_t depbar = 0;
         LaneWords words;
-        std::size_t returned = 0;  // rounds whose words are in `words`
+        uint32_t returned = 0;     // rounds whose words are in `words`
         bool engine_filled = false; // an atomic's return slot: one fill from the RMW engine
-        [[nodiscard]] bool complete() const { return returned == (engine_filled ? 1 : access.rounds.size()); }
+        [[nodiscard]] bool complete() const { return returned == (engine_filled ? 1 : access.rounds); }
     };
 
     // A store slot: one sts from admission until its last
-    // round is granted. From each grant the A-write pipeline owns that round's
+    // round is granted, with each accessing lane's word (its 64 B data
+    // register). From each grant the A-write pipeline owns that round's
     // addresses, data and (last round) depbar completion for D cycles.
     struct StoreSlot {
         uint32_t warp = 0;
         SlotRounds access;
+        std::array<uint32_t, limits::lanes> data{};
         uint8_t depbar = 0;
     };
 
@@ -714,22 +729,32 @@ private:
         MmaShape shape;          // the command's: the dense layout's strides follow it
     };
 
+    // A step's operand elements by position: its A block (core_m x core_k,
+    // row-major; read only by a step that reloads A), then its B block (core_k
+    // x core_n, k-major). Each one's shared-memory address follows from the
+    // step (mma_element_address).
+    static constexpr std::size_t mma_step_elements = 2 * limits::mma_block;
+
     // The step whose port-B rounds are being granted: one round per cycle,
-    // from its first round to its last (no preemption).
+    // from its first round to its last (no preemption). Its bank rounds are
+    // set once when it starts: round r reads every bank's r-th distinct 4-byte
+    // word (ascending), and each element is in its word's round (the two
+    // halves of a word, and A and B elements at one address, share it).
     struct MmaFetch {
         MmaStep step;
+        uint32_t rounds = 0;
         uint32_t next_round = 0;
-        std::vector<std::vector<uint32_t>> round_elements; // fp16 element byte addresses, per round
+        std::array<uint8_t, mma_step_elements> element_round{};
     };
 
     // One granted port-B read round, in the read pipeline: D stages to the
     // RAM sample, then Lb stages to the port output (the same D and Lb as
-    // port A). Its element values are read at the sample.
+    // port A). Its elements' values are read at the sample.
     struct MmaRead {
         MmaStep step;
         bool last_round = false;
-        Bounded<uint32_t, 2 * limits::shmem_banks> elements;                       // fp16 element byte addresses
-        Bounded<Fp16At, 2 * limits::shmem_banks> values;    // (address, bits), read at the RAM sample
+        std::array<bool, mma_step_elements> in_round{};    // the step's elements this round reads
+        std::array<uint16_t, mma_step_elements> values{};  // their bits, from the RAM sample on
     };
 
     // What the RMW engine does with the word(s) it reads: an mbar operation
@@ -1448,6 +1473,17 @@ private:
         std::optional<PlacementEnd> placed;    // a TMA placement's last round: its load write ends
     };
 
+    // What the RMW engine's ALU computed from the word(s) it read, in its ALU
+    // stages: the word to write back (an mbar's eight bytes, an atomic's four
+    // in the low half) and, for an mbar operation that flips the phase, the
+    // new phase (the waiters wake when the write reaches the RAM). Its address
+    // and whether it is an atomic are the operation's, in the engine's register
+    // until the write's grant, where the write round is made (rmw_write_round).
+    struct RmwUpdate {
+        uint64_t word = 0;
+        std::optional<uint8_t> wake_phase;
+    };
+
     // The RMW engine: the operation in flight (its presence IS the store
     // PAUSE: store_pause()), its ALU stages and the admission state between
     // its requesters (they change together).
@@ -1540,9 +1576,11 @@ private:
         // its head.
         Bounded<MmaCommand, limits::mma_queue_commands> slots;
         std::optional<MmaFetch> fetch;  // the step whose rounds port B is granting
-        // The core's operand latch: the values of the step whose rounds are
-        // arriving at the port output (A + B of one step: at most 128 B).
-        std::vector<Fp16At> arriving;
+        // The core's operand latch, by element position: the values of the
+        // step whose rounds are arriving at the port output (A + B of one
+        // step: 128 B at the canonical profile). Its last round enters the
+        // core with them.
+        std::array<uint16_t, mma_step_elements> latch{};
         // The held A block: core_m x core_k fp16 (64 B at 4x8), written when a
         // reloading step enters the core, used by the steps after it.
         Bounded<uint16_t, limits::mma_block> a_held;
@@ -1883,7 +1921,7 @@ private:
         std::optional<uint32_t> a_write_warp;
         // What the grants and returns do to their requesters.
         std::optional<LoadFill> load_fill;           // a load round's words for its gather register
-        std::optional<WriteBeat> rmw_update;         // the RMW's update, from its read's words: enters ALU stage 0
+        std::optional<RmwUpdate> rmw_update;         // the RMW's update, from its read's words: enters ALU stage 0
         std::optional<ActiveMbarRmw> rmw_started;    // the operation the RMW engine takes now (from rmw_start's register)
         bool simt_rmw_started = false;               // rmw_start empties the SIMT RMW register
         bool tma_event_claimed = false;              // ... the TMA's event register
@@ -2032,10 +2070,12 @@ private:
         std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_refilled;
         // The RF write port: async grants and SIMT inhibition.
         RfWriteDecision rf_write;
-        std::vector<uint64_t> released_lsu_commands;  // their last write / ack at the port now
-        // The RF and predicate writes at the RAM now: they land at this
-        // cycle's clock edge (after every read of this cycle).
-        std::vector<Writeback> rf_landings;
+        std::vector<uint64_t> released_lsu_commands;  // their last RF write granted now, or their store completed
+        // Per RF write port (bank x rf.write_ports_per_bank + port): the
+        // write presented now, entering that port's write pipeline.
+        std::vector<std::optional<RfWrite>> rf_port_writes;
+        // The predicate writes now: the file has them from the next cycle.
+        std::vector<PredicateWrite> predicate_writes;
         // The tmem writes at the RAM now, through each fine bank's two write
         // ports (MMA results, acc.st beats): they land at this cycle's clock
         // edge, after every tmem read of this cycle (READ_FIRST, as shmem).
@@ -2045,7 +2085,10 @@ private:
         // Collected as they happen, from several steps below.
         std::vector<DepbarEvent> depbar_completions;  // in the order they happened
         std::vector<uint32_t> completed_waits;        // try-wait slots completed this cycle
-        std::vector<Writeback> new_writebacks;        // RF writes booked now, in wire order
+        // A fixed result executed now: it enters its unit's result pipeline.
+        std::optional<std::pair<ArithmeticUnit, ArithmeticResult>> arithmetic_result;
+        // LSU command slots whose store had its last acknowledgement now.
+        std::vector<uint8_t> store_completions;
         // The store path's last stage; request generation; the two selects.
         EgressWrite egress;
         TmaRequests tma;
@@ -2264,7 +2307,7 @@ private:
     // computed from the read's words at the port output enters stage 0 at that
     // cycle's edge; it is ready in the last stage C cycles after the port
     // output, and its write is granted then.
-    Pipe<WriteBeat> rmw_alu_{registers_, Unit::barriers, "RMW engine: ALU stages"};
+    Pipe<RmwUpdate> rmw_alu_{registers_, Unit::barriers, "RMW engine: ALU stages"};
     Reg<ShmemArbiters> shmem_arbiters_{registers_, Unit::shared_memory, "shmem A-read / A-write arbiters"};
     // fence.sh, per warp: how many cycles from now until
     // the warp's latest granted shmem round reaches the RAM (a write's edge,
@@ -2339,9 +2382,24 @@ private:
     Reg<uint32_t> tma_read_received_{registers_, Unit::tma, "read records: TMA stream head's bytes consumed"};
     Reg<uint32_t> lsu_read_received_{registers_, Unit::load_store, "read records: LSU stream head's bytes consumed"};
     Regs<uint8_t> free_id_tags_{registers_, Unit::load_store, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
-    // The RF write path: fixed results waiting for their booked port cycle,
-    // and every write from its port cycle until it lands (src/timing.hpp).
-    Reg<std::deque<Writeback>> writebacks_{registers_, Unit::register_file, "RF write pipeline"};
+    // A store whose last acknowledgement came at t completes at t + 1: its
+    // command slot frees at the RF write port and its depbar counts down at
+    // the RAM stage (the memory controller is decided after both). One bit per
+    // LSU command slot (lsu.active_commands): the slot still holds the
+    // command's warp and depbar.
+    Regs<uint8_t> store_completions_{registers_, Unit::load_store, "store completions", 1};
+    // The RF write path (src/timing.hpp): the fixed units' result pipelines,
+    // then one write pipeline per RF write port (bank x
+    // rf.write_ports_per_bank + port), from the port to the RAM.
+    std::array<Pipe<ArithmeticResult>, arithmetic_units> arithmetic_results_{{
+        {registers_, Unit::arithmetic, "ALU result pipeline"},
+        {registers_, Unit::arithmetic, "FPU result pipeline"},
+        {registers_, Unit::arithmetic, "SFU result pipeline"},
+    }};
+    // The units slowest first: at one port cycle their results are presented
+    // in the order they executed.
+    std::array<ArithmeticUnit, arithmetic_units> units_slowest_first_{};
+    std::deque<Pipe<RfWrite>> rf_write_pipes_;
     // The predicate files: per warp slot (core.warps) seven predicates of
     // core.lanes bits, flip-flops, not a memory (src/timing.hpp): a predicate
     // presented at W is in the file from W + 1. Predicate p of warp w is
@@ -2467,7 +2525,9 @@ private:
     void rf_ram_stage(Wires& w);
     void land_rf_writes(const Wires& w);
     void release_lsu_command(Wires& w, uint64_t id);
-    Writeback async_writeback(const AsyncWrite& write);
+    // A granted async holder's write, and the LSU command its write ends
+    // (the load buffer's last write of a command).
+    RfWrite async_rf_write(const AsyncWrite& write, std::optional<uint64_t>& ends_command);
     void count_rf_write_waits(const RfWriteDecision& decision);
     // ---- store path ----
     EgressWrite decide_egress_write();
@@ -2600,7 +2660,9 @@ private:
     void drive_egress(const Wires& w);
     void drive_read_records(const Wires& w);
     void drive_free_id_tags(const Wires& w);
-    void drive_writebacks(const Wires& w);
+    void drive_arithmetic_results(const Wires& w);
+    void drive_rf_write_pipes(const Wires& w);
+    void drive_store_completions(const Wires& w);
     void drive_predicates(const Wires& w);
     void drive_load_slots(const Wires& w);
     void drive_acc_ld_pipe(const Wires& w);
@@ -2619,10 +2681,8 @@ private:
     // go only to sanitizer_.
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] IssueSite site(const DispatchEntry& op) const;
-    [[nodiscard]] static std::vector<uint32_t> access_addresses(
-        const std::vector<std::vector<LaneAccess>>& rounds);
-    [[nodiscard]] static std::vector<std::vector<uint32_t>> round_addresses(
-        const std::vector<std::vector<LaneAccess>>& rounds);
+    [[nodiscard]] std::vector<uint32_t> access_addresses(const SlotRounds& access) const;
+    [[nodiscard]] std::vector<std::vector<uint32_t>> round_addresses(const SlotRounds& access) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
         uint32_t base, uint32_t spacing, bool a_operand, const MmaShape& shape) const;
     [[nodiscard]] std::vector<uint8_t> shmem_after_edge(uint32_t address, uint32_t size, const Wires& w) const;
@@ -2680,9 +2740,11 @@ private:
     ReadBeat load_round(uint32_t slot);
     ReadBeat tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register);
     WriteBeat store_round(uint32_t slot);
-    WriteBeat rmw_update(const ReadBeat& read);
+    RmwUpdate rmw_update(const ReadBeat& read);
     [[nodiscard]] static bool is_atomic_operation(MbarRmwOperation operation);
-    [[nodiscard]] WriteBeat atomic_update(const MbarRmwRequest& request, uint32_t old_word) const;
+    [[nodiscard]] static RmwUpdate atomic_update(const MbarRmwRequest& request, uint32_t old_word);
+    // The RMW's write round: the update's word at the operation's address.
+    [[nodiscard]] WriteBeat rmw_write_round(const RmwUpdate& update) const;
     WriteBeat placement_round(const TmaPortRequest& request, bool start);
     void advance_tma_read(Wires& w);
     void fill_tma_store_register(const ReadBeat& beat, Wires& w);
@@ -2700,6 +2762,8 @@ private:
     void advance_mma(MmaPipeline& mma, Wires& w);
     [[nodiscard]] std::optional<MmaFetch> next_mma_step(MmaPipeline& mma, Wires& w);
     [[nodiscard]] MmaRead grant_mma_round(MmaPipeline& mma);
+    [[nodiscard]] std::optional<uint32_t> mma_element_address(const MmaStep& step, std::size_t element) const;
+    [[nodiscard]] std::size_t mma_elements() const;
     void sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w);
     void enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w);
     void sample_mma_c(MmaResult& result);
@@ -2722,6 +2786,7 @@ private:
     // instruction's words per row and width, its words (sorted here).
     [[nodiscard]] TmemRegion tmem_region(uint32_t pointer, const Instruction& inst, std::vector<uint32_t> words) const;
     void execute_arithmetic(const ArithmeticRead& pending, Wires& w);
+    [[nodiscard]] static ArithmeticUnit arithmetic_unit(const Instruction& inst);
 
     // TMA.
     void apply_tma_requests(TmaQueue& tma, Wires& w);
@@ -2799,17 +2864,16 @@ private:
     }
     // SIMT shmem bank rounds (lds/sts by bank decode; lds.uni: one access),
     // from the captured operands.
-    [[nodiscard]] std::vector<std::vector<LaneAccess>> build_shmem_rounds(const DispatchEntry& op, bool load) const;
-    [[nodiscard]] std::vector<std::vector<LaneAccess>> build_uniform_shmem_round(const DispatchEntry& op) const;
+    [[nodiscard]] SlotRounds build_shmem_rounds(const DispatchEntry& op) const;
+    [[nodiscard]] SlotRounds build_uniform_shmem_round(const DispatchEntry& op) const;
+    // The lanes in round `round` of an access, in bank order (one per bank
+    // at most): the round's words at the RAM.
+    [[nodiscard]] Bounded<uint8_t, limits::shmem_banks> round_lanes(const SlotRounds& access, uint32_t round) const;
     [[nodiscard]] uint32_t shmem_address(const DispatchEntry& op, uint32_t base) const;
     void apply_image(
         std::vector<uint8_t>& memory,
         const std::vector<ImageSegment>& image,
         const std::string& name);
-    Writeback register_writeback(
-        const Warp& warp, uint8_t dst, uint64_t port_cycle, std::vector<uint32_t> values) const;
-    Writeback predicate_writeback(
-        const Warp& warp, uint8_t dst, uint64_t port_cycle, std::vector<uint32_t> values) const;
     [[noreturn]] void panic(const Warp& warp, const Instruction& inst, const std::string& reason) const;
     [[noreturn]] void panic(const DispatchEntry& op, const std::string& reason) const;
     [[noreturn]] void mbar_rmw_panic(
@@ -2857,15 +2921,10 @@ uint32_t half_to_float_bits(uint16_t half);
 uint16_t float_to_half_bits(uint32_t bits);
 
 // ---- Clocked state that is not yet a fixed bundle of bits ----
-// Every other register, group, pipeline and FIFO of the machine holds a
+// Every register, group, pipeline, FIFO and memory of the machine holds a
 // payload of a fixed size (machine/state.hpp checks it when this compiles).
-// These four still hold a container; each line says which, and what it would
-// become. Removing a line makes the compiler point at what is left to do.
-//
-// Stored bank schedules and the register file's write path (their own design steps):
-template <> struct NotYetFixedPayload<std::optional<Machine::LoadSlot>> : std::true_type {};  // load_slots_: SlotRounds::rounds, a list of rounds of lanes
-template <> struct NotYetFixedPayload<std::optional<Machine::StoreSlot>> : std::true_type {}; // store_slots_: the same
-template <> struct NotYetFixedPayload<Machine::MmaPipeline> : std::true_type {};              // mma_: the fetch's round_elements and the arriving operands (by byte address)
-template <> struct NotYetFixedPayload<std::deque<Machine::Writeback>> : std::true_type {};    // writebacks_: results of every latency in one deque, removed from the middle
+// A payload that cannot be one yet is named here, one line each, as
+//   template <> struct NotYetFixedPayload<T> : std::true_type {}; // what it still holds
+// with what it would become. There is none.
 
 } // namespace nanosm

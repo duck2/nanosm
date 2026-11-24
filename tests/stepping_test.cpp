@@ -613,9 +613,7 @@ void test_state_report_adds_up() {
     launch.active_warps = 1;
     const nanosm::Machine machine(config, compile("halt\n", config), std::move(launch));
     const auto missing = machine.state_not_yet_declared();
-    require(missing == std::vector<std::string>{"load slots", "store slots", "MMA queue and pipeline",
-                           "RF write pipeline"},
-        "the primitives not yet declared are not the four listed");
+    require(missing.empty(), "a primitive is listed as not yet declared");
     uint64_t declared = 0;
     for (const auto& size : machine.state_sizes()) {
         require(size.unit != nanosm::Unit::none, "'" + size.name + "' belongs to no unit");
@@ -666,6 +664,57 @@ void test_state_report_adds_up() {
         calendar = calendar || (size.name == "RF write calendar" && size.bits() == std::optional<uint64_t>(42));
     }
     require(calendar, "the RF write calendar is not declared as 42 flip-flops");
+    require(report.find("  flip-flops       68,210\n") != std::string::npos,
+        "the canonical profile's flip-flops moved from 68,210");
+    // The operands the dispatch and arithmetic pipelines carry inside the
+    // RF's and URF's read delays are the memories' (their lines give the
+    // ports' bound: banks x read ports x word bits x delay); what is held
+    // after a delay counts, as wide as the path's widest round there. The
+    // dispatch entry is 175 bits a stage before its words, the arithmetic
+    // one 132.
+    struct Case {
+        uint32_t rf_delay, urf_delay, rf_banks;
+        uint64_t dispatch, arithmetic;
+        const char* rf_note;
+        const char* urf_note;
+    };
+    for (const auto& expected : {
+             // canonical: uniform round 0 held one stage (two words dispatched, ur2r's one)
+             Case{2, 1, 3, 3 * 175 + 64, 3 * 132 + 32, "at most 3,072 bits", "at most 64 bits"},
+             // equal delays: the dispatch's vector holding stage, two words (sts, stg)
+             Case{1, 1, 3, 3 * 175 + 1024 + 64, 2 * 132, "at most 1,536 bits", "at most 64 bits"},
+             // a slow RF: uniform round 0 held two stages, an mma.async's urC one
+             Case{3, 1, 3, 4 * 175 + 128 + 32, 4 * 132 + 64, "at most 4,608 bits", "at most 64 bits"},
+             // one bank, one read port: the RF's bound is one word for two cycles
+             Case{2, 1, 1, 3 * 175 + 64, 3 * 132 + 32, "at most 1,024 bits", "at most 64 bits"},
+         }) {
+        auto profile = canonical_profile();
+        profile.rf_read_latency_cycles = expected.rf_delay;
+        profile.urf_read_latency_cycles = expected.urf_delay;
+        profile.rf_banks = expected.rf_banks;
+        profile.urf_issue_to_port_cycles = std::max(profile.urf_issue_to_port_cycles, 1 + expected.rf_delay);
+        nanosm::Launch one;
+        one.active_warps = 1;
+        const nanosm::Machine varied(profile, compile("halt\n", profile), std::move(one));
+        const auto where = " (RF delay " + std::to_string(expected.rf_delay) + ", URF delay " +
+            std::to_string(expected.urf_delay) + ", " + std::to_string(expected.rf_banks) + " RF banks)";
+        const auto bits_of = [&](const std::string& name) {
+            for (const auto& size : varied.state_sizes()) {
+                if (size.name == name) return size.bits().value_or(0);
+            }
+            return uint64_t{0};
+        };
+        require(bits_of("dispatch pipeline") == expected.dispatch,
+            "the dispatch pipeline declares " + std::to_string(bits_of("dispatch pipeline")) + " bits" + where);
+        require(bits_of("arithmetic pipeline: operand latches") == expected.arithmetic,
+            "the arithmetic pipeline declares " + std::to_string(bits_of("arithmetic pipeline: operand latches")) +
+                " bits" + where);
+        const auto text = varied.state_report();
+        require(text.find("read first; read data in flight: " + std::string(expected.rf_note)) != std::string::npos &&
+                text.find("2R 1W, read delay " + std::to_string(expected.urf_delay) + ", read first; read data in flight: " +
+                    expected.urf_note) != std::string::npos,
+            "the register files' read-delay notes" + where);
+    }
 }
 
 // The host's view of shared memory is shmem.bytes long, though the memory's

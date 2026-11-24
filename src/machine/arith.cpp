@@ -64,7 +64,7 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
     const auto fail = [&](const std::string& reason) {
         throw_issue_panic(IssueSite{cycle_, pending.warp, pending.pc, inst, &config_.mma_shapes}, reason);
     };
-    std::vector<uint32_t> result(config_.lanes, 0);
+    LaneWords result(config_.lanes, 0);
     // The round holds each source register once; duplicated operand slots
     // broadcast from the same captured latch.
     const auto operand = [&](uint8_t reg, uint32_t lane) {
@@ -233,17 +233,32 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending, Wires& w) {
         break;
     default: fail("non-arithmetic instruction in RF read pipeline");
     }
-    // The execution pipeline's E cycles, then the write port it booked. Every
-    // lane computes; the issue cycle's active mask AND the instruction's write
-    // mask (sampled with the operands) is the write's lane enables (the port, its cycle and the
-    // booking are the same whatever the lanes, none included).
-    // (It executes issue_to_operands after its issue.)
-    const auto port_cycle = cycle_ - issue_to_operands(config_) + issue_to_port(inst, config_);
-    auto writeback = is_setp(inst.opcode)
-        ? predicate_writeback(warp, inst.dst, port_cycle, std::move(result))
-        : register_writeback(warp, inst.dst, port_cycle, std::move(result));
-    writeback.lane_enables = pending.active_mask;
-    w.new_writebacks.push_back(std::move(writeback));
+    // Into its unit's result pipeline: E cycles to the write port it booked.
+    // Every lane computes; the issue cycle's active mask AND the instruction's
+    // write mask (sampled with the operands) is the write's lane enables (the
+    // port, its cycle and the booking are the same whatever the lanes, none
+    // included).
+    w.arithmetic_result = std::pair{arithmetic_unit(inst),
+        ArithmeticResult{warp.id, inst.dst, is_setp(inst.opcode), result, pending.active_mask}};
+}
+
+// Which unit executes a fixed-latency instruction: the latency class
+// fixed_latency gives it (src/isa.cpp), probed with three different delays.
+Machine::ArithmeticUnit Machine::arithmetic_unit(const Instruction& inst) {
+    switch (fixed_latency(inst, Timing{1, 2, 3})) {
+    case 1: return ArithmeticUnit::alu;
+    case 2: return ArithmeticUnit::fpu;
+    case 3: return ArithmeticUnit::sfu;
+    default: throw SimError("internal: an instruction with no fixed-latency unit in the arithmetic pipeline");
+    }
+}
+
+// The units' result pipelines: a result executed now enters its unit's;
+// the one at each unit's output leaves (it was presented at the port).
+void Machine::drive_arithmetic_results(const Wires& w) {
+    if (!w.arithmetic_result.has_value()) return;
+    const auto& [unit, result] = *w.arithmetic_result;
+    arithmetic_results_[static_cast<std::size_t>(unit)].push(result, "drive_arithmetic_results");
 }
 
 } // namespace nanosm

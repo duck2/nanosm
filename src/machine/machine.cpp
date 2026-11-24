@@ -14,9 +14,10 @@
 //   dispatch.cpp       dispatch: the dispatch pipeline and its end, where each unit takes an issued instruction
 //                      (a unit's own dispatch_* function is in the unit's file), and a dispatch entry's operands.
 //   rf.cpp             the vector register file: the write calendar, the read and write port decisions, the
-//                      RAM stages, and writebacks. (Its timing rules are src/timing.hpp.)
+//                      write ports' pipelines and the RAM stage. (Its timing rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
-//   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit.
+//   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, and their result
+//                      pipelines.
 //   shmem.cpp          shared memory: ports A and B, the selects, load and store slots, bank rounds, and what
 //                      issue sees of them.
 //   barriers.cpp       barriers (mbar): probes, the read-modify-write engine, atomics, and the try-wait slots.
@@ -207,6 +208,26 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // ports per bank, zero meaning free (no valid bit).
         write_calendar_.declare_total_bits(uint64_t{write_calendar_.stages() - 1} * config_.rf_banks *
             static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
+        // The fixed units' result pipelines (E stages each, src/timing.hpp),
+        // and one pipeline per RF write port, write_depth_cycles stages.
+        const std::array<uint32_t, arithmetic_units> unit_stages{
+            config_.timing.alu, config_.timing.fadd, config_.timing.sfu};
+        for (std::size_t unit = 0; unit < arithmetic_units; ++unit) {
+            arithmetic_results_[unit].build(unit_stages[unit]);
+            units_slowest_first_[unit] = static_cast<ArithmeticUnit>(unit);
+        }
+        std::stable_sort(units_slowest_first_.begin(), units_slowest_first_.end(),
+            [&](ArithmeticUnit a, ArithmeticUnit b) {
+                return unit_stages[static_cast<std::size_t>(a)] > unit_stages[static_cast<std::size_t>(b)];
+            });
+        for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+            for (uint32_t port = 0; port < config_.rf_write_ports_per_bank; ++port) {
+                rf_write_pipes_.emplace_back(registers_, Unit::register_file,
+                    "RF write pipeline, bank " + std::to_string(bank) + " port " + std::to_string(port));
+                rf_write_pipes_.back().build(config_.rf_write_depth_cycles);
+            }
+        }
+        store_completions_.build(config_.lsu_active_commands);
         TmaSectorRegister sector;
         sector.data.assign(config_.gmem_sector_bytes, 0);
         tma_sector_.poke(std::move(sector));
@@ -446,9 +467,9 @@ void Machine::tick() {
     // The RF write path, from Q and before any SIMT candidate: the one RF
     // write decision (the ready async holders share this cycle's unbooked
     // write ports; banks whose service is owed inhibit new SIMT bookings),
-    // the write port (booked results and granted holders enter the write
-    // pipeline) and its RAM stage (the writes landing at this cycle's edge,
-    // and their completions).
+    // the write port (booked results and granted holders enter their ports'
+    // write pipelines) and the RAM stage (the writes landing at this cycle's
+    // edge, and their completions).
     w.rf_write = decide_rf_writes();
     rf_write_port(w);
     rf_ram_stage(w);
@@ -569,10 +590,12 @@ bool Machine::done() const {
         tma.commands.empty() && tma_returns_.empty() && !tma.event_command.has_value() &&
         tma.credits_used == 0 && tma_walker_start_pipe_.empty() && empty(urf_read_rounds_) &&
         tma_read_pairs_.empty() &&
-        empty(tma_holding_) && writebacks_.cur().empty() && arithmetic_reads_.empty() &&
+        empty(tma_holding_) && arithmetic_reads_.empty() &&
+        std::all_of(arithmetic_results_.begin(), arithmetic_results_.end(), [](const auto& pipe) { return pipe.empty(); }) &&
+        std::all_of(rf_write_pipes_.begin(), rf_write_pipes_.end(), [](const auto& pipe) { return pipe.empty(); }) &&
+        std::all_of(store_completions_.cur().begin(), store_completions_.cur().end(), [](uint8_t bit) { return bit == 0; }) &&
         dispatch_pipe_.empty() && lsu_read_pipe_.empty() && urf_pipe_.empty() &&
         mma.slots.empty() && mma_results_.empty() && !mma.fetch.has_value() && mma_reads_.empty() &&
-        mma.arriving.empty() &&
         !acc[0].has_value() && !acc[1].has_value();
 }
 
@@ -651,7 +674,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 43> canonical = {
+    static constexpr std::array<Driver, 45> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -685,7 +708,9 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_egress,
         &Machine::drive_read_records,
         &Machine::drive_free_id_tags,
-        &Machine::drive_writebacks,
+        &Machine::drive_arithmetic_results,
+        &Machine::drive_rf_write_pipes,
+        &Machine::drive_store_completions,
         &Machine::drive_predicates,
         &Machine::drive_rf_write_policy,
         &Machine::drive_rf_read_policy,

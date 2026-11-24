@@ -100,6 +100,8 @@ struct StateSize {
     uint32_t write_ports = 0;
     uint32_t read_delay = 0;
     const char* same_cycle = "";
+    // What the report says beside the bits (where some of them are counted).
+    std::string note;
 
     // The declared bits of the whole thing (entries and control), when
     // declared.
@@ -121,13 +123,16 @@ public:
     [[nodiscard]] Unit unit() const { return unit_; }
     virtual void commit() = 0;
     [[nodiscard]] virtual StateSize size() const { return sized("register", 1, std::nullopt); }
+    // A note for the state report, set when the machine is built.
+    void declare_note(std::string note) { note_ = std::move(note); }
 
 protected:
-    // A size with this one's name and unit.
+    // A size with this one's name, unit and note.
     [[nodiscard]] StateSize sized(const char* kind, uint64_t entries, std::optional<uint64_t> bits) const {
         StateSize size;
         size.name = name_;
         size.unit = unit_;
+        size.note = note_;
         size.kind = kind;
         size.entries = entries;
         size.bits_per_entry = bits;
@@ -147,6 +152,7 @@ private:
     uint32_t id_ = 0;
     Unit unit_ = Unit::none;
     std::string name_;
+    std::string note_;
 };
 
 template <typename T>

@@ -42,7 +42,7 @@ uint32_t Machine::read_urf(uint32_t warp, uint8_t reg, const char* tag) {
 // (land_urf_write). Each stage holds at most one write, so the one write
 // port is never contended. A usetp in stage L - 1 presents its predicate at
 // the predicate file instead -- the same bit in every lane, taken by the
-// flip-flops at this cycle's edge (land_rf_writes) -- and leaves (step_urf).
+// flip-flops at this cycle's edge (drive_predicates) -- and leaves (step_urf).
 void Machine::urf_ram_stage(Wires& w) {
     const auto& pipe = urf_pipe_.cur();
     if (const auto& presented = pipe.at(config_.urf_issue_to_port_cycles - 1); presented.has_value()) {
@@ -50,10 +50,8 @@ void Machine::urf_ram_stage(Wires& w) {
             throw SimError("internal: a uniform write reached the URF write port without its value");
         }
         if (is_usetp(presented->instruction.opcode)) {
-            auto predicate = predicate_writeback(warps_.at(presented->warp), presented->instruction.dst, cycle_,
-                std::vector<uint32_t>(config_.lanes, *presented->value));
-            predicate.lane_enables = presented->active_mask;
-            w.rf_landings.push_back(std::move(predicate));
+            w.predicate_writes.push_back(PredicateWrite{presented->warp, presented->instruction.dst,
+                *presented->value != 0 ? full_mask() : 0, presented->active_mask});
         } else {
             trace_->urf_write(cycle_, presented->warp, presented->instruction.dst, *presented->value);
         }

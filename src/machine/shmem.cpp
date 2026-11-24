@@ -180,13 +180,17 @@ void Machine::deliver_shmem_read(Wires& w) {
     case ReadClient::load_slot:
         break;
     }
+    // The round's words are in bank order, as its lanes (round_lanes): the
+    // slot's round table finds each lane's word D + Lb after the grant. An
+    // lds.uni's one word goes to every lane.
     const auto& slot = *load_slots_.at(beat->slot).cur();
-    const auto& lanes = slot.access.rounds.at(beat->round);
     LoadFill fill{beat->slot, {}};
-    for (std::size_t access = 0; access < lanes.size(); ++access) {
-        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-            if (slot.uniform || lane == lanes[access].lane) fill.lanes.emplace_back(lane, beat->words[access]);
-        }
+    if (slot.uniform) {
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) fill.lanes.emplace_back(lane, beat->words.at(0));
+    } else {
+        const auto lanes = round_lanes(slot.access, static_cast<uint32_t>(beat->round));
+        if (lanes.size() != beat->words.size()) throw SimError("internal: a load round came back with the wrong words");
+        for (std::size_t at = 0; at < lanes.size(); ++at) fill.lanes.emplace_back(lanes[at], beat->words[at]);
     }
     w.shmem.load_fill = std::move(fill);
 }
@@ -385,7 +389,7 @@ void Machine::serve_a_read(Wires& w) {
 Machine::ReadBeat Machine::load_round(uint32_t index) {
     const auto& slot = *load_slots_.at(index).cur();
     const auto round = slot.access.granted;
-    const auto rounds = slot.access.rounds.size();
+    const auto rounds = slot.access.rounds;
     if (round == 0) {
         trace_->shmem_begin(ShmemService::a_read, cycle_, slot.uniform ? "lds.uni" : "lds",
             "warp=" + std::to_string(slot.warp) + ", rounds=" + std::to_string(rounds), TraceCategory::shmem);
@@ -397,7 +401,7 @@ Machine::ReadBeat Machine::load_round(uint32_t index) {
     beat.client = ReadClient::load_slot;
     beat.slot = index;
     beat.round = round;
-    for (const auto& lane : slot.access.rounds[round]) beat.addresses.push_back(static_cast<uint32_t>(lane.byte_address));
+    for (const auto lane : round_lanes(slot.access, round)) beat.addresses.push_back(slot.access.address[lane]);
     return beat;
 }
 
@@ -435,14 +439,14 @@ void Machine::serve_a_write(Wires& w) {
                 std::to_string(*request.warp) + " pc " + std::to_string(request.pc) + ")",
                 std::vector<std::pair<uint32_t, uint32_t>>{{request.byte_address, request.byte_address + 4}});
         } else {
-            trace_->mbar_rmw_end(cycle_ + 1, update.wake.has_value());
+            trace_->mbar_rmw_end(cycle_ + 1, update.wake_phase.has_value());
         }
         // A SIMT RMW's final write: its warp's access reaches the RAM D cycles from now.
         if (const auto warp = request.warp; warp.has_value()) {
             sanitizer_.record_simt_shmem_grant(cycle_, SimtShmemHolder::rmw, *warp, cycle_ + config_.shmem_port_a_depth);
             shmem.a_write_warp = warp;
         }
-        shmem.a_write_beat = update;
+        shmem.a_write_beat = rmw_write_round(update);
         return;
     }
     }
@@ -453,7 +457,7 @@ void Machine::serve_a_write(Wires& w) {
 Machine::WriteBeat Machine::store_round(uint32_t index) {
     const auto& slot = *store_slots_.at(index).cur();
     const auto round = slot.access.granted;
-    const auto rounds = slot.access.rounds.size();
+    const auto rounds = slot.access.rounds;
     if (round == 0) {
         trace_->shmem_begin(ShmemService::a_write, cycle_, "sts",
             "warp=" + std::to_string(slot.warp) + ", rounds=" + std::to_string(rounds), TraceCategory::shmem);
@@ -462,10 +466,10 @@ Machine::WriteBeat Machine::store_round(uint32_t index) {
     // (The sanitizer checks here too that the round does not write a live mbar.)
     sanitizer_.record_simt_shmem_grant(cycle_, SimtShmemHolder::store_slot, index, cycle_ + config_.shmem_port_a_depth);
     WriteBeat beat;
-    for (const auto& access : slot.access.rounds[round]) {
-        std::vector<uint8_t> bytes(4);
-        std::memcpy(bytes.data(), &access.value, sizeof(access.value));
-        beat.writes.push_back({static_cast<uint32_t>(access.byte_address), std::move(bytes)});
+    for (const auto lane : round_lanes(slot.access, round)) {
+        ShmemWrite write{slot.access.address[lane], {}};
+        for (uint32_t byte = 0; byte < 4; ++byte) write.bytes.push_back(static_cast<uint8_t>(slot.data[lane] >> (8 * byte)));
+        beat.writes.push_back(write);
     }
     if (round + 1 == rounds) {
         beat.sts_done = DepbarEvent{slot.warp, slot.depbar};
@@ -549,14 +553,14 @@ bool Machine::warp_dispatching(uint32_t warp, bool reads, bool writes, bool prob
 bool Machine::store_slot_released(const Wires& w, uint32_t index) const {
     const auto& slot = store_slots_[index].cur();
     return slot.has_value() && w.shmem.a_write.user == AWriteUser::store_slot && w.shmem.a_write.slot == index &&
-        slot->access.granted + 1 == slot->access.rounds.size();
+        slot->access.granted + 1 == slot->access.rounds;
 }
 
 // Load slot `index` still has a round to be granted after this cycle.
 bool Machine::load_rounds_left(const Wires& w, uint32_t index) const {
     const auto& slot = *load_slots_[index].cur();
     const bool granted_now = w.shmem.a_read.user == AReadUser::load_slot && w.shmem.a_read.slot == index;
-    return slot.access.granted + (granted_now ? 1 : 0) < slot.access.rounds.size();
+    return slot.access.granted + (granted_now ? 1 : 0) < slot.access.rounds;
 }
 
 // An unserviced read: the warp has an lds in the dispatch pipeline, or holds
@@ -608,16 +612,16 @@ bool Machine::own_shmem_at_ram(const Wires& w, uint32_t warp) const {
 void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool uniform = inst.opcode == Opcode::lds_uni;
-    auto rounds = uniform ? build_uniform_shmem_round(op) : build_shmem_rounds(op, true);
+    const auto access = uniform ? build_uniform_shmem_round(op) : build_shmem_rounds(op);
     const auto index = *free_load_slot(w);
-    sanitizer_.check_simt_shmem_access(site(op), access_addresses(rounds), true);
-    sanitizer_.record_simt_shmem_issue(site(op), SimtShmemHolder::load_slot, index, round_addresses(rounds),
+    sanitizer_.check_simt_shmem_access(site(op), access_addresses(access), true);
+    sanitizer_.record_simt_shmem_issue(site(op), SimtShmemHolder::load_slot, index, round_addresses(access),
         4, false);
     LoadSlot slot;
     slot.warp = op.warp;
     slot.uniform = uniform;
     slot.mask = op.active_mask;
-    slot.access.rounds = std::move(rounds);
+    slot.access = access;
     slot.dst = inst.dst;
     slot.depbar = inst.control.set_depbar;
     slot.words.assign(config_.lanes, 0);
@@ -630,16 +634,20 @@ void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
 // sanitizer's PANIC); the machine just writes both, in round
 // order, so the highest active lane's word lands.
 void Machine::dispatch_shared_store(const DispatchEntry& op, Wires& w) {
-    auto rounds = build_shmem_rounds(op, false);
+    const auto access = build_shmem_rounds(op);
     const auto index = *free_store_slot(w);
-    const auto words = access_addresses(rounds);
+    const auto words = access_addresses(access);
     sanitizer_.check_store_word_collision(site(op), std::vector<uint64_t>(words.begin(), words.end()), "shmem");
     sanitizer_.check_simt_shmem_access(site(op), words, false);
-    sanitizer_.record_simt_shmem_issue(site(op), SimtShmemHolder::store_slot, index, round_addresses(rounds),
+    sanitizer_.record_simt_shmem_issue(site(op), SimtShmemHolder::store_slot, index, round_addresses(access),
         4, true);
     StoreSlot slot;
     slot.warp = op.warp;
-    slot.access.rounds = std::move(rounds);
+    slot.access = access;
+    const auto data = capture(op, op.instruction.src1);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        if ((access.lanes >> lane & 1) != 0) slot.data[lane] = data[lane];
+    }
     slot.depbar = op.instruction.control.set_depbar;
     w.dispatch.store_slot = std::make_pair(index, std::move(slot));
 }
@@ -737,33 +745,45 @@ void Machine::drive_shmem_to_ram(const Wires& w) {
 // (UB: the sanitizer's live-mbar check) simply writes it.
 // ---------------------------------------------------------------------------
 
-std::vector<std::vector<Machine::LaneAccess>> Machine::build_shmem_rounds(const DispatchEntry& op, bool load) const {
-    const auto& inst = op.instruction;
-    const auto bases = capture(op, inst.src0);
-    const auto data = load ? std::vector<uint32_t>(config_.lanes, 0) : capture(op, inst.src1);
-    std::vector<std::vector<LaneAccess>> lanes_by_bank(config_.shmem_banks);
+Machine::SlotRounds Machine::build_shmem_rounds(const DispatchEntry& op) const {
+    const auto bases = capture(op, op.instruction.src0);
+    SlotRounds access;
+    std::array<uint32_t, limits::shmem_banks> lanes_on_bank{};
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
         if ((op.active_mask >> lane & 1) == 0) continue;
         const auto byte_address = shmem_address(op, bases[lane]);
-        auto& bank_lanes = lanes_by_bank[(byte_address / 4) % config_.shmem_banks];
-        bank_lanes.push_back({.lane = lane, .byte_address = byte_address, .value = data[lane]});
+        auto& on_bank = lanes_on_bank[(byte_address / 4) % config_.shmem_banks];
+        access.lanes |= uint64_t{1} << lane;
+        access.address[lane] = byte_address;
+        access.round[lane] = static_cast<uint8_t>(on_bank++);
+        access.rounds = std::max(access.rounds, on_bank);
     }
-    std::size_t round_count = 0;
-    for (const auto& bank_lanes : lanes_by_bank) round_count = std::max(round_count, bank_lanes.size());
-    std::vector<std::vector<LaneAccess>> rounds(round_count);
-    for (const auto& bank_lanes : lanes_by_bank) {
-        for (std::size_t round = 0; round < bank_lanes.size(); ++round) {
-            rounds[round].push_back(bank_lanes[round]);
-        }
-    }
-    return rounds;
+    return access;
 }
 
 // lds.uni: the address comes from a uniform register (as ldg.uni's does) and
-// makes one access; serve_simt_round fans the word out to every lane.
-std::vector<std::vector<Machine::LaneAccess>> Machine::build_uniform_shmem_round(const DispatchEntry& op) const {
-    const auto base = uniform_operand(op, op.instruction.src0);
-    return {{LaneAccess{.lane = 0, .byte_address = shmem_address(op, base)}}};
+// makes one access, lane 0's; its word goes to every lane (deliver_shmem_read).
+Machine::SlotRounds Machine::build_uniform_shmem_round(const DispatchEntry& op) const {
+    SlotRounds access;
+    access.lanes = 1;
+    access.address[0] = shmem_address(op, uniform_operand(op, op.instruction.src0));
+    access.rounds = 1;
+    return access;
+}
+
+// A round's lanes, one per bank at most, in bank order: bank b's lane is the
+// one of its lanes whose round it is.
+Bounded<uint8_t, limits::shmem_banks> Machine::round_lanes(const SlotRounds& access, uint32_t round) const {
+    std::array<int, limits::shmem_banks> lane_on_bank;
+    lane_on_bank.fill(-1);
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        if (access.in_round(lane, round)) lane_on_bank[(access.address[lane] / 4) % config_.shmem_banks] = static_cast<int>(lane);
+    }
+    Bounded<uint8_t, limits::shmem_banks> lanes;
+    for (uint32_t bank = 0; bank < config_.shmem_banks; ++bank) {
+        if (lane_on_bank[bank] >= 0) lanes.push_back(static_cast<uint8_t>(lane_on_bank[bank]));
+    }
+    return lanes;
 }
 
 // One lane's address from its captured base register value and the immediate.

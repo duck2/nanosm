@@ -1440,6 +1440,44 @@ void test_m32_walker() {
                 "m32 on the bottom half: element (" + std::to_string(row) + ", " + std::to_string(col) + ")");
 }
 
+// One object as both operands (mma.async C, A, A): B(k, n) is the object's
+// row n, so the result is A x A^T. Where a step's B rows are its A rows, the
+// two blocks are the same sixteen words: one bank round fills both from the
+// operand latch's A and B positions.
+void test_one_object_as_both_operands() {
+    const auto& profile = canonical_profile();
+    nanosm::Launch launch;
+    launch.active_warps = 1;
+    i9_write_operands(launch);
+    nanosm::Machine machine(profile, compile(R"(
+        umov ur0, 0
+        umov ur4, 8192
+        umov ur2, 4096
+        mbar.init [ur4], 1
+        mma.async.init.m32n64k8 [ur2], [ur0], [ur0]
+        mma.commit [ur4]
+    wait:
+        mbar.try_wait p0, [ur4], 0
+        @!p0 bra.uni wait
+        halt
+    )", profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
+    machine.run(20000);
+    std::vector<std::string> inputs;
+    for (const auto& event : machine.trace().events()) {
+        if (event.name == "MMA input step") inputs.push_back(event.detail);
+    }
+    require(inputs.size() == 128 && inputs[0] == "rounds=1, reads A" && inputs[16] == "rounds=2, reads A",
+        "a step whose A and B blocks are the same words did not take one round");
+    for (uint32_t row = 0; row < 32; ++row) {
+        for (uint32_t col = 0; col < 64; ++col) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < 8; ++k) sum += static_cast<float>(i9_a(row, k) * i9_a(col, k));
+            require(nanosm::bits_float(machine.tmem_word(i9_tmem_word(4096, 64, row, col))) == sum,
+                "A x A^T: element (" + std::to_string(row) + ", " + std::to_string(col) + ")");
+        }
+    }
+}
+
 // The same 64-row A object as one m64 command and as two m32 commands on its
 // halves (bases 0 and 512): the halves equal the m64 result bit for bit, and
 // both equal the logical reference. Then two m32 commands back to back keep
@@ -2519,6 +2557,11 @@ TEST(Mma, bank_census) {
 // M32n64k8 walker
 TEST(Mma, m32_walker) {
     test_m32_walker();
+}
+
+// mma.async C, A, A: one object as both operands
+TEST(Mma, one_object_as_both_operands) {
+    test_one_object_as_both_operands();
 }
 
 // Two m32 halves equal one m64

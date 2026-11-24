@@ -65,13 +65,8 @@ void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
     if (request.test) {
         // The predicate file (flip-flops) takes it at this cycle's edge; the
         // warp issues from the next cycle (probe_in_flight).
-        Writeback predicate;
-        predicate.port_cycle = cycle_;
-        predicate.land_cycle = cycle_;
-        predicate.warp = warp.id;
-        predicate.predicate_dst = request.predicate_dst;
-        predicate.values.assign(config_.lanes, complete ? 1 : 0);
-        w.rf_landings.push_back(std::move(predicate));
+        w.predicate_writes.push_back(
+            PredicateWrite{warp.id, request.predicate_dst, complete ? full_mask() : 0, full_mask()});
         sanitizer_.record_pred_ready(warp.id, request.predicate_dst, cycle_ + 1);
         return;
     }
@@ -168,7 +163,7 @@ void Machine::serve_rmw_start(Wires& w) {
 // sanitizer's question (the TMA's accept-time peek; the host's parity).
 // An atomic's word is ordinary data, not an mbar: it goes to atomic_update
 // before any mbar decode (no live-phase validation, no tx check).
-Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
+Machine::RmwUpdate Machine::rmw_update(const ReadBeat& read) {
     const auto& request = rmw_.cur().active->request;
     if (is_atomic_operation(request.operation)) return atomic_update(request, read.words.at(0));
     auto state = decode_mbar_state(static_cast<uint64_t>(read.words.at(0)) | static_cast<uint64_t>(read.words.at(1)) << 32);
@@ -230,17 +225,28 @@ Machine::WriteBeat Machine::rmw_update(const ReadBeat& read) {
         throw SimError("internal: an atomic reached the mbar update");
     }
 
-    WriteBeat beat;
+    RmwUpdate update;
     if (request.operation != MbarRmwOperation::init && state.remaining == 0 && state.tx_bytes == 0) {
         state.phase = !state.phase;
         state.remaining = state.expected;
-        beat.wake = MbarWake{request.byte_address, static_cast<uint8_t>(state.phase)};
+        update.wake_phase = static_cast<uint8_t>(state.phase);
     }
     sanitizer_.record_mbar_tx(request.byte_address, state.tx_bytes);
-    const auto word = encode_mbar_state(state);
-    std::vector<uint8_t> bytes(8);
-    std::memcpy(bytes.data(), &word, sizeof(word));
-    beat.writes.push_back({request.byte_address, std::move(bytes)});
+    update.word = encode_mbar_state(state);
+    return update;
+}
+
+// The write round of the RMW in flight: its update's word at its address,
+// eight bytes for an mbar, four for an atomic; a phase flip's wake rides to
+// the RAM with it.
+Machine::WriteBeat Machine::rmw_write_round(const RmwUpdate& update) const {
+    const auto& request = rmw_.cur().active.value().request;
+    const std::size_t size = is_atomic_operation(request.operation) ? 4 : 8;
+    ShmemWrite write{request.byte_address, {}};
+    for (std::size_t byte = 0; byte < size; ++byte) write.bytes.push_back(static_cast<uint8_t>(update.word >> (8 * byte)));
+    WriteBeat beat;
+    beat.writes.push_back(write);
+    if (update.wake_phase.has_value()) beat.wake = MbarWake{request.byte_address, *update.wake_phase};
     return beat;
 }
 
@@ -255,7 +261,7 @@ bool Machine::is_atomic_operation(MbarRmwOperation operation) {
 // modulo 2^32 -- defined 32-bit two's-complement wrap, never host signed
 // overflow. (For add, and, xor and exchange the signed and unsigned bit
 // results agree.) No wake: an atomic is not an mbar operation.
-Machine::WriteBeat Machine::atomic_update(const MbarRmwRequest& request, uint32_t old_word) const {
+Machine::RmwUpdate Machine::atomic_update(const MbarRmwRequest& request, uint32_t old_word) {
     uint32_t word = 0;
     switch (request.operation) {
     case MbarRmwOperation::atom_add: word = old_word + request.value; break;
@@ -264,11 +270,7 @@ Machine::WriteBeat Machine::atomic_update(const MbarRmwRequest& request, uint32_
     case MbarRmwOperation::atom_exch: word = request.value; break;
     default: throw SimError("internal: an mbar operation in the atomic ALU");
     }
-    WriteBeat beat;
-    std::vector<uint8_t> bytes(4);
-    std::memcpy(bytes.data(), &word, sizeof(word));
-    beat.writes.push_back({request.byte_address, std::move(bytes)});
-    return beat;
+    return RmwUpdate{word, std::nullopt};
 }
 
 // (T) An engine's held event waits while the RMW engine works on the OTHER
@@ -384,13 +386,7 @@ void Machine::complete_mbar_try_wait(Wires& w, uint32_t index, bool result) {
         throw SimError("internal completion of an empty mbar try-wait slot");
     }
     const auto& slot = *slots[index];
-    Writeback predicate;
-    predicate.port_cycle = cycle_;
-    predicate.land_cycle = cycle_;
-    predicate.warp = slot.warp;
-    predicate.predicate_dst = slot.predicate_dst;
-    predicate.values.assign(config_.lanes, result ? 1 : 0);
-    w.rf_landings.push_back(std::move(predicate));
+    w.predicate_writes.push_back(PredicateWrite{slot.warp, slot.predicate_dst, result ? full_mask() : 0, full_mask()});
     sanitizer_.record_pred_ready(slot.warp, slot.predicate_dst, cycle_ + 1);
     w.completed_waits.push_back(index);
 }

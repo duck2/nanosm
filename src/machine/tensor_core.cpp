@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
-#include <set>
 #include <utility>
 
 namespace nanosm {
@@ -141,17 +140,37 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
         sample_mma_read(mma, *w.mma_read_sampled, w);
     }
     if (const auto& output = mma_reads_.last(); output.has_value()) {
-        mma.arriving.insert(mma.arriving.end(), output->values.begin(), output->values.end());
-        if (output->last_round) {
-            enter_mma_core(mma, output->step, w);
-            mma.arriving.clear();
+        for (std::size_t element = 0; element < mma_step_elements; ++element) {
+            if (output->in_round[element]) mma.latch[element] = output->values[element];
         }
+        if (output->last_round) enter_mma_core(mma, output->step, w);
     }
     if (!mma.fetch.has_value()) mma.fetch = next_mma_step(mma, w);
     if (mma.fetch.has_value()) {
         w.mma_read_granted = grant_mma_round(mma);
-        if (mma.fetch->next_round == mma.fetch->round_elements.size()) mma.fetch.reset();
+        if (mma.fetch->next_round == mma.fetch->rounds) mma.fetch.reset();
     }
+}
+
+// Element `element` of a step (MmaFetch): its shared-memory byte address, or
+// none for an A element of a step that uses the held A block.
+std::optional<uint32_t> Machine::mma_element_address(const MmaStep& step, std::size_t element) const {
+    const std::size_t a_elements = std::size_t{config_.mma_core_m} * config_.mma_core_k;
+    if (element < a_elements) {
+        if (!step.reload_a) return std::nullopt;
+        const auto mi = static_cast<uint32_t>(element / config_.mma_core_k);
+        const auto kk = static_cast<uint32_t>(element % config_.mma_core_k);
+        return mma_a_address(config_, step.shape, step.a_base, step.a_spacing, step.m0 + mi, step.k0 + kk);
+    }
+    const auto at = element - a_elements;
+    const auto kk = static_cast<uint32_t>(at / config_.mma_core_n);
+    const auto ni = static_cast<uint32_t>(at % config_.mma_core_n);
+    return mma_b_address(config_, step.shape, step.b_base, step.b_spacing, step.k0 + kk, step.n0 + ni);
+}
+
+// A step's elements: core_m x core_k of A and core_k x core_n of B.
+std::size_t Machine::mma_elements() const {
+    return std::size_t{config_.mma_core_m} * config_.mma_core_k + std::size_t{config_.mma_core_k} * config_.mma_core_n;
 }
 
 // The next step port B may start now, if any; or the head commit presents
@@ -228,49 +247,45 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
         trace_->mma_recurrence_stall();
         return std::nullopt; // explicit recurrence bubble for a profile whose sweep is too short
     }
-    std::vector<uint32_t> elements;
-    if (step.reload_a) {
-        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                elements.push_back(mma_a_address(config_, step.shape, step.a_base, step.a_spacing,
-                    step.m0 + mi, step.k0 + kk));
-    }
-    for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-        for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
-            elements.push_back(mma_b_address(config_, step.shape, step.b_base, step.b_spacing,
-                step.k0 + kk, step.n0 + ni));
-    // Bank rounds: round r reads every bank's r-th distinct word.
-    std::vector<std::set<uint32_t>> words_by_bank(config_.shmem_banks);
-    for (const auto address : elements) {
-        const auto word = address / 4;
-        words_by_bank[word % config_.shmem_banks].insert(word);
-    }
-    uint32_t rounds = 1;
-    std::map<uint32_t, uint32_t> word_round;
-    for (const auto& words : words_by_bank) {
-        rounds = std::max<uint32_t>(rounds, static_cast<uint32_t>(words.size()));
-        uint32_t index = 0;
-        for (const auto word : words) word_round[word] = index++;
-    }
+    // Bank rounds: round r reads every bank's r-th distinct word, in
+    // ascending order; each element is in its word's round. (At least one
+    // round: a step reads B.)
     MmaFetch fetch;
     fetch.step = step;
-    fetch.round_elements.resize(rounds);
-    for (const auto address : elements) fetch.round_elements[word_round.at(address / 4)].push_back(address);
+    Bounded<uint32_t, mma_step_elements> distinct; // the step's distinct words
+    for (std::size_t element = 0; element < mma_elements(); ++element) {
+        if (const auto address = mma_element_address(step, element); address.has_value()) {
+            if (std::find(distinct.begin(), distinct.end(), *address / 4) == distinct.end()) distinct.push_back(*address / 4);
+        }
+    }
+    for (std::size_t element = 0; element < mma_elements(); ++element) {
+        const auto address = mma_element_address(step, element);
+        if (!address.has_value()) continue;
+        const uint32_t word = *address / 4;
+        const auto round = static_cast<uint32_t>(std::count_if(distinct.begin(), distinct.end(), [&](uint32_t other) {
+            return other % config_.shmem_banks == word % config_.shmem_banks && other < word;
+        }));
+        fetch.element_round[element] = static_cast<uint8_t>(round);
+        fetch.rounds = std::max(fetch.rounds, round + 1);
+    }
     ++command.next_step;
     ++command.outstanding_results; // retires at its tmem write
     sanitizer_.record_mma_fetch_start(command.id);
-    trace_->mma_input(cycle_, command.id, rounds, command.next_step - 1, step.reload_a);
+    trace_->mma_input(cycle_, command.id, fetch.rounds, command.next_step - 1, step.reload_a);
     return fetch;
 }
 
-// Port B grants the step in service its next round.
+// Port B grants the step in service its next round: the elements in it.
 Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
     auto& fetch = *mma.fetch;
     MmaRead read;
     read.step = fetch.step;
-    read.elements = fetch.round_elements.at(fetch.next_round);
+    for (std::size_t element = 0; element < mma_elements(); ++element) {
+        read.in_round[element] = mma_element_address(fetch.step, element).has_value() &&
+            fetch.element_round[element] == fetch.next_round;
+    }
     ++fetch.next_round;
-    read.last_round = fetch.next_round == fetch.round_elements.size();
+    read.last_round = fetch.next_round == fetch.rounds;
     return read;
 }
 
@@ -279,7 +294,9 @@ Machine::MmaRead Machine::grant_mma_round(MmaPipeline& mma) {
 // command's last step's last round is its final physical operand read: the
 // operands are consumed and its depbar clears here.
 void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
-    for (const auto address : read.elements) {
+    for (std::size_t element = 0; element < mma_elements(); ++element) {
+        if (!read.in_round[element]) continue;
+        const auto address = *mma_element_address(read.step, element);
         if (static_cast<uint64_t>(address) + 2 > shmem_bytes())
             throw SimError("MMA operand footprint is outside shmem");
         // Its two bytes, from the word(s) port B reads in their banks now (a
@@ -290,7 +307,7 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
             const auto bytes = shmem_.read(at.bank, at.row, "port-B read sample", shmem_port_b);
             bits = static_cast<uint16_t>(bits | uint32_t{bytes[at.byte]} << (8 * byte));
         }
-        read.values.emplace_back(address, bits);
+        read.values[element] = bits;
     }
     if (!read.last_round || !read.step.last_step) return;
     const auto id = read.step.command;
@@ -308,28 +325,15 @@ void Machine::sample_mma_read(MmaPipeline& mma, MmaRead& read, Wires& w) {
 // its result leaves the core result_latency after entry and lands in tmem
 // tmem.port_depth after that.
 void Machine::enter_mma_core(MmaPipeline& mma, const MmaStep& step, Wires& w) {
-    std::map<uint32_t, uint16_t> latch;
-    for (const auto& value : mma.arriving) latch.emplace(value.first, value.second);
-    const auto value = [&](uint32_t address) {
-        const auto found = latch.find(address);
-        if (found == latch.end()) throw SimError("internal MMA operand did not arrive with its step");
-        return found->second;
-    };
-    if (step.reload_a) {
-        mma.a_held.assign(config_.mma_core_m * config_.mma_core_k, 0);
-        for (uint32_t mi = 0; mi < config_.mma_core_m; ++mi)
-            for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-                mma.a_held[mi * config_.mma_core_k + kk] = value(mma_a_address(config_, step.shape,
-                    step.a_base, step.a_spacing, step.m0 + mi, step.k0 + kk));
-    }
-    if (mma.a_held.size() != config_.mma_core_m * config_.mma_core_k)
-        throw SimError("internal MMA step found no held A block");
-    // B is transposed here only in the simulator's local operand snapshot.
+    const std::size_t a_elements = std::size_t{config_.mma_core_m} * config_.mma_core_k;
+    if (step.reload_a) mma.a_held.assign(mma.latch.begin(), mma.latch.begin() + static_cast<std::ptrdiff_t>(a_elements));
+    if (mma.a_held.size() != a_elements) throw SimError("internal MMA step found no held A block");
+    // B is transposed here only in the simulator's local operand snapshot
+    // (the latch holds it k-major).
     std::vector<uint16_t> b(config_.mma_core_n * config_.mma_core_k);
     for (uint32_t ni = 0; ni < config_.mma_core_n; ++ni)
         for (uint32_t kk = 0; kk < config_.mma_core_k; ++kk)
-            b[ni * config_.mma_core_k + kk] = value(mma_b_address(config_, step.shape,
-                step.b_base, step.b_spacing, step.k0 + kk, step.n0 + ni));
+            b[ni * config_.mma_core_k + kk] = mma.latch[a_elements + kk * config_.mma_core_n + ni];
     MmaResult result;
     result.command = step.command;
     result.address = step.c_pointer + step.m0 * step.shape.n + step.n0;

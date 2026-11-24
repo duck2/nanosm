@@ -1267,6 +1267,53 @@ void test_async_writer_vs_fixed_booking() {
     }
 }
 
+// One write pipeline per RF write port. One bank (two read ports): an fadd
+// and a mov issued three cycles after it reach bank 0's write port in the
+// same cycle. With one write port the mov's booking waits a cycle; with two
+// both are presented in that cycle, on ports 0 and 1. At write depths 1, 2
+// and 3 every result lands in every lane, and the second port ends the
+// kernel one cycle earlier.
+void test_two_writes_on_one_bank() {
+    for (const uint32_t depth : {1u, 2u, 3u}) {
+        std::array<uint64_t, 2> cycles{};
+        for (const uint32_t ports : {1u, 2u}) {
+            auto profile = canonical_profile();
+            profile.rf_banks = 1;
+            profile.rf_read_ports_per_bank = 2;
+            profile.rf_write_ports_per_bank = ports;
+            profile.rf_write_depth_cycles = depth;
+            const auto what = "write depth " + std::to_string(depth) + ", " + std::to_string(ports) + " write ports: ";
+            nanosm::Launch launch;
+            launch.active_warps = 1;
+            nanosm::Machine machine(profile, compile(R"(
+                mov r1, 1016
+                shli r1, r1, 20
+                fadd r2, r1, r1
+                mov r3, 7
+                mov r4, 13
+                mov r5, 23
+                halt
+            )", profile), std::move(launch), {.timeline = true, .debug = true});
+            machine.run(1000);
+            cycles[ports - 1] = machine.cycle();
+            std::map<uint64_t, uint32_t> writes; // RF writes presented, by cycle
+            for (const auto& event : machine.trace().events()) {
+                if (event.name == "RF write") ++writes[event.start_cycle];
+            }
+            const bool two_in_a_cycle =
+                std::any_of(writes.begin(), writes.end(), [](const auto& cycle) { return cycle.second == 2; });
+            require(two_in_a_cycle == (ports == 2), what + "two writes were presented in one cycle only with two ports");
+            for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
+                require(machine.read_reg(0, lane, 2) == nanosm::float_bits(2.0f) && machine.read_reg(0, lane, 3) == 7 &&
+                        machine.read_reg(0, lane, 4) == 13 && machine.read_reg(0, lane, 5) == 23,
+                    what + "lane " + std::to_string(lane) + " lost a write");
+            }
+        }
+        require(cycles[1] + 1 == cycles[0], "write depth " + std::to_string(depth) + ": the second write port did not "
+            "save one cycle (" + std::to_string(cycles[0]) + " and " + std::to_string(cycles[1]) + ")");
+    }
+}
+
 // Slots are claimed at admission and held while the operands travel (the
 // coupled lds / sts slots stay reserved from accept; the unit takes the
 // instruction issue_to_dispatch later). One load slot: lds.uni A accepted at
@@ -2153,6 +2200,11 @@ TEST(Rf, waw_order) {
 // Async writer vs a fixed booking
 TEST(Rf, async_writer_vs_fixed_booking) {
     test_async_writer_vs_fixed_booking();
+}
+
+// Two writes on one bank: one write pipeline per port
+TEST(Rf, two_writes_on_one_bank) {
+    test_two_writes_on_one_bank();
 }
 
 // Slots claimed while operands travel
