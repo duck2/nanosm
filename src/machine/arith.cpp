@@ -243,28 +243,30 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending) {
         "execute_arithmetic");
 }
 
-// Which unit executes a fixed-latency instruction: the latency class
-// fixed_latency gives it (src/isa.cpp), probed with three different delays.
+// BLACK BOX SHARED: arithmetic unit routing
+// Which unit executes a fixed-latency instruction: the unit whose list
+// (src/isa.cpp) has its opcode, asked in the order fixed_latency asks.
 Machine::ArithmeticUnit Machine::arithmetic_unit(const Instruction& inst) {
-    switch (fixed_latency(inst, Timing{1, 2, 3})) {
-    case 1: return ArithmeticUnit::alu;
-    case 2: return ArithmeticUnit::fpu;
-    case 3: return ArithmeticUnit::sfu;
-    default: throw SimError("internal: an instruction with no fixed-latency unit in the arithmetic pipeline");
-    }
+    if (is_alu_operation(inst.opcode)) return ArithmeticUnit::alu;
+    if (is_fpu_operation(inst.opcode)) return ArithmeticUnit::fpu;
+    if (is_sfu_operation(inst.opcode)) return ArithmeticUnit::sfu;
+    throw SimError("internal: an instruction with no fixed-latency unit in the arithmetic pipeline");
 }
+// END BLACK BOX SHARED: arithmetic unit routing
 
 // ===========================================================================
 // The three units as black boxes (src/machine/blackbox.hpp)
 // ===========================================================================
 //
+// BLACK BOX SHARED: arithmetic units
 // A unit takes an instruction when it executes (the arithmetic pipeline's
 // last stage): its operands from the vector RF's read registers, the
 // instruction, its warp and its lane enables from that stage. It computes the
-// whole result then (execute_arithmetic) and holds it E cycles, to its
-// output register. What a real unit holds in its stages is its declared cost
-// below; none of it is simulated. Each one's sign-off is the line that
-// names it: only the human changes it.
+// whole result then (execute_arithmetic, above: the inside of all three, not
+// in their markers) and holds it E cycles, to its output register. What a
+// real unit holds in its stages is its declared cost below; none of it is
+// simulated. Each unit is between its own markers with its own sign-off
+// line; this part, which all three use, is in each one's fingerprint.
 void Machine::declare_arithmetic_black_boxes() {
     const auto& c = config_;
     const uint64_t lanes = c.lanes;
@@ -288,7 +290,17 @@ void Machine::declare_arithmetic_black_boxes() {
         black_boxes_.push_back(std::move(black_box));
     };
     const auto text = [](uint64_t value) { return std::to_string(value); };
+    // END BLACK BOX SHARED: arithmetic units
 
+    // BLACK BOX: ALU
+    // BLACK BOX USES: arithmetic units
+    // BLACK BOX USES: arithmetic unit order
+    // BLACK BOX USES: arithmetic output registers
+    // BLACK BOX USES: arithmetic unit routing
+    // BLACK BOX USES: arithmetic unit latencies
+    // BLACK BOX USES: ALU operations
+    // BLACK BOX USES: ALU and FPU latencies
+    // BLACK BOX USES: bit widths
     // The ALU (mov, sread, ur2r, the integer and logic ops, shifts, setp).
     // It would probably use, per lane, a 32-bit adder, the logic ops, a
     // barrel shifter and a comparator between the RF's read registers and its
@@ -313,6 +325,17 @@ void Machine::declare_arithmetic_black_boxes() {
             ", tag " + text(tag + 1);
         declare(ArithmeticUnit::alu, std::move(alu), bits_for(c.core_warps) + 8 + lane_bits + lanes + 1);
     }
+    // END BLACK BOX: ALU
+
+    // BLACK BOX: FPU
+    // BLACK BOX USES: arithmetic units
+    // BLACK BOX USES: arithmetic unit order
+    // BLACK BOX USES: arithmetic output registers
+    // BLACK BOX USES: arithmetic unit routing
+    // BLACK BOX USES: arithmetic unit latencies
+    // BLACK BOX USES: FPU operations
+    // BLACK BOX USES: ALU and FPU latencies
+    // BLACK BOX USES: bit widths
     // The FPU (fadd, fsub, fmul, fma, fmax, cvt.pack), every lane each cycle.
     // It would probably use, per lane, a single-precision fused multiply-add
     // (fadd, fmul and fmax are its special cases): a 24 x 24 significand
@@ -331,6 +354,17 @@ void Machine::declare_arithmetic_black_boxes() {
             ", lanes " + text(lanes) + ", tag " + text(tag);
         declare(ArithmeticUnit::fpu, std::move(fpu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
     }
+    // END BLACK BOX: FPU
+
+    // BLACK BOX: special-function unit
+    // BLACK BOX USES: arithmetic units
+    // BLACK BOX USES: arithmetic unit order
+    // BLACK BOX USES: arithmetic output registers
+    // BLACK BOX USES: arithmetic unit routing
+    // BLACK BOX USES: arithmetic unit latencies
+    // BLACK BOX USES: special-function unit operations
+    // BLACK BOX USES: special-function unit latency
+    // BLACK BOX USES: bit widths
     // The special-function unit (ex2, rcp). It serves sfu.lanes lanes a
     // cycle, so an instruction's G = ceil(lanes / sfu.lanes) lane groups start
     // one a cycle (issue keeps two instructions G apart: the interval) and
@@ -366,6 +400,7 @@ void Machine::declare_arithmetic_black_boxes() {
             text(groups) + ", sfu.lanes " + text(c.sfu_lanes) + ", Ls " + text(ls) + ", E " + text(e) + ", tag " + text(tag);
         declare(ArithmeticUnit::sfu, std::move(sfu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
     }
+    // END BLACK BOX: special-function unit
 }
 
 } // namespace nanosm

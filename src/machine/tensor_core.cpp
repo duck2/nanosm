@@ -390,6 +390,8 @@ void Machine::finish_mma_step(const MmaBlock& c) {
     waiting.pop_front();
 }
 
+// BLACK BOX: MMA core
+// BLACK BOX USES: MMA core output register
 // The core's arithmetic as a black box (src/machine/blackbox.hpp). It takes a
 // step's A and B blocks at its entry and its C at tmem's output, W =
 // tmem.port_depth + tmem.read_latency_cycles later, and has the result in its
@@ -406,7 +408,9 @@ void Machine::finish_mma_step(const MmaBlock& c) {
 // stage, each sum a bit wider; the stage that holds the one sum holds it and
 // the exponent (at most 9 terms of 2^27: within the sum's width), and every
 // later stage only delays the packed result, 32 bits a word. Its sign-off is
-// the line that names it: only the human changes it.
+// the line that names it: only the human changes it. (Its inside --
+// enter_mma_core, read_mma_c and finish_mma_step above, the dot products in
+// mma_numeric.cpp -- is not between its markers.)
 void Machine::declare_mma_core_black_box() {
     const auto& c = config_;
     const uint64_t m = c.mma_core_m;
@@ -463,6 +467,7 @@ void Machine::declare_mma_core_black_box() {
     mma_core_.build(black_box, [](const std::deque<MmaCoreStep>& waiting) { return waiting.empty(); });
     black_boxes_.push_back(std::move(black_box));
 }
+// END BLACK BOX: MMA core
 
 // The tmem writes at the RAM now: the MMA's result block through each fine
 // bank's write port 0, an acc.st beat through write port 1 (one word per fine

@@ -764,5 +764,10 @@ std::string format_instruction(const Instruction& instruction, bool include_cont
 std::string format_control(const Control& control);
 std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes = nullptr);
 uint8_t fixed_latency(const Instruction& instruction, const Timing& timing);
+// The opcodes each fixed-latency unit executes: the ALU (timing.alu), the FPU
+// (timing.fadd), the special-function unit (timing.sfu).
+bool is_alu_operation(Opcode opcode);
+bool is_fpu_operation(Opcode opcode);
+bool is_sfu_operation(Opcode opcode);
 
 } // namespace nanosm

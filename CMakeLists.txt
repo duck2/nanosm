@@ -282,6 +282,22 @@ if(Python3_Interpreter_FOUND)
             --lib $<TARGET_FILE:nanosm_capi>
     )
     set_tests_properties(nanosm_driver_shuffle_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
+    # The black boxes' sign-off script (scripts/blackboxes.py, which the commit
+    # hook runs): on small trees of its own, and on this one (ten black boxes,
+    # read cleanly, the same ten the machine declares; whether they are signed
+    # is the human's, not the test's).
+    add_test(
+        NAME nanosm_blackboxes_script
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/blackboxes_test.py --fixtures
+    )
+    set_tests_properties(nanosm_blackboxes_script PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(
+        NAME nanosm_blackboxes_tree
+        COMMAND ${CMAKE_COMMAND} -E env
+            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
+            ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/blackboxes_test.py --tree
+    )
+    set_tests_properties(nanosm_blackboxes_tree PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 if(NANOSM_SANITIZER)

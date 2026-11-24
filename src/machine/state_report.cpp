@@ -32,6 +32,12 @@ std::string number(uint64_t value) {
     return digits;
 }
 
+// A black box's sign-off as its definition gives it: "not signed off", or
+// "signed off" and the fingerprint the human signed.
+std::string sign_off_text(const BlackBoxDeclaration& black_box) {
+    return black_box.signed_off() ? "signed off " + std::string(black_box.fingerprint()) : "not signed off";
+}
+
 } // namespace
 
 void Machine::declare_state_bits() {
@@ -374,8 +380,9 @@ void Machine::declare_state_bits() {
         arithmetic_reads_.declare_note("its operands' words count only where they are held after the RF's and URF's "
             "read delays: " + number(words) + " bits");
     }
+    // BLACK BOX SHARED: memory notes
     // A memory's read data in flight: every read port's word for each cycle
-    // of the read delay.
+    // of the read delay. (Its black box's report prints it: memory_blackbox.)
     const auto in_flight = [](auto& memory) {
         const auto& shape = memory.shape();
         memory.declare_note("read data in flight: at most " +
@@ -388,6 +395,7 @@ void Machine::declare_state_bits() {
     in_flight(shmem_);
     in_flight(tmem_);
     instruction_memory_.declare_note("the kernel's words (no profile size)");
+    // END BLACK BOX SHARED: memory notes
     // ---- launch ----
     // The launch record: valid, the block's global and shared address and
     // bytes, and per launch flag a valid bit, its depbar (a kernel's .flag
@@ -396,38 +404,19 @@ void Machine::declare_state_bits() {
         1 + global + shared + shared_count + uint64_t{c.core_launch_flags} * (1 + depbar + shared_count));
 }
 
-// The black boxes (blackbox.hpp), each declared beside its black box: the
-// arithmetic units (arith.cpp), the tensor core's arithmetic
-// (tensor_core.cpp), and here the memories, whose cost is their words
-// (memory_blackbox), each with its own sign-off. Listed by unit.
+// The black boxes (blackbox.hpp), each declared where it is defined, with its
+// own sign-off: the arithmetic units (arith.cpp), the tensor core's
+// arithmetic (tensor_core.cpp), and the memories, beside each in machine.hpp
+// (their cost is their words: memory_blackbox). Listed by unit.
 void Machine::declare_black_boxes() {
     declare_arithmetic_black_boxes();
     declare_mma_core_black_box();
-    black_boxes_.push_back(memory_blackbox(instruction_memory_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "a fetch's packet the next cycle", "the instruction memory read register (in the open)", ""));
-    black_boxes_.push_back(memory_blackbox(divergence_stack_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "a pop's new top the next cycle", "the divergence stack memory read register (in the open)",
-        "the issue register's branch (a push; in the open)"));
-    black_boxes_.push_back(memory_blackbox(rf_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "rf.read_latency_cycles", "the issue register's round, the acc.st and store-data readers (in the open)",
-        "the RF write pipelines' last stages (in the open)"));
-    black_boxes_.push_back(memory_blackbox(urf_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "urf.read_latency_cycles",
-        "the issue register's round, the round counter, the URF write pipeline's sample (in the open)",
-        "the URF write pipeline's last stage (in the open)"));
-    black_boxes_.push_back(memory_blackbox(shmem_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "shmem.read_latency_cycles", "the A-read and port-B read pipelines' RAM stage (in the open)",
-        "the A-write and port-B write pipelines' last stages (in the open)"));
-    black_boxes_.push_back(memory_blackbox(tmem_,
-        SignOff::not_signed, // sign-off: only the human changes this line
-        "tmem.read_latency_cycles",
-        "the MMA core's step tags and the acc.ld pipeline at their RAM stage (in the open)",
-        "the MMA result write and acc.st pipelines' last stages (in the open)"));
+    black_boxes_.push_back(instruction_memory_black_box());
+    black_boxes_.push_back(divergence_stack_black_box());
+    black_boxes_.push_back(rf_black_box());
+    black_boxes_.push_back(urf_black_box());
+    black_boxes_.push_back(shmem_black_box());
+    black_boxes_.push_back(tmem_black_box());
     std::stable_sort(black_boxes_.begin(), black_boxes_.end(),
         [](const BlackBoxDeclaration& a, const BlackBoxDeclaration& b) { return a.unit < b.unit; });
 }
@@ -455,7 +444,8 @@ std::string Machine::state_report() const {
     out << "state report: " << config_.name << " (declared hardware bits)\n";
     out << "In the open: registers, groups, pipelines, FIFOs and the black boxes' output registers, counted. Behind\n"
            "walls: black boxes, the memories among them, each a contract with a declared cost that only the human\n"
-           "signs off.\n";
+           "signs off. A sign-off shown is the one at the black box's definition, with the fingerprint signed;\n"
+           "whether it is still current is scripts/blackboxes.py's to say.\n";
     uint64_t total_flops = 0;
     uint64_t total_fifo = 0;
     for (auto unit = static_cast<uint8_t>(Unit::front_end); unit <= static_cast<uint8_t>(last_unit); ++unit) {
@@ -501,8 +491,7 @@ std::string Machine::state_report() const {
             any = true;
             char line[200];
             std::snprintf(line, sizeof(line), "  %-9s %-52s %12s  declared; %s\n", "black box", black_box.name.c_str(),
-                number(black_box.cost.flip_flops + black_box.cost.memory_bits).c_str(),
-                black_box.signed_off() ? "signed off" : "not signed off");
+                number(black_box.cost.flip_flops + black_box.cost.memory_bits).c_str(), sign_off_text(black_box).c_str());
             out << line;
             walls.flip_flops += black_box.cost.flip_flops;
             walls.memory_bits += black_box.cost.memory_bits;
@@ -516,14 +505,14 @@ std::string Machine::state_report() const {
         total_fifo += fifo;
     }
     // The black boxes: each one's contract, its declared cost and the
-    // function it comes from, and whether the human has signed it off.
+    // function it comes from, and the sign-off its definition carries.
     BlackBoxCost declared;
     std::size_t signed_off = 0;
     out << "\nblack boxes (a contract outside, anything inside: the cost is declared, not counted)\n";
     if (black_boxes_.empty()) out << "  none\n";
     for (const auto& black_box : black_boxes_) {
-        out << "  " << black_box.name << " (" << unit_name(black_box.unit) << "): "
-            << (black_box.signed_off() ? "signed off" : "not signed off") << "\n    latency " << black_box.latency << " ("
+        out << "  " << black_box.name << " (" << unit_name(black_box.unit) << "): " << sign_off_text(black_box)
+            << "\n    latency " << black_box.latency << " ("
             << black_box.latency_from << ")";
         if (black_box.interval > 1) out << ", a new input at most every " << black_box.interval << " cycles";
         out << "\n";

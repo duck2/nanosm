@@ -4,6 +4,8 @@
 
 #include <regex>
 #include <sstream>
+#include <string>
+#include <type_traits>
 
 namespace {
 
@@ -519,6 +521,17 @@ void test_fifo_second_push_panics() {
     throw std::runtime_error("a second push in one tick did not panic");
 }
 
+// A black box's sign-off is the one written at its definition: a sign-off
+// cannot be copied or moved but by the declaration it is written for, a
+// declaration cannot be copied (only moved, into the machine's list), and
+// none can be made without a sign-off.
+static_assert(!std::is_copy_constructible_v<nanosm::SignOff> && !std::is_move_constructible_v<nanosm::SignOff> &&
+    !std::is_copy_assignable_v<nanosm::SignOff> && !std::is_move_assignable_v<nanosm::SignOff> &&
+    !std::is_default_constructible_v<nanosm::SignOff>);
+static_assert(!std::is_copy_constructible_v<nanosm::BlackBoxDeclaration> &&
+    !std::is_copy_assignable_v<nanosm::BlackBoxDeclaration> && std::is_move_constructible_v<nanosm::BlackBoxDeclaration> &&
+    !std::is_constructible_v<nanosm::BlackBoxDeclaration, std::string>);
+
 // A black box's output register holds a value from its inputs' cycle +
 // latency, for that one cycle; nothing passes through it in one cycle, and
 // inputs closer than its interval are refused (a refused value is not a
@@ -706,7 +719,7 @@ void test_state_report_adds_up() {
     };
     const std::regex line(R"(^  (register|group|pipeline|FIFO) .* ([0-9,]+)  .*$)");
     const std::regex unit_total(R"(^  in the open: flip-flops ([0-9,]+), FIFO ([0-9,]+), total ([0-9,]+)$)");
-    const std::regex black_box_line(R"(^  black box +.+ ([0-9,]+)  declared; (not signed off|signed off)$)");
+    const std::regex black_box_line(R"(^  black box +.+ ([0-9,]+)  declared; (not signed off|signed off [0-9a-f]{12})$)");
     const std::regex unit_walls(R"(^  behind walls: flip-flops ([0-9,]+), memory ([0-9,]+), multipliers ([0-9,]+) \(declared\)$)");
     // The first total is the open state's (then the black boxes' declared one, then the sum).
     const std::regex grand_total(R"(^    total +([0-9,]+)$)");
@@ -758,13 +771,18 @@ void test_state_report_adds_up() {
     require(report.find("    flip-flops       18,083\n    memory bits      1,415,296\n    total            1,433,379\n"
                         "    multipliers      168\n") != std::string::npos,
         "the canonical profile's declared costs moved (18,083 flip-flops, 1,415,296 memory bits, 168 multipliers)");
-    // Every black box prints the sign-off its definition gives, and the
-    // totals count the signed ones as the definitions do.
+    // Every black box prints the sign-off its definition gives (a signed one
+    // with its fingerprint), and the totals count the signed ones as the
+    // definitions do.
+    const auto sign_off_text = [](const nanosm::BlackBoxDeclaration& black_box) {
+        return black_box.signed_off() ? "signed off " + std::string(black_box.fingerprint())
+                                      : std::string("not signed off");
+    };
     std::size_t signed_off = 0;
     for (const auto& black_box : machine.black_boxes()) {
         if (black_box.signed_off()) ++signed_off;
         require(report.find("  " + black_box.name + " (" + nanosm::unit_name(black_box.unit) + "): " +
-                    (black_box.signed_off() ? "signed off\n" : "not signed off\n")) != std::string::npos,
+                    sign_off_text(black_box) + "\n") != std::string::npos,
             "the report does not print black box '" + black_box.name + "' with its definition's sign-off");
     }
     require(report.find("black boxes, " + std::to_string(signed_off) + " signed off)") != std::string::npos,
@@ -839,11 +857,19 @@ void test_state_report_adds_up() {
             "the arithmetic pipeline declares " + std::to_string(bits_of("arithmetic pipeline: operand latches")) +
                 " bits" + where);
         const auto text = varied.state_report();
-        require(text.find("  vector register file (register file): not signed off\n    latency " +
-                    std::to_string(expected.rf_delay) + " (rf.read_latency_cycles)\n") != std::string::npos &&
+        const auto sign_off_of = [&](const std::string& name) {
+            for (const auto& black_box : varied.black_boxes()) {
+                if (black_box.name == name) return sign_off_text(black_box);
+            }
+            return std::string("no such black box");
+        };
+        require(text.find("  vector register file (register file): " + sign_off_of("vector register file") +
+                    "\n    latency " + std::to_string(expected.rf_delay) + " (rf.read_latency_cycles)\n") !=
+                    std::string::npos &&
                 text.find("read first\n    read data in flight: " + std::string(expected.rf_note)) !=
                     std::string::npos &&
-                text.find("  uniform register file (uniform register file): not signed off\n    latency " +
+                text.find("  uniform register file (uniform register file): " + sign_off_of("uniform register file") +
+                    "\n    latency " +
                     std::to_string(expected.urf_delay) + " (urf.read_latency_cycles)\n") != std::string::npos &&
                 text.find("2R 1W, read first\n    read data in flight: " + std::string(expected.urf_note)) !=
                     std::string::npos,

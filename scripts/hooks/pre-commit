@@ -1,0 +1,32 @@
+#!/bin/sh
+# Refuses a commit while a black box in what is being committed is not signed
+# off by the human, or has changed since it was signed (scripts/blackboxes.py).
+
+script="$(dirname "$0")/../blackboxes.py"
+
+python=""
+for candidate in python3 python py; do
+    if "$candidate" -c "import sys; sys.exit(sys.version_info[0] != 3)" >/dev/null 2>&1; then
+        python="$candidate"
+        break
+    fi
+done
+if [ -z "$python" ]; then
+    echo "Commit refused: Python 3 (python3, python or py) was not found; it checks the black boxes' sign-offs." >&2
+    exit 1
+fi
+
+status=0
+out=$("$python" -B "$script" --check --staged 2>&1) || status=$?
+[ "$status" -eq 0 ] && exit 0
+
+if [ "$status" -eq 1 ]; then
+    echo "Commit refused: these black boxes are not signed off by the human, or changed since signing:" >&2
+    echo "$out" >&2
+    echo "To sign one: run python scripts/blackboxes.py, which prints each black box's fingerprint and sign-off line;" >&2
+    echo "write the fingerprint into that line, SignOff::signed_by_human(\"<fingerprint>\"), and stage the file." >&2
+else
+    echo "Commit refused: the black boxes' sign-offs could not be checked:" >&2
+    echo "$out" >&2
+fi
+exit 1

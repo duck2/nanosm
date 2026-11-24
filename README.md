@@ -58,9 +58,31 @@ python -m nanosm --state-report kernels/pipeline.launch.py   # first, the machin
 The state report lists every piece of the machine's state by unit with its declared hardware
 bits: in the open, flip-flops (registers, groups, pipelines) and FIFO storage, counted; behind
 walls, the black boxes (the arithmetic units, the tensor core's arithmetic, the memories), each
-with its contract, its declared cost and whether the human has signed it off (src/machine/blackbox.hpp);
+with its contract, its declared cost and the sign-off its definition carries (src/machine/blackbox.hpp);
 and the totals of each, kept apart (src/machine/state_report.cpp; the C API's
 `nanosm_session_state_report`).
+
+**Black boxes and their sign-offs.** A black box is a unit modelled opaquely: registered inputs
+and outputs, a fixed latency, a cost declared as a function of the profile, and anything inside.
+There are ten: the ALU, the FPU, the special-function unit, the tensor core's MMA core and six
+memories. Everything that defines one is between `// BLACK BOX: <name>` and
+`// END BLACK BOX: <name>`, with one sign-off line, and only the human signs it.
+`python scripts/blackboxes.py` lists each black box with its sign-off line, its state (not
+signed, signed, or changed since signing) and its fingerprint, a hash of the text between its
+markers; to sign one, write that fingerprint into its sign-off line,
+`SignOff::signed_by_human("<fingerprint>")` in place of `SignOff::not_signed`. Changing a signed
+black box is fine: the change gives it another fingerprint, so it shows as changed since signing
+until the human signs it again. The simulator runs either way; the commit hook
+(`scripts/hooks/pre-commit`) refuses a commit while a black box is not signed or has changed
+since it was signed. Setup:
+
+```sh
+git config core.hooksPath scripts/hooks               # once per clone: enables the commit hook
+git update-index --chmod=+x scripts/hooks/pre-commit  # once, after the hook is first added on Windows
+```
+
+A `git add` on Windows records the hook as mode 100644; the second line makes it 100755, which
+Git on Unix needs to run it.
 
 No Python package or third-party binding generator is required; the wrapper uses the standard
 library's `ctypes`. Set `NANOSM_LIBRARY` when the shared library is outside `build`. A launch may

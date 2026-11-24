@@ -990,9 +990,13 @@ std::string format_instruction(
     return out.str();
 }
 
-uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
-    if (is_mma_async(inst.opcode)) return 0; // asynchronous: its depbar clears at the last operand read
-    switch (inst.opcode) {
+// The fixed-latency units' operations: each unit's black box
+// (src/machine/arith.cpp) prices its own list, so each list is in that
+// unit's fingerprint only.
+
+// BLACK BOX SHARED: ALU operations
+bool is_alu_operation(Opcode opcode) {
+    switch (opcode) {
     case Opcode::sread:
     case Opcode::mov:
     case Opcode::add:
@@ -1010,19 +1014,6 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     // ur2r: its uniform operand, sampled with the round at issue + 1, rides
     // the vector arithmetic pipeline to the RF write port like mov.
     case Opcode::ur2r:
-        return timing.alu;
-    case Opcode::fadd:
-    // The new float ops ride the FPU pipeline: fsub is fadd with a negation,
-    // and fmul/fma/fmax/cvt are full-width float datapaths, not 1-cycle ALU.
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::fma:
-    case Opcode::cvt_pack:
-        return timing.fadd;
-    case Opcode::ex2:
-    case Opcode::rcp:
-        return timing.sfu;
     case Opcode::setp_eq:
     case Opcode::setp_ne:
     case Opcode::setp_lt:
@@ -1043,7 +1034,98 @@ uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
     case Opcode::setpi_le_s32:
     case Opcode::setpi_gt_s32:
     case Opcode::setpi_ge_s32:
-        return timing.alu;
+        return true;
+    default:
+        return false;
+    }
+}
+// END BLACK BOX SHARED: ALU operations
+
+// BLACK BOX SHARED: FPU operations
+bool is_fpu_operation(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::fadd:
+    // The new float ops ride the FPU pipeline: fsub is fadd with a negation,
+    // and fmul/fma/fmax/cvt are full-width float datapaths, not 1-cycle ALU.
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::fma:
+    case Opcode::cvt_pack:
+        return true;
+    default:
+        return false;
+    }
+}
+// END BLACK BOX SHARED: FPU operations
+
+// BLACK BOX SHARED: special-function unit operations
+bool is_sfu_operation(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::ex2:
+    case Opcode::rcp:
+        return true;
+    default:
+        return false;
+    }
+}
+// END BLACK BOX SHARED: special-function unit operations
+
+uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
+    if (is_mma_async(inst.opcode)) return 0; // asynchronous: its depbar clears at the last operand read
+    // BLACK BOX SHARED: arithmetic unit latencies
+    // A fixed-latency unit's operations take its latency.
+    if (is_alu_operation(inst.opcode)) return timing.alu;
+    if (is_fpu_operation(inst.opcode)) return timing.fadd;
+    if (is_sfu_operation(inst.opcode)) return timing.sfu;
+    // END BLACK BOX SHARED: arithmetic unit latencies
+    switch (inst.opcode) {
+    // The arithmetic opcodes: each is in one unit's list above. (Named here
+    // so that this switch stays exhaustive: a new opcode is decided here.)
+    case Opcode::sread:
+    case Opcode::mov:
+    case Opcode::add:
+    case Opcode::addi:
+    case Opcode::and_:
+    case Opcode::andi:
+    case Opcode::or_:
+    case Opcode::ori:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
+    case Opcode::shli:
+    case Opcode::shri:
+    case Opcode::xori:
+    case Opcode::ur2r:
+    case Opcode::fadd:
+    case Opcode::fmul:
+    case Opcode::fsub:
+    case Opcode::fmax:
+    case Opcode::fma:
+    case Opcode::cvt_pack:
+    case Opcode::ex2:
+    case Opcode::rcp:
+    case Opcode::setp_eq:
+    case Opcode::setp_ne:
+    case Opcode::setp_lt:
+    case Opcode::setp_le:
+    case Opcode::setp_gt:
+    case Opcode::setp_ge:
+    case Opcode::setpi_eq:
+    case Opcode::setpi_ne:
+    case Opcode::setpi_lt:
+    case Opcode::setpi_le:
+    case Opcode::setpi_gt:
+    case Opcode::setpi_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
+    case Opcode::setpi_lt_s32:
+    case Opcode::setpi_le_s32:
+    case Opcode::setpi_gt_s32:
+    case Opcode::setpi_ge_s32:
+        throw SimError("internal: an arithmetic opcode in no fixed-latency unit's list");
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_test_wait_r:
         return 1;

@@ -540,8 +540,10 @@ DeviceProfile parse_device_profile(std::string_view source) {
     optional_field(tma, "tma", "walker_start_cycles", 0, 8, p.tma_walker_start_cycles);        // absent: 2
     const auto& core = document.at("core");
     p.core_clock_hz = field<uint64_t>(core, "clock_hz");
+    // BLACK BOX SHARED: ALU and FPU latencies
     p.timing.alu = field<uint8_t>(core, "alu_latency_cycles");
     p.timing.fadd = field<uint8_t>(core, "fadd_latency_cycles");
+    // END BLACK BOX SHARED: ALU and FPU latencies
     // Optional (absent: the canonical 16 warps, 2 packets); present: an integer
     // in [low, high].
     optional_field(core, "core", "warps", 1, 64, p.core_warps);
@@ -551,8 +553,10 @@ DeviceProfile parse_device_profile(std::string_view source) {
     const auto& sfu = document.at("sfu");
     p.sfu_lanes = ranged_field(sfu.at("lanes"), "sfu", "lanes", 1, p.lanes);
     p.sfu_latency_cycles = ranged_field(sfu.at("latency_cycles"), "sfu", "latency_cycles", 1, 24);
+    // BLACK BOX SHARED: special-function unit latency
     const auto sfu_occupancy = (p.lanes + p.sfu_lanes - 1) / p.sfu_lanes;
     p.timing.sfu = static_cast<uint8_t>(sfu_occupancy - 1 + p.sfu_latency_cycles);
+    // END BLACK BOX SHARED: special-function unit latency
     const auto& gmem = document.at("gmem");
     p.gmem_bytes = field<uint64_t>(gmem, "bytes");
     p.dram_clock_hz = field<uint64_t>(gmem, "dram_clock_hz");

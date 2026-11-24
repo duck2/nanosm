@@ -155,21 +155,13 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     // ...), so every warp takes that many rows in every bank (rf_address).
     rf_rows_per_warp_ = (kernel_.register_count + config_.rf_banks - 1) / config_.rf_banks;
     try {
-        rf_.build(MemoryShape{config_.rf_banks, config_.rf_rows_per_bank, config_.lanes, uint64_t{32} * config_.lanes,
-            config_.rf_read_ports_per_bank, config_.rf_write_ports_per_bank, config_.rf_read_latency_cycles,
-            SameCycle::read_first});
-        urf_.build(MemoryShape{1, std::size_t{config_.core_warps} * config_.urf_registers, 1, 32, urf_read_ports,
-            urf_write_ports, config_.urf_read_latency_cycles, SameCycle::read_first});
-        // An mbar's two words are read and written in one round (a probe, an
-        // RMW's read and write), so a one-bank shared memory is 8 bytes wide.
-        shmem_word_bytes_ = config_.shmem_banks == 1 ? 8 : 4;
-        const std::size_t shmem_line_bytes = std::size_t{shmem_word_bytes_} * config_.shmem_banks;
-        shmem_.build(MemoryShape{config_.shmem_banks, (config_.shmem_bytes + shmem_line_bytes - 1) / shmem_line_bytes,
-            shmem_word_bytes_, uint64_t{8} * shmem_word_bytes_, 2, 2, config_.shmem_read_latency_cycles,
-            SameCycle::read_first});
+        // The memories' shapes are beside them (machine.hpp).
+        rf_.build(rf_shape());
+        urf_.build(urf_shape());
+        shmem_.build(shmem_shape());
+        shmem_word_bytes_ = static_cast<uint32_t>(shmem_.shape().elements);
         gmem_.assign(static_cast<std::size_t>(config_.gmem_bytes), 0);
-        tmem_.build(MemoryShape{config_.tmem_fine_banks, config_.tmem_words_per_fine_bank, 1, 32, 2, 2,
-            config_.tmem_read_latency_cycles, SameCycle::read_first});
+        tmem_.build(tmem_shape());
         acc_engines_.poke(AccEngines{});
         acc_ld_pipe_.build(config_.tmem_port_depth + config_.tmem_read_latency_cycles);
         acc_st_pipe_.build(config_.rf_read_latency_cycles + config_.tmem_port_depth);
@@ -284,11 +276,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // The mask, the depth, and the top copy (a pc and a mask).
         divergence_.declare_member_bits(uint64_t{config_.lanes} +
             static_cast<uint64_t>(std::bit_width(config_.core_divergence_stack_entries)) + 32 + config_.lanes);
-        divergence_stack_.build(MemoryShape{1,
-            std::size_t{config_.core_warps} * config_.core_divergence_stack_entries, 1, uint64_t{32} + config_.lanes, 1,
-            1, 1, SameCycle::read_first});
-        instruction_memory_.build(MemoryShape{1, (kernel_.words.size() + 1) / 2, 2, 128, 1, 0,
-            instruction_read_cycles, SameCycle::read_only});
+        divergence_stack_.build(divergence_stack_shape());
+        instruction_memory_.build(instruction_memory_shape());
         for (std::size_t word = 0; word < kernel_.words.size(); ++word) {
             instruction_memory_.poke(0, word / 2, word % 2, kernel_.words[word]);
         }

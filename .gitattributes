@@ -1,0 +1,2 @@
+# The commit hook is run by sh, which does not take CRLF line endings.
+scripts/hooks/* text eol=lf
