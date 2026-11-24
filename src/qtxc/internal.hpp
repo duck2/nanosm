@@ -99,14 +99,10 @@ std::string format_object_directive(const MemoryObject& object);
 void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile);
 const char* file_kind_name(bool uniform);
 
-// The per-instruction rules (checks.cpp).
+// The per-instruction rules (checks.cpp): all of them, and the one-round RF
+// read rule alone (register allocation checks its own numbers with it).
+void check_instruction(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_divergence_stack(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_write_mask(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
-void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, const std::string& where);
 
 } // namespace qtxc_internal
 

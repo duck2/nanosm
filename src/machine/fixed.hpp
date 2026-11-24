@@ -85,10 +85,6 @@ public:
     void emplace_back(Fields&&... fields) {
         push_back(T{std::forward<Fields>(fields)...});
     }
-    void pop_back() {
-        check(0);
-        items_[--count_] = T{};
-    }
     // The first item leaves and the others move up: an ordered buffer's head.
     void pop_front() {
         check(0);
@@ -128,8 +124,6 @@ public:
         for (std::size_t index = count; index < count_; ++index) items_[index] = T{};
         count_ = static_cast<uint32_t>(count);
     }
-
-    [[nodiscard]] std::vector<T> to_vector() const { return std::vector<T>(begin(), end()); }
 
     // Places past the count are kept at T{}, so two equal payloads are equal
     // bit for bit; the comparison still looks only at the counted items.

@@ -1,4 +1,4 @@
-// Constant expressions (src/qtxc/; README "Memory"). Wherever qtx or assembly
+// Constant expressions (src/qtxc/; docs/qtx.md "Lines"). Wherever qtx or assembly
 // takes a constant -- an immediate, an address offset, an `.equ`, a
 // directive's argument -- it may be an expression of numbers and names:
 //

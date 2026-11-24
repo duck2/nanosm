@@ -90,54 +90,11 @@ target_link_libraries(qtxc PRIVATE nanosm)
 add_executable(qtxas tools/qtxas.cpp)
 target_link_libraries(qtxas PRIVATE nanosm)
 
-set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 set(DEVICE_PROFILE ${CMAKE_SOURCE_DIR}/profiles/nanosm-v0.json)
 
-function(add_qtx_kernel NAME SOURCE)
-    set(ASM_FILE ${GENERATED_DIR}/${NAME}.asm)
-    set(HEX_FILE ${GENERATED_DIR}/${NAME}.hex)
-    add_custom_command(
-        OUTPUT ${ASM_FILE}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
-        COMMAND $<TARGET_FILE:qtxc> ${DEVICE_PROFILE} ${SOURCE} ${ASM_FILE}
-        DEPENDS qtxc ${DEVICE_PROFILE} ${SOURCE}
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT ${HEX_FILE}
-        COMMAND $<TARGET_FILE:qtxas> ${DEVICE_PROFILE} ${ASM_FILE} ${HEX_FILE}
-        DEPENDS qtxas ${DEVICE_PROFILE} ${ASM_FILE}
-        VERBATIM
-    )
-    set(${NAME}_HEX ${HEX_FILE} PARENT_SCOPE)
-endfunction()
-
-add_qtx_kernel(vadd ${CMAKE_SOURCE_DIR}/kernels/vadd.qtx)
-add_qtx_kernel(pipeline ${CMAKE_SOURCE_DIR}/kernels/pipeline.qtx)
-add_custom_target(qtx_kernels ALL DEPENDS ${vadd_HEX} ${pipeline_HEX})
-
-add_executable(make_demo_image tools/demo_image.cpp)
-target_link_libraries(make_demo_image PRIVATE nanosm)
-
-set(VADD_LAUNCH ${GENERATED_DIR}/vadd.launch.json)
-set(PIPELINE_LAUNCH ${GENERATED_DIR}/pipeline.launch.json)
-add_custom_command(
-    OUTPUT ${VADD_LAUNCH}
-    COMMAND $<TARGET_FILE:make_demo_image> ${DEVICE_PROFILE} vadd ${vadd_HEX} ${VADD_LAUNCH}
-    DEPENDS make_demo_image ${DEVICE_PROFILE} ${vadd_HEX}
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT ${PIPELINE_LAUNCH}
-    COMMAND $<TARGET_FILE:make_demo_image> ${DEVICE_PROFILE} pipeline ${pipeline_HEX} ${PIPELINE_LAUNCH}
-    DEPENDS make_demo_image ${DEVICE_PROFILE} ${pipeline_HEX}
-    VERBATIM
-)
-add_custom_target(launch_images ALL DEPENDS ${VADD_LAUNCH} ${PIPELINE_LAUNCH})
-
+# Replays a .launch.json (nanosm.launch's write_image) without Python.
 add_executable(nanosm_run src/main.cpp)
 target_link_libraries(nanosm_run PRIVATE nanosm)
-add_dependencies(nanosm_run launch_images)
 
 # GoogleTest, vendored (third_party/googletest/VENDORED.md): no network at
 # build time.
@@ -213,6 +170,19 @@ endfunction()
 discover_nanosm_tests(nanosm_tests "")
 add_test(NAME nanosm_capi_tests COMMAND nanosm_capi_tests)
 set_tests_properties(nanosm_capi_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# The command-line compiler and assembler: kernels/vadd.qtx to scheduled
+# assembly to instruction words, into the build directory.
+file(WRITE ${CMAKE_BINARY_DIR}/qtx_tools_check.cmake [=[
+execute_process(COMMAND ${QTXC} ${PROFILE} ${SOURCE} ${OUT}.asm COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND ${QTXAS} ${PROFILE} ${OUT}.asm ${OUT}.hex COMMAND_ERROR_IS_FATAL ANY)
+]=])
+add_test(
+    NAME nanosm_qtx_tools
+    COMMAND ${CMAKE_COMMAND} -DQTXC=$<TARGET_FILE:qtxc> -DQTXAS=$<TARGET_FILE:qtxas>
+        -DPROFILE=${DEVICE_PROFILE} -DSOURCE=${CMAKE_SOURCE_DIR}/kernels/vadd.qtx
+        -DOUT=${CMAKE_BINARY_DIR}/vadd -P ${CMAKE_BINARY_DIR}/qtx_tools_check.cmake
+)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
@@ -301,18 +271,3 @@ if(NANOSM_SANITIZER)
         set_tests_properties(nanosm_sanitizer_off_identical PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
     endif()
 endif()
-
-add_custom_target(run
-    COMMAND $<TARGET_FILE:nanosm_run> ${DEVICE_PROFILE} ${VADD_LAUNCH}
-    DEPENDS nanosm_run launch_images
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    USES_TERMINAL
-)
-
-add_custom_target(trace_pipeline
-    COMMAND $<TARGET_FILE:nanosm_run> ${DEVICE_PROFILE} ${PIPELINE_LAUNCH}
-        --trace ${CMAKE_BINARY_DIR}/pipeline.perfetto.json
-    DEPENDS nanosm_run launch_images
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    USES_TERMINAL
-)

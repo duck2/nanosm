@@ -279,7 +279,7 @@ class Session:
 
     @property
     def state_report(self) -> str:
-        """Declared hardware bits by unit (src/machine/state_report.cpp)."""
+        """Clocked state by unit and the black boxes (src/machine/state_report.cpp)."""
         return _string(lib.nanosm_session_state_report, self._live_handle())
 
     def _read(self, function, address: int, size: int) -> bytes:

@@ -12,8 +12,7 @@
 // PANIC, as for Reg. With NANOSM_SANITIZER=0 the second write simply replaces
 // the first; correct code never writes twice.
 //
-// The group reports its size as one unit: N members of the member's declared
-// bits.
+// The group is listed in the state inventory as one thing of N members.
 
 #include "machine/reg.hpp"
 
@@ -57,14 +56,10 @@ public:
         std::size_t index_;
     };
 
-    // member_bits: the declared hardware bits of one member, or none where
-    // not declared yet.
-    Regs(AllClocked& all, Unit unit, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
-        : Clocked(all,unit, std::move(name)), member_bits_(member_bits) {
-        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
+    Regs(AllClocked& all, Unit unit, std::string name) : Clocked(all,unit, std::move(name)) {
+        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp)");
     }
-    Regs(AllClocked& all, std::string name, std::optional<uint64_t> member_bits = std::nullopt)
-        : Regs(all,Unit::none, std::move(name), member_bits) {}
+    Regs(AllClocked& all, std::string name) : Regs(all,Unit::none, std::move(name)) {}
 
     // The number of members, once, when the machine is built.
     void build(std::size_t members, const T& initial = T{}) {
@@ -75,12 +70,6 @@ public:
         points_.reserve(members);
         for (std::size_t member = 0; member < members; ++member) points_.push_back(new_write_point());
     }
-
-    // The declared hardware bits of one member, where they follow from the
-    // profile (set when the machine is built).
-    void declare_member_bits(uint64_t bits) { member_bits_ = bits; }
-    // Members of unequal widths: the declared bits of all of them.
-    void declare_total_bits(uint64_t bits) { total_bits_ = bits; }
 
     [[nodiscard]] std::size_t count() const { return q_.size(); }
 
@@ -118,11 +107,7 @@ public:
     // Host / test seam, only between ticks: Q changes at once.
     void poke(std::size_t index, T value) { q_.at(index) = std::move(value); }
 
-    [[nodiscard]] StateSize size() const override {
-        auto size = sized("group", q_.size(), member_bits_);
-        size.total_bits = total_bits_;
-        return size;
-    }
+    [[nodiscard]] StateSize size() const override { return sized("group", q_.size()); }
 
 private:
     std::vector<T> q_;
@@ -130,8 +115,6 @@ private:
     std::vector<std::size_t> written_; // members with a D this tick
     std::vector<uint32_t> points_;     // one write point per member
     bool built_ = false;
-    std::optional<uint64_t> member_bits_;
-    std::optional<uint64_t> total_bits_;
 };
 
 } // namespace nanosm

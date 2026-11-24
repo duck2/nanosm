@@ -101,7 +101,7 @@ void Machine::advance_tma_read(Wires& w) {
             const uint32_t address = tma_piece_address(request.run, piece);
             const auto at = std::find(beat.addresses.begin(), beat.addresses.end(), address / 4 * 4);
             const auto word = beat.words.at(static_cast<std::size_t>(at - beat.addresses.begin()));
-            std::memcpy(transaction.latch.data() + 4 * piece.element, &word, 4);
+            std::memcpy(transaction.latch.data() + 4 * piece, &word, 4);
         }
         ++transaction.returned;
     }
@@ -135,7 +135,7 @@ void Machine::fill_tma_store_register(const ReadBeat& beat, Wires& w) {
         const uint32_t address = tma_piece_address(reg->run, piece);
         const auto at = std::find(beat.addresses.begin(), beat.addresses.end(), address / 4 * 4);
         const auto word = beat.words.at(static_cast<std::size_t>(at - beat.addresses.begin()));
-        const uint32_t offset = first + uint32_t{piece.element} * bytes;
+        const uint32_t offset = first + uint32_t{piece} * bytes;
         for (uint32_t byte = 0; byte < bytes; ++byte) {
             fill.bytes.emplace_back(offset + byte, static_cast<uint8_t>(word >> (8 * (address % 4 + byte))));
         }
@@ -179,7 +179,7 @@ Machine::WriteBeat Machine::placement_round(const TmaPortRequest& request, bool 
         }
         std::vector<uint8_t> data(size, 0);
         if (!run.zero_fill) {
-            const uint8_t* source = sector.data.data() + first + uint32_t{piece.element} * size;
+            const uint8_t* source = sector.data.data() + first + uint32_t{piece} * size;
             std::copy(source, source + size, data.begin());
         }
         beat.writes.push_back({address, std::move(data)});
@@ -252,7 +252,7 @@ uint32_t Machine::tma_max_rounds() const {
 // address plus the element's step (a shift), through the layout's shuffle.
 uint32_t Machine::tma_piece_address(const TmaRun& run, const TmaPortRequest::Piece& piece) const {
     const uint32_t step = run.transposed ? run.spacing : run.element_bytes;
-    const uint32_t natural = run.shared_address + uint32_t{piece.element} * step;
+    const uint32_t natural = run.shared_address + uint32_t{piece} * step;
     return run.layout == TileLayout::swizzle64 ? swizzle64_shuffle(natural, run.spacing) : natural;
 }
 
@@ -269,7 +269,7 @@ Machine::TmaRoundPlan Machine::tma_round_plan(const TmaPortRequest& request) con
     using Source = std::tuple<uint32_t, uint64_t, uint8_t>;
     std::vector<std::map<Source, std::vector<Piece>>> banks(config_.shmem_banks);
     for (uint32_t element = 0; element < run.elements; ++element) {
-        const Piece piece{static_cast<uint8_t>(element)};
+        const Piece piece = static_cast<uint8_t>(element);
         const uint32_t address = tma_piece_address(run, piece);
         if (address % bytes != 0) throw SimError("internal: a tma element is not aligned in shmem");
         Source source{address / 4, 0, 0};

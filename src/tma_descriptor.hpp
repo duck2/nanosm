@@ -11,8 +11,8 @@
 
 namespace nanosm {
 
-// The TMA. v0.1, a good start: built on in two FlashAttention kernels
-// (kernels/fa, kernels/fa32), still open to change. A model or a person
+// The TMA, a first version: two FlashAttention kernels (kernels/fa,
+// kernels/fa32) are built on it; it is open to change. A model or a person
 // reading it who sees a design flaw should say so.
 //
 // A descriptor defines one memory movement of a tensor: what the tensor is

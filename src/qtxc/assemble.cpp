@@ -107,23 +107,12 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                 "line " + std::to_string(inst.line) +
                 ": mbar wait predicate destination must be p0..p6");
         }
-        if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
+        check_instruction(inst, profile, "line " + std::to_string(inst.line));
+        if (is_tma_opcode(inst.opcode) &&
+            (inst.imm < 0 || inst.imm % 64 != 0 || static_cast<uint64_t>(inst.imm) + 64 > profile.shmem_bytes)) {
             throw SimError(
                 "line " + std::to_string(inst.line) +
-                ": mbar.try_wait is unsupported by this device profile");
-        }
-        if (is_tma_opcode(inst.opcode)) {
-            if (profile.tma_queue_commands == 0) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": tma.load / tma.store are unsupported by this device profile");
-            }
-            if (inst.imm < 0 || inst.imm % 64 != 0 ||
-                static_cast<uint64_t>(inst.imm) + 64 > profile.shmem_bytes) {
-                throw SimError(
-                    "line " + std::to_string(inst.line) +
-                    ": tma descriptor address must be 64-byte aligned and in shmem");
-            }
+                ": tma descriptor address must be 64-byte aligned and in shmem");
         }
         if (inst.opcode == Opcode::mbar_init_i && (inst.imm <= 0 || inst.imm > 0x7fff)) {
             throw SimError("line " + std::to_string(inst.line) + ": mbar expected count must be 1..32767");
@@ -135,7 +124,6 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
             inst.imm != 0 && inst.imm != 1) {
             throw SimError("line " + std::to_string(inst.line) + ": mbar parity must be 0 or 1");
         }
-        check_divergence(inst, profile, "line " + std::to_string(inst.line));
         if (has_displacement(inst.opcode)) {
             const auto target = static_cast<int64_t>(index + 1) * 8 + inst.imm;
             if (inst.imm % 8 != 0 || target < 0 ||
@@ -143,10 +131,6 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
                 throw SimError("line " + std::to_string(inst.line) + ": invalid branch displacement");
             }
         }
-        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
-        check_tmem_operand(inst, profile, "line " + std::to_string(inst.line));
-        check_v8_sector(inst, profile, "line " + std::to_string(inst.line));
         kernel.words.push_back(encode(inst));
     }
     return kernel;

@@ -37,7 +37,7 @@ namespace nanosm {
 
 class AllClocked;
 
-// The machine's units, for the state report: every piece of clocked state
+// The machine's units, for the state inventory: every piece of clocked state
 // names the one it belongs to when it is constructed.
 enum class Unit : uint8_t {
     none, // a primitive outside a machine (a test's)
@@ -77,40 +77,26 @@ inline const char* unit_name(Unit unit) {
     return "?";
 }
 
-// What one piece of clocked state declares about its size, for a report of the
-// machine's state by unit: how many entries it has (a register: 1; a group:
-// its members; a pipeline: its stages; a FIFO: its capacity; a memory: its
-// words) and the bits of one entry, when its declaration states them.
-// Declared hardware bits, not what C++ stores; none when not declared yet.
+// What one piece of clocked state is, for the inventory of the machine's
+// state by unit: its kind and how many entries it has (a register: 1; a
+// group: its members; a pipeline: its stages; a FIFO: its capacity; a memory:
+// its words).
 struct StateSize {
     std::string name;
     Unit unit = Unit::none;
     const char* kind = "register";
     uint64_t entries = 1;
-    std::optional<uint64_t> bits_per_entry;
-    // Members of unequal widths (the LSU's two buffers): their sum.
-    std::optional<uint64_t> total_bits;
-    // Flip-flops beside the entries: a FIFO's pointers.
-    uint64_t control_bits = 0;
     // A memory (memory.hpp): its entries are its words, in `banks` banks of
-    // entries / banks words each, with these ports per bank; the read delay
-    // and the rule for a read and a write of one word in one cycle. A FIFO:
-    // its write and read ports' widths in entries and its read latency.
+    // entries / banks words each, `word_bits` wide, with these ports per
+    // bank; the read delay and the rule for a read and a write of one word in
+    // one cycle. A FIFO: its write and read ports' widths in entries and its
+    // read latency.
     uint64_t banks = 1;
+    uint64_t word_bits = 0;
     uint32_t read_ports = 0;
     uint32_t write_ports = 0;
     uint32_t read_delay = 0;
     const char* same_cycle = "";
-    // What the report says beside the bits (where some of them are counted).
-    std::string note;
-
-    // The declared bits of the whole thing (entries and control), when
-    // declared.
-    [[nodiscard]] std::optional<uint64_t> bits() const {
-        if (total_bits.has_value()) return *total_bits + control_bits;
-        if (!bits_per_entry.has_value()) return std::nullopt;
-        return entries * *bits_per_entry + control_bits;
-    }
 };
 
 // The base of everything that takes the clock edge: a register, group,
@@ -125,20 +111,16 @@ public:
     [[nodiscard]] const std::string& name() const { return name_; }
     [[nodiscard]] Unit unit() const { return unit_; }
     virtual void commit() = 0;
-    [[nodiscard]] virtual StateSize size() const { return sized("register", 1, std::nullopt); }
-    // A note for the state report, set when the machine is built.
-    void declare_note(std::string note) { note_ = std::move(note); }
+    [[nodiscard]] virtual StateSize size() const { return sized("register", 1); }
 
 protected:
-    // A size with this one's name, unit and note.
-    [[nodiscard]] StateSize sized(const char* kind, uint64_t entries, std::optional<uint64_t> bits) const {
+    // A size with this one's name and unit.
+    [[nodiscard]] StateSize sized(const char* kind, uint64_t entries) const {
         StateSize size;
         size.name = name_;
         size.unit = unit_;
-        size.note = note_;
         size.kind = kind;
         size.entries = entries;
-        size.bits_per_entry = bits;
         return size;
     }
     // Tells the sanitizer about a write; it panics on the second one in a tick.
@@ -155,7 +137,6 @@ private:
     uint32_t id_ = 0;
     Unit unit_ = Unit::none;
     std::string name_;
-    std::string note_;
 };
 
 template <typename T>
@@ -163,14 +144,9 @@ class Reg final : public Clocked {
 public:
     Reg(AllClocked& all, Unit unit, std::string name, T initial = T{})
         : Clocked(all,unit, std::move(name)), q_(std::move(initial)) {
-        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
+        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp)");
     }
     Reg(AllClocked& all, std::string name, T initial = T{}) : Reg(all,Unit::none, std::move(name), std::move(initial)) {}
-
-    // The declared hardware bits of its payload (set when the machine is
-    // built, from the profile).
-    void declare_bits(uint64_t bits) { bits_ = bits; }
-    [[nodiscard]] StateSize size() const override { return sized("register", 1, bits_); }
 
     // Q: the value at the start of this tick, for every reader, all tick.
     [[nodiscard]] const T& cur() const { return q_; }
@@ -194,7 +170,6 @@ public:
 private:
     T q_;
     std::optional<T> d_;
-    std::optional<uint64_t> bits_;
 };
 
 // The roll call of everything clocked that the machine owns: it commits them
@@ -221,7 +196,7 @@ public:
         for (auto* reg : clocked_) reg->commit();
     }
 
-    // Every register's declared size, in declaration order.
+    // What each piece of state is, in declaration order.
     [[nodiscard]] std::vector<StateSize> sizes() const {
         std::vector<StateSize> all;
         all.reserve(clocked_.size());

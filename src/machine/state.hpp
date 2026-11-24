@@ -10,20 +10,12 @@
 // FixedPayload below is checked by Reg, Regs, Pipe, Fifo and Memory, and by
 // a black box's output register (blackbox.hpp; its inside is not state of this
 // kind).
-//
-// The payloads that are not there yet are named one by one, in one place:
-// the list at the end of machine.hpp, each with what is still in it. That
-// list is what remains to be made honest.
 
 #include <type_traits>
 
 namespace nanosm {
 
-// Specialized (to true) only in machine.hpp's list of exceptions.
 template <typename T>
-struct NotYetFixedPayload : std::false_type {};
-
-template <typename T>
-concept FixedPayload = std::is_trivially_copyable_v<T> || NotYetFixedPayload<T>::value;
+concept FixedPayload = std::is_trivially_copyable_v<T>;
 
 } // namespace nanosm

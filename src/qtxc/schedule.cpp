@@ -199,7 +199,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     program.profile_name = profile.name;
     program.profile_fingerprint = device_profile_fingerprint(profile);
     std::array<bool, 6> live{};
-    // Launch flags (README "Launch"): a depbar the launch counted once in
+    // Launch flags (docs/qtx.md "Launch"): a depbar the launch counted once in
     // every warp before the first instruction, decremented when the launch
     // copy has delivered its part of the launch block. flag_pending[b]: on
     // the path to this instruction nothing has waited on flag b yet, so its
@@ -330,20 +330,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
         // A label: some path may arrive here without having waited on a flag.
         if (labelled[index]) flag_pending = launch_flag;
-        if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": mbar.try_wait is unsupported by this device profile");
-        }
-        if (is_tma_opcode(inst.opcode) && profile.tma_queue_commands == 0) {
-            throw SimError(
-                "line " + std::to_string(inst.line) +
-                ": tma.load / tma.store are unsupported by this device profile");
-        }
-        if ((is_mma_async(inst.opcode) || inst.opcode == Opcode::mma_commit) && profile.mma_queue_commands == 0) {
-            throw SimError("line " + std::to_string(inst.line) + ": MMA is unsupported by this device profile");
-        }
-        check_divergence(inst, profile, "line " + std::to_string(inst.line));
+        check_instruction(inst, profile, "line " + std::to_string(inst.line));
         uint8_t wait_mask = 0;
         for (const auto source : sources(inst)) {
             if (pending_register[source].has_value()) {
@@ -390,10 +377,6 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
 
         if (wait_mask != 0) release(wait_mask);
 
-        check_rf_read_round(inst, profile, "line " + std::to_string(inst.line));
-        check_mma_shape(inst, profile, "line " + std::to_string(inst.line));
-        check_tmem_operand(inst, profile, "line " + std::to_string(inst.line));
-        check_v8_sector(inst, profile, "line " + std::to_string(inst.line));
         const auto required = timeline.required(inst, profile, vtime);
         if (required > vtime) {
             if (previous == nullptr) {

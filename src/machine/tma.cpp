@@ -437,7 +437,7 @@ uint64_t Machine::run_byte_enable(const TmaRun& run) const {
 // descriptor and the command's coordinates; they travel through the walker
 // start pipeline's tma.walker_start_cycles stages (TmaWalkerStart, canonical
 // 2) before the walker is loaded, so the walk starts that many cycles after
-// the next one (0 stages: in the next one, the timing before the stages).
+// the next one (0 stages: in the next one).
 // Three products, side by side, each a 32-bit coordinate x a 32-bit stride:
 // the row dimension's (c_row x s_row) and the two other dimensions' (c_k x
 // s_k; their in-range test is two compares each); the stages are theirs and
@@ -600,9 +600,6 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     sanitizer_.check_tma_operand_alignment(where, holding.buffer, holding.barrier);
     TmaCommand command;
     command.id = next_tma_command_id_++;
-    command.warp = header.warp;
-    command.pc = header.pc;
-    command.instruction = inst;
     command.direction = is_tma_store(inst.opcode) ? TmaDirection::store : TmaDirection::load;
     command.descriptor_address = static_cast<uint32_t>(inst.imm);
     command.coordinates = holding.coordinates;

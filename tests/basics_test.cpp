@@ -622,7 +622,7 @@ void test_staged_pipeline_kernel() {
     require(warp_cycles == summary.cycles * 2, "pipeline warp attribution does not sum");
 }
 
-// The launch (README "Launch"): the kernel's `.param` lines are its signature,
+// The launch (docs/qtx.md "Launch"): the kernel's `.param` lines are its signature,
 // and with its `.mbar` and `.data` they are the launch block, in declaration
 // order at the top of shared memory. The host writes the block into global
 // memory; the launch copy brings it into shared memory from the first cycle,

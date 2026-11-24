@@ -81,7 +81,7 @@ std::vector<std::string> split(const std::string& text, char separator) {
     return result;
 }
 
-// qtx's register names (README "Registers"; registers.cpp). While
+// qtx's register names (docs/qtx.md "Registers"; registers.cpp). While
 // parse_program reads qtx, `names` points at the program being built: a
 // register operand is then a name, %x, and what the instruction's field
 // holds is the name's place in its file's list -- vector_registers or
@@ -680,7 +680,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         }
     };
 
-    // The sections first (`.param`, `.mbar`, `.data` lines, README "Launch"):
+    // The sections first (`.param`, `.mbar`, `.data` lines, docs/qtx.md "Launch"):
     // a section's address depends on the whole list (src/isa.hpp
     // launch_block), and its name is a constant, the address, from the first
     // line on. This pass takes each section's name, kind and size; the lines
@@ -1135,7 +1135,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.src0 = parse_reg(args[1], line_number);
             inst.imm = parse_value(args[2], constants, line_number);
         } else if (op == "ld.param.u32" || op == "ld.param.f32") {
-            // ld.param.u32 %x, [NAME] (qtx; README "Memory"): a parameter's
+            // ld.param.u32 %x, [NAME] (qtx; docs/qtx.md "Launch"): a parameter's
             // value into every lane of a vector register. It is written for
             // the reader and stands for the two instructions a parameter read
             // is: umov of the parameter's shared address into a uniform

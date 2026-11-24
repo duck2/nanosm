@@ -11,7 +11,7 @@
 // stages from gates) -- and its outside is a contract:
 //   inputs     taken from registers (their Q) in the cycle the black box
 //              takes them, each named with its bits and the register that
-//              holds it, which is counted in the open where it is;
+//              holds it, which is in the open where it is;
 //   outputs    the black box's own registers, clocked with every other one:
 //              a value whose inputs were taken at t is in the output register
 //              at t + latency, latency >= 1, so nothing passes through a black
@@ -20,9 +20,8 @@
 //   interval   a new input at most every `interval` cycles;
 //   operations an arithmetic unit's: the instructions it executes (its list
 //              in src/isa.cpp).
-// What it costs is not part of it: the state report gives a cost, from the
-// profile or a default guess (state_report.cpp), and a memory's size is its
-// words. The state report prints every black box's contract.
+// What it costs is not part of it. The state report prints every black box's
+// contract.
 // The memories (memory.hpp) are black boxes by the same contract --
 // registered ports, a declared read delay, a shape from the profile -- so they
 // are declared in the same list (memory_blackbox below, each memory's own
@@ -46,8 +45,6 @@ namespace nanosm {
 
 // Bits to tell `n` things apart (0 for one or none).
 inline uint64_t bits_for(uint64_t n) { return n <= 1 ? 0 : static_cast<uint64_t>(std::bit_width(n - 1)); }
-// Bits to count from 0 to `n`.
-inline uint64_t count_bits(uint64_t n) { return static_cast<uint64_t>(std::bit_width(n)); }
 
 // An input or an output: its bits and the register that holds it.
 struct BlackBoxPort {
@@ -67,8 +64,6 @@ struct BlackBoxDeclaration {
     uint32_t interval = 1;
     std::vector<BlackBoxPort> inputs;
     std::vector<BlackBoxPort> outputs;
-    std::optional<MemoryShape> memory; // a memory's shape: its size is its words
-    std::string note;                  // what else the report says of it
 };
 
 // A black box's output register, and what the inside has finished and not
@@ -106,10 +101,6 @@ public:
         inside_idle_ = inside_idle;
     }
     [[nodiscard]] uint32_t latency() const { return latency_; }
-
-    // The declared bits of the output register's payload (its valid bit is
-    // counted beside it).
-    void declare_output_bits(uint64_t bits) { output_bits_ = bits; }
 
     // The inside hands over a value whose inputs it took at cycle
     // `taken_at`: it is in the output register at taken_at + latency. At most
@@ -152,9 +143,7 @@ public:
         }
     }
 
-    [[nodiscard]] StateSize size() const override {
-        return sized("register", 1, output_bits_.has_value() ? std::optional<uint64_t>(*output_bits_ + 1) : std::nullopt);
-    }
+    [[nodiscard]] StateSize size() const override { return sized("black box", 1); }
 
 private:
     std::string black_box_; // its name
@@ -166,11 +155,11 @@ private:
     std::deque<std::pair<uint64_t, Out>> in_flight_; // (its output cycle, the value)
     std::optional<uint64_t> last_taken_;
     bool delivered_ = false;
-    std::optional<uint64_t> output_bits_;
     Inside inside_{};
 };
 
-// A memory as a black box: its read delay, its ports, its shape. What it
+// A memory as a black box: its read delay and its ports (its shape is the
+// memory's own, MemoryShape). What it
 // holds is its words (memory bits); a read's word in flight is in the
 // memory's own read registers (a block RAM's output register), not
 // flip-flops of the machine's.
@@ -195,8 +184,6 @@ BlackBoxDeclaration memory_blackbox(const Memory<T>& memory, std::string latency
     }
     blackbox.outputs.push_back(BlackBoxPort{ports(ports_read, "read") + ": the word", ports_read * shape.word_bits,
         "the memory's read registers (its own, not flip-flops)"});
-    blackbox.memory = shape;
-    blackbox.note = memory.size().note;
     return blackbox;
 }
 

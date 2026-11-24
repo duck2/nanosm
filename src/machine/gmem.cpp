@@ -123,7 +123,7 @@ void Machine::accept_lsu_request(RequestChannel& channel) {
         // returns in request order, which is command admission order, so the
         // one load buffer passes from a command to the next.
         channel.accepted = lsu_read_request(command, channel.lsu_id);
-        sanitizer_.record_ordered_request(command.stream, channel.lsu_id);
+        sanitizer_.record_ordered_request(lsu_stream, channel.lsu_id);
         const auto& sector = command.sectors.at(command.requests_emitted);
         LsuRead record;
         record.kind = command.kind == LsuKind::vector_load ? LsuReadKind::vector

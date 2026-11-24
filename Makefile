@@ -1,7 +1,7 @@
 CMAKE ?= cmake
 BUILD_DIR ?= build
 
-.PHONY: all configure build test run trace-pipeline clean
+.PHONY: all configure build test clean
 
 all: build
 
@@ -13,12 +13,6 @@ build: configure
 
 test: build
 	"$(CMAKE)" --build "$(BUILD_DIR)" --target test
-
-run: build
-	"$(CMAKE)" --build "$(BUILD_DIR)" --target run
-
-trace-pipeline: build
-	"$(CMAKE)" --build "$(BUILD_DIR)" --target trace_pipeline
 
 clean:
 	"$(CMAKE)" -E remove_directory "$(BUILD_DIR)"

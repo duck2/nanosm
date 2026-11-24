@@ -17,27 +17,6 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// A costed black box's cost in the profile's optional "cost" section (README):
-// plain numbers, each a fixed amount plus an amount per lane of the unit
-// (core.lanes for the ALU and FPU, sfu.lanes for the special-function unit;
-// the MMA core takes fixed amounts only). A field left out is zero.
-struct BlackBoxCostEntry {
-    uint64_t flip_flops = 0;
-    uint64_t flip_flops_per_lane = 0;
-    uint64_t memory_bits = 0;
-    uint64_t memory_bits_per_lane = 0;
-    uint64_t basic_dsps = 0;
-    uint64_t basic_dsps_per_lane = 0;
-};
-// An entry present is the whole cost of its unit; absent, the state report
-// takes its default guess (src/machine/state_report.cpp).
-struct BlackBoxCosts {
-    std::optional<BlackBoxCostEntry> alu;
-    std::optional<BlackBoxCostEntry> fpu;
-    std::optional<BlackBoxCostEntry> sfu;
-    std::optional<BlackBoxCostEntry> mma_core;
-};
-
 // One profile is consumed by qtxc, qtxas and the simulator. Core quantities are
 // measured in core cycles; controller quantities are measured in DRAM ticks.
 struct DeviceProfile {
@@ -60,7 +39,7 @@ struct DeviceProfile {
     // is legal and means no stack: a kernel with ssy, sync or a predicated bra
     // is refused by qtxc, the assembler and kernel load. 0..64.
     uint32_t core_divergence_stack_entries = 8;
-    // Launch flags (core.launch_flags; README "Launch"): how many of each
+    // Launch flags (core.launch_flags; docs/qtx.md "Launch"): how many of each
     // warp's six depbars,
     // from sb5 downward, the launch may count once in every warp before the
     // first instruction; each is decremented in every warp when the launch
@@ -179,8 +158,8 @@ struct DeviceProfile {
     // command's descriptor words are back and the cycle its walker registers
     // are loaded (the three coordinate x stride products and the add chain
     // into row 0's address; src/machine/machine.hpp TmaWalkerStart). 0..8; canonical 2
-    // ("some configurable delay to those multipliers"). 0 is
-    // the timing before the stages existed: products in the return cycle.
+    // ("some configurable delay to those multipliers"). 0: no stages, the
+    // products in the return cycle.
     uint32_t tma_walker_start_cycles = 2;
     uint64_t gmem_bytes = 0;
 
@@ -230,11 +209,6 @@ struct DeviceProfile {
     uint32_t lsu_egress_latency_cycles = 0;
     // Outstanding scalar (gather, scatter, uniform) sectors = free-ID tags.
     uint32_t lsu_sectors_in_flight = 0;
-
-    // What the costed black boxes cost (the optional "cost" section). Only
-    // the state report reads it: it changes nothing the machine does, so it
-    // is not in device_profile_fingerprint.
-    BlackBoxCosts costs;
 };
 
 using Config = DeviceProfile;

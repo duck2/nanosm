@@ -1100,7 +1100,7 @@ void test_read_first_across_services() {
     // never granted the fetch first. A host event's RMW now pauses the sts in
     // its slot until w + 1 (w = D + Lb + C; Lb 41 makes w + 1 later than the
     // first pads' fetch) while the pads move the fetch across that grant.
-    auto dense = dense_one_bank_profile(4);
+    auto dense = dense_one_bank_profile(5);
     dense.shmem_read_latency_cycles = 41;
     nanosm::validate_device_profile(dense);
     const uint64_t depth = dense.shmem_port_a_depth;
@@ -2028,7 +2028,7 @@ void test_missing_fence_panics() {
     }
 
     // sts -> mma.async on that tile (one bank: the sts is sixteen rounds).
-    const auto dense = dense_one_bank_profile(4);
+    const auto dense = dense_one_bank_profile(5);
     const auto mma_machine = [&](bool fence) {
         nanosm::Launch launch;
         launch.active_warps = 1;
@@ -2183,7 +2183,7 @@ void test_cross_warp_race() {
 // accepted. Both run, and the asserted timing shows the lds really was in
 // flight at the accept.
 void test_read_read_overlap_is_clean() {
-    const auto dense = dense_one_bank_profile(4);
+    const auto dense = dense_one_bank_profile(5);
     nanosm::Launch launch;
     launch.active_warps = 1;
     auto& shmem = image_bytes(launch.test_shmem, 2048);

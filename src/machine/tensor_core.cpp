@@ -394,7 +394,9 @@ void Machine::finish_mma_step(const MmaBlock& c) {
 // step's A and B blocks at its entry and its C at tmem's output, W =
 // tmem.port_depth + tmem.read_latency_cycles later, and has the result in its
 // output register L = mma.result_latency_cycles after entry; a step can enter
-// every cycle. (Its inside: enter_mma_core, read_mma_c and finish_mma_step
+// every cycle. L > W (validate_device_profile refuses a profile that breaks
+// it), so a clock edge is left for the arithmetic after C is at tmem's
+// output. (Its inside: enter_mma_core, read_mma_c and finish_mma_step
 // above, the dot products in mma_numeric.cpp.)
 void Machine::declare_mma_core_black_box() {
     const auto& c = config_;
@@ -415,14 +417,6 @@ void Machine::declare_mma_core_black_box() {
         BlackBoxPort{"C is zero (the tile's first step)", 1, "MMA core: step tags (in the open)"}};
     black_box.outputs = {BlackBoxPort{"result block (core_m x core_n words)", m * n * 32 + 1,
         mma_core_.name() + " (in the open)"}};
-    if (c.mma_result_latency_cycles <= wait) {
-        black_box.note = "AT THIS PROFILE THE LATENCY IS NOT A REGISTERED ONE: mma.result_latency_cycles (" +
-            std::to_string(c.mma_result_latency_cycles) + ") equals tmem.port_depth + tmem.read_latency_cycles (" +
-            std::to_string(wait) + "), so C is at tmem's output in the cycle the result is due in the output register and no clock edge "
-            "is left for the arithmetic after C (the simulator computes at the C read, " +
-            std::to_string(c.tmem_read_latency_cycles) + " cycles earlier); the profile is accepted";
-    }
-    mma_core_.declare_output_bits(m * n * 32);
     mma_core_.build(black_box, [](const std::deque<MmaCoreStep>& waiting) { return waiting.empty(); });
     black_boxes_.push_back(std::move(black_box));
 }
@@ -592,7 +586,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
         return;
     }
     // The shape is the profile's (its list gives each opcode pair a shape);
-    // its existence was checked at kernel load (check_mma_shapes).
+    // its existence was checked at kernel load (check_kernel).
     const auto shape = *mma_shape_of(config_, inst.opcode);
     const auto a = uniform_operand(op, inst.src0);
     const auto b = uniform_operand(op, inst.src1);
@@ -608,7 +602,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
     sanitizer_.check_tmem_pointer(site(op), opcode_name(inst.opcode, &config_.mma_shapes) + " result", c,
         shape.n, shape.n);
     // The spacings are instruction constants, checked at kernel load
-    // (check_mma_shapes): under swizzle64 a power of two, 16 or more.
+    // (check_kernel): under swizzle64 a power of two, 16 or more.
     const auto a_spacing = mma_row_spacing(inst, true);
     const auto b_spacing = mma_row_spacing(inst, false);
     // A swizzle64 operand starts at a 16-byte piece. Every byte it reads must

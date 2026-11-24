@@ -732,9 +732,16 @@ void test_mma_bare_transfer_race_panics() {
     // The FAIL.asm shape (cases 01/02): three commands, a commit, and an
     // acc.ld with no wait on the commit mbar. Racing accepted MMA work is UB
     // and the simulator diagnoses it instead of returning stale columns.
-    // (Result latency 4: the shortest that covers the C read, tmem port depth
-    // 2 + read latency 2.)
-    const auto profile = dense_one_bank_profile(4);
+    // (Result latency 5: the shortest that is more than the C read, tmem port
+    // depth 2 + read latency 2; 4 is refused.)
+    try {
+        (void)dense_one_bank_profile(4);
+        throw std::runtime_error("a result latency equal to the C read was accepted");
+    } catch (const nanosm::ProfileError& error) {
+        require_mentions(error.what(), {"mma result_latency_cycles 4", "tmem port_depth + read_latency_cycles = 4",
+            "at least 5"}, "the result latency rule's message");
+    }
+    const auto profile = dense_one_bank_profile(5);
     const auto kernel = compile(R"(
         umov ur4, 14000
         mbar.init [ur4], 1

@@ -5,6 +5,17 @@
 // and the checks a kernel passes at load. The simulator includes it for those
 // checks and for SimError, which lives here for now. How each step works is in the .cpp files
 // next to it; internal.hpp is theirs, not part of this interface.
+//
+// The three layers. qtx has semantic instructions and no control bits.
+// Assembly is scheduled qtx: every instruction with its register numbers and
+// its explicit control fields (predicate, stall, the depbar it sets and the
+// ones it waits on); it is the layer a person edits by hand. Hex is one
+// annotated 64-bit instruction word per line, what the simulator fetches,
+// with the register count the assembler derived. One device profile serves
+// all three: assembly and hex carry its name and fingerprint (a hash of its
+// fields, src/profile.cpp profile_json), and the assembler and kernel load
+// refuse a kernel whose name or fingerprint is not the profile's, so a
+// schedule cannot run under timings it was not made for.
 
 #include "isa.hpp"
 #include "profile.hpp"
@@ -100,34 +111,17 @@ std::string emit_hex(const Kernel& kernel, const std::vector<MmaShape>* mma_shap
 Kernel load_hex(std::string_view source);
 Kernel load_hex_file(const std::string& path);
 void validate_kernel(const Kernel& kernel);
-// Kernel load: every instruction's distinct sources fit its RF banks' read
-// ports in one round (src/timing.hpp), else a SimError naming the pc, the
-// instruction and the registers. qtxc and the assembler apply the same rule
-// per source line.
-void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: every mma.async names a shape the profile lists (with legal
-// row spacings), and every acc.ld / acc.st a legal words per row (qtxc and
-// the assembler apply the same rules per source line).
-void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: a write mask (@p / @!p) only on an instruction that can be
-// masked (src/isa.hpp can_be_masked; bra and bra.uni have their own
-// predicate), else a SimError naming the pc (qtxc and the assembler refuse it
-// per source line).
-void check_write_masks(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: ssy, sync and a predicated bra only on a profile with a
-// divergence stack (core.divergence_stack_entries), else a SimError naming
-// the pc (qtxc and the assembler refuse it per source line).
-void check_divergence_stacks(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: an ldg.v8 / stg.v8 only on a profile with 32-byte sectors (a
-// lane's eight words are one sector), else a SimError naming the pc (qtxc
-// and the assembler refuse it per source line).
-void check_v8_sectors(const Kernel& kernel, const DeviceProfile& profile);
-// Kernel load: every uniform register an instruction names (src/isa.hpp
-// uniform_sources -- a tma's last coordinate register included -- and
-// uniform_destination) is below the profile's urf.registers, else a SimError
-// naming the pc and the instruction (qtxc and the assembler refuse it per
-// source line).
-void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile);
+// Kernel load: every instruction passes the rules qtxc and the assembler
+// apply per source line (src/qtxc/checks.cpp check_instruction: what the
+// profile supports, write masks, the divergence stack, the one-round RF read,
+// mma.async shapes, acc.ld / acc.st words per row, ldg.v8 / stg.v8 sectors),
+// else a SimError naming the pc (an instruction the profile has no unit for
+// -- mbar.try_wait, tma -- is refused for the kernel, without one). And
+// every uniform register an instruction names (src/isa.hpp uniform_sources
+// -- a tma's last coordinate register included -- and uniform_destination)
+// is below the profile's urf.registers, else a SimError naming the pc and
+// the instruction (qtxc and the assembler refuse it per source line).
+void check_kernel(const Kernel& kernel, const DeviceProfile& profile);
 
 // Kernel load and assembly: what the kernel declares beside its code
 // (`.warps`, its sections `.param` / `.mbar` / `.data`, its launch flags)

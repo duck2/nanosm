@@ -29,9 +29,7 @@ std::vector<std::string> mma_shape_names(const std::vector<MmaShape>& shapes) {
     return names;
 }
 
-// What the fingerprint hashes. Not the costs: they change nothing the machine
-// does, so a kernel or launch image built for a profile stays valid when its
-// cost section changes.
+// What the fingerprint hashes.
 json profile_json(const DeviceProfile& p) {
     return {
         {"name", p.name},
@@ -155,45 +153,6 @@ uint32_t ranged_field(const json& value, const char* section, const char* name, 
 void optional_field(
     const json& object, const char* section, const char* name, uint32_t low, uint32_t high, uint32_t& out) {
     if (object.contains(name)) out = ranged_field(object.at(name), section, name, low, high);
-}
-
-// The optional cost section: {"<unit>": {"<field>": n, ...}, ...}, each n a
-// non-negative integer; a unit or a field it does not know is refused by name.
-BlackBoxCosts parse_costs(const json& section) {
-    if (!section.is_object()) throw ProfileError("device profile: cost must be an object of black boxes");
-    constexpr std::pair<const char*, uint64_t BlackBoxCostEntry::*> fields[] = {
-        {"flip_flops", &BlackBoxCostEntry::flip_flops}, {"flip_flops_per_lane", &BlackBoxCostEntry::flip_flops_per_lane},
-        {"memory_bits", &BlackBoxCostEntry::memory_bits}, {"memory_bits_per_lane", &BlackBoxCostEntry::memory_bits_per_lane},
-        {"basic_dsps", &BlackBoxCostEntry::basic_dsps}, {"basic_dsps_per_lane", &BlackBoxCostEntry::basic_dsps_per_lane},
-    };
-    BlackBoxCosts costs;
-    for (const auto& [unit, entry] : section.items()) {
-        auto* slot = unit == "alu" ? &costs.alu : unit == "fpu" ? &costs.fpu : unit == "sfu" ? &costs.sfu
-            : unit == "mma_core" ? &costs.mma_core : nullptr;
-        if (slot == nullptr) {
-            throw ProfileError("device profile: cost " + unit + " is not a costed black box (alu, fpu, sfu, mma_core)");
-        }
-        if (!entry.is_object()) throw ProfileError("device profile: cost " + unit + " must be an object of numbers");
-        BlackBoxCostEntry cost;
-        for (const auto& [name, value] : entry.items()) {
-            const auto* field = std::find_if(std::begin(fields), std::end(fields),
-                [&](const auto& known) { return name == known.first; });
-            if (field == std::end(fields)) {
-                throw ProfileError("device profile: cost " + unit + " " + name + " is not a cost field (flip_flops, "
-                    "memory_bits, basic_dsps, each also _per_lane)");
-            }
-            if (unit == "mma_core" && name.ends_with("_per_lane")) {
-                throw ProfileError("device profile: cost mma_core " + name + ": the MMA core has fixed amounts only");
-            }
-            if (!value.is_number_unsigned()) {
-                throw ProfileError("device profile: cost " + unit + " " + name + " must be a non-negative integer (got " +
-                    value.dump() + ")");
-            }
-            cost.*(field->second) = value.get<uint64_t>();
-        }
-        *slot = cost;
-    }
-    return costs;
 }
 
 } // namespace
@@ -336,10 +295,14 @@ void validate_device_profile(const DeviceProfile& p) {
         p.mma_result_latency_cycles == 0) {
         throw ProfileError("device profile: invalid MMA core, timing, or queue capacity");
     }
-    // The MMA shapes: m, n and k are multiples of the core's m, n and k, and a
-    // shape whose k is more than the core's needs m and n large enough to hide
-    // the accumulator latency. Each listed shape takes one opcode pair of the
-    // mma.async block, in list order.
+    // The MMA shapes: m, n and k are powers of two and multiples of the
+    // core's m, n and k; a result has at least one row per lane and fits in
+    // tmem; and a shape whose k is more than the core's needs m and n large
+    // enough to hide the accumulator latency (below). Each listed shape takes
+    // one opcode pair of the mma.async block, in list order (src/isa.hpp
+    // mma_block_first), so the list's order is in the profile's fingerprint.
+    // A kernel naming a shape the list lacks is refused by qtxc, the
+    // assembler and kernel load (src/qtxc/checks.cpp check_instruction).
     if (p.mma_shapes.empty()) throw ProfileError("device profile: mma shapes must list at least one shape");
     if (p.mma_shapes.size() > mma_block_shapes) {
         throw ProfileError("device profile: mma shapes lists " + std::to_string(p.mma_shapes.size()) +
@@ -410,11 +373,16 @@ void validate_device_profile(const DeviceProfile& p) {
         throw ProfileError("device profile: tmem port_depth and read_latency_cycles must be in 1..64 "
             "register stages");
     }
-    // A step's C is read from tmem as the step enters the core and is added in
-    // the core's last stage, so the core's result latency must cover that read.
-    if (p.mma_result_latency_cycles < p.tmem_port_depth + p.tmem_read_latency_cycles) {
-        throw ProfileError("device profile: mma result_latency_cycles must cover the accumulator read "
-            "(tmem port_depth + read_latency_cycles)");
+    // A step's C is read from tmem as the step enters the core and is at
+    // tmem's output tmem port_depth + read_latency_cycles (W) after entry; it
+    // is added in the core's last stage, so the MMA core's black box (latency
+    // mma result_latency_cycles, src/machine/tensor_core.cpp) must leave at
+    // least one clock edge after C: the latency is more than W.
+    if (const uint32_t c_read = p.tmem_port_depth + p.tmem_read_latency_cycles;
+        p.mma_result_latency_cycles <= c_read) {
+        throw ProfileError("device profile: mma result_latency_cycles " + std::to_string(p.mma_result_latency_cycles) +
+            " must be more than the accumulator read, tmem port_depth + read_latency_cycles = " +
+            std::to_string(c_read) + ": at least " + std::to_string(c_read + 1));
     }
     // The swizzle64 layout puts four neighbouring rows' same 16-byte piece in
     // four different slots of 16 banks, which serves a core block of 4 rows
@@ -615,7 +583,6 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.lsu_sectors_in_flight = field<uint32_t>(lsu, "sectors_in_flight");
     p.lsu_ingress_latency_cycles = field<uint32_t>(lsu, "ingress_latency_cycles");
     p.lsu_egress_latency_cycles = field<uint32_t>(lsu, "egress_latency_cycles");
-    if (document.contains("cost")) p.costs = parse_costs(document.at("cost"));
     validate_device_profile(p);
     report_profile_warnings(p);
     return p;

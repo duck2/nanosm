@@ -13,9 +13,11 @@ namespace nanosm {
 
 namespace {
 
-// Every new float opcode canonicalizes NaN outputs to 0x7fc00000: the sim is
-// the spec, and platform NaN-payload propagation must not leak into it.
-// (fadd predates this rule and keeps its legacy behavior.)
+// A NaN single-precision result is 0x7fc00000 (fsub, fmul, fma, fmax, ex2,
+// rcp), so the host's NaN-payload propagation does not leak into the
+// machine; fadd's is the exception: its NaN is the host's single-precision
+// sum as it comes (the payload is the host's choice). cvt.pack's halves keep
+// their own rule (float_to_half_bits).
 uint32_t canonical_float(float value) {
     if (std::isnan(value)) return 0x7fc00000u;
     return float_bits(value);
@@ -51,9 +53,12 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
     return a > b ? a_bits : b_bits;
 }
 
-// The FPU's and the special-function unit's single precision is this
-// implementation's (README): it rounds to nearest even, fuses fma, and has
-// no subnormals. A subnormal word is zero of its sign; every single-precision
+// The vector floating point -- the FPU's fadd, fsub, fmul, fma, fmax and
+// cvt.pack, the special-function unit's ex2 and rcp -- is this
+// implementation's: the instruction set does not specify its rounding, its
+// denormals or whether fma is fused, so a kernel's check carries a tolerance
+// (docs/qtx.md). This one rounds to nearest even, fuses fma, and has no
+// subnormals. A subnormal word is zero of its sign; every single-precision
 // operation of the two units takes its inputs and gives its result through
 // this (denormals are zero in, flush to zero out). NaNs and infinities pass.
 uint32_t no_subnormal(uint32_t bits) { return (bits & 0x7f800000u) == 0 ? bits & 0x80000000u : bits; }
@@ -279,7 +284,7 @@ Machine::ArithmeticUnit Machine::arithmetic_unit(const Instruction& inst) {
 // instruction, its warp and its lane enables from that stage. It computes the
 // whole result then (execute_arithmetic, above: the inside of all three) and
 // holds it E cycles, to its output register. What a real unit holds in its
-// stages is not simulated (the state report gives its cost).
+// stages is not simulated.
 void Machine::declare_arithmetic_black_boxes() {
     const auto& c = config_;
     const uint64_t lanes = c.lanes;
@@ -295,7 +300,6 @@ void Machine::declare_arithmetic_black_boxes() {
         black_box.unit = Unit::arithmetic;
         black_box.outputs = {BlackBoxPort{"result (warp, destination, lanes' words, lane enables)", result_bits + 1,
             at.name() + " (in the open)"}};
-        at.declare_output_bits(result_bits);
         at.build(black_box);
         black_boxes_.push_back(std::move(black_box));
     };

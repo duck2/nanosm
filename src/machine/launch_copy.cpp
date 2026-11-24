@@ -9,7 +9,7 @@
 
 namespace nanosm {
 
-// The launch copy (README "Launch"). The
+// The launch copy (docs/qtx.md "Launch"). The
 // host wrote the kernel's launch block into global memory and the launch
 // record says where it is, where it goes in shared memory and how long it
 // is. Nothing of it is in shared memory at the first cycle. The copy is the

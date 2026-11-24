@@ -32,7 +32,7 @@
 //   sanitizer.cpp      the sanitizer (sanitizer.hpp): shadow state that only decides whether to PANIC.
 //   sanitizer_arguments.cpp what the machine hands the sanitizer: pure reads of hardware state that feed
 //                      nothing in the machine.
-//   state_report.cpp   every primitive's declared hardware bits, and the state report by unit.
+//   state_report.cpp   the state report: every piece of clocked state by unit, and the black boxes.
 //   trace.cpp          the trace writer (trace.hpp).
 //   common.cpp         helpers shared by the units: float bit conversions, round-robin grants, the lane mask and
 //                      panics.
@@ -44,8 +44,7 @@
 //                      files, shared memory, tmem, the instruction memory, the divergence stack.
 //   blackbox.hpp       black boxes: units modelled opaquely behind a contract (registered inputs and outputs,
 //                      a fixed latency); the memories are black boxes.
-//   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles; the
-//                      payloads not there yet are listed at the end of machine.hpp).
+//   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles).
 //   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.
 //   internal.hpp       small pure functions that more than one unit uses (setp's comparison, a sector's
 //                      bus beats). The opcode classes are src/isa.hpp's.
@@ -82,11 +81,9 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
     } catch (const ProfileError& error) {
         throw SimError(error.what());
     }
-    if (config_.lanes == 0 || config_.rf_banks == 0 || config_.shmem_banks == 0 ||
-        config_.gmem_bytes == 0 || kernel_.register_count > 256 ||
-        config_.gmem_bytes > std::numeric_limits<std::size_t>::max() ||
-        config_.gmem_sector_bytes == 0 || config_.gmem_bus_bytes_per_dram_tick == 0 ||
-        config_.gmem_sector_bytes % 4 != 0 || config_.gmem_queue_sectors == 0 ||
+    // (validate_device_profile refused a profile with no lanes, banks, global
+    // memory or sectors.)
+    if (kernel_.register_count > 256 || config_.gmem_bytes > std::numeric_limits<std::size_t>::max() ||
         kernel_.words.empty()) {
         throw SimError("invalid zero-sized or unencodable machine resource");
     }
@@ -97,36 +94,13 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             format_profile_fingerprint(kernel_.profile_fingerprint) + "' does not match simulator '" +
             config_.name + "@" + format_profile_fingerprint(expected_profile) + "'");
     }
-    if (config_.mbar_wait_slots == 0) {
-        for (const auto word : kernel_.words) {
-            if (is_mbar_try_wait(decode(word).opcode)) {
-                throw SimError("mbar.try_wait is unsupported by this device profile");
-            }
-        }
-    }
-    if (config_.tma_queue_commands == 0) {
-        for (const auto word : kernel_.words) {
-            if (is_tma_opcode(decode(word).opcode)) {
-                throw SimError("tma.load / tma.store are unsupported by this device profile");
-            }
-        }
-    }
-    // ssy, sync and a predicated bra need the divergence stack
-    // (core.divergence_stack_entries).
-    check_divergence_stacks(kernel_, config_);
-    // Distinct sources beyond a bank's read ports are a property of the
-    // instruction (src/timing.hpp): refused here, at kernel load, in both builds.
-    check_rf_read_rounds(kernel_, config_);
-    // A write mask only on an instruction that can be masked (src/isa.hpp
-    // can_be_masked).
-    check_write_masks(kernel_, config_);
-    // An mma.async's shape is one the profile lists; an acc.ld / acc.st's
-    // words per row are legal (src/layout.hpp).
-    check_mma_shapes(kernel_, config_);
-    // An ldg.v8 / stg.v8 needs 32-byte sectors.
-    check_v8_sectors(kernel_, config_);
-    // Every uniform register named is one the profile's URF has.
-    check_uniform_registers(kernel_, config_);
+    // The rules every instruction must pass on this profile (src/qtxc/checks.cpp
+    // check_instruction: what the profile supports, write masks, the
+    // divergence stack, the one-round RF read (src/timing.hpp), mma.async
+    // shapes, acc.ld / acc.st words per row, ldg.v8 / stg.v8 sectors) and
+    // the uniform registers it names: refused here, at kernel load, in both
+    // builds.
+    check_kernel(kernel_, config_);
     // The host's part (src/image.hpp bind_launch): the warp count settled
     // against the kernel's `.warps`; the kernel's launch block (its `.data`,
     // its `.mbar` states, the launch's arguments) written into global memory
@@ -177,7 +151,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         mbar_wait_slots_.build(config_.mbar_wait_slots);
         rf_read_policy_.build(config_.rf_banks);
         issue_read_banks_.build(config_.rf_banks);
-        issue_read_banks_.declare_member_bits(std::bit_width(config_.rf_read_ports_per_bank));
         // The load buffer: 8 words per lane of a group. The store buffer the
         // same, and at least a word per lane (a scatter's data).
         const uint32_t load_words = 8 * config_.lsu_load_group_lanes;
@@ -201,8 +174,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // stages - 1 - d and is in the stage after it from the edge on, so
         // stage 0 never holds one. Each other stage is a count of booked
         // ports per bank, zero meaning free (no valid bit).
-        write_calendar_.declare_total_bits(uint64_t{write_calendar_.stages() - 1} * config_.rf_banks *
-            static_cast<uint64_t>(std::bit_width(config_.rf_write_ports_per_bank)));
         // The fixed units in the order of their delays (E each, src/timing.hpp;
         // their black boxes are built with their contracts, arith.cpp), and one
         // pipeline per RF write port, write_depth_cycles stages.
@@ -239,7 +210,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         ingress_.build(std::size_t{config_.lsu_ingress_sectors} * config_.gmem_sector_bytes / 4,
             FifoPorts{static_cast<std::size_t>(dram_ticks_per_cycle * (config_.gmem_bus_bytes_per_dram_tick / 4)),
                 config_.lsu_pluck_words_per_cycle, config_.lsu_ingress_latency_cycles});
-        ingress_.declare_entry_bits(32 + 1); // the word and its stream
         egress_open_.poke(std::nullopt);
         // The request pointer's FIFO shows its next entry too: the LSU's view
         // of the channel after a TMA write took the head (egress_request_slot).
@@ -247,7 +217,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // The bus may finish a slot and start the next within one core cycle.
         egress_data_.build(config_.lsu_egress_sectors,
             FifoPorts{1, static_cast<std::size_t>(dram_ticks_per_cycle) + 1, config_.lsu_egress_latency_cycles});
-        egress_data_.declare_entry_bits(uint64_t{8} * config_.gmem_sector_bytes);
         tma_reads_.build(config_.tma_sector_credits, FifoPorts{1, records_per_pluck, 1});
         lsu_reads_.build(std::size_t{config_.lsu_active_commands} * config_.lanes + 1, FifoPorts{1, records_per_pluck, 1});
         tma_returns_.build(config_.tma_sector_credits);
@@ -259,7 +228,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             warps_.push_back(std::move(warp));
         }
         predicates_.build(std::size_t{config_.core_warps} * predicates_per_warp);
-        predicates_.declare_member_bits(config_.lanes);
         urf_pipe_.build(config_.urf_issue_to_port_cycles + config_.urf_write_depth_cycles);
         tma_read_pairs_.build(config_.urf_read_latency_cycles);
         // Every slot's FIFO empty and nothing in flight: launched warps fetch
@@ -272,9 +240,6 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         }
         // Every warp slot starts converged: all lanes active, an empty stack.
         divergence_.build(config_.core_warps, WarpDivergence{full_mask(), 0, {}});
-        // The mask, the depth, and the top copy (a pc and a mask).
-        divergence_.declare_member_bits(uint64_t{config_.lanes} +
-            static_cast<uint64_t>(std::bit_width(config_.core_divergence_stack_entries)) + 32 + config_.lanes);
         divergence_stack_.build(divergence_stack_shape());
         instruction_memory_.build(instruction_memory_shape());
         for (std::size_t word = 0; word < kernel_.words.size(); ++word) {
@@ -282,6 +247,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         }
         // Per warp slot, launched or not (a slot not launched never counts).
         depbar_.build(config_.core_warps);
+        stall_left_.build(config_.core_warps);
         // The most one warp can have counted on one depbar. An instruction
         // counts from its admission (lds, lds.uni, sts, an atomic, ldg / stg
         // and their v8 forms, acc.ld / acc.st, mma.async; nothing else sets
@@ -325,11 +291,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
             config_.lsu_active_commands + config_.mma_queue_commands + 2 +
             config_.tmem_port_depth + config_.tmem_read_latency_cycles +
             config_.rf_banks * config_.rf_write_ports_per_bank * config_.rf_write_depth_cycles + 1;
-        depbar_.declare_member_bits(6 * static_cast<uint64_t>(std::bit_width(depbar_counter_max_)));
         shmem_to_ram_.build(config_.core_warps);
-        shmem_to_ram_.declare_member_bits(
-            static_cast<uint64_t>(std::bit_width(config_.shmem_port_a_depth > 0 ? config_.shmem_port_a_depth - 1 : 0u)));
-        declare_state_bits();
         declare_black_boxes();
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
@@ -669,12 +631,13 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 44> canonical = {
+    static constexpr std::array<Driver, 45> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
         &Machine::drive_divergence,
         &Machine::drive_depbar,
+        &Machine::drive_scheduler,
         &Machine::drive_wait_slots,
         &Machine::drive_load_slots,
         &Machine::drive_store_slots,

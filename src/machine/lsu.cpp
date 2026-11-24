@@ -71,8 +71,6 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
     const auto& inst = op.instruction;
     LsuCommand command;
     command.warp = op.warp;
-    command.pc = op.pc;
-    command.instruction = inst;
     const auto checked_address = [&](uint32_t base) {
         const auto address = static_cast<int64_t>(base) + inst.imm;
         if (address < 0) panic(op, "gmem address arithmetic underflow");
@@ -88,7 +86,7 @@ Machine::LsuCommand Machine::plan_lsu_command(const DispatchEntry& op) const {
         command.kind = load ? LsuKind::vector_load : LsuKind::vector_store;
         command.reg = load ? inst.dst : inst.src1;
         command.lanes = op.active_mask;
-        if (config_.gmem_sector_bytes != 32) { // refused at kernel load (check_v8_sectors)
+        if (config_.gmem_sector_bytes != 32) { // refused at kernel load (check_kernel)
             throw SimError("internal: " + opcode_name(inst.opcode) + " dispatched on a profile without 32-byte sectors");
         }
         std::vector<uint64_t> named;
@@ -284,7 +282,7 @@ Machine::GmemSectorRequest Machine::lsu_read_request(const LsuCommand& command, 
     request.beats = beats_per_sector(config_);
     request.ready_dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
     const auto index = command.requests_emitted;
-    request.stream = command.stream;
+    request.stream = lsu_stream;
     request.sector_address = command.sectors.at(index).sector_address;
     return request;
 }
@@ -729,9 +727,6 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     if (!slot.has_value()) throw SimError("internal: an LSU command dispatched with no free slot");
     command.slot = *slot;
     command.depbar = inst.control.set_depbar;
-    command.buffer = is_store(command.kind) ? store_buffer : load_buffer;
-    // Every load rides the one ordered LSU read stream (accept_lsu_request).
-    command.stream = lsu_stream;
     DispatchDecision::LsuAdmission admission;
     switch (command.kind) {
     case LsuKind::vector_load:
@@ -802,7 +797,11 @@ void Machine::drive_lsu_commands(const Wires& w) {
     if (w.channel.granted == GmemClient::lsu) ++command(w.channel.lsu_command).requests_emitted;
     for (const auto& [id, acks] : w.controller.lsu_acks) command(id).acks += acks;
     for (const auto released : w.released_lsu_commands) next.release(released);
-    if (w.dispatch.lsu.has_value()) next.take(w.dispatch.lsu->command, config_.lsu_active_commands);
+    // A new command takes the slot its dispatch chose: the lowest free one.
+    if (w.dispatch.lsu.has_value() &&
+        next.take(w.dispatch.lsu->command, config_.lsu_active_commands) != w.dispatch.lsu->command.slot) {
+        throw SimError("internal: the LSU holds more than lsu.active_commands commands");
+    }
     if (w.lsu_rf_read.command.has_value()) {
         auto& reading = next.slots.at(*w.lsu_rf_read.command);
         if (!reading.has_value()) throw SimError("internal: a store-data read for an empty LSU command slot");
@@ -951,9 +950,7 @@ void Machine::drive_egress(const Wires& w) {
         egress_open_.set_next(open, "drive_egress");
         return;
     }
-    egress_requests_.push(EgressRequest{open.client, open.owner, open.index, open.sector_address, open.byte_enable,
-                              open.id, open.command},
-        "drive_egress");
+    egress_requests_.push(static_cast<const EgressRequest&>(open), "drive_egress");
     EgressSector sector;
     sector.data = open.data;
     sector.id = open.id;

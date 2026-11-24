@@ -1,15 +1,13 @@
-// The rules an instruction must pass whoever wrote it (src/qtxc/): the
-// one-round RF read rule, the mma.async shape rule and the acc.ld / acc.st
-// words-per-row rule, applied per source
-// line by qtxc and the assembler and per pc at kernel load, and the other
-// kernel-load checks (validate_kernel, check_uniform_registers). It does not
-// parse or schedule. The refusals that depend on what a profile supports
-// (try_wait, tma, MMA) stay where they were, in schedule.cpp and
-// assemble.cpp.
+// The rules an instruction must pass whoever wrote it (src/qtxc/), in one
+// place: check_instruction, applied per source line by qtxc's scheduler and
+// the assembler and per pc at kernel load (check_kernel), and the other
+// kernel-load checks (validate_kernel, the uniform registers). It does not
+// parse or schedule.
 
 #include "qtxc/internal.hpp"
 #include "timing.hpp"
 
+#include <optional>
 #include <string>
 
 namespace nanosm {
@@ -22,6 +20,8 @@ void check_rf_read_round(const Instruction& inst, const DeviceProfile& profile, 
         throw SimError(where + ": " + *conflict);
     }
 }
+
+namespace {
 
 // An acc.ld / acc.st names the words per row of its region: a power of two,
 // 4 or more, and at most tmem's words (src/layout.hpp). A property of the
@@ -42,8 +42,7 @@ void check_tmem_operand(const Instruction& inst, const DeviceProfile& profile, c
 
 // A write mask (@p / @!p) on an instruction that cannot be masked
 // (src/isa.hpp can_be_masked): only the per-lane instructions can; bra and
-// bra.uni have their own predicate. Applied by qtxc and the assembler per
-// line and at kernel load per pc (check_write_masks).
+// bra.uni have their own predicate.
 void check_write_mask(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (!has_write_mask(inst) || inst.opcode == Opcode::bra || inst.opcode == Opcode::bra_uni ||
         can_be_masked(inst.opcode)) {
@@ -56,9 +55,8 @@ void check_write_mask(const Instruction& inst, const DeviceProfile& profile, con
 
 // ldg.v8 / stg.v8 move one sector per lane, a lane's eight words: they need
 // a profile whose sectors are 32 bytes. A property of the instruction and
-// the profile, so refused by qtxc and the assembler per line and at kernel
-// load per pc (check_v8_sectors), as an mma.async of an unlisted shape is.
-// Scalar ldg / stg work with any sector size.
+// the profile, as an mma.async of an unlisted shape is. Scalar ldg / stg
+// work with any sector size.
 void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8) return;
     if (profile.gmem_sector_bytes == 32) return;
@@ -67,16 +65,8 @@ void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, cons
         std::to_string(profile.gmem_sector_bytes) + "-byte sectors (gmem.sector_bytes)");
 }
 
-// Predication and the divergence stack:
-// a write mask only on an instruction that can be masked (check_write_mask), and ssy, sync
-// and a predicated bra need a stack, which a profile with
-// core.divergence_stack_entries = 0 does not have. Kernel load refuses both
-// too (src/machine/machine.cpp).
-void check_divergence(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
-    check_write_mask(inst, profile, where);
-    check_divergence_stack(inst, profile, where);
-}
-
+// ssy, sync and a predicated bra need a divergence stack, which a profile
+// with core.divergence_stack_entries = 0 does not have.
 void check_divergence_stack(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     if (profile.core_divergence_stack_entries == 0 && uses_divergence_stack(inst)) {
         throw SimError(where + ": " + (inst.opcode == Opcode::bra ? "a predicated bra" : opcode_name(inst.opcode)) +
@@ -118,6 +108,45 @@ void check_mma_shape(const Instruction& inst, const DeviceProfile& profile, cons
     }
 }
 
+// An instruction this profile has no unit for: mbar.try_wait needs wait slots
+// (sync.mbar_wait_slots), a tma the TMA queue (tma.queue_commands). (A profile
+// always has an MMA queue: validate_device_profile refuses none.)
+std::optional<std::string> unsupported_by_profile(const Instruction& inst, const DeviceProfile& profile) {
+    if (is_mbar_try_wait(inst.opcode) && profile.mbar_wait_slots == 0) {
+        return "mbar.try_wait is unsupported by this device profile";
+    }
+    if (is_tma_opcode(inst.opcode) && profile.tma_queue_commands == 0) {
+        return "tma.load / tma.store are unsupported by this device profile";
+    }
+    return std::nullopt;
+}
+
+// Every rule but what the profile supports, in order.
+void check_rules(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    check_write_mask(inst, profile, where);
+    check_divergence_stack(inst, profile, where);
+    check_rf_read_round(inst, profile, where);
+    check_mma_shape(inst, profile, where);
+    check_tmem_operand(inst, profile, where);
+    check_v8_sector(inst, profile, where);
+}
+
+} // namespace
+
+// The rules every instruction must pass on this profile, whoever wrote it,
+// in this order: the profile has its unit (mbar.try_wait, tma); a write mask
+// only where it can be (check_write_mask); the divergence stack; the
+// one-round RF read; an mma.async's shape and row spacings; an acc.ld /
+// acc.st's words per row; ldg.v8 / stg.v8's sectors. qtxc's scheduler and
+// the assembler apply it per source line (`where` is "line N"), kernel load
+// per pc (check_kernel).
+void check_instruction(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
+    if (const auto refusal = unsupported_by_profile(inst, profile); refusal.has_value()) {
+        throw SimError(where + ": " + *refusal);
+    }
+    check_rules(inst, profile, where);
+}
+
 } // namespace qtxc_internal
 
 void validate_kernel(const Kernel& kernel) {
@@ -132,18 +161,17 @@ void validate_kernel(const Kernel& kernel) {
     }
 }
 
-void check_mma_shapes(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        const auto inst = decode(kernel.words[index]);
-        const auto where = "kernel pc " + std::to_string(8 * index);
-        check_mma_shape(inst, profile, where);
-        check_tmem_operand(inst, profile, where);
+void check_kernel(const Kernel& kernel, const DeviceProfile& profile) {
+    // What the profile has no unit for is refused for the kernel as a whole.
+    for (const auto word : kernel.words) {
+        if (const auto refusal = unsupported_by_profile(decode(word), profile); refusal.has_value()) {
+            throw SimError(*refusal);
+        }
     }
-}
-
-void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
         const auto inst = decode(kernel.words[index]);
+        check_rules(inst, profile, "kernel pc " + std::to_string(8 * index));
+        // Every uniform register it names is one the profile's URF has.
         if (is_tma_opcode(inst.opcode) &&
             uint32_t{inst.src1} + tma_coordinate_count(inst.opcode) > profile.urf_registers) {
             throw SimError("kernel pc " + std::to_string(8 * index) + ": '" + format_instruction(inst, false) +
@@ -159,30 +187,6 @@ void check_uniform_registers(const Kernel& kernel, const DeviceProfile& profile)
                 std::to_string(reg) + ", outside this profile's " + std::to_string(profile.urf_registers) +
                 " (urf.registers)");
         }
-    }
-}
-
-void check_v8_sectors(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_v8_sector(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
-    }
-}
-
-void check_divergence_stacks(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_divergence_stack(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
-    }
-}
-
-void check_write_masks(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_write_mask(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
-    }
-}
-
-void check_rf_read_rounds(const Kernel& kernel, const DeviceProfile& profile) {
-    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
-        check_rf_read_round(decode(kernel.words[index]), profile, "kernel pc " + std::to_string(8 * index));
     }
 }
 

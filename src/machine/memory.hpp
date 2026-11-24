@@ -159,8 +159,9 @@ public:
     }
 
     [[nodiscard]] StateSize size() const override {
-        auto size = sized("memory", shape_.banks * shape_.rows, shape_.word_bits);
+        auto size = sized("memory", shape_.banks * shape_.rows);
         size.banks = shape_.banks;
+        size.word_bits = shape_.word_bits;
         size.read_ports = shape_.read_ports;
         size.write_ports = shape_.write_ports;
         size.read_delay = shape_.read_delay;

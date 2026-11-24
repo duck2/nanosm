@@ -220,29 +220,14 @@ public:
     [[nodiscard]] std::vector<uint32_t> lsu_buffer_words(uint32_t index) const {
         return lsu_buffers_.at(index).cur().words;
     }
-    // Every clocked register's and memory's declared size, in declaration order.
+    // What each piece of clocked state is (its kind, unit and size), in
+    // declaration order.
     [[nodiscard]] std::vector<StateSize> state_sizes() const { return clocked_.sizes(); }
-    // The state report (src/machine/state_report.cpp): declared bits by unit,
-    // flip-flops, memories and FIFO storage, the black boxes, and the totals.
+    // The state report (src/machine/state_report.cpp): every piece of
+    // clocked state by unit, and every black box's contract.
     [[nodiscard]] std::string state_report() const;
     // Every black box's contract (src/machine/blackbox.hpp).
     [[nodiscard]] const std::vector<BlackBoxDeclaration>& black_boxes() const { return black_boxes_; }
-    // What a black box costs as the state report gives it: from the profile's
-    // cost section, a default guess, or (a memory) its words.
-    struct BlackBoxCost {
-        uint64_t flip_flops = 0;  // registers inside it (its input and output registers are counted in the open)
-        uint64_t memory_bits = 0; // RAM and ROM inside it
-        uint64_t basic_dsps = 0;
-        const char* source = "";  // "from the profile", "default guess", "its words"
-    };
-    [[nodiscard]] BlackBoxCost black_box_cost(const BlackBoxDeclaration& black_box) const;
-    // The primitives that cannot declare their bits yet, by name, each with
-    // what is still in it.
-    [[nodiscard]] std::vector<std::string> state_not_yet_declared() const {
-        std::vector<std::string> names;
-        for (const auto& entry : not_yet_declared()) names.push_back(entry.first->name());
-        return names;
-    }
     // Test seams (Q, between ticks): whether load slot `index` is held, and
     // whether its gathered vector is complete (a ready async RF writer);
     // whether store slot `index` is held.
@@ -346,22 +331,15 @@ private:
         uint64_t deadline_cycle = 0;
     };
 
-    // Issue-internal warp state (only the scheduler reads or writes it). The
-    // depbar counters and the mbar wait slots, which other units complete,
-    // are registers (below), and so are the warp's front end (its PCs,
-    // instruction buffer and halted bit, WarpFrontEnd), which fetch reads,
-    // and its predicate file (predicates_). Its vector and uniform registers
-    // are in the register files' memories (rf_, urf_).
+    // A launched warp: its warp slot's number. Everything the warp has is a
+    // register or a memory (below): its stall countdown (stall_left_), its
+    // depbar counters and mbar wait slots, its front end (PCs, instruction
+    // buffer and halted bit, WarpFrontEnd), its active mask and divergence
+    // stack (divergence_), its predicate file (predicates_), and its vector
+    // and uniform registers in the register files' memories (rf_, urf_).
+    // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
     struct Warp {
         uint32_t id = 0;
-        // (The warp's active mask is a register: divergence_, below.)
-        // The stall count's end: the warp issues again from this cycle. Only
-        // the scheduler reads it (before it accepts anything) and writes it
-        // (at its acceptance, for the warp it accepted), so the in-place write
-        // is the register's next value; nothing else -- fetch included --
-        // reads it.
-        uint64_t stall_until = 0;
-        // RAW/WAW/WAR horizons (no scoreboard exists) live in the Sanitizer.
     };
 
     // One warp slot's front end, one
@@ -514,24 +492,19 @@ private:
         uint64_t lane_enables = 0;
     };
 
-    // A fixed-latency instruction in the arithmetic pipeline, from accepted
-    // issue until its operands are all at the RF output (issue +
-    // issue_to_operands: the last stage of arithmetic_reads_), when it
-    // executes: its operand latches.
-    struct ArithmeticRead {
-        uint32_t warp = 0;
-        uint32_t pc = 0;                             // (S) PANIC text: the instruction's own pc
-        // Its result's lane enables (16 bits): the issue cycle's active mask,
-        // ANDed with the instruction's write mask at the sample.
-        uint64_t active_mask = 0;
-        DecodedInstruction instruction;
-        Bounded<uint8_t, limits::round_reads> reads;                  // the round's registers
-        Bounded<LaneWords, limits::round_reads> operands; // by read, latched at the sample
-        Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // ur2r: the round's uniform register
-        Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
-    };
-
-    // A memory / engine / mbar instruction between accepted issue and its
+    // An instruction and its operand round, from accepted issue until its
+    // unit takes it. Two pipelines carry one, each with its own type name
+    // (the same fields):
+    //
+    // ArithmeticRead: a fixed-latency instruction in the arithmetic pipeline,
+    // from accepted issue until its operands are all at the RF output (issue
+    // + issue_to_operands: the last stage of arithmetic_reads_), when it
+    // executes: its operand latches. Its pc is (S) PANIC text; its active
+    // mask is its result's lane enables (16 bits): the issue cycle's active
+    // mask, ANDed with the instruction's write mask at the sample; its uniform
+    // read is ur2r's.
+    //
+    // DispatchEntry: a memory / engine / mbar instruction between accepted issue and its
     // unit: the issue register and the
     // RF read pipeline carry it. Its operands are latched at its RF sample
     // (issue + 1) and reach the unit at DISPATCH (issue + 1 + Lr), where the
@@ -545,7 +518,7 @@ private:
     // issue + 1 + k: stage 0 is its sample, the last stage its dispatch.
     struct DispatchEntry {
         uint32_t warp = 0;
-        uint32_t pc = 0;
+        uint32_t pc = 0;                             // the instruction's own pc
         uint64_t active_mask = 0;
         DecodedInstruction instruction;
         Bounded<uint8_t, limits::round_reads> reads;                  // the round's registers
@@ -553,6 +526,7 @@ private:
         Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // the round's uniform registers
         Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
     };
+    using ArithmeticRead = DispatchEntry;
 
     // One uniform-register write in the URF write pipeline (src/timing.hpp),
     // from its writer's accepted issue at t
@@ -1094,15 +1068,14 @@ private:
     // (lsu.active_commands) from admission until its completion commits; it
     // holds the load or the store buffer only while its data is in it.
     struct LsuCommand {
+        static constexpr const char* unit = "LSU";                     // (CommandSlots' errors)
+        static constexpr const char* capacity = "lsu.active_commands";
         uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer, the wires' names
         uint8_t slot = 0;           // the command slot it holds (chosen at its dispatch)
         LsuKind kind = LsuKind::vector_load;
         uint32_t warp = 0;
-        uint32_t pc = 0;
-        DecodedInstruction instruction;
         uint8_t reg = 0;            // rD (loads) / rS (vector store)
         uint8_t depbar = 0;
-        uint32_t buffer = 0;      // load_buffer or store_buffer (by kind; kept for the trace and probes)
         // The instruction's lanes (16 bits; the active mask AND its write mask,
         // as its operands were sampled): an inactive lane makes no request, a
         // load writes only these lanes (a uniform load: all lanes).
@@ -1112,7 +1085,6 @@ private:
         // the lanes' addresses latched at admission (16 x 64 bits as held
         // here; a sector address and a word offset each).
         Bounded<LsuSector, limits::lanes> sectors;
-        uint32_t stream = 0;        // a load: the ordered LSU read stream (lsu_stream)
         uint32_t requests_total = 0;
         uint32_t requests_emitted = 0;
         uint32_t lanes_written = 0;    // loads: active lanes whose data is written to the RF
@@ -1120,6 +1092,103 @@ private:
         uint32_t sectors_pushed = 0; // v8 store: lanes (sectors) moved into the egress FIFO
         uint32_t words_pushed = 0; // stores: words of the current sector (v8) / sectors (scalar) in egress
         uint32_t acks = 0;
+    };
+
+    // A unit's command slots (the LSU's and the TMA's): N slots, each holding
+    // one command from the cycle it takes one until it leaves, and the
+    // occupied slots' age order. A command takes the lowest free slot of the
+    // profile's capacity and leaves from any slot. A command (C) carries its
+    // number (id) and its slot; C::unit and C::capacity name the unit and its
+    // profile knob in internal errors. A plain-data payload of fixed size.
+    template <typename C, std::size_t N>
+    struct CommandSlots {
+        std::array<std::optional<C>, N> slots{};
+        Bounded<uint8_t, N> by_age; // occupied slots, oldest first
+        [[nodiscard]] std::size_t size() const { return by_age.size(); }
+        [[nodiscard]] bool empty() const { return by_age.empty(); }
+        // The command in slot `slot`; it must be there.
+        [[nodiscard]] const C& in_slot(uint8_t slot) const {
+            if (slot >= slots.size() || !slots[slot].has_value()) {
+                throw SimError(std::string("internal reference to the empty ") + C::unit + " command slot " +
+                    std::to_string(slot));
+            }
+            return *slots[slot];
+        }
+        // The command in slot `slot`; `id` is the number the referring state
+        // carries beside the slot (a check that the slot was not reused).
+        [[nodiscard]] const C& in_slot(uint8_t slot, uint64_t id) const {
+            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) {
+                throw SimError(std::string("internal: ") + C::unit + " command #" + std::to_string(id) +
+                    " is not in slot " + std::to_string(slot));
+            }
+            return *slots[slot];
+        }
+        [[nodiscard]] C& in_slot(uint8_t slot, uint64_t id) {
+            return const_cast<C&>(std::as_const(*this).in_slot(slot, id));
+        }
+        [[nodiscard]] const C* find_in_slot(uint8_t slot, uint64_t id) const {
+            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) return nullptr;
+            return &*slots[slot];
+        }
+        [[nodiscard]] C* find_in_slot(uint8_t slot, uint64_t id) {
+            return const_cast<C*>(std::as_const(*this).find_in_slot(slot, id));
+        }
+        [[nodiscard]] const C* find(uint64_t id) const {
+            for (const auto slot : by_age) {
+                if (slots[slot]->id == id) return &*slots[slot];
+            }
+            return nullptr;
+        }
+        [[nodiscard]] C* find(uint64_t id) { return const_cast<C*>(std::as_const(*this).find(id)); }
+        [[nodiscard]] const C& at(uint64_t id) const {
+            const auto* command = find(id);
+            if (command == nullptr) {
+                throw SimError(std::string("internal: ") + C::unit + " command #" + std::to_string(id) + " is in no slot");
+            }
+            return *command;
+        }
+        [[nodiscard]] C& at(uint64_t id) { return const_cast<C&>(std::as_const(*this).at(id)); }
+        // The commands, oldest first.
+        [[nodiscard]] Bounded<const C*, N> oldest_first() const {
+            Bounded<const C*, N> commands;
+            for (const auto slot : by_age) commands.push_back(&*slots[slot]);
+            return commands;
+        }
+        // The lowest slot of the profile's `capacity` free once the commands
+        // `leaving` (by number) have left.
+        [[nodiscard]] std::optional<uint8_t> lowest_free(
+            std::size_t capacity, const std::vector<uint64_t>& leaving = {}) const {
+            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
+                if (!slots[slot].has_value() ||
+                    std::find(leaving.begin(), leaving.end(), slots[slot]->id) != leaving.end()) {
+                    return static_cast<uint8_t>(slot);
+                }
+            }
+            return std::nullopt;
+        }
+        // A new command takes the lowest free slot of the profile's
+        // `capacity`; the slot it took.
+        uint8_t take(C command, std::size_t capacity) {
+            const auto slot = lowest_free(capacity);
+            if (!slot.has_value()) {
+                throw SimError(std::string("internal: the ") + C::unit + " holds more than " + C::capacity + " commands");
+            }
+            command.slot = *slot;
+            slots[*slot] = std::move(command);
+            by_age.push_back(*slot);
+            return *slot;
+        }
+        void release(uint64_t id) {
+            for (std::size_t index = 0; index < by_age.size(); ++index) {
+                const auto slot = by_age[index];
+                if (slots[slot]->id != id) continue;
+                slots[slot].reset();
+                by_age.erase_at(index);
+                return;
+            }
+            throw SimError(std::string("internal: ") + C::unit + " command #" + std::to_string(id) +
+                " left a slot it is not in");
+        }
     };
 
     // The load / store unit's command slots: lsu.active_commands slots (2),
@@ -1131,64 +1200,7 @@ private:
     // buffer's owner, a read record, an egress slot, a read in the store-data
     // pipeline) holds its slot number; this cycle's wires name it by its
     // number (LsuCommand::id), found here by comparing the slots.
-    struct LsuCommandSlots {
-        std::array<std::optional<LsuCommand>, limits::lsu_active_commands> slots{};
-        Bounded<uint8_t, limits::lsu_active_commands> by_age; // occupied slots, oldest first
-        [[nodiscard]] std::size_t size() const { return by_age.size(); }
-        [[nodiscard]] bool empty() const { return by_age.empty(); }
-        // The command in slot `slot`; it must be there.
-        [[nodiscard]] const LsuCommand& in_slot(uint8_t slot) const {
-            if (slot >= slots.size() || !slots[slot].has_value()) {
-                throw SimError("internal reference to the empty LSU command slot " + std::to_string(slot));
-            }
-            return *slots[slot];
-        }
-        // The lowest slot of the profile's `capacity` free once the commands
-        // `leaving` (by number) have left.
-        [[nodiscard]] std::optional<uint8_t> lowest_free(std::size_t capacity, const std::vector<uint64_t>& leaving) const {
-            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
-                if (!slots[slot].has_value() ||
-                    std::find(leaving.begin(), leaving.end(), slots[slot]->id) != leaving.end()) {
-                    return static_cast<uint8_t>(slot);
-                }
-            }
-            return std::nullopt;
-        }
-        [[nodiscard]] const LsuCommand* find(uint64_t id) const {
-            for (const auto slot : by_age) {
-                if (slots[slot]->id == id) return &*slots[slot];
-            }
-            return nullptr;
-        }
-        [[nodiscard]] LsuCommand* find(uint64_t id) {
-            return const_cast<LsuCommand*>(std::as_const(*this).find(id));
-        }
-        // The commands, oldest first.
-        [[nodiscard]] Bounded<const LsuCommand*, limits::lsu_active_commands> oldest_first() const {
-            Bounded<const LsuCommand*, limits::lsu_active_commands> commands;
-            for (const auto slot : by_age) commands.push_back(&*slots[slot]);
-            return commands;
-        }
-        // A new command takes the slot its dispatch chose (the lowest free one).
-        void take(const LsuCommand& command, std::size_t capacity) {
-            if (command.slot >= capacity || command.slot >= slots.size() || slots[command.slot].has_value() ||
-                lowest_free(capacity, {}) != command.slot) {
-                throw SimError("internal: the LSU holds more than lsu.active_commands commands");
-            }
-            slots[command.slot] = command;
-            by_age.push_back(command.slot);
-        }
-        void release(uint64_t id) {
-            for (std::size_t index = 0; index < by_age.size(); ++index) {
-                const auto slot = by_age[index];
-                if (slots[slot]->id != id) continue;
-                slots[slot].reset();
-                by_age.erase_at(index);
-                return;
-            }
-            throw SimError("internal: LSU command #" + std::to_string(id) + " left a slot it is not in");
-        }
-    };
+    using LsuCommandSlots = CommandSlots<LsuCommand, limits::lsu_active_commands>;
 
     // (T) Trace phases and per-command stall reasons of an LSU command. Read
     // only for its trace slice; updated in place by the decisions that see
@@ -1221,31 +1233,25 @@ private:
     // Writes leave in FIFO order, so the bus's head is always the oldest
     // accepted request. Slots in use: the data FIFO's entries and the open
     // one; a new grant needs a free slot (drive_egress checks it).
-    struct EgressOpenSlot {
+    // The request FIFO's entry: what the write request needs (and the LSU's
+    // check that the request pointer is its command's next sector). The open
+    // slot (below) begins with the same fields.
+    struct EgressRequest {
         GmemClient client = GmemClient::lsu;
         uint8_t owner = 0;          // LSU: its command's slot
         uint32_t index = 0;         // LSU: the command's request index this slot carries
         uint64_t sector_address = 0;
         uint64_t byte_enable = 0;
+        uint64_t id = 0;            // (T) running slot number (trace / probe)
+        uint64_t command = 0;       // (T) its command's number
+    };
+    struct EgressOpenSlot : EgressRequest {
         uint32_t words_total = 0;   // words the client writes into this slot
         uint32_t words_written = 0;
         // The words written so far. In hardware they are in the RAM at the
         // write pointer's slot already; the write pointer moves on (the push)
         // when the last one is written.
         std::array<uint8_t, limits::sector_bytes> data{};
-        uint64_t id = 0;            // (T) running slot number (trace / probe)
-        uint64_t command = 0;       // (T) its command's number
-    };
-    // The request FIFO's entry: what the write request needs (and the LSU's
-    // check that the request pointer is its command's next sector).
-    struct EgressRequest {
-        GmemClient client = GmemClient::lsu;
-        uint8_t owner = 0;          // LSU: its command's slot
-        uint32_t index = 0;         // LSU: the command's request index
-        uint64_t sector_address = 0;
-        uint64_t byte_enable = 0;
-        uint64_t id = 0;            // (T) running slot number
-        uint64_t command = 0;       // (T) its command's number
     };
     // The data FIFO's entry: the slot's sector (gmem.sector_bytes of it).
     struct EgressSector {
@@ -1277,11 +1283,10 @@ private:
     // The decoded descriptor is not kept here: it goes into the walker's
     // registers when the descriptor read returns (TmaWalker).
     struct TmaCommand {
+        static constexpr const char* unit = "TMA";                     // (CommandSlots' errors)
+        static constexpr const char* capacity = "tma.queue_commands";
         uint64_t id = 0;            // (T) the command's number: the trace, the sanitizer
         uint8_t slot = 0;           // the queue slot it holds (set when it takes one)
-        uint32_t warp = 0;
-        uint32_t pc = 0;
-        DecodedInstruction instruction;
         // The instruction's operands: the opcode's direction, the descriptor
         // (a constant), the tile's coordinates c0..c3 (zero past the opcode's
         // N), the buffer's and the barrier's shared addresses (their low bits
@@ -1362,7 +1367,7 @@ private:
     // so at most one stage is occupied. Each stage carries the finished
     // walker registers (the multipliers' partial products are not modelled
     // bit by bit) and the command's queue slot; 0 stages: no pipeline, the
-    // walker is loaded at the descriptor's return, the timing before.
+    // walker is loaded at the descriptor's return.
     struct TmaWalkerStart {
         uint8_t slot = 0;           // the command's queue slot
         uint64_t command = 0;       // (T) its number
@@ -1384,11 +1389,10 @@ private:
     // the run and the round number (tma_round_plan), so nothing per piece is
     // held. At most tma_max_rounds() rounds (2 at the canonical profile).
     struct TmaPortRequest {
-        // One element of the run, served in one round: its bytes lie in one
-        // shared word (and, from the sector register, one sector word).
-        struct Piece {
-            uint8_t element = 0;
-        };
+        // One element of the run (its number), served in one round: its bytes
+        // lie in one shared word (and, from the sector register, one sector
+        // word).
+        using Piece = uint8_t;
         TmaPortKind kind = TmaPortKind::descriptor;
         uint64_t sector_request = 0; // (T) a placement's sector request (the edge probe)
         TmaRun run;                  // run.command: the command
@@ -1689,72 +1693,7 @@ private:
     // placement's end and a walker start name their command by its slot; the
     // frontend and the event register's command are still named by number,
     // found here by comparing the slots.
-    struct TmaCommandSlots {
-        std::array<std::optional<TmaCommand>, limits::tma_queue_commands> slots{};
-        Bounded<uint8_t, limits::tma_queue_commands> by_age; // occupied slots, oldest first
-        [[nodiscard]] std::size_t size() const { return by_age.size(); }
-        [[nodiscard]] bool empty() const { return by_age.empty(); }
-        [[nodiscard]] const TmaCommand* find(uint64_t id) const {
-            for (const auto slot : by_age) {
-                if (slots[slot]->id == id) return &*slots[slot];
-            }
-            return nullptr;
-        }
-        [[nodiscard]] TmaCommand* find(uint64_t id) {
-            return const_cast<TmaCommand*>(std::as_const(*this).find(id));
-        }
-        [[nodiscard]] const TmaCommand& at(uint64_t id) const {
-            const auto* command = find(id);
-            if (command == nullptr) throw SimError("internal: TMA command #" + std::to_string(id) + " is in no slot");
-            return *command;
-        }
-        [[nodiscard]] TmaCommand& at(uint64_t id) { return const_cast<TmaCommand&>(std::as_const(*this).at(id)); }
-        // The command in slot `slot`; `id` is the number the referring state
-        // carries beside the slot (a check that the slot was not reused).
-        [[nodiscard]] const TmaCommand& in_slot(uint8_t slot, uint64_t id) const {
-            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) {
-                throw SimError("internal: TMA command #" + std::to_string(id) + " is not in slot " + std::to_string(slot));
-            }
-            return *slots[slot];
-        }
-        [[nodiscard]] TmaCommand& in_slot(uint8_t slot, uint64_t id) {
-            return const_cast<TmaCommand&>(std::as_const(*this).in_slot(slot, id));
-        }
-        [[nodiscard]] const TmaCommand* find_in_slot(uint8_t slot, uint64_t id) const {
-            if (slot >= slots.size() || !slots[slot].has_value() || slots[slot]->id != id) return nullptr;
-            return &*slots[slot];
-        }
-        [[nodiscard]] TmaCommand* find_in_slot(uint8_t slot, uint64_t id) {
-            return const_cast<TmaCommand*>(std::as_const(*this).find_in_slot(slot, id));
-        }
-        // The commands, oldest first.
-        [[nodiscard]] Bounded<const TmaCommand*, limits::tma_queue_commands> oldest_first() const {
-            Bounded<const TmaCommand*, limits::tma_queue_commands> commands;
-            for (const auto slot : by_age) commands.push_back(&*slots[slot]);
-            return commands;
-        }
-        // A new command takes the lowest free slot of the profile's `capacity`.
-        void take(const TmaCommand& command, std::size_t capacity) {
-            for (std::size_t slot = 0; slot < capacity && slot < slots.size(); ++slot) {
-                if (slots[slot].has_value()) continue;
-                slots[slot] = command;
-                slots[slot]->slot = static_cast<uint8_t>(slot);
-                by_age.push_back(static_cast<uint8_t>(slot));
-                return;
-            }
-            throw SimError("internal: the TMA holds more than tma.queue_commands commands");
-        }
-        void release(uint64_t id) {
-            for (std::size_t index = 0; index < by_age.size(); ++index) {
-                const auto slot = by_age[index];
-                if (slots[slot]->id != id) continue;
-                slots[slot].reset();
-                by_age.erase_at(index);
-                return;
-            }
-            throw SimError("internal: TMA command #" + std::to_string(id) + " left a slot it is not in");
-        }
-    };
+    using TmaCommandSlots = CommandSlots<TmaCommand, limits::tma_queue_commands>;
     struct TmaQueue {
         TmaCommandSlots commands;                // tma.queue_commands slots; issue's command takes one
         std::optional<uint64_t> frontend;        // the command the descriptor / walker frontend serves
@@ -1780,16 +1719,23 @@ private:
         uint8_t reg = 0;
     };
 
+    // One bank's part of the RF write or read decision: a holder is ready for
+    // it, a holder was granted it, SIMT is inhibited there, and the bank's
+    // round-robin cursor after this cycle. (The write decision's names:
+    // async_ready, async_grant, async_denied AND async_owed; the read
+    // decision's below.)
+    struct RfBankDecision {
+        bool ready = false;
+        bool granted = false;
+        bool inhibit_simt = false;
+        uint32_t cursor_after = 0;
+    };
+
     // The RF write decision of this cycle, computed from Q before issue.
     struct RfWriteDecision {
         std::vector<std::optional<AsyncWrite>> holders; // every holder in round-robin order; set when ready
         std::vector<uint8_t> granted;                    // per holder: written into the RF this cycle
-        struct Bank {
-            bool ready = false;          // async_ready
-            bool granted = false;        // async_grant
-            bool inhibit_simt = false;   // async_denied AND async_owed
-            uint32_t cursor_after = 0;
-        };
+        using Bank = RfBankDecision;
         std::vector<Bank> banks;
         std::optional<uint32_t> lsu_presented;           // the load buffer, on the LSU's one write path
         [[nodiscard]] bool granted_to(AsyncWriter writer, uint32_t index) const;
@@ -1823,12 +1769,7 @@ private:
     struct RfReadDecision {
         std::vector<std::optional<RfReadRequest>> holders;
         std::vector<uint8_t> granted;
-        struct Bank {
-            bool ready = false;
-            bool granted = false;
-            bool inhibit_simt = false;
-            uint32_t cursor_after = 0;
-        };
+        using Bank = RfBankDecision;
         std::vector<Bank> banks;
         [[nodiscard]] bool granted_to(RfReader reader, uint32_t index) const;
     };
@@ -2049,6 +1990,8 @@ private:
     // What an accepted instruction changes outside the issue unit now.
     struct IssueDecision {
         std::optional<uint32_t> popped;                  // the warp whose FIFO head was accepted
+        uint8_t stall = 0;                               // ... its instruction's stall count (its stall countdown)
+        bool sfu = false;                                // ... an SFU op: the unit's occupancy countdown loads
         bool halt = false;                               // ... a halt: the warp's front end stops
         std::optional<IssuedBranch> branch;              // ... a branch: into the issue register
         std::optional<DepbarEvent> depbar_admission;
@@ -2222,7 +2165,7 @@ private:
     // Each memory is a black box (src/machine/blackbox.hpp): beside it are its
     // description, its shape (built in the constructor) and its declaration as
     // a black box (memory_blackbox; read by declare_black_boxes).
-    std::vector<Warp> warps_;                     // + the predicate files
+    std::vector<Warp> warps_;                     // the launched warps (their slot numbers; fixed at launch)
     // The vector register file: rf.banks memories (one per bank) of
     // rf.rows_per_bank rows, a row one lane-wide register (lanes x 32 bits,
     // a write enables lanes one by one); rf.read_ports_per_bank read ports
@@ -2477,13 +2420,13 @@ private:
     Fifo<LsuRead> lsu_reads_{clocked_,Unit::load_store, "read records: LSU stream"};
     Reg<uint32_t> tma_read_received_{clocked_,Unit::tma, "read records: TMA stream head's bytes consumed"};
     Reg<uint32_t> lsu_read_received_{clocked_,Unit::load_store, "read records: LSU stream head's bytes consumed"};
-    Regs<uint8_t> free_id_tags_{clocked_,Unit::load_store, "free-ID tags", 1}; // lsu.sectors_in_flight bits; 1 = in flight
+    Regs<uint8_t> free_id_tags_{clocked_,Unit::load_store, "free-ID tags"}; // lsu.sectors_in_flight bits; 1 = in flight
     // A store whose last acknowledgement came at t completes at t + 1: its
     // command slot frees at the RF write port and its depbar counts down at
     // the RAM stage (the memory controller is decided after both). One bit per
     // LSU command slot (lsu.active_commands): the slot still holds the
     // command's warp and depbar.
-    Regs<uint8_t> store_completions_{clocked_,Unit::load_store, "store completions", 1};
+    Regs<uint8_t> store_completions_{clocked_,Unit::load_store, "store completions"};
     // The RF write path (src/timing.hpp): the fixed units (black boxes, each
     // with its output register), then one write pipeline per RF write port
     // (bank x rf.write_ports_per_bank + port), from the port to the RAM.
@@ -2527,14 +2470,26 @@ private:
     Pipe<UrfWrite> urf_pipe_{clocked_,Unit::uniform_file, "URF write pipeline"};
 
     // ---- Unit-internal state (only its own unit's code touches it) ----
-    // Issue: scheduler cursor, SFU occupancy. (Read only by the scheduler
-    // before it accepts, written at acceptance: fetch never reads them.)
-    uint32_t scheduler_cursor_ = 0;
-    // First cycle the SFU is free again. The unit is occupied from an SFU
-    // op's execution start (issue + issue_to_operands) for ceil(lanes /
-    // sfu_lanes) cycles; a later SFU op stalls structurally until its own
-    // execution start fits.
-    uint64_t sfu_busy_until_ = 0;
+    // Issue: the scheduler's registers, read only by the scheduler before it
+    // accepts and driven from its acceptance (drive_scheduler): fetch never
+    // reads them.
+    // The round-robin cursor: the warp the scan starts from (the one after
+    // the warp accepted last), bits_for(core.warps) bits.
+    Reg<uint32_t> scheduler_cursor_{clocked_,Unit::issue, "scheduler round-robin cursor"};
+    // Per warp slot (core.warps), its stall countdown: the cycles before the
+    // warp may issue again. An instruction accepted at t loads its stall
+    // count (5 bits) less one, so the warp is held while it is nonzero, from
+    // t + 1 to t + stall - 1, and issues again from t + stall (a stall of 0
+    // or 1: from t + 1); it counts down to 0. 5 bits.
+    Regs<uint8_t> stall_left_{clocked_,Unit::issue, "stall countdowns"};
+    // The special-function unit's occupancy: an SFU op accepted at t starts
+    // executing at t + issue_to_operands and holds the unit for G =
+    // ceil(lanes / sfu.lanes) cycles (its lane groups), so a later SFU op is
+    // refused (structural) until its own execution start fits. The countdown
+    // loads G - 1 at the accept and counts down to 0; an SFU op may be
+    // accepted when it is 0. bits_for(G) bits.
+    Reg<uint32_t> sfu_busy_{clocked_,Unit::issue, "SFU occupancy countdown"};
+    [[nodiscard]] uint32_t sfu_occupancy() const { return (config_.lanes + config_.sfu_lanes - 1) / config_.sfu_lanes; }
     // The arithmetic pipeline's operand latches: issue_to_operands stages. An
     // instruction accepted at t samples its round in stage 0 (t + 1) and
     // executes from the last stage (t + issue_to_operands), its operands at
@@ -2730,6 +2685,7 @@ private:
     void drive_issue_branch(const Wires& w);
     void drive_divergence(const Wires& w);
     void drive_depbar(const Wires& w);
+    void drive_scheduler(const Wires& w);
     void drive_wait_slots(const Wires& w);
     void drive_store_slots(const Wires& w);
     void drive_mbar_probe(const Wires& w);
@@ -2867,12 +2823,10 @@ private:
     [[nodiscard]] static MmaTag mma_tag(const MmaStep& step);
     void land_tmem_writes(const Wires& w);
 
-    // The state report's declarations (src/machine/state_report.cpp), and
-    // the black boxes' contracts, each beside its black box.
-    void declare_state_bits();
+    // The black boxes' contracts, each declared beside its black box and
+    // gathered here (src/machine/state_report.cpp).
     void declare_black_boxes();
     std::vector<BlackBoxDeclaration> black_boxes_;
-    [[nodiscard]] std::vector<std::pair<const Clocked*, std::string>> not_yet_declared() const;
     // The physical tmem word of logical word `logical` in a region whose rows
     // are row_words words (src/layout.hpp); dispatch panicked on any word
     // outside tmem, so past that this is an internal error.
@@ -2897,7 +2851,7 @@ private:
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
     void complete_tma_store_capture(TmaQueue& tma, uint8_t slot, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
-    // The launch copy (README "Launch"): the TMA's first command and walker
+    // The launch copy (docs/qtx.md "Launch"): the TMA's first command and walker
     // and the warps' launch flags, from the launch record; each landed
     // sector's bytes and the flags they clear.
     void start_launch_copy(const LaunchRecord& record);
@@ -3015,18 +2969,12 @@ private:
 
 uint32_t float_bits(float value);
 float bits_float(uint32_t value);
-// fp16 <-> fp32 bit conversions. MMA now retains raw halves and uses its
-// integer decoder in mma_numeric.cpp. The encode direction (RNE, overflow to inf, subnormal support,
+// fp16 <-> fp32 bit conversions. (The MMA does not use them: it keeps its
+// operands as raw halves and decodes them itself, mma_numeric.cpp.) The
+// encode direction (RNE, overflow to inf, subnormal support,
 // NaN keeps its truncated payload or the quiet bit) is cvt.pack.f16x2's
 // spec. Finite and infinite halves round-trip exactly.
 uint32_t half_to_float_bits(uint16_t half);
 uint16_t float_to_half_bits(uint32_t bits);
-
-// ---- Clocked state that is not yet a fixed bundle of bits ----
-// Every register, group, pipeline, FIFO and memory of the machine holds a
-// payload of a fixed size (machine/state.hpp checks it when this compiles).
-// A payload that cannot be one yet is named here, one line each, as
-//   template <> struct NotYetFixedPayload<T> : std::true_type {}; // what it still holds
-// with what it would become. There is none.
 
 } // namespace nanosm

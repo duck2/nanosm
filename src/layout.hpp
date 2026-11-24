@@ -4,9 +4,8 @@
 
 namespace nanosm {
 
-// v0.1 of the shared-memory tile layout and of the tensor core's operand
-// interface (an operand is a 16-byte piece's address in row 0 plus a row
-// spacing). Two choices shape it. Rows stay whole: a layout that cuts every
+// The shared-memory tile layout and the tensor core's operand interface (an
+// operand is a 16-byte piece's address in row 0 plus a row spacing). Two choices shape it. Rows stay whole: a layout that cuts every
 // row into 16-byte pieces stored K slices apart scatters a row over K / 8
 // places and cannot take gathered rows or small pieces. And the shuffle's row
 // number is the byte's own address divided by the spacing, not a count from
@@ -99,7 +98,7 @@ inline uint32_t swizzle64_address(uint32_t base, uint32_t spacing, uint32_t row,
 }
 
 // ---------------------------------------------------------------------------
-// Tensor-core memory (tmem), v0.1.
+// Tensor-core memory (tmem), a first version.
 // An accumulator is no declared object: an instruction names a POINTER (a
 // word address, held in a uniform register) and the words per row S of the
 // region it treats as rows (an instruction constant; the matmul's result

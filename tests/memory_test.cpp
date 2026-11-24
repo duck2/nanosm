@@ -1,4 +1,4 @@
-// qtx's memory objects (src/qtxc/objects.cpp, expressions.cpp; README
+// qtx's memory objects (src/qtxc/objects.cpp, expressions.cpp; docs/qtx.md
 // "Memory"): `.shmem` / `.tmem` name a piece of the kernel's own memory and
 // qtxc places it; constants are expressions; ld.param reads a parameter.
 // Smoke tests: objects land where the rule says and the code reaches them

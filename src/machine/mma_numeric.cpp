@@ -9,6 +9,20 @@
 // d96b82180ac9041c09295f3a6a3c2c4e592ddce6, model.py's raw-window FP16 path.
 // Copyright (c) 2026 San Francisco Tensor Company; MIT license, reproduced
 // in third_party/tcgen05-LICENSE. No host floating-point arithmetic is used.
+//
+// The model, mma.numeric_model "fp16_raw_window25_rz_v1" (in the profile's
+// fingerprint). One step of the core fuses its core_k fp16 products with the
+// fp32 accumulator word C: the largest raw exponent among the nonzero terms
+// (a product's is its operands' exponent sum) chooses the window; every term
+// is aligned to a quantum of 2^(that exponent - 25), its magnitude truncated;
+// the signed integer units are summed, and the sum is normalized and
+// truncated once to fp32. Subnormal operands are kept; an exact or an
+// underflowed zero is +0; a generated NaN is 0x7fffffff; an overflow is an
+// infinity of its sign. Only fp32 survives between steps (the canonical
+// 4x4x8 core fuses eight products and C in a step, not a whole mma.async).
+// It takes tcgen05's measured arithmetic rules, not B200's fusion extent,
+// and claims no whole-instruction B200 equivalence. There are no numerical
+// tuning knobs.
 namespace nanosm {
 namespace {
 

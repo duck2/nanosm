@@ -1,5 +1,12 @@
 #pragma once
 
+// The C boundary of the simulator and the toolchain (nanosm/_native.py binds
+// it with ctypes). Fixed-width C values, integer session handles,
+// pointer-plus-length inputs and caller-owned output buffers; no file I/O,
+// and no C++ object or exception crosses it. Under Emscripten the same
+// functions are kept alive (EMSCRIPTEN_KEEPALIVE), so a browser shell can put
+// JSON and qtx in linear memory and call them directly.
+
 #include <stdint.h>
 
 #if defined(__EMSCRIPTEN__)
@@ -127,8 +134,9 @@ NANOSM_CAPI uint64_t nanosm_session_trace_json(
     uint32_t handle, char* output, uint64_t capacity);
 NANOSM_CAPI uint64_t nanosm_session_launch_image(
     uint32_t handle, char* output, uint64_t capacity);
-// The machine's state report: declared hardware bits by unit (flip-flops,
-// memories, FIFO storage) and the totals. Fixed when the machine is built.
+// The machine's state report: every piece of clocked state by unit (its kind,
+// name and size) and every black box's contract. Fixed when the machine is
+// built.
 NANOSM_CAPI uint64_t nanosm_session_state_report(
     uint32_t handle, char* output, uint64_t capacity);
 

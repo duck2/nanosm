@@ -30,7 +30,6 @@
 
 #include "machine/reg.hpp"
 
-#include <bit>
 #include <cstddef>
 #include <optional>
 #include <stdint.h>
@@ -49,16 +48,12 @@ struct FifoPorts {
 template <typename T>
 class Fifo final : public Clocked {
 public:
-    // entry_bits: the declared hardware bits of one entry, or none where not
-    // declared yet.
-    Fifo(AllClocked& all, Unit unit, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
-        : Clocked(all,unit, std::move(name)), entry_bits_(entry_bits) {
-        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp); what is not there yet is listed at the end of machine.hpp");
+    Fifo(AllClocked& all, Unit unit, std::string name) : Clocked(all,unit, std::move(name)) {
+        static_assert(FixedPayload<T>, "a register's payload must be a fixed bundle of bits (machine/state.hpp)");
         push_point_ = new_write_point();
         pop_point_ = new_write_point();
     }
-    Fifo(AllClocked& all, std::string name, std::optional<uint64_t> entry_bits = std::nullopt)
-        : Fifo(all,Unit::none, std::move(name), entry_bits) {}
+    Fifo(AllClocked& all, std::string name) : Fifo(all,Unit::none, std::move(name)) {}
 
     // The FIFO's shape, once, when the machine is built.
     void build(std::size_t capacity, FifoPorts ports = {}) {
@@ -73,11 +68,6 @@ public:
         delay_.assign(ports.read_latency - 1, 0);
         pushed_.reserve(ports.write_width);
     }
-
-    void declare_entry_bits(uint64_t bits) { entry_bits_ = bits; }
-    // The read port's width as hardware has it, when an observer looks past
-    // it (an entry only a counter reads is no port; the report counts this).
-    void declare_read_width(std::size_t entries) { declared_read_width_ = entries; }
 
     [[nodiscard]] std::size_t capacity() const { return storage_.size(); }
     [[nodiscard]] const FifoPorts& ports() const { return ports_; }
@@ -167,16 +157,11 @@ public:
         popped_.reset();
     }
 
-    // The entries (FIFO storage: a RAM), and the pointers beside them in
-    // flip-flops: the write and read pointers, and the latency - 1 copies of
-    // the write pointer the read side sees it through, each as wide as a
-    // count of the capacity.
+    // Its capacity, its ports' widths and its read latency.
     [[nodiscard]] StateSize size() const override {
-        auto size = sized("FIFO", storage_.size(), entry_bits_);
-        const auto pointer = static_cast<uint64_t>(std::bit_width(storage_.size()));
-        size.control_bits = storage_.empty() ? 0 : (ports_.read_latency + 1) * pointer;
+        auto size = sized("FIFO", storage_.size());
         size.write_ports = static_cast<uint32_t>(ports_.write_width);
-        size.read_ports = static_cast<uint32_t>(declared_read_width_.value_or(ports_.read_width));
+        size.read_ports = static_cast<uint32_t>(ports_.read_width);
         size.read_delay = static_cast<uint32_t>(ports_.read_latency);
         return size;
     }
@@ -193,8 +178,6 @@ private:
     bool pushing_ = false;
     std::optional<std::size_t> popped_;
     bool built_ = false;
-    std::optional<uint64_t> entry_bits_;
-    std::optional<std::size_t> declared_read_width_;
     uint32_t push_point_ = 0;
     uint32_t pop_point_ = 0;
 };

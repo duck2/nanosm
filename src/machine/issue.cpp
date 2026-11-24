@@ -171,7 +171,7 @@ void Machine::decide_issue(Wires& w) {
     trace_->instruction_fifo_empty(fifo_empty);
     // The scan keeps going past the winner (for the trace), so it walks from
     // the cursor as it was at the start of the cycle.
-    const auto cursor = scheduler_cursor_;
+    const auto cursor = scheduler_cursor_.cur();
     for (uint32_t offset = 0; offset < warps_.size(); ++offset) {
         const auto index = (cursor + offset) % static_cast<uint32_t>(warps_.size());
         auto& warp = warps_[index];
@@ -187,7 +187,7 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::mbar_wait, "mbar phase"};
             continue;
         }
-        if (cycle_ < warp.stall_until) {
+        if (stall_left_.cur()[index] != 0) {
             states[index] = {WarpState::stall_count, "stall count"};
             continue;
         }
@@ -208,7 +208,6 @@ void Machine::decide_issue(Wires& w) {
         const auto attempt = try_issue(warp, w);
         if (attempt.issued) {
             states[index] = {WarpState::issued, {}};
-            scheduler_cursor_ = (index + 1) % static_cast<uint32_t>(warps_.size());
             issued = true;
             continue;
         }
@@ -241,10 +240,10 @@ void Machine::decide_issue(Wires& w) {
 //      mbar instruction, its entry into the dispatch pipeline, which carries
 //      it to its unit as its operands arrive. Operand-value panics
 //      (alignment, bounds) happen there, at dispatch.
-// The issue unit's own state (stall count, the SFU and the arithmetic operand
-// latches) changes in place; everything else goes into w.issue, which its
-// drivers apply -- the buffer's pop and the warp's pc included
-// (step_front_end).
+// What an acceptance changes goes into w.issue, which its drivers apply --
+// the warp's stall countdown, the SFU's occupancy and the scheduler's cursor
+// (drive_scheduler), the buffer's pop and the warp's pc (step_front_end)
+// included.
 Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
     const auto inst = head_instruction(warp);
     sanitizer_.record_issue_attempt(warp.id);
@@ -265,7 +264,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
 // Panics on the instruction word alone: register encodings that wrap and
 // special registers read by the wrong instruction. (A write mask on an
 // instruction that cannot be masked was refused at kernel load:
-// check_write_masks.)
+// check_kernel.)
 void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) const {
     if ((inst.opcode == Opcode::ldg_v8 && static_cast<unsigned>(inst.dst) + 8 > 256) ||
         (inst.opcode == Opcode::stg_v8 && static_cast<unsigned>(inst.src1) + 8 > 256))
@@ -386,7 +385,7 @@ ResourceView Machine::resource_view(
     for (const auto reg : plan.reads) {
         if (w.rf_read.banks.at(reg % config_.rf_banks).inhibit_simt) view.read_inhibited = true;
     }
-    view.sfu_free = cycle_ + issue_to_operands(config_) >= sfu_busy_until_;
+    view.sfu_free = sfu_busy_.cur() == 0;
     if (plan.write_reg.has_value()) {
         view.write_slot_free = write_slot_free(*plan.write_reg, plan.write_cycle);
         view.write_inhibited = w.rf_write.banks.at(*plan.write_reg % config_.rf_banks).inhibit_simt;
@@ -522,7 +521,7 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         break;
     }
     check_issue_latency(warp, inst);
-    warp.stall_until = cycle_ + inst.control.stall;
+    w.issue.stall = inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
@@ -539,9 +538,8 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
     for (const auto reg : plan.reads) ++w.issue.rf_read_banks[reg % config_.rf_banks];
     if (is_sfu(inst.opcode)) {
-        const auto occupancy = (config_.lanes + config_.sfu_lanes - 1) / config_.sfu_lanes;
-        sfu_busy_until_ = cycle_ + issue_to_operands(config_) + occupancy;
-        trace_->sfu_accept(occupancy);
+        w.issue.sfu = true;
+        trace_->sfu_accept(sfu_occupancy());
     }
     for (const auto reg : plan.reads) {
         sanitizer_.record_reg_read_until(warp.id, reg, cycle_ + issue_to_sample + 1);
@@ -561,7 +559,7 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     pending.uniform_reads = plan.uniform_reads;
     pending.uniform_operands.resize(plan.uniform_reads.size());
     w.issue.arithmetic = std::move(pending);
-    warp.stall_until = cycle_ + inst.control.stall;
+    w.issue.stall = inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
@@ -595,7 +593,7 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
     write.active_mask = active_mask(warp.id);
     write.instruction = inst;
     w.issue.urf_write = std::move(write);
-    warp.stall_until = cycle_ + inst.control.stall;
+    w.issue.stall = inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
@@ -708,6 +706,27 @@ void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) con
                opcode != Opcode::nop && opcode != Opcode::halt) {
         panic(warp, inst, "zero-latency RF writer is unsupported");
     }
+}
+
+// The scheduler's registers. The cursor moves to the warp after the one
+// accepted now. The accepted warp's stall countdown loads its instruction's
+// stall count less one (0 for a stall of 0); every other count goes down to
+// 0. The SFU's occupancy countdown loads G - 1 at an SFU op's accept and
+// otherwise goes down to 0 (machine.hpp, beside the registers).
+void Machine::drive_scheduler(const Wires& w) {
+    if (w.issue.popped.has_value()) {
+        const uint32_t next = (*w.issue.popped + 1) % static_cast<uint32_t>(warps_.size());
+        if (next != scheduler_cursor_.cur()) scheduler_cursor_.set_next(next, "drive_scheduler");
+    }
+    const auto& stalls = stall_left_.cur();
+    for (uint32_t warp = 0; warp < stalls.size(); ++warp) {
+        const uint8_t left = w.issue.popped == warp ? w.issue.stall : stalls[warp];
+        const uint8_t next = left == 0 ? 0 : static_cast<uint8_t>(left - 1);
+        if (next != stalls[warp]) stall_left_.set_next(warp, next, "drive_scheduler");
+    }
+    const uint32_t busy = w.issue.sfu ? sfu_occupancy() : sfu_busy_.cur();
+    const uint32_t next = busy == 0 ? 0 : busy - 1;
+    if (next != sfu_busy_.cur()) sfu_busy_.set_next(next, "drive_scheduler");
 }
 
 // depbar: next = Q - this cycle's completions + issue's admission. (The

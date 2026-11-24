@@ -14,8 +14,9 @@ The reference and checking functions (inputs, references, check_close and
 the problem constants) and the four descriptor arguments are imported from
 kernels/fa.launch.py, not copied: the FA problem is defined once. This file
 adds the checks of the new tile arrangement -- the tiles' addresses come from
-the kernel's symbols, the shuffle inside a tile is restated from the README's
-swizzle64 rule (not the simulator's layout code) -- and its own algorithmic
+the kernel's symbols, the shuffle inside a tile is restated from the swizzle64
+rule as src/layout.hpp's comment states it (not the simulator's layout code) --
+and its own algorithmic
 counter census.
 """
 
@@ -67,7 +68,7 @@ def make_launch(q: list[list[float]], k: list[list[float]], v: list[list[float]]
 def swizzle64(base: int, spacing: int, row: int, byte: int) -> int:
     """Where byte `byte` of row `row` of a swizzle64 tile at `base` is stored.
 
-    The README's rule, restated for rows of 64 bytes or more: the unshuffled
+    src/layout.hpp's rule, restated for rows of 64 bytes or more: the unshuffled
     address a = base + row x spacing + byte has the row number R = a // spacing
     (the address's own, not counted from the tile); its 16-byte piece's slot is
     XORed with R % 4 and its 4-byte word in the piece with (R // 4) % 4.
