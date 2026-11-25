@@ -1008,8 +1008,8 @@ TEST(Lsu, lsu_no_fall_through_timelines) {
 // One write contract. A TMA store and an stg.v8 of the same 512 B under the
 // same (canonical) profile: every write is acknowledged exactly
 // gmem.latency_dram_ticks after its last bus beat; TMA credits are released
-// in the ack's cycle; the LSU slot at the commit of the ack (the next cycle,
-// with the depbar), so both are reusable from the cycle after the ack.
+// in the ack's cycle. The LSU's command slot does not wait for any of it: it
+// is released the cycle after the store's last sector request is accepted.
 TEST(Lsu, lsu_one_write_contract) {
     const auto config = canonical_profile();
     const auto ack_lags = [](const nanosm::Machine& machine) {
@@ -1061,9 +1061,14 @@ TEST(Lsu, lsu_one_write_contract) {
             if (now < in_flight) released = machine.cycle() - 1;
             in_flight = now;
         }
-        uint64_t last_ack = 0;
-        for (const auto& event : machine.edge_events()) if (event.edge == LsuEdge::write_ack) last_ack = event.cycle;
-        require(released == last_ack + 1, "the stg.v8 slot was not released at the commit of its last ack");
+        uint64_t last_request = 0;
+        uint64_t first_ack = 0;
+        for (const auto& event : machine.edge_events()) {
+            if (event.edge == LsuEdge::write_request) last_request = event.cycle;
+            if (event.edge == LsuEdge::write_ack && first_ack == 0) first_ack = event.cycle;
+        }
+        require(released == last_request + 1, "the stg.v8 slot was not released the cycle after its last sector request");
+        require(released < first_ack, "the stg.v8 slot was held until an acknowledgement");
         lsu_lags = ack_lags(machine);
         for (uint32_t i = 0; i < 128; ++i) // lane i / 8's sector, word i % 8: r(8 + i % 8) at that lane
             require(machine.read_gmem_u32(1024 + 4 * i) == i / 8 + 16 * (i % 8), "stg.v8 data");
@@ -1071,6 +1076,64 @@ TEST(Lsu, lsu_one_write_contract) {
     require(tma_lags.size() == 16 && lsu_lags.size() == 16, "expected sixteen writes per client");
     require(all_equal(tma_lags, config.gmem_latency_dram_ticks) && tma_lags == lsu_lags,
         "TMA store and stg.v8 acks are not both gmem.latency_dram_ticks after the last beat");
+}
+
+// A store's command slot is its own only until its last sector request is
+// accepted; its acknowledgements are counted in its record. With two command
+// slots, two stg.v8 and then an ldg.v8: the load is admitted while both
+// stores still wait for acknowledgements (their depbars still counted), and
+// each store's depbar counts down the cycle after its own last
+// acknowledgement, not before.
+TEST(Lsu, store_slot_freed_at_last_request) {
+    const auto config = canonical_profile();
+    require(config.lsu_active_commands == 2, "the test is written for two command slots");
+    std::string text = "sread r1, LANE_ID\nshli r0, r1, 5\naddi r2, r0, 1024\naddi r3, r0, 2048\n";
+    for (uint32_t j = 0; j < 8; ++j) text += "addi r" + std::to_string(8 + j) + ", r1, " + std::to_string(16 * j) + "\n";
+    text += "stg.v8 [r2], r8\nstg.v8 [r3], r8\nldg.v8 r16, [r0]\nhalt\n";
+    // Both stores count on one depbar (qtxc reuses it for the same registers):
+    // it reads 2 while both wait, 1 after the first completes, then 0.
+    std::vector<uint8_t> bars;
+    for (const auto& inst : qtx_program(text).instructions) {
+        if (inst.opcode == nanosm::Opcode::stg_v8) bars.push_back(inst.control.set_depbar);
+    }
+    require(bars.size() == 2 && bars[0] == bars[1], "the two stores do not count on one depbar");
+    const auto bar = bars[0];
+
+    auto launch = launch_warps(1);
+    image_bytes(launch.gmem_image, 4096);
+    nanosm::Machine machine(config, compile(text), std::move(launch));
+    machine.enable_edge_probe();
+    std::size_t in_flight = 0;
+    uint32_t admissions = 0;
+    uint64_t load_admitted = 0;
+    std::array<uint64_t, 2> lowered{};
+    uint32_t counted = 0;
+    while (!machine.done()) {
+        tick_capped(machine);
+        const auto now = machine.lsu_commands_in_flight();
+        require(now <= 2, "more than two LSU commands hold slots");
+        if (now > in_flight && ++admissions == 3) {
+            load_admitted = machine.cycle() - 1;
+            require(machine.depbar_value(0, bar) == 2, "the load was admitted only after a store had completed");
+        }
+        in_flight = now;
+        const auto value = machine.depbar_value(0, bar);
+        if (value < counted) lowered.at(1 - value) = machine.cycle() - 1; // 2 -> 1: the first store; 1 -> 0: the second
+        counted = value;
+    }
+    std::vector<uint64_t> acks;
+    for (const auto& event : machine.edge_events()) if (event.edge == LsuEdge::write_ack) acks.push_back(event.cycle);
+    require(admissions == 3 && acks.size() == 32, "expected three commands and thirty-two write acknowledgements");
+    require(load_admitted < acks[0], "the load was not admitted before the first store's first acknowledgement");
+    // Writes are acknowledged in order: the first sixteen are the first store's.
+    require(lowered[0] == acks[15] + 1 && lowered[1] == acks[31] + 1,
+        "a store's depbar did not count down the cycle after its last acknowledgement: " +
+            std::to_string(lowered[0]) + ", " + std::to_string(lowered[1]) + " for acknowledgements at " +
+            std::to_string(acks[15]) + ", " + std::to_string(acks[31]));
+    for (uint32_t i = 0; i < 128; ++i) {
+        require(machine.read_gmem_u32(1024 + 4 * i) == i / 8 + 16 * (i % 8) &&
+            machine.read_gmem_u32(2048 + 4 * i) == i / 8 + 16 * (i % 8), "stg.v8 data");
+    }
 }
 
 // The DRAM runs on its own clock: at a core clock four times the DRAM's, an

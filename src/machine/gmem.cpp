@@ -126,6 +126,7 @@ void Machine::accept_lsu_request(RequestChannel& channel) {
         channel.lsu_tag = tag;
         channel.egress_requested = true;
         channel.accepted = write_request(*slot, GmemClient::lsu, channel.lsu_id, tag);
+        channel.accepted->ack_record = command.ack_record;
     } else {
         // Every LSU read rides the one ordered LSU read stream: its data
         // returns in request order, which is command admission order, so the
@@ -344,31 +345,40 @@ void Machine::tick_gmem_controller(Wires& w, bool& return_ready_low) {
     }
 }
 
+// The most write sectors whose last beat fell within the last
+// gmem.latency_dram_ticks + extra_dram_ticks DRAM ticks: the one bus finishes
+// at most one sector every beats-per-sector ticks.
+uint32_t Machine::write_acks_in_flight_max(uint32_t extra_dram_ticks) const {
+    const uint64_t window = uint64_t{config_.gmem_latency_dram_ticks} + extra_dram_ticks;
+    const uint64_t per_sector = beats_per_sector(config_);
+    return static_cast<uint32_t>((window + per_sector - 1) / per_sector + 1);
+}
+
 // One write contract for every client: the data went on the bus
 // beat by beat; the acknowledgement comes gmem.latency_dram_ticks after the
-// last beat, and only then are the TMA credit or the LSU slot released.
+// last beat, and only then is the TMA's credit returned or the LSU store's
+// record counted down.
 void Machine::finish_gmem_write(GmemSectorRequest request) {
     WriteAck ack;
     ack.dram_tick = dram_tick_ + config_.gmem_latency_dram_ticks;
     ack.request = request.id;
     ack.command = request.command;
-    ack.lsu_slot = request.lsu_slot;
+    ack.ack_record = request.ack_record;
     ack.client = request.owner == GmemSectorRequest::Owner::tma_store ? GmemClient::tma : GmemClient::lsu;
     if (ack.client == GmemClient::lsu && request.stream >= config_.lsu_read_streams)
         ack.tag = request.stream - config_.lsu_read_streams;
     pending_write_acks_.push_back(ack);
-    // The B channel's size (machine.hpp, gmem_queue_): one ack per write in flight.
-    const std::size_t lsu_requests = std::max<std::size_t>(
-        config_.lanes, std::size_t{8} * config_.lanes * 4 / config_.gmem_sector_bytes);
-    if (pending_write_acks_.size() > config_.tma_sector_credits + config_.lsu_active_commands * lsu_requests) {
+    // The B channel's size (machine.hpp, gmem_queue_): one ack per write
+    // sector whose last beat is less than the latency old.
+    if (pending_write_acks_.size() > write_acks_in_flight_max(0)) {
         throw SimError("internal: more write acknowledgements pending than writes can be in flight");
     }
 }
 
 // Acks due now. A TMA ack returns its sector credit; an LSU ack its scatter
-// tag, and the command's last ack completes it in the next cycle
-// (store_completions_): its slot is released at that cycle's RF write port
-// and its depbar counts down at its RAM stage.
+// tag and counts one off its store's record (store_acks_): the store whose
+// record reaches none owed completes in the next cycle, its depbar counting
+// down at that cycle's RAM stage.
 void Machine::deliver_write_acks(Wires& w) {
     while (!pending_write_acks_.empty() && pending_write_acks_.front().dram_tick <= dram_tick_) {
         const auto ack = pending_write_acks_.front();
@@ -379,15 +389,16 @@ void Machine::deliver_write_acks(Wires& w) {
             continue;
         }
         if (ack.tag.has_value()) w.controller.freed_tags.push_back(*ack.tag);
-        // A store holds its slot until its last acknowledgement.
-        const auto* command = &lsu_commands_.cur().in_slot(ack.lsu_slot);
-        if (command->id != ack.command) {
-            throw SimError("internal: LSU command #" + std::to_string(ack.command) + "'s write was acknowledged to #" +
-                std::to_string(command->id));
+        // A store holds its record until its last acknowledgement.
+        const auto& record = store_acks_.cur().at(ack.ack_record);
+        if (!record.valid || record.command != ack.command) {
+            throw SimError("internal: LSU store #" + std::to_string(ack.command) +
+                "'s write was acknowledged to a record that is not its own");
         }
-        const auto acks = command->acks + ++w.controller.lsu_acks[ack.command];
-        if (acks != command->requests_total) continue;
-        w.store_completions.push_back(ack.lsu_slot);
+        if (++w.controller.store_acks[ack.ack_record] > record.acks_owed) {
+            throw SimError("internal: LSU store #" + std::to_string(ack.command) +
+                " got more acknowledgements than it sent sectors");
+        }
     }
 }
 

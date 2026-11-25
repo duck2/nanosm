@@ -815,7 +815,7 @@ private:
 
         uint64_t id = 0;            // simulator request number (trace, probe); the wire is stream + tag
         uint64_t command = 0;       // (T) tma command id or lsu command id
-        uint8_t lsu_slot = 0;       // an LSU write: its command's slot (the acknowledgement's owner)
+        uint32_t ack_record = 0;    // an LSU write: its store's acknowledgement record (store_acks_)
         uint32_t stream = 0;        // read ID; writes: free-ID tag stream for scatters
         uint64_t sector_address = 0;
         uint64_t ready_dram_tick = 0;
@@ -960,8 +960,11 @@ private:
     //          vector store from each RF read beat's landing, until the last
     //          word of that data is pushed into the egress FIFO (at the pluck
     //          rate). NOT until the write acknowledgement.
-    // The command slot holds the command (addresses, counters, depbar) to its
-    // end: a load's last RF write, a store's last acknowledgement.
+    // The command slot holds the command (addresses, counters, depbar) while
+    // it has anything to send or to write: a load to its last RF write, a
+    // store to its last sector request's acceptance (the cycle after it). A
+    // store's acknowledgements, and the depbar they count down, are its
+    // record's (StoreAckRecord), not the slot's.
     // Why returning data always has somewhere to go: only loads use the load
     // buffer, every LSU read returns on one ordered stream (request order =
     // command order), and the buffer's only exit is the RF write port, which
@@ -1010,8 +1013,11 @@ private:
     };
 
     // An admitted ldg/stg/ldg.v8/stg.v8/ldg.uni. Owner of one command slot
-    // (lsu.active_commands) from admission until its completion commits; it
-    // holds the load or the store buffer only while its data is in it.
+    // (lsu.active_commands) from admission: a load until its last register
+    // write is granted, a store until the cycle after its last sector request
+    // is accepted (its acknowledgements are counted in its record,
+    // StoreAckRecord). It holds the load or the store buffer only while its
+    // data is in it.
     struct LsuCommand {
         static constexpr const char* unit = "LSU";                     // (CommandSlots' errors)
         static constexpr const char* capacity = "lsu.active_commands";
@@ -1036,7 +1042,21 @@ private:
         uint32_t group_beats_read = 0; // v8 store: RF read beats of the current group (0..8)
         uint32_t sectors_pushed = 0; // v8 store: lanes (sectors) moved into the egress FIFO
         uint32_t words_pushed = 0; // stores: words of the current sector (v8) / sectors (scalar) in egress
-        uint32_t acks = 0;
+        uint32_t ack_record = 0;   // stores: the acknowledgement record taken at dispatch
+    };
+
+    // A store between its dispatch and its completion: the warp and depbar
+    // its last acknowledgement counts down, and the acknowledgements still
+    // owed (one per sector request). In Q with none owed: its last
+    // acknowledgement came last cycle, it completes now and the record is
+    // free from the next cycle.
+    struct StoreAckRecord {
+        bool valid = false;
+        uint32_t warp = 0;
+        uint8_t depbar = 0;
+        uint32_t acks_owed = 0;
+        uint64_t command = 0;      // (T) the store's command number: the trace, and a check on each acknowledgement
+        bool operator==(const StoreAckRecord&) const = default;
     };
 
     // A unit's command slots (the LSU's and the TMA's): N slots, each holding
@@ -1137,8 +1157,8 @@ private:
     };
 
     // The load / store unit's command slots: lsu.active_commands slots (2),
-    // each holding one command from its dispatch until its last
-    // acknowledgement or register write, and which is older. A command takes
+    // each holding one command from its dispatch until its last register
+    // write (a load) or its last sector request (a store), and which is older. A command takes
     // the lowest free slot (as its dispatch cycle's releases leave them).
     // Requests, store data and register reads are chosen oldest first; a
     // command leaves from either slot. State that refers to a command (a
@@ -1208,7 +1228,7 @@ private:
         uint64_t dram_tick = 0;
         uint64_t request = 0;
         GmemClient client = GmemClient::lsu;
-        uint8_t lsu_slot = 0;        // LSU: the command's slot
+        uint32_t ack_record = 0;     // LSU: the store's acknowledgement record
         uint64_t command = 0;        // (T)
         std::optional<uint32_t> tag; // scalar scatter: the free-ID tag to return
     };
@@ -1539,8 +1559,8 @@ private:
     // instructions that count on the depbar are admitted and not yet
     // decremented. The counter's width follows from the places such an
     // instruction can be between its admission and its decrement
-    // (Machine::depbar_counter_max_, where each place is listed: 23 at the
-    // canonical profile, a 5-bit counter). An admission past it is an
+    // (Machine::depbar_counter_max_, where each place is listed: 45 at the
+    // canonical profile, a 6-bit counter). An admission past it is an
     // internal error.
     using DepbarCounters = std::array<uint32_t, 6>;
     using AccEngines = std::array<std::optional<AccTransfer>, 2>; // [0 the acc.ld engine, 1 the acc.st engine]
@@ -1890,7 +1910,7 @@ private:
         uint32_t egress_slots_freed = 0;                 // last beats left the FIFO head
         uint32_t tma_credit_releases = 0;                // TMA write acks
         std::vector<uint32_t> freed_tags;                // scatter write acks
-        std::map<uint64_t, uint32_t> lsu_acks;           // command -> write acks
+        std::map<uint32_t, uint32_t> store_acks;         // acknowledgement record -> write acks
     };
 
     // LSU: RF -> the store buffer (vector stores), below issue in priority.
@@ -1991,7 +2011,9 @@ private:
         std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_refilled;
         // The RF write port: async grants and SIMT inhibition.
         RfWriteDecision rf_write;
-        std::vector<uint64_t> released_lsu_commands;  // their last RF write granted now, or their store completed
+        // LSU commands leaving their slots: a load whose last RF write is
+        // granted now, a store whose last sector request was accepted last cycle.
+        std::vector<uint64_t> released_lsu_commands;
         // Per RF write port (bank x rf.write_ports_per_bank + port): the
         // write presented now, entering that port's write pipeline.
         std::vector<std::optional<RfWrite>> rf_port_writes;
@@ -2006,8 +2028,6 @@ private:
         // Collected as they happen, from several steps below.
         std::vector<DepbarEvent> depbar_completions;  // in the order they happened
         std::vector<uint32_t> completed_waits;        // try-wait slots completed this cycle
-        // LSU command slots whose store had its last acknowledgement now.
-        std::vector<uint8_t> store_completions;
         // The store path's last stage; request generation; the two selects.
         EgressWrite egress;
         TmaRequests tma;
@@ -2262,6 +2282,8 @@ private:
     // (Per warp slot, core.warps; sync.mbar_wait_slots slots.)
     Regs<DepbarCounters> depbar_{clocked_,Unit::issue, "depbar counters"};
     uint32_t depbar_counter_max_ = 0;
+    // The acknowledgement records beyond the command slots (Machine::Machine).
+    uint32_t store_ack_records_detached_ = 0;
     Regs<std::optional<MbarWaitSlot>> mbar_wait_slots_{clocked_,Unit::barriers, "mbar wait slots"};
     // shmem: the SIMT service slots, the probe register, the RMW
     // engine and its three requester registers, the services' pipelines and
@@ -2379,12 +2401,14 @@ private:
     Reg<uint32_t> tma_read_received_{clocked_,Unit::tma, "read records: TMA stream head's bytes consumed"};
     Reg<uint32_t> lsu_read_received_{clocked_,Unit::load_store, "read records: LSU stream head's bytes consumed"};
     Regs<uint8_t> free_id_tags_{clocked_,Unit::load_store, "free-ID tags"}; // lsu.sectors_in_flight bits; 1 = in flight
-    // A store whose last acknowledgement came at t completes at t + 1: its
-    // command slot frees at the RF write port and its depbar counts down at
-    // the RAM stage (the memory controller is decided after both). One bit per
-    // LSU command slot (lsu.active_commands): the slot still holds the
-    // command's warp and depbar.
-    Regs<uint8_t> store_completions_{clocked_,Unit::load_store, "store completions"};
+    // The stores whose acknowledgements are not all in: one record each, from
+    // the store's dispatch until the cycle after its last acknowledgement,
+    // when its depbar counts down at the RF's RAM stage (the memory controller
+    // is decided after that stage). The store's command slot is free long
+    // before: from the cycle after its last sector request is accepted. How
+    // many records there are follows from where such a store can be
+    // (Machine::Machine, where store_acks_ is built).
+    Regs<StoreAckRecord> store_acks_{clocked_,Unit::load_store, "stores awaiting acknowledgement"};
     // The RF write path (src/timing.hpp): the fixed units (black boxes, each
     // with its output register), then one write pipeline per RF write port
     // (bank x rf.write_ports_per_bank + port), from the port to the RAM.
@@ -2541,6 +2565,10 @@ private:
     void rf_ram_stage(Wires& w);
     void land_rf_writes(const Wires& w);
     void release_lsu_command(Wires& w, uint64_t id);
+    void release_requested_stores(Wires& w);
+    void complete_stores(Wires& w);
+    [[nodiscard]] uint32_t free_store_ack_record() const;
+    [[nodiscard]] uint32_t write_acks_in_flight_max(uint32_t extra_dram_ticks) const;
     // A granted async holder's write, and the LSU command its write ends
     // (the load buffer's last write of a command).
     RfWrite async_rf_write(const AsyncWrite& write, std::optional<uint64_t>& ends_command);
@@ -2679,7 +2707,7 @@ private:
     void drive_free_id_tags(const Wires& w);
     void drive_request_channel(const Wires& w);
     void drive_rf_write_pipes(const Wires& w);
-    void drive_store_completions(const Wires& w);
+    void drive_store_acks(const Wires& w);
     void drive_predicates(const Wires& w);
     void drive_load_slots(const Wires& w);
     void drive_acc_ld_pipe(const Wires& w);
@@ -2930,7 +2958,7 @@ private:
         const Wires& w);
     void note_first_return(uint64_t command);
     void probe(LsuEdge edge, uint64_t id, uint64_t aux, uint32_t bytes);
-    [[nodiscard]] std::string lsu_phase_detail(const LsuCommand& command) const;
+    [[nodiscard]] std::string lsu_phase_detail(uint64_t command, bool store) const;
 };
 
 uint32_t float_bits(float value);

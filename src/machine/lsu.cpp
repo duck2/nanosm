@@ -259,7 +259,6 @@ Machine::GmemSectorRequest Machine::write_request(
     GmemSectorRequest request;
     request.id = id;
     request.command = slot.command;
-    request.lsu_slot = slot.owner;
     request.owner = client == GmemClient::tma
         ? GmemSectorRequest::Owner::tma_store : GmemSectorRequest::Owner::lsu;
     request.load = false;
@@ -681,7 +680,7 @@ Machine::EgressWrite Machine::decide_egress_write() {
                     "egress write port");
                 write.words.emplace_back(sector.word_offset, buffer.words[sector.lane]);
                 // Its last word leaves: the store buffer is free from the
-                // next cycle (the command still waits for its acks).
+                // next cycle (the command still has its requests to send).
                 if (index + 1 == command->sectors.size()) write.lsu_store_drained = true;
             }
         }
@@ -691,27 +690,92 @@ Machine::EgressWrite Machine::decide_egress_write() {
     return write;
 }
 
-std::string Machine::lsu_phase_detail(const LsuCommand& command) const {
+std::string Machine::lsu_phase_detail(uint64_t command, bool store) const {
     LsuCommandPhases phases;
-    if (const auto found = lsu_phases_.find(command.id); found != lsu_phases_.end()) phases = found->second;
+    if (const auto found = lsu_phases_.find(command); found != lsu_phases_.end()) phases = found->second;
     std::ostringstream out;
     out << "admit=" << phases.admit_cycle
         << " requests_done=" << (phases.requests_done_cycle ? std::to_string(*phases.requests_done_cycle) : "-")
         << " first_return=" << (phases.first_return_cycle ? std::to_string(*phases.first_return_cycle) : "-")
-        << (is_store(command.kind) ? " last_ack=" : " last_rf_write=") << cycle_
+        << (store ? " last_ack=" : " last_rf_write=") << cycle_
         << " request_wait=" << phases.request_wait
         << " rf_wait=" << phases.rf_wait
         << " egress_wait=" << phases.egress_wait;
     return out.str();
 }
 
-// An LSU command ends: its slot is free for a new owner this same cycle (d).
+// An LSU command leaves its slot, which is free for a new owner this same
+// cycle (d). A load ends here (its last register write is granted). A store
+// only hands over: all its sector requests are accepted, and it ends when its
+// record's last acknowledgement completes it (complete_stores).
 void Machine::release_lsu_command(Wires& w, uint64_t id) {
     const auto* command = find_lsu_command(id);
     if (command == nullptr) throw SimError("internal release of an unknown LSU command");
-    trace_->lsu_command_end(cycle_, id, lsu_phase_detail(*command));
-    lsu_phases_.erase(id);
+    if (!is_store(command->kind)) {
+        trace_->lsu_command_end(cycle_, id, lsu_phase_detail(id, false));
+        lsu_phases_.erase(id);
+    }
     w.released_lsu_commands.push_back(id);
+}
+
+// Stores whose last sector request was accepted last cycle (in Q: every
+// request emitted) give up their command slots now. From Q only, before issue.
+void Machine::release_requested_stores(Wires& w) {
+    for (const auto* command : lsu_commands_.cur().oldest_first()) {
+        if (is_store(command->kind) && command->requests_emitted == command->requests_total) {
+            release_lsu_command(w, command->id);
+        }
+    }
+}
+
+// Stores whose last acknowledgement came last cycle (in Q: a record with none
+// owed) complete now: the depbar counts down at the RF's RAM stage.
+void Machine::complete_stores(Wires& w) {
+    for (const auto& record : store_acks_.cur()) {
+        if (!record.valid || record.acks_owed != 0) continue;
+        record_depbar_completion(w, record.warp, record.depbar, "depbar underflow on sb" + std::to_string(record.depbar));
+        trace_->lsu_command_end(cycle_, record.command, lsu_phase_detail(record.command, true));
+        lsu_phases_.erase(record.command);
+    }
+}
+
+// The acknowledgement record a store dispatched now takes: the lowest one
+// free in Q. There is always one (store_acks_ is sized for every place a
+// store can be; Machine::Machine).
+uint32_t Machine::free_store_ack_record() const {
+    const auto& records = store_acks_.cur();
+    for (uint32_t index = 0; index < records.size(); ++index) {
+        if (!records[index].valid) return index;
+    }
+    throw SimError("internal: a store dispatched with every acknowledgement record in use (" +
+        std::to_string(records.size()) + ") at cycle " + std::to_string(cycle_));
+}
+
+// The acknowledgement records, each in one calculation: a store that
+// completed now leaves; this cycle's acknowledgements count down; a store
+// dispatched now takes the record its dispatch chose (free in Q).
+void Machine::drive_store_acks(const Wires& w) {
+    const auto& records = store_acks_.cur();
+    const auto* dispatched = w.dispatch.lsu.has_value() && is_store(w.dispatch.lsu->command.kind)
+        ? &w.dispatch.lsu->command : nullptr;
+    for (uint32_t index = 0; index < records.size(); ++index) {
+        const auto& cur = records[index];
+        StoreAckRecord next = cur;
+        if (cur.valid && cur.acks_owed == 0) {
+            next = StoreAckRecord{};
+        } else if (const auto acks = w.controller.store_acks.find(index); acks != w.controller.store_acks.end()) {
+            next.acks_owed -= acks->second; // (checked when each was delivered)
+        }
+        if (dispatched != nullptr && dispatched->ack_record == index) {
+            if (cur.valid) throw SimError("internal: a store took an acknowledgement record in use");
+            next.valid = true;
+            next.warp = dispatched->warp;
+            next.depbar = dispatched->depbar;
+            next.acks_owed = dispatched->requests_total;
+            next.command = dispatched->id;
+        }
+        if (next != cur) store_acks_.set_next(index, next, "drive_store_acks");
+    }
 }
 
 // ldg / stg / ldg.v8 / stg.v8 / ldg.uni: the addresses arrive and are
@@ -727,6 +791,7 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     if (!slot.has_value()) throw SimError("internal: an LSU command dispatched with no free slot");
     command.slot = *slot;
     command.depbar = inst.control.set_depbar;
+    if (is_store(command.kind)) command.ack_record = free_store_ack_record();
     DispatchDecision::LsuAdmission admission;
     switch (command.kind) {
     case LsuKind::vector_load:
@@ -775,7 +840,7 @@ void Machine::drive_lsu_commands(const Wires& w) {
             ? 1u : static_cast<uint32_t>(std::popcount(buffer.lanes)));
     }
     const bool changed = drained.has_value() || w.egress.client == GmemClient::lsu ||
-        w.channel.granted == GmemClient::lsu || !w.controller.lsu_acks.empty() ||
+        w.channel.granted == GmemClient::lsu ||
         w.lsu_rf_read.command.has_value() || !w.released_lsu_commands.empty() || w.dispatch.lsu.has_value();
     if (!changed) return;
     auto next = lsu_commands_.cur();
@@ -795,7 +860,6 @@ void Machine::drive_lsu_commands(const Wires& w) {
         if (w.egress.lsu_group_drained) store.group_beats_read = 0;
     }
     if (w.channel.granted == GmemClient::lsu) ++command(w.channel.lsu_command).requests_emitted;
-    for (const auto& [id, acks] : w.controller.lsu_acks) command(id).acks += acks;
     for (const auto released : w.released_lsu_commands) next.release(released);
     // A new command takes the slot its dispatch chose: the lowest free one.
     if (w.dispatch.lsu.has_value() &&

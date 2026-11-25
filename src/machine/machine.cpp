@@ -194,7 +194,23 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
                 rf_write_pipes_.back().build(config_.rf_write_depth_cycles);
             }
         }
-        store_completions_.build(config_.lsu_active_commands);
+        // One acknowledgement record per store that can be between its
+        // dispatch and its completion. Such a store is in exactly one of:
+        //   lsu.active_commands  its command slot, until its last sector
+        //                        request is accepted;
+        //   lsu.egress_sectors   requests all accepted, its last sector still
+        //                        in the egress FIFO (there until its last
+        //                        beat leaves the bus);
+        //   the write window     its last beat left, its last acknowledgement
+        //                        gmem.latency_dram_ticks later, the record
+        //                        free two core cycles after that (the
+        //                        completion's cycle, then free in Q): at most
+        //                        one sector's last beat every beats-per-sector
+        //                        ticks on the one bus.
+        const auto ticks_per_cycle = static_cast<uint32_t>(
+            (config_.dram_clock_hz + config_.core_clock_hz - 1) / config_.core_clock_hz);
+        store_ack_records_detached_ = config_.lsu_egress_sectors + write_acks_in_flight_max(2 * ticks_per_cycle);
+        store_acks_.build(config_.lsu_active_commands + store_ack_records_detached_);
         TmaSectorRegister sector;
         sector.data.assign(config_.gmem_sector_bytes, 0);
         tma_sector_.poke(std::move(sector));
@@ -269,7 +285,11 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         //   lsu.active_commands an ldg or stg: its command slot or its claim
         //                       on one, a load's until its last register
         //                       write is granted, a store's until its last
-        //                       acknowledgement's decrement;
+        //                       sector request is accepted;
+        //   the store records beyond the command slots
+        //                       a store out of its slot, until its last
+        //                       acknowledgement's decrement (store_acks_,
+        //                       above: lsu.egress_sectors + the write window);
         //   mma.queue_commands  an mma.async: decremented when its operands
         //                       are consumed, its command still in its slot;
         //   2                   an acc.ld and an acc.st: each engine, or the
@@ -289,7 +309,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         //   1                   a launch flag, counted from the launch until
         //                       the copy passes its cut.
         depbar_counter_max_ = config_.shmem_load_slots + config_.shmem_store_slots + config_.shmem_port_a_depth +
-            config_.lsu_active_commands + config_.mma_queue_commands + 2 +
+            config_.lsu_active_commands + store_ack_records_detached_ + config_.mma_queue_commands + 2 +
             config_.tmem_port_depth + config_.tmem_read_latency_cycles +
             config_.rf_banks * config_.rf_write_ports_per_bank * config_.rf_write_depth_cycles + 1;
         shmem_to_ram_.build(config_.core_warps);
@@ -550,7 +570,8 @@ bool Machine::done() const {
         std::all_of(arithmetic_black_boxes_.begin(), arithmetic_black_boxes_.end(),
             [](const auto& black_box) { return black_box.empty(); }) &&
         std::all_of(rf_write_pipes_.begin(), rf_write_pipes_.end(), [](const auto& pipe) { return pipe.empty(); }) &&
-        std::all_of(store_completions_.cur().begin(), store_completions_.cur().end(), [](uint8_t bit) { return bit == 0; }) &&
+        std::all_of(store_acks_.cur().begin(), store_acks_.cur().end(),
+            [](const StoreAckRecord& record) { return !record.valid; }) &&
         dispatch_pipe_.empty() && lsu_read_pipe_.empty() && urf_pipe_.empty() &&
         mma.slots.empty() && mma_core_.empty() && mma_tags_.empty() && mma_writes_.empty() && !mma.fetch.has_value() &&
         mma_reads_.empty() &&
@@ -663,7 +684,7 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_free_id_tags,
         &Machine::drive_request_channel,
         &Machine::drive_rf_write_pipes,
-        &Machine::drive_store_completions,
+        &Machine::drive_store_acks,
         &Machine::drive_predicates,
         &Machine::drive_rf_write_policy,
         &Machine::drive_rf_read_policy,

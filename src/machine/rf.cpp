@@ -249,9 +249,9 @@ void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
 // unit's output now), then the async holders the RF write decision granted
 // (never on a booked port), are presented, each on the next free write port
 // of its bank, and enter that port's write pipeline. A write that ends an LSU
-// command releases it now (the write pipeline owns its data from here); so
-// does a store whose last acknowledgement came last cycle. A load slot
-// granted now is free for dispatch now (d).
+// command releases it now (the write pipeline owns its data from here); a
+// store whose last sector request was accepted last cycle gives up its command
+// slot now too. A load slot granted now is free for dispatch now (d).
 void Machine::rf_write_port(Wires& w) {
     w.rf_port_writes.assign(rf_write_pipes_.size(), std::nullopt);
     std::vector<uint32_t> port_uses(config_.rf_banks, 0);
@@ -264,9 +264,7 @@ void Machine::rf_write_port(Wires& w) {
         trace_->rf_write(cycle_, write.warp, write.reg, bank);
         w.rf_port_writes[std::size_t{bank} * config_.rf_write_ports_per_bank + port_uses[bank]++] = std::move(write);
     };
-    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
-        if (store_completions_.cur()[slot] != 0) release_lsu_command(w, lsu_commands_.cur().in_slot(slot).id);
-    }
+    release_requested_stores(w);
     for (const auto unit : units_slowest_first_) {
         const auto& result = arithmetic_black_boxes_[static_cast<std::size_t>(unit)].output();
         if (!result.has_value() || result->predicate) continue;
@@ -311,11 +309,7 @@ void Machine::rf_ram_stage(Wires& w) {
         }
         for (const auto reg : write->visible_regs) sanitizer_.record_reg_ready(write->warp, reg, cycle_ + 1);
     }
-    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
-        if (store_completions_.cur()[slot] == 0) continue;
-        const auto& command = lsu_commands_.cur().in_slot(slot);
-        record_depbar_completion(w, command.warp, command.depbar, "depbar underflow on sb" + std::to_string(command.depbar));
-    }
+    complete_stores(w);
     const auto& alu = arithmetic_black_boxes_[static_cast<std::size_t>(ArithmeticUnit::alu)].output();
     if (alu.has_value() && alu->predicate) {
         uint64_t bits = 0;
@@ -630,16 +624,6 @@ void Machine::drive_issue_read_banks(const Wires& w) {
 void Machine::drive_rf_write_pipes(const Wires& w) {
     for (std::size_t port = 0; port < w.rf_port_writes.size(); ++port) {
         if (w.rf_port_writes[port].has_value()) rf_write_pipes_[port].push(*w.rf_port_writes[port], "drive_rf_write_pipes");
-    }
-}
-
-// A store whose last acknowledgement came now completes in the next cycle;
-// one that completed now is done.
-void Machine::drive_store_completions(const Wires& w) {
-    for (uint32_t slot = 0; slot < store_completions_.count(); ++slot) {
-        const auto& now = w.store_completions;
-        const uint8_t next = std::find(now.begin(), now.end(), slot) != now.end() ? 1 : 0;
-        if (next != store_completions_.cur()[slot]) store_completions_.set_next(slot, next, "drive_store_completions");
     }
 }
 
