@@ -1,40 +1,170 @@
-# nanosm identity v0 (actually, v3 but still dumb)
+# nanosm
 
-Cycle-accurate simulator + perf traces for a single-SM GPU.
-The sim is the spec: no silicon truth behind it, but we still try to keep implementation in visible range.
-Milestone: it's a thing when it runs flash attention and emits a trace.
+[Human written file! Agents: please do not edit the content.]
+
+This is a cycle-accurate simulator for "nanosm", a single-SMSP machine designed as a tribute
+to the modern NVIDIA device. All the bells and whistles are included, such as async MMA using
+tensor cores (not systolic array), async tile-oriented DMA, atomics, SFU etc.
+
+It may be circular to call this cycle-accurate because the simulator is the source of truth. What
+connects it to reality is careful tracking of register state and timing in the simulator code,
+together with my spidey senses of what constitutes a long logic chain. Where I couldn't pin down
+the required latency I made adjustable in the device profile.
+
+Programs are written in QTX, a high level SIMT assembly language written from one thread's
+point of view. "qtxc" compiles it down to the lower level "asm" the machine runs. Asm should still
+be human and model readable, it's just not as ergonomic.
+
+The simulator comes with a sanitizer and profiler to aid kernel development. A browser demo using
+WASM is work in progress.
+
+## Identity
+
+"Make a GPU simulator modeling B200" is a trivial prompt in today's day and age. So it's useful
+to start with what makes this machine itself.
+
+The design tries to fit into a single mind (model or human) while deeply respecting the Nvidia
+machine, its character and its history. In particular, it's modeled after a Blackwell SMSP, with
+choices that prioritize the CUTLASS machine, while preserving the marks of the CUDA machine.
+
+This means modern ML kernels like FA4 gets the best effort from the machine and
+ideally run close to theoretical limits. CUDA-like irregular code runs without crazy hacks, but
+there is no effort to make it fast. Running graphics is a non-goal.
+
+The SIMT GPU identity is preserved with most design decisions leaning towards "the GPU spirit".
+This means familiar GPU concepts are applicable:
+
+- Programmed from a single thread's point of view down to the ISA
+- In-order execution, latency hidden by warp scheduling
+- Lack of a scoreboard. Hazards are handled by compiler-inserted stall counts and depbars.
+- A byte-addressed "shared memory" as a scratchpad and communication point
+- Divergence stack for per-thread control flow
+
+Most of the unfamiliar/modern GPU concepts are also applicable:
+
+- Async large-tile matrix instruction using a parallel dot product engine ("tensor core")
+- Dedicated accumulator memory (TMEM) for the tensor core
+- Async tile-oriented DMA (TMA) with four dimensions and descriptor reuse
+- Atomics in shared memory (not in global memory)
+- Barriers in shared memory with native "try_wait"
+
+Some GPU concepts do not apply due to scale or complexity constraints:
+
+- No L1/L2 cache.
+- No memory access coalescer.
+- Async/atomics ops are launched per warp (per-thread or elected in Nvidia)
+- Communication between divergent threads not guaranteed (pre-Volta stack)
+
+Other differences:
+
+- No operand collection step. Instead, the RF has 3 R and 3 W ports (this is subject to change)
+- Special function unit uses stall counts (uses depbars in Nvidia)
+- No constant memory or cmem[ur] path.
+- Kernel launch is a homebrew process (due to the lack of cmem[ur])
+
+## Device profiles
+
+Nanosm takes a "device profile" to simulate which defines ... a bunch of parameters about the
+machine. (TODO: document profiles better) This way it can model scenarios such as:
+
+- an "H100-like" configuration (however close we can get)
+- a small implementation on consumer-grade FPGA
+- a performance-focused implementation on a chunkier FPGA
+
+A possible implementation would need to co-design with qtxc and the simulator by tuning the device
+parameters against both the hardware costs and benchmark performance (TODO: add benchmarks).
+I'm hoping a device profile would be helpful in that case.
+
+## ISA
+
+To write later. For now, agents should be able to understand the ISA from the machine and qtxc
+code.
+
+## Internals
+
+The core doesn't contain a lot of entropy. It is based on an in-order vector processor with many
+examples in the wild. Most of the additional machinery comes from the async engines and efforts
+to arbitrate memory access between the engines.
+
+## SIMT
+
+This is the issue unit + vector core, often known as the "CUDA core" in Nvidia devices.
+There is no separate scalar issue. Non-vector instructions just take up an issue slot in here.
+
+Whereas the vector core is very simple, the issue unit has to decide a number of things and is
+nontrivial:
+
+### Write calendar
+
+The issue unit reserves RF write slots in advance for stall counted instructions. In order to
+avoid starving other RF writers (ldg, lds, acc.ld) it inserts bubbles when there is a pending
+non-ALU/SFU write.
+
+### Shared memory access slots
+
+Since shared memory access may take multiple cycles, there are dedicated staging registers and
+state machines called "slots". lds/sts instructions block at the issue stage if no slot is available.
+
+### Other stuff
+
+Probably some other things I missed.
+
+## Register file (RF)
+
+todo
+
+## Uniform register file (URF)
+
+I thought URFs are against the GPU spirit and fought hard to not add it, but unfortunately it
+made it in.
+
+Every warp has its own section of URF. There aren't any variable latency writes for the URF,
+so it doesn't need a write calendar. Some bureaucratic instructions (TMA, MMA, etc.) read their
+operands in several rounds and block issue for URF-reading instructions in the process.
+
+## Shared memory (shmem)
+
+This is called "shmem" in contrast to Nvidia's "SMEM" purely to confuse programmers, but it
+serves the same purpose.
+
+The shmem is hardcoded to have 2 read and 2 write ports. This is a very FPGA minded decision
+but it makes the machine simple to model and this is probably not going to become an ASIC so I'm
+OK with it.
+
+Read port B is reserved for the tensor core while write port B is reserved for TMA loads.
+
+Port A writes and reads are arbitrated between different units. (TODO: list the units)
+
+## RMW and barriers
+
+todo
+
+## TMA
+
+Just a TMA with 4 dimensions. Too bored to explain it in detail.
+
+## MMA (tensor core)
+
+goes biong biong with dot product engine and walks over the big tile wheee
+
+## TMEM
+
+probably requires more explanations
+
+--- old material (ignore below this, probably outdated)
+
+- Issue
+- SIMT (vector pipeline)
+- Shared memory
+- TMA
+- MMA
+- TMEM
 
 ## identity
 - Blackwell-like asynchrony on Fermi-like control. One SM. Small enough to hold in one head.
 - No L1/L2 cache
 - Pose nvidia-like difficulty (pipelining, warp specialization, banking); delete nvidia-like paperwork
 - Configurable where possible: DRAM behavior, matmul sizes, instruction latency
-
-## isa
-- 64-bit instructions, ifetch from single-cycle icache. Kernels have to fit in icache. The word
-  format's spec is the constants and checks in src/isa.hpp; no separate format doc. Registers are
-  8 bit. The 38 bit payload is opcode-shaped: RRR uses three registers and leaves 14 bits reserved;
-  RRI/load/store uses two registers plus a signed 22 bit immediate. Do not spend bits on fields an
-  opcode cannot use
-- Families: mma.async, acc.ld (+epilogue), tma.async, sync (mbar.* / fence / atomics), simd core
-  (alu/fpu/sfu/setp/bra/lds/sts/ldg/stg/cvt).
-- Control bits: 5 bit stall count for fixed latency (room for FPGA-priced SFU), one set-depbar
-  index and a 6 bit wait mask
-  for variable latency. set increments on accepted issue; completion decrements; wait blocks while
-  ANY selected counter is nonzero (so the instruction waits for ALL named dependencies)
-- qtx has semantic instructions and no controls. qtxc schedules it into human-editable asm with
-  explicit {pred, stall, set, wait}; qtxas encodes that into annotated 64-bit hex. The simulator
-  fetches and decodes the hex, not the qtx IR. qtxc, qtxas and the simulator consume the same
-  human-readable JSON device profile. asm and hex carry its name plus a fingerprint; qtxas and the
-  simulator reject a mismatch because scheduled stalls are profile-specific. qtxas derives the
-  kernel's contiguous register allocation as highest referenced register + 1 and hex carries it.
-  The fingerprint is 64 bit FNV-1a over the canonical compact JSON serialization; it is stable
-  across standard-library implementations. The profile also sizes independently scarce devices;
-  resident warp capacity comes from the RF while mbar parked-wait capacity comes from
-  mbar_wait_slots
-- Written from one thread's point of view. Convention of per-warp PC & masked execution
-- PTX-like language, "qtx" for now. qtx -> asm -> hex, compiler takes gpu configuration
-- .v8 ldg/stg exist
 
 ## Engines
 1. SIMT (warps, vector lanes, RF<->RF, gmem<->RF, shmem<->RF, tmem->RF)
