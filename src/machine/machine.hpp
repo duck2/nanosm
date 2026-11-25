@@ -2852,7 +2852,7 @@ private:
     void complete_tma_load_write(TmaQueue& tma, const PlacementEnd& placed);
     void complete_tma_store_capture(TmaQueue& tma, uint8_t slot, uint64_t command);
     void mark_tma_data_complete(TmaCommand& command);
-    // The launch copy (README "Launch"): the TMA's first command and walker
+    // The launch copy (docs/qtx.md "Launch"): the TMA's first command and walker
     // and the warps' launch flags, from the launch record; each landed
     // sector's bytes and the flags they clear.
     void start_launch_copy(const LaunchRecord& record);

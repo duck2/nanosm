@@ -179,7 +179,7 @@ def launch_copy_counters(expected: Mapping[str, Mapping[str, int]], copied_bytes
 class Launch:
     """One launch of a kernel: its arguments and the host's global memory.
 
-    The kernel's qtx declares everything else (README "Launch"): its
+    The kernel's qtx declares everything else (docs/qtx.md "Launch"): its
     signature (`.param` lines), how many warps it is written for (`.warps`),
     its barriers (`.mbar`) and constants (`.data`).
 
@@ -205,7 +205,7 @@ class Launch:
         if block_address is not None and block_address < 0:
             raise ValueError("the launch block's global address is negative")
         # Where in global memory the host puts the kernel's launch block (its
-        # arguments, barrier states and data; README "Launch"). None: the top
+        # arguments, barrier states and data; docs/qtx.md "Launch"). None: the top
         # of global memory.
         self.block_address = block_address
         self.kernel = Path(kernel)

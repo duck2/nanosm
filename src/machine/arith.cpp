@@ -58,7 +58,7 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
 // cvt.pack, the special-function unit's ex2 and rcp -- is this
 // implementation's: the instruction set does not specify its rounding, its
 // denormals or whether fma is fused, so a kernel's check carries a tolerance
-// (README). This one rounds to nearest even, fuses fma, and has no
+// (docs/qtx.md). This one rounds to nearest even, fuses fma, and has no
 // subnormals. A subnormal word is zero of its sign; every single-precision
 // operation of the two units takes its inputs and gives its result through
 // this (denormals are zero in, flush to zero out). NaNs and infinities pass.

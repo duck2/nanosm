@@ -199,7 +199,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     program.profile_name = profile.name;
     program.profile_fingerprint = device_profile_fingerprint(profile);
     std::array<bool, 6> live{};
-    // Launch flags (README "Launch"): a depbar the launch counted once in
+    // Launch flags (docs/qtx.md "Launch"): a depbar the launch counted once in
     // every warp before the first instruction, decremented when the launch
     // copy has delivered its part of the launch block. flag_pending[b]: on
     // the path to this instruction nothing has waited on flag b yet, so its

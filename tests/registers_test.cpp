@@ -1,4 +1,4 @@
-// qtx's registers (src/qtxc/registers.cpp, README "Registers"): a register
+// qtx's registers (src/qtxc/registers.cpp, docs/qtx.md "Registers"): a register
 // is a name, qtxc picks its number. Smoke tests: names compute, the
 // refusals read well, groups are neighbours, the bank rule is qtxc's (a copy
 // and a warning where it cannot fit), and names share a number only when

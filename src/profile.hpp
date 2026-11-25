@@ -39,7 +39,7 @@ struct DeviceProfile {
     // is legal and means no stack: a kernel with ssy, sync or a predicated bra
     // is refused by qtxc, the assembler and kernel load. 0..64.
     uint32_t core_divergence_stack_entries = 8;
-    // Launch flags (core.launch_flags; README "Launch"): how many of each
+    // Launch flags (core.launch_flags; docs/qtx.md "Launch"): how many of each
     // warp's six depbars,
     // from sb5 downward, the launch may count once in every warp before the
     // first instruction; each is decremented in every warp when the launch

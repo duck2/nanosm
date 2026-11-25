@@ -4,11 +4,12 @@ nanosm is a cycle-accurate simulator of one GPU streaming multiprocessor, with a
 language (qtx) for its kernels. The kernels are meant to be written by models and read by
 people.
 
-- Start with `README.md`: how to build, the machine's parts, how a kernel is written.
-- To write or change a kernel, then read the kernel in `kernels/` nearest to what you need.
-  A kernel is `NAME.qtx` with `NAME.launch.py` beside it.
-- To change the simulator, read `design.md`, then the unit's file in `src/machine/` (each
-  opens with a description; the list is at the top of `src/machine/machine.cpp`).
+- `README.md` and `design.md` are written by the human. Do not edit them.
+- To write or change a kernel, read `docs/qtx.md`, then the kernel in `kernels/` nearest to
+  what you need. A kernel is `NAME.qtx` with `NAME.launch.py` beside it.
+- To change the machine, read `design.md` and `docs/machine.md`, then the unit's file in
+  `src/machine/` (each opens with a description; the list is at the top of
+  `src/machine/machine.cpp`).
 
 ## Build and run
 

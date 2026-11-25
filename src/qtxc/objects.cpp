@@ -1,4 +1,4 @@
-// The kernel's own memory by name (src/qtxc/; README "Memory"): the
+// The kernel's own memory by name (src/qtxc/; docs/qtx.md "Memory"): the
 // `.shmem` and `.tmem` lines, where qtxc puts each object, and the same lines
 // as assembly carries them.
 //

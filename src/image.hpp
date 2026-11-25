@@ -18,7 +18,7 @@ struct ImageSegment {
     std::vector<uint8_t> bytes;
 };
 
-// One argument of a launch (README "Launch"): the value for the kernel's
+// One argument of a launch (docs/qtx.md "Launch"): the value for the kernel's
 // `.param` of that name. The parameter's type says what fits: an unsigned
 // integer for ptr and u32, a number for f32, 64 bytes for desc.
 struct LaunchArgument {
@@ -26,7 +26,7 @@ struct LaunchArgument {
     std::variant<uint64_t, double, std::vector<uint8_t>> value;
 };
 
-// The launch record (README "Launch"): the few registers the host writes to
+// The launch record (docs/qtx.md "Launch"): the few registers the host writes to
 // start a kernel, in place before the first cycle like the warp count. They
 // say where the kernel's launch block is in global memory, where it goes in
 // shared memory, how long it is, and after how many delivered bytes each

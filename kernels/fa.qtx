@@ -23,7 +23,7 @@
 ; each pair. %block is the key block and the parity of its score, work and
 ; PV barriers.
 
-; The kernel's own memory, by name (README "Memory"): qtxc places each object,
+; The kernel's own memory, by name (docs/qtx.md "Memory"): qtxc places each object,
 ; one after another from address 0; the code uses the names, their elements
 ; (QBUF[1]) and their properties (.row_bytes, .stride, .bytes).
 ;
@@ -54,7 +54,7 @@
 ; that order, are the kernel's signature. Everything else below is the
 ; kernel's own: five warps and its barriers (its two float constants are umov immediates).
 ; Together, in the order written, these lines are the launch block, the first
-; declared arriving first (README "Launch"): the issuer's first act is an
+; declared arriving first (docs/qtx.md "Launch"): the issuer's first act is an
 ; arrive on INPUT_DONE and a load through QDESC, so those come first. A pair
 ; of barriers is an array (`.mbar NAME[2]`: NAME[1] is 8 bytes after NAME[0],
 ; and the workers reach it as NAME + 8 t); an array arrives whole.

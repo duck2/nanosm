@@ -10,7 +10,7 @@ nanosm::Kernel assemble(const std::string& body) {
     return hand_assemble(hand_asm(canonical_profile(), body), canonical_profile());
 }
 
-// The launch (README "Launch"): the kernel's `.param` lines are its signature,
+// The launch (docs/qtx.md "Launch"): the kernel's `.param` lines are its signature,
 // and with its `.mbar` and `.data` they are the launch block, in declaration
 // order at the top of shared memory. The host writes the block into global
 // memory; the launch copy brings it into shared memory from the first cycle,
