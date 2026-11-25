@@ -153,7 +153,7 @@ A kernel declares what a launch must give it, beside its code:
 - A name is its address in shared memory: `umov %m, FULL[1]`.
 - One float constant needs no `.data`: `umov %bits, 0.5`, then `ur2r` for every lane.
 - The Python side is `nanosm/launch.py`: `Launch(...)`, `launch.gmem`, `launch.run(...)`,
-  `result.gmem(...)`, `result.cycle`, `result.summary`.
+  `result.gmem(...)`, `result.cycle`, `result.summary`. A launch prints qtxc's warnings itself.
 - Float results are the implementation's (rounding and denormals are not specified), so a
   check compares with a tolerance.
 
@@ -164,6 +164,8 @@ A kernel declares what a launch must give it, beside its code:
 | vector | `%x` | 32 bits in each lane |
 | uniform | `%x` | one 32-bit value for the warp |
 | predicate | `p0`, `p1`, ... or `%name` | one bit per lane |
+
+(`%p0` .. `%p6` are the predicates themselves, so a register cannot have those names.)
 
 - A name exists from its first use and qtxc gives it a number. The instruction decides its
   kind: `add` takes vector registers, `uadd` uniform ones. `ur2r %vec, %uni` copies a
@@ -222,7 +224,7 @@ and compare rows, the second source (for `fma`, either multiplicand) may be a un
 | divergence | `ssy L`; `@p bra L`; `sync` (written by hand today: `kernels/diverge.qtx`) |
 | shared memory | `lds d, [a + imm]`; `sts [a + imm], s`; `lds.uni d, [u + imm]`; `atom.{add,and,xor,exch}.uni d, [u + imm], u2`; `fence.sh` |
 | global memory | `ldg d, [a + imm]`; `stg [a + imm], s` (a word per lane); `ldg.v8 d0, [a + imm]`; `stg.v8 [a + imm], s0` (a sector of eight words per lane); `ldg.uni d, [u + imm]` |
-| barriers | `mbar.arrive [u]`; `mbar.arrive.expect_tx [u], bytes`; `mbar.try_wait p, [u], parity`; `mbar.test_wait p, [u], parity` |
+| barriers | `mbar.init [u], count`; `mbar.arrive [u]`; `mbar.arrive.expect_tx [u], bytes`; `mbar.try_wait p, [u], parity`; `mbar.test_wait p, [u], parity` |
 | TMA | `tma.load.Nd [buffer], [DESC, coord0], [barrier]`; `tma.store.Nd [DESC, coord0], [buffer], [barrier]` |
 | tensor core | `mma.async.SHAPE [acc], [a, spacing], [b, spacing]`; `mma.async.init.SHAPE`; `mma.commit [barrier]`; `acc.ld`, `acc.st`, `acc.ld.v8`, `acc.st.v8` |
 | other | `ld.param.u32 d, [NAME]`, `ld.param.f32`; `wait` |
@@ -249,6 +251,24 @@ one arrival made by the tensor core when the matmuls queued before it are done. 
 holds a warp until its own loads and stores have finished; it does not wait for a TMA copy
 or a matmul's results. `kernels/pipeline_tma.qtx` and `kernels/fa32.qtx` are the patterns
 whole.
+
+### Good to know before the first kernel
+
+- **A scalar `ldg` or `stg` moves a whole sector for each lane's word.** Nothing merges
+  requests. `ldg.v8` / `stg.v8` move the sector's eight words, so streaming code gives each
+  lane eight neighbouring words. The run summary's byte counters show the difference.
+- **The start of a kernel decides when its first load goes out.** A kernel's `.param`
+  values arrive by a copy that takes a while after cycle 0; `ld.param` is a shared-memory
+  load (shared memory serves few loads at once); every warp runs the same opening lines,
+  one instruction a cycle among them; and qtxc issues instructions in the order written.
+  Put what the first `ldg` needs first and the rest of the setup after it.
+- **A branch waits for the warp's loads and stores.** A loop cannot keep a load in flight
+  across its back edge; other warps fill the bus meanwhile.
+- **A warp's own shared-memory accesses happen in the order written.** An `lds` after an
+  `sts` of the same warp sees the store; no `fence.sh` is needed between them.
+- **There is no shuffle between lanes, on purpose.** Lanes combine through shared memory:
+  each lane stores its value in its own word, loads another lane's (the address differs in
+  one bit: `xori`), combines, and repeats for each bit of the lane number.
 
 ## Read next
 

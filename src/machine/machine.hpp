@@ -1559,8 +1559,8 @@ private:
     // instructions that count on the depbar are admitted and not yet
     // decremented. The counter's width follows from the places such an
     // instruction can be between its admission and its decrement
-    // (Machine::depbar_counter_max_, where each place is listed: 45 at the
-    // canonical profile, a 6-bit counter). An admission past it is an
+    // (Machine::depbar_counter_max_, where each place is listed and the
+    // maximum follows from the profile). An admission past it is an
     // internal error.
     using DepbarCounters = std::array<uint32_t, 6>;
     using AccEngines = std::array<std::optional<AccTransfer>, 2>; // [0 the acc.ld engine, 1 the acc.st engine]
