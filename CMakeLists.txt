@@ -18,6 +18,9 @@ endif()
 # OFF twin of the library, C API and unit tests, and ctest proves the two
 # byte-identical (scripts/sanitizer_off_check.py).
 option(NANOSM_SANITIZER "Build the ownership/hazard sanitizer (OFF: compiled to no-ops)" ON)
+# Warnings are errors only when asked for (the gate scripts ask): a newer compiler's new
+# warning should not stop someone else's build.
+option(NANOSM_WERROR "Treat compiler warnings as errors" OFF)
 
 set(NANOSM_SOURCES
     src/isa.cpp
@@ -65,7 +68,10 @@ function(add_nanosm_library NAME SANITIZER)
     if(MSVC)
         target_compile_options(${NAME} PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(${NAME} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_compile_options(${NAME} PRIVATE -Wall -Wextra -Wpedantic)
+        if(NANOSM_WERROR)
+            target_compile_options(${NAME} PRIVATE -Werror)
+        endif()
     endif()
 endfunction()
 

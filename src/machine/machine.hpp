@@ -1969,13 +1969,20 @@ private:
         std::optional<UrfReadRounds> urf_rounds;         // a tma or an mma.async loads the URF's round counter
     };
 
+    // A slot's number and what goes into it.
+    template <typename T>
+    struct IntoSlot {
+        uint32_t slot;
+        T contents;
+    };
+
     // Everything a dispatched instruction hands to its unit (the unit takes it now).
     struct DispatchDecision {
-        std::optional<std::pair<uint32_t, LoadSlot>> load_slot;   // lds: (slot, its new contents)
-        std::optional<std::pair<uint32_t, StoreSlot>> store_slot; // sts: (slot, its new contents)
+        std::optional<IntoSlot<LoadSlot>> load_slot;     // lds: (slot, its new contents)
+        std::optional<IntoSlot<StoreSlot>> store_slot;   // sts: (slot, its new contents)
         std::optional<MbarRmwRequest> rmw;               // SIMT mbar RMW: into the SIMT RMW register
         std::optional<MbarReadRequest> mbar_probe;
-        std::optional<std::pair<uint32_t, MbarWaitSlot>> wait_slot; // try-wait: (slot, record)
+        std::optional<IntoSlot<MbarWaitSlot>> wait_slot; // try-wait: (slot, record)
         std::optional<MmaCommand> mma;
         struct AccAdmission { bool load = false; AccTransfer transfer; };
         std::optional<AccAdmission> acc;

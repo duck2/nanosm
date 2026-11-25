@@ -631,7 +631,7 @@ std::string mma_shape_name(const MmaShape& shape) {
 std::optional<MmaShape> parse_mma_shape_name(const std::string& name) {
     MmaShape shape;
     std::size_t at = 0;
-    for (const auto [letter, field] : {std::pair{'m', &shape.m}, std::pair{'n', &shape.n}, std::pair{'k', &shape.k}}) {
+    for (const auto& [letter, field] : {std::pair{'m', &shape.m}, std::pair{'n', &shape.n}, std::pair{'k', &shape.k}}) {
         if (at >= name.size() || name[at] != letter) return std::nullopt;
         ++at;
         const auto digits = at;

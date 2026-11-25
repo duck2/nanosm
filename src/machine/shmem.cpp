@@ -625,7 +625,7 @@ void Machine::dispatch_shared_load(const DispatchEntry& op, Wires& w) {
     slot.dst = inst.dst;
     slot.depbar = inst.control.set_depbar;
     slot.words.assign(config_.lanes, 0);
-    w.dispatch.load_slot = std::make_pair(index, std::move(slot));
+    w.dispatch.load_slot = IntoSlot<LoadSlot>{index, std::move(slot)};
 }
 
 // sts: address and data arrive now (its RF reads were
@@ -649,7 +649,7 @@ void Machine::dispatch_shared_store(const DispatchEntry& op, Wires& w) {
         if ((access.lanes >> lane & 1) != 0) slot.data[lane] = data[lane];
     }
     slot.depbar = op.instruction.control.set_depbar;
-    w.dispatch.store_slot = std::make_pair(index, std::move(slot));
+    w.dispatch.store_slot = IntoSlot<StoreSlot>{index, std::move(slot)};
 }
 
 // Each load slot, in one calculation: the old owner leaves when the RF write
@@ -659,14 +659,14 @@ void Machine::dispatch_shared_store(const DispatchEntry& op, Wires& w) {
 void Machine::drive_load_slots(const Wires& w) {
     for (uint32_t index = 0; index < load_slots_.count(); ++index) {
         const bool written = w.rf_write.granted_to(AsyncWriter::load_slot, index);
-        const bool admitted = w.dispatch.load_slot.has_value() && w.dispatch.load_slot->first == index;
+        const bool admitted = w.dispatch.load_slot.has_value() && w.dispatch.load_slot->slot == index;
         const bool granted = w.shmem.a_read.user == AReadUser::load_slot && w.shmem.a_read.slot == index;
         const bool filled = w.shmem.load_fill.has_value() && w.shmem.load_fill->slot == index;
         if (!written && !admitted && !granted && !filled) continue;
         auto next = written ? std::nullopt : load_slots_[index].cur();
         if (admitted) {
             if (next.has_value()) throw SimError("internal lds admitted into a held load slot");
-            next = w.dispatch.load_slot->second;
+            next = w.dispatch.load_slot->contents;
         }
         if ((granted || filled) && !next.has_value()) throw SimError("internal shmem round for an empty load slot");
         if (granted) ++next->access.granted;
@@ -683,7 +683,7 @@ void Machine::drive_load_slots(const Wires& w) {
 void Machine::drive_store_slots(const Wires& w) {
     for (uint32_t index = 0; index < store_slots_.count(); ++index) {
         const bool granted = w.shmem.a_write.user == AWriteUser::store_slot && w.shmem.a_write.slot == index;
-        const bool admitted = w.dispatch.store_slot.has_value() && w.dispatch.store_slot->first == index;
+        const bool admitted = w.dispatch.store_slot.has_value() && w.dispatch.store_slot->slot == index;
         if (!granted && !admitted) continue;
         auto next = store_slots_[index].cur();
         if (granted) {
@@ -693,7 +693,7 @@ void Machine::drive_store_slots(const Wires& w) {
         }
         if (admitted) {
             if (next.has_value()) throw SimError("internal sts admitted into a held store slot");
-            next = w.dispatch.store_slot->second;
+            next = w.dispatch.store_slot->contents;
         }
         store_slots_[index].set_next(std::move(next), "drive_store_slots");
     }

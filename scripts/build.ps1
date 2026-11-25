@@ -34,7 +34,7 @@ $env:TMP = $env:TEMP
 $compilerCmake = $compiler -replace '\\', '/'
 $ninjaCmake = $ninja -replace '\\', '/'
 
-& $cmake -S . -B build -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninjaCmake" "-DCMAKE_CXX_COMPILER=$compilerCmake"
+& $cmake -S . -B build -G Ninja "-DNANOSM_WERROR=ON" "-DCMAKE_MAKE_PROGRAM=$ninjaCmake" "-DCMAKE_CXX_COMPILER=$compilerCmake"
 if ($LASTEXITCODE -ne 0) { throw 'cmake configure failed' }
 
 & $cmake --build build

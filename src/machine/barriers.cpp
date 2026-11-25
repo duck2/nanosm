@@ -473,7 +473,7 @@ void Machine::dispatch_atomic(const DispatchEntry& op, Wires& w) {
     slot.depbar = inst.control.set_depbar;
     slot.words.assign(config_.lanes, 0);
     slot.engine_filled = true;
-    w.dispatch.load_slot = std::make_pair(slot_index, std::move(slot));
+    w.dispatch.load_slot = IntoSlot<LoadSlot>{slot_index, std::move(slot)};
     MbarRmwRequest request;
     switch (inst.opcode) {
     case Opcode::atom_add_uni: request.operation = MbarRmwOperation::atom_add; break;
@@ -522,7 +522,7 @@ void Machine::dispatch_mbar_wait(const DispatchEntry& op, Wires& w) {
         slot.byte_address = request.byte_address;
         slot.parity = request.parity;
         slot.predicate_dst = request.predicate_dst;
-        w.dispatch.wait_slot = std::make_pair(*slot_index, slot);
+        w.dispatch.wait_slot = IntoSlot<MbarWaitSlot>{*slot_index, slot};
         request.wait_slot = *slot_index;
     }
     sanitizer_.check_simt_mbar_probe(site(op), request.byte_address);
@@ -538,7 +538,7 @@ void Machine::drive_wait_slots(const Wires& w) {
     // (One calculation per slot touched now: free, then park, then take.)
     std::vector<uint32_t> touched(w.completed_waits.begin(), w.completed_waits.end());
     if (w.shmem.park.has_value()) touched.push_back(w.shmem.park->first);
-    if (w.dispatch.wait_slot.has_value()) touched.push_back(w.dispatch.wait_slot->first);
+    if (w.dispatch.wait_slot.has_value()) touched.push_back(w.dispatch.wait_slot->slot);
     std::sort(touched.begin(), touched.end());
     touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
     for (const auto index : touched) {
@@ -550,9 +550,9 @@ void Machine::drive_wait_slots(const Wires& w) {
             next->parked = true;
             next->deadline_cycle = park->second;
         }
-        if (const auto& taken = w.dispatch.wait_slot; taken.has_value() && taken->first == index) {
+        if (const auto& taken = w.dispatch.wait_slot; taken.has_value() && taken->slot == index) {
             if (next.has_value()) throw SimError("internal mbar wait slot allocated twice");
-            next = taken->second;
+            next = taken->contents;
         }
         mbar_wait_slots_.set_next(index, std::move(next), "drive_wait_slots");
     }
