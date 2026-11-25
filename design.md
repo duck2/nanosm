@@ -86,6 +86,28 @@ The core doesn't contain a lot of entropy. It is based on an in-order vector pro
 examples in the wild. Most of the additional machinery comes from the async engines and efforts
 to arbitrate memory access between the engines.
 
+## Register file (RF)
+
+A scratchpad which is banked per-lane (one vector lane can't read others' registers). It is
+built from three 1R 1W memories, which are called RF banks, unrelated to the per-lane thing.
+Register r lives in bank r % 3.
+
+(I'm still on the fence about whether to make this two banks / configurable number of banks and
+introduce an operand collection step. Let's see.)
+
+### RF port arbitration
+
+RF has input/output connections to pretty much everything else in the machine, so "who uses
+RF port X this cycle" is something we need to handle.
+
+We grant port access in sort of a round robin way between sync/async units. Sync readers such as the
+ALU, FPU etc have fixed issue-to-read time and they can read right away. Async readers such as
+stg.v8 or acc.st wait for an empty read slot. To avoid starving async readers we occasionally
+stop issuing to inject a bubble.
+
+It works ~the same for writes. The difference is sync writers may have different issue-to-write
+times, which is handled using the write calendar in the issue unit.
+
 ## SIMT
 
 This is the issue unit + vector core, often known as the "CUDA core" in Nvidia devices.
@@ -108,10 +130,6 @@ state machines called "slots". lds/sts instructions block at the issue stage if 
 ### Other stuff
 
 Probably some other things I missed.
-
-## Register file (RF)
-
-todo
 
 ## Uniform register file (URF)
 
