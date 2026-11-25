@@ -217,7 +217,6 @@ TEST(Alu, fa_menu_numeric_vectors) {
         for (uint32_t lane = 0; lane < 16; ++lane) {
             const float fa = as_float(a[lane]);
             const float fb = as_float(b[lane]);
-            const float fc = as_float(c[lane]);
             require(machine->read_reg(0, lane, 5) == canonical(fa * fb), "fmul vector mismatch");
             require(machine->read_reg(0, lane, 13) == canonical(fa - fb), "fsub vector mismatch");
             const uint32_t expected_max = (std::isnan(fa) && std::isnan(fb)) ? nan
@@ -227,7 +226,6 @@ TEST(Alu, fa_menu_numeric_vectors) {
                     ? ((std::signbit(fa) && std::signbit(fb)) ? a[lane] : 0u)
                     : (fa > fb ? a[lane] : b[lane]);
             require(machine->read_reg(0, lane, 7) == expected_max, "fmax vector mismatch");
-            require(machine->read_reg(0, lane, 8) == canonical(std::fma(fa, fb, fc)), "fma vector mismatch");
             const uint32_t expected_pack = static_cast<uint32_t>(nanosm::float_to_half_bits(a[lane])) |
                 static_cast<uint32_t>(nanosm::float_to_half_bits(b[lane])) << 16;
             require(machine->read_reg(0, lane, 14) == expected_pack, "cvt.pack vector mismatch");
@@ -300,6 +298,143 @@ TEST(Alu, fa_menu_numeric_vectors) {
          }) {
         const uint32_t got = machine->read_reg(0, pin.lane, pin.reg);
         require(got == pin.bits, std::string(pin.what) + ": got " + std::to_string(got));
+    }
+}
+
+// fma is a x b + c rounded once, nearest even, by the simulator's own
+// arithmetic. The expected bits were derived independently: the exact value
+// with Python's fractions.Fraction, rounded to binary32 by hand (gradual
+// underflow), then the machine's rule (a subnormal result is zero of its
+// sign). The last three rows are IEEE's special cases.
+TEST(Alu, fma_rounds_once) {
+    struct Row {
+        uint32_t a, b, c, expected;
+        const char* what;
+    };
+    const std::vector<Row> rows = {
+        {0x40200000u, 0x3fedb6dbu, 0x40955555u, 0x4114f3cfu, "2.5 x 1.8571428 + 4.6666665 (a host fmaf's miss)"},
+        {0x3f800001u, 0x3f800001u, 0xbf800002u, 0x28800000u, "(1+2^-23)^2 - (1+2^-22) = 2^-46: massive cancellation"},
+        {0x3f8ccccdu, 0x3f8ccccdu, 0xbf9ae148u, 0x3275c290u, "1.1f^2 - round(1.1f^2): the product's rounding error"},
+        {0x3f800800u, 0x3f800800u, 0x00000000u, 0x3f801000u, "(1+2^-12)^2: a tie, to even (down)"},
+        {0x3f800800u, 0x3f800800u, 0x34000000u, 0x3f801002u, "(1+2^-12)^2 + 2^-23: a tie, to even (up)"},
+        {0x7f7fffffu, 0x3f800000u, 0x73000000u, 0x7f800000u, "max + half its ulp: a tie, to even, overflows to inf"},
+        {0x7f000000u, 0x40000000u, 0x00000000u, 0x7f800000u, "2^127 x 2 overflows to inf"},
+        {0xff000000u, 0x40000000u, 0x3f800000u, 0xff800000u, "-2^127 x 2 + 1 overflows to -inf"},
+        {0x1c800000u, 0x1c800000u, 0x00000000u, 0x00000000u, "2^-70 x 2^-70 = 2^-140, subnormal: +0"},
+        {0x9c800000u, 0x1c800000u, 0x00000000u, 0x80000000u, "-2^-70 x 2^-70: -0"},
+        {0x1a000000u, 0x9a000000u, 0x00800000u, 0x00800000u, "2^-126 - 2^-150: a tie in the subnormal range rounds to 2^-126"},
+        {0x3f800000u, 0x3f800000u, 0xbf800000u, 0x00000000u, "1 x 1 - 1: an exact zero is +0"},
+        {0x80000000u, 0x3f800000u, 0x80000000u, 0x80000000u, "-0 x 1 + -0 = -0"},
+        {0x40400000u, 0x3eaaaaabu, 0xbf800000u, 0x33000000u, "3 x round(1/3) - 1 = 2^-25 exactly"},
+        {0xbfd113bbu, 0xc031cf30u, 0xc018099eu, 0x400a6617u, "fused and unfused differ"},
+        {0x3ffe2f42u, 0xbf6eed33u, 0x402c8b88u, 0x3f57b739u, "fused and unfused differ"},
+        {0xc0214564u, 0xc07aae5fu, 0xc0604c04u, 0x40cbb137u, "fused and unfused differ"},
+        {0xbf80a054u, 0x3fca332au, 0x3f90f726u, 0xbee8e523u, "fused and unfused differ"},
+        {0xc02f1ddbu, 0xc01ab1dcu, 0xbf356714u, 0x40bcf65du, "fused and unfused differ"},
+        {0xc0436550u, 0xc07b8f25u, 0x3ffb51acu, 0x415f6bcdu, "fused and unfused differ"},
+        {0x3f800800u, 0x3f800800u, 0x17800000u, 0x3f801001u, "just above a tie: a double fma then a narrowing would round down"},
+        {0x7f800000u, 0x00000000u, 0x3f800000u, 0x7fc00000u, "inf x 0 + 1 is NaN"},
+        {0x7f800000u, 0x3f800000u, 0xff800000u, 0x7fc00000u, "inf x 1 - inf is NaN"},
+        {0x3f800000u, 0x7fc00000u, 0x3f800000u, 0x7fc00000u, "1 x NaN + 1 is the canonical NaN"},
+    };
+    for (std::size_t first = 0; first < rows.size(); first += 16) {
+        std::array<uint32_t, 16> a{}, b{}, c{};
+        for (std::size_t i = first; i < std::min(rows.size(), first + 16); ++i) {
+            a[i - first] = rows[i].a;
+            b[i - first] = rows[i].b;
+            c[i - first] = rows[i].c;
+        }
+        const auto machine = run_fpu_menu(a, b, c);
+        for (std::size_t i = first; i < std::min(rows.size(), first + 16); ++i) {
+            const auto got = machine->read_reg(0, static_cast<uint32_t>(i - first), 8);
+            require(got == rows[i].expected, std::string(rows[i].what) + ": got " + std::to_string(got) +
+                ", expected " + std::to_string(rows[i].expected));
+        }
+    }
+}
+
+// One source from a uniform register (src/isa.hpp takes_uniform_source):
+// the U bit round-trips through encode, decode, the text and hex; the
+// values of fadd, fsub, fmul, fma (the multiplicand written first or
+// second), shl, setp and cvt.pack with a uniform second source, masked and
+// not.
+TEST(Alu, uniform_second_source) {
+    const auto& profile = canonical_profile();
+    nanosm::Instruction fma;
+    fma.opcode = nanosm::Opcode::fma;
+    fma.dst = 8;
+    fma.src0 = 250;
+    fma.src1 = 31;
+    fma.src2 = 201;
+    fma.src1_uniform = true;
+    const auto decoded = nanosm::decode(nanosm::encode(fma));
+    require(decoded.src1_uniform && decoded.src0 == 250 && decoded.src1 == 31 && decoded.src2 == 201,
+        "fma's uniform multiplicand did not survive encode / decode");
+    require(nanosm::format_instruction(decoded, false) == "fma r8, r250, ur31, r201", "fma's uniform text");
+    nanosm::Instruction immediate;
+    immediate.opcode = nanosm::Opcode::addi;
+    immediate.src1_uniform = true;
+    expect_error([&] { (void)nanosm::encode(immediate); }, {"addi has no uniform source"}, "a U bit on addi");
+
+    const std::string source = R"(
+        sread r0, LANE_ID
+        shli r9, r0, 2
+        lds r1, [r9]
+        lds r2, [r9+64]
+        umov ur1, 1.5
+        umov ur2, 3
+        fadd r3, r1, ur1
+        fsub r4, r1, ur1
+        fmul r5, r1, ur1
+        fma r6, ur1, r1, r2
+        fma r7, r1, ur1, r2
+        shl r8, r0, ur2
+        setp.lt.u32 p0, r0, ur2
+        mov r10, 100
+        mov r11, 0
+        @p0 add r10, r0, ur2
+        @!p0 fmul r11, r1, ur1
+        cvt.pack.f16x2 r12, r1, ur1
+        halt
+    )";
+    const auto kernel = compile(source, profile);
+    const std::vector<std::string> expected = {"fadd r3, r1, ur1", "fsub r4, r1, ur1", "fmul r5, r1, ur1",
+        "fma r6, r1, ur1, r2", "fma r7, r1, ur1, r2", "shl r8, r0, ur2", "setp.lt.u32 p0, r0, ur2",
+        "add r10, r0, ur2", "fmul r11, r1, ur1", "cvt.pack.f16x2 r12, r1, ur1"};
+    std::vector<std::string> texts;
+    for (const auto word : kernel.words) {
+        const auto inst = nanosm::decode(word);
+        if (inst.src1_uniform) texts.push_back(nanosm::format_instruction(inst, false));
+        require(nanosm::encode(inst) == word, "encode / decode changed a word");
+    }
+    require(texts == expected, "the uniform sources did not reach the words as written");
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "hex round trip");
+
+    auto launch = launch_warps(1);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        write_u32(shmem, lane * 4, nanosm::float_bits(static_cast<float>(lane) + 0.25f));
+        write_u32(shmem, 64 + lane * 4, nanosm::float_bits(2.0f * static_cast<float>(lane)));
+    }
+    nanosm::Machine machine(profile, kernel, std::move(launch));
+    machine.run(20000);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        const float a = static_cast<float>(lane) + 0.25f;
+        const float c = 2.0f * static_cast<float>(lane);
+        const auto at = [&](uint32_t reg) { return machine.read_reg(0, lane, reg); };
+        const std::string where = "lane " + std::to_string(lane) + ": ";
+        require(at(3) == nanosm::float_bits(a + 1.5f), where + "fadd x, U");
+        require(at(4) == nanosm::float_bits(a - 1.5f), where + "fsub x, U is x - U");
+        require(at(5) == nanosm::float_bits(a * 1.5f), where + "fmul x, U");
+        // a x 1.5 + c is exact in single precision for these values.
+        const auto product_sum = nanosm::float_bits(static_cast<float>(static_cast<double>(a) * 1.5 + c));
+        require(at(6) == product_sum && at(7) == product_sum, where + "fma with a uniform multiplicand, either place");
+        require(at(8) == lane << 3, where + "shl by a uniform count");
+        require(at(10) == (lane < 3 ? lane + 3 : 100u), where + "setp against U, then add under @p0");
+        require(at(11) == (lane < 3 ? 0u : nanosm::float_bits(a * 1.5f)), where + "fmul under @!p0");
+        require(at(12) == (static_cast<uint32_t>(nanosm::float_to_half_bits(nanosm::float_bits(a))) |
+                           static_cast<uint32_t>(nanosm::float_to_half_bits(nanosm::float_bits(1.5f))) << 16),
+            where + "cvt.pack with a uniform high half");
     }
 }
 

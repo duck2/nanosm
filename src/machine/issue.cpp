@@ -756,8 +756,14 @@ void Machine::drive_depbar(const Wires& w) {
     }
 }
 
+// The vector registers an instruction reads. A uniform second source (the U
+// bit, src/isa.hpp takes_uniform_source) is the URF's, so the others are.
 std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
     if (is_mma_async(inst.opcode)) return {};
+    if (inst.src1_uniform && takes_uniform_source(inst.opcode)) {
+        if (inst.opcode == Opcode::fma) return {inst.src0, inst.src2};
+        return {inst.src0};
+    }
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::fadd:

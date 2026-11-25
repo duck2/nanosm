@@ -133,6 +133,12 @@
 //     register) is a fixed-latency VECTOR result: its uniform operand is
 //     sampled at c0 + 1 and it rides the arithmetic pipeline like mov, its
 //     write booked on the RF write calendar at issue_to_port.
+//   - A uniform second source (an ALU or FPU instruction's U bit, src/isa.hpp
+//     takes_uniform_source) is read the same way: sampled at c0 + 1 in the
+//     instruction's one round, beside its vector sources (the others), and at
+//     its unit with them; no latency changes. Its writer is kept the distance
+//     every uniform reader is (issue_to_urf_visible - issue_to_urf_sample),
+//     the one ur2r's has.
 //   - usetp pD, urA, urB | imm (the uniform compare) is uniform arithmetic
 //     whose result
 //     is one bit for the predicate file: it rides the URF write pipeline like

@@ -623,9 +623,9 @@ DeviceProfile load_device_profile(const std::string& path) {
     return parse_device_profile(contents.str());
 }
 
-uint64_t device_profile_fingerprint(const DeviceProfile& p) {
+uint64_t device_profile_fingerprint(const DeviceProfile& p, uint32_t revision) {
     validate_device_profile(p);
-    return fnv1a_64(profile_json(p).dump());
+    return fnv1a_64(profile_json(p).dump() + "\nisa_revision " + std::to_string(revision));
 }
 
 std::string format_profile_fingerprint(uint64_t fingerprint) {

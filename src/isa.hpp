@@ -9,6 +9,13 @@
 
 namespace nanosm {
 
+// The instruction set's revision: the opcodes, each form's fields in the
+// instruction word (encoding below) and what they mean. It is folded into the
+// stamp a kernel carries (src/profile.hpp device_profile_fingerprint), so a
+// reader built for another revision refuses the kernel. It changes with any
+// change to what a word means, a reserved bit given a meaning included.
+inline constexpr uint32_t isa_revision = 1;
+
 enum class Opcode : uint8_t {
     sread = 0x01,
     mov   = 0x02,
@@ -44,8 +51,8 @@ enum class Opcode : uint8_t {
     bra   = 0x20,
     bra_uni = 0x21,
     shri  = 0x22,    // logical; 0x19..0x1f were full
-    // Interleaved vector: rA warp-uniform, 64 B aligned, 512 contiguous
-    // bytes; register rD+j, lane l <-> word 16*j + l.
+    // Per lane: each active lane's rA is its own sector-aligned address; the
+    // sector's eight words are registers rD .. rD+7 at that lane.
     ldg_v8 = 0x23,
     stg_v8 = 0x24,
     ldg_uni = 0x25,  // base in a uniform register: one sector request, the word fans out to every lane
@@ -222,6 +229,9 @@ struct Instruction {
     uint8_t src0 = 0;
     uint8_t src1 = 0;
     uint8_t src2 = 0; // third source; only fma uses it (RRR reserved bits)
+    // src1 names a uniform register, not a vector register: the one uniform
+    // source of a per-lane ALU or FPU instruction (takes_uniform_source).
+    bool src1_uniform = false;
     int32_t imm = 0;
     uint32_t line = 0;
     std::string text;
@@ -238,12 +248,13 @@ struct DecodedInstruction {
     uint8_t src0 = 0;
     uint8_t src1 = 0;
     uint8_t src2 = 0;
+    bool src1_uniform = false;
     int32_t imm = 0;
 
     DecodedInstruction() = default;
     DecodedInstruction(const Instruction& inst)
         : opcode(inst.opcode), control(inst.control), dst(inst.dst), src0(inst.src0), src1(inst.src1),
-          src2(inst.src2), imm(inst.imm) {}
+          src2(inst.src2), src1_uniform(inst.src1_uniform), imm(inst.imm) {}
     operator Instruction() const {
         Instruction inst;
         inst.opcode = opcode;
@@ -252,6 +263,7 @@ struct DecodedInstruction {
         inst.src0 = src0;
         inst.src1 = src1;
         inst.src2 = src2;
+        inst.src1_uniform = src1_uniform;
         inst.imm = imm;
         return inst;
     }
@@ -478,7 +490,11 @@ namespace encoding {
 // +-------------------------------+-----------------------------------------+
 // | opcode/predicate/stall/depbars | opcode-selected 38-bit payload          |
 // +-------------------------------+-----------------------------------------+
-// RRR payload: dst[8], src0[8], src1[8], reserved[14]
+// A payload bit its form does not name is reserved and must be zero
+// (reserved_bit below; kernel load refuses one that is set).
+// RRR payload: dst[8], src0[8], src1[8], reserved[13], U[1]. U (bit 0) set:
+// src1 is a uniform register (takes_uniform_source; fma's rc sits in bits
+// 6..13 of the reserved bits, below them U is free in every RRR form)
 // RRI payload: dst[8], src0[8], simm[22]
 // store payload: base[8], value[8], simm[22]
 // RI payload: dst[8], reserved[8], simm[22]
@@ -494,6 +510,7 @@ namespace encoding {
 // displacements relative to the following PC; sync has no payload.
 // mbar addresses are held in a uniform register; mbar immediates and register
 // operands have distinct opcodes, as do setp immediates and register operands.
+// mbar.arrive has the address register alone (in dst's place).
 // A uniform register (ur0..) sits in the same 8-bit register fields: which
 // field names which file is the opcode's (uniform_sources / uniform_destination).
 // tma payload: buffer[8] (urS), coordinates[8] (urC, the first of N),
@@ -538,8 +555,19 @@ inline constexpr unsigned reg0_shift = 30;
 inline constexpr unsigned reg1_shift = 22;
 inline constexpr unsigned reg2_shift = 14;
 inline constexpr unsigned reg3_shift = 6; // fma's rc, in RRR reserved bits
+inline constexpr unsigned uniform_source_shift = 0; // U: src1 is a uniform register
 
 } // namespace encoding
+
+// The per-lane ALU and FPU instructions that may take ONE source from a
+// uniform register: always the second, src1 (the instruction's U bit), the
+// one slot the uniform value enters the datapath by. add, and, or, xor, shl,
+// shr (a uniform shift count), the register setp forms, fadd, fsub (x minus
+// the uniform value), fmul, fmax, cvt.pack (the high half) and fma (a
+// multiplicand: a x U + c). The uniform register is read in the instruction's
+// one round beside its vector registers (src/timing.hpp); the vector sources
+// are the others, and only they count for the RF banks.
+bool takes_uniform_source(Opcode opcode);
 
 // A logical MMA shape: an m x k A times a k x n B into an m x n accumulator.
 struct MmaShape {
@@ -745,7 +773,8 @@ inline bool uses_urf_pipeline(Opcode opcode) {
 // The uniform registers an instruction reads, in operand order (a register
 // named twice is listed twice). Most read at most two, all in one read round
 // at issue + 1 (src/timing.hpp; the round reads a repeated register once): the
-// URF has two read ports. acc.ld / acc.st read their tmem pointer. Two read
+// URF has two read ports. acc.ld / acc.st read their tmem pointer, an ALU or
+// FPU instruction with its U bit its src1 (takes_uniform_source). Two read
 // more over several rounds, two per round, listed in read order and read by
 // operand position (a register named twice is read twice;
 // uniform_read_rounds in src/timing.hpp): a tma, N + 2 registers (urS, urM, then
@@ -756,6 +785,13 @@ std::optional<uint8_t> uniform_destination(const Instruction& instruction);
 
 uint64_t encode(const Instruction& instruction);
 Instruction decode(uint64_t word);
+// The lowest bit of `word` that its form does not define, if any: a bit that
+// encoding what decode reads from the word does not write back (so a form
+// defines exactly what encode writes for it; an opcode the set does not have
+// defines only the opcode and control fields). A reserved bit must be zero:
+// kernel load refuses a word with one set (src/qtxc/checks.cpp), so a word
+// that gives one a meaning is never read as if it were not there.
+std::optional<unsigned> reserved_bit(uint64_t word);
 // Names. An mma.async opcode's shape is the profile's: given its shape list
 // (`mma_shapes`), it is named "mma.async[.init].m64n64k8"; without one, or
 // past the list's end, by its place in the block ("mma.async.slot0").

@@ -34,9 +34,14 @@ bool has_displacement(Opcode opcode) {
 
 // The VECTOR registers an instruction reads (its uniform registers:
 // uniform_sources, src/isa.hpp). acc.st and stg.v8 read their data later,
-// beat by beat (issue_sources: only what the issue round reads).
+// beat by beat (issue_sources: only what the issue round reads). A uniform
+// second source (the U bit) is not one of them.
 std::vector<uint8_t> sources(const Instruction& inst) {
     if (is_mma_async(inst.opcode)) return {};
+    if (inst.src1_uniform && takes_uniform_source(inst.opcode)) {
+        if (inst.opcode == Opcode::fma) return {inst.src0, inst.src2};
+        return {inst.src0};
+    }
     switch (inst.opcode) {
     case Opcode::add:
     case Opcode::and_:

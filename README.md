@@ -168,6 +168,10 @@ A kernel declares what a launch must give it, beside its code:
 - A name exists from its first use and qtxc gives it a number. The instruction decides its
   kind: `add` takes vector registers, `uadd` uniform ones. `ur2r %vec, %uni` copies a
   uniform value into every lane; `r2ur %uni, %vec` takes lane 0.
+- One source of a per-lane ALU or FPU instruction may be a uniform register: the second
+  (`fadd %d, %x, %u`, `setp.lt.u32 p0, %x, %u`), or either multiplicand of `fma`. A name is
+  uniform when the rest of the kernel makes it so. A uniform first source or addend needs
+  `ur2r` first. The uniform source takes no bank.
 - Every warp has its own registers. Warps share only memory and barriers.
 - The vector file is banked and an instruction's distinct sources must sit in different banks.
   qtxc arranges that; where it cannot, it inserts a copy and warns with the line.
@@ -205,12 +209,13 @@ Wherever a constant goes it may be an expression (`+ - * / << >>`, parentheses,
 
 ### Instructions
 
-`d` is the destination; `b|imm` a register or a constant.
+`d` is the destination; `b|imm` a register or a constant. In the per-lane integer, float
+and compare rows, the second source (for `fma`, either multiplicand) may be a uniform register.
 
 | what | instructions |
 |---|---|
 | integers, per lane | `mov d, a\|imm`; `add and or xor shl shr d, a, b`; `addi andi ori xori shli shri d, a, imm`. Shifts are logical. There is no subtract, multiply or divide. |
-| floats, per lane | `fadd fsub fmul fmax d, a, b`; `fma d, a, b, c`; `ex2 d, a` (2^a); `rcp d, a`; `cvt.pack.f16x2 d, lo, hi`. There is no float compare. |
+| floats, per lane | `fadd fsub fmul fmax d, a, b`; `fma d, a, b, c` (a x b + c); `ex2 d, a` (2^a); `rcp d, a`; `cvt.pack.f16x2 d, lo, hi`. There is no float compare. |
 | compare, per lane | `setp.{eq,ne,lt,le,gt,ge}.{u32,s32} p, a, b\|imm` |
 | uniform | `umov d, a\|imm`; `uadd usub ushl ushr uand uor uxor d, a, b`; `uaddi ushli ushri uandi uori uxori d, a, imm`; `usetp.{...}.{u32,s32} p, a, b\|imm` |
 | branch | `bra.uni L`; `@p bra.uni L` (every lane must agree); `halt` |

@@ -2,6 +2,7 @@
 
 #include "qtxc/qtxc.hpp"
 
+#include <bit>
 #include <iomanip>
 #include <sstream>
 
@@ -56,6 +57,9 @@ uint64_t encode(const Instruction& inst) {
          static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit > encoding::tma_descriptor_field_mask)) {
         throw SimError("tma descriptor address must be 64-byte aligned and below 1 MiB: " + format_instruction(inst));
     }
+    if (inst.src1_uniform && !takes_uniform_source(inst.opcode)) {
+        throw SimError(opcode_name(inst.opcode) + " has no uniform source: " + format_instruction(inst));
+    }
     const auto predicate = static_cast<uint64_t>(
         inst.control.predicate | (inst.control.predicate_invert ? 8 : 0));
     uint64_t word =
@@ -107,12 +111,14 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
+        word |= static_cast<uint64_t>(inst.src1_uniform ? 1 : 0) << encoding::uniform_source_shift;
         break;
     case Opcode::fma:
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
         word |= static_cast<uint64_t>(inst.src2) << encoding::reg3_shift;
+        word |= static_cast<uint64_t>(inst.src1_uniform ? 1 : 0) << encoding::uniform_source_shift;
         break;
     case Opcode::ex2:
     case Opcode::rcp:
@@ -152,10 +158,12 @@ uint64_t encode(const Instruction& inst) {
         word |= immediate;
         break;
     case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive:
     case Opcode::mbar_arrive_expect_tx_r:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
+        break;
+    case Opcode::mbar_arrive:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
         break;
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_try_wait_i:
@@ -333,12 +341,14 @@ Instruction decode(uint64_t word) {
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
+        inst.src1_uniform = ((word >> encoding::uniform_source_shift) & 1) != 0;
         break;
     case Opcode::fma:
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.src1 = reg2;
         inst.src2 = static_cast<uint8_t>((word >> encoding::reg3_shift) & encoding::register_mask);
+        inst.src1_uniform = ((word >> encoding::uniform_source_shift) & 1) != 0;
         break;
     case Opcode::ex2:
     case Opcode::rcp:
@@ -378,10 +388,12 @@ Instruction decode(uint64_t word) {
         inst.imm = static_cast<int32_t>(immediate);
         break;
     case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive:
     case Opcode::mbar_arrive_expect_tx_r:
         inst.src0 = reg0;
         inst.src1 = reg1;
+        break;
+    case Opcode::mbar_arrive:
+        inst.src0 = reg0;
         break;
     case Opcode::mbar_test_wait_i:
     case Opcode::mbar_try_wait_i:
@@ -501,7 +513,44 @@ Instruction decode(uint64_t word) {
     return inst;
 }
 
+std::optional<unsigned> reserved_bit(uint64_t word) {
+    const auto stray = word ^ encode(decode(word));
+    if (stray == 0) return std::nullopt;
+    return static_cast<unsigned>(std::countr_zero(stray));
+}
+
+bool takes_uniform_source(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::add:
+    case Opcode::and_:
+    case Opcode::or_:
+    case Opcode::xor_:
+    case Opcode::shl:
+    case Opcode::shr:
+    case Opcode::setp_eq:
+    case Opcode::setp_ne:
+    case Opcode::setp_lt:
+    case Opcode::setp_le:
+    case Opcode::setp_gt:
+    case Opcode::setp_ge:
+    case Opcode::setp_lt_s32:
+    case Opcode::setp_le_s32:
+    case Opcode::setp_gt_s32:
+    case Opcode::setp_ge_s32:
+    case Opcode::fadd:
+    case Opcode::fsub:
+    case Opcode::fmul:
+    case Opcode::fmax:
+    case Opcode::cvt_pack:
+    case Opcode::fma:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::vector<uint8_t> uniform_sources(const Instruction& inst) {
+    if (inst.src1_uniform && takes_uniform_source(inst.opcode)) return {inst.src1};
     if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1, inst.src2};
     if (is_tma_opcode(inst.opcode)) {
         std::vector<uint8_t> result{inst.src0, inst.src2};
@@ -767,6 +816,8 @@ std::string format_instruction(
     const Instruction& inst, bool include_control, const std::vector<MmaShape>* mma_shapes) {
     std::ostringstream out;
     out << opcode_name(inst.opcode, mma_shapes);
+    // The second source: a uniform register when the U bit says so.
+    const auto source_b = [&] { return inst.src1_uniform ? ureg(inst.src1) : reg(inst.src1); };
     if (is_mma_async(inst.opcode)) {
         // The spacing is printed when it is not the default (as it is written).
         const auto operand = [&](uint8_t base, bool a_operand) {
@@ -797,10 +848,10 @@ std::string format_instruction(
     case Opcode::fsub:
     case Opcode::fmax:
     case Opcode::cvt_pack:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << reg(inst.src1);
+        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << source_b();
         break;
     case Opcode::fma:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << reg(inst.src1)
+        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << source_b()
             << ", " << reg(inst.src2);
         break;
     case Opcode::ex2:
@@ -818,7 +869,7 @@ std::string format_instruction(
     case Opcode::setp_gt_s32:
     case Opcode::setp_ge_s32:
         out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
-            << ", " << reg(inst.src1);
+            << ", " << source_b();
         break;
     case Opcode::setpi_eq:
     case Opcode::setpi_ne:

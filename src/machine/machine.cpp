@@ -92,7 +92,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         throw SimError(
             "kernel profile '" + kernel_.profile_name + "@" +
             format_profile_fingerprint(kernel_.profile_fingerprint) + "' does not match simulator '" +
-            config_.name + "@" + format_profile_fingerprint(expected_profile) + "'");
+            config_.name + "@" + format_profile_fingerprint(expected_profile) + "' (the fingerprint stamps the "
+            "device profile and the instruction-set revision, " + std::to_string(isa_revision) + " here)");
     }
     // The rules every instruction must pass on this profile (src/qtxc/checks.cpp
     // check_instruction: what the profile supports, write masks, the

@@ -14,7 +14,9 @@
 //      an instruction inside a loop counting more.
 //   2. Copies. For an instruction still in conflict, a copy of one source
 //      into a scratch register of a free bank, immediately before it; a
-//      label on the instruction moves to the copy. A warning says so.
+//      label on the instruction moves to the copy. Inside a loop the source
+//      copied is one the innermost loop does not write, when there is one. A
+//      warning says so, and whether a copy made before the loop would do.
 //   3. Who may share a number. A name holds its value from a write to the
 //      last read that needs it (liveness over the kernel's control flow);
 //      two names that never hold a value at the same time may share.
@@ -169,6 +171,33 @@ std::vector<uint32_t> loop_depths(const std::vector<Instruction>& instructions) 
         for (auto i = static_cast<std::size_t>(target); i <= index; ++i) ++depth[i];
     }
     return depth;
+}
+
+// The innermost loop around each instruction, as [first, last]. A loop is a
+// header and every backward branch to it: the stretch from the header to the
+// last of them (an earlier one, a `continue`, is inside the same loop). The
+// innermost loop around an instruction is the shortest such stretch that
+// holds it. nullopt outside every loop.
+std::vector<std::optional<std::pair<std::size_t, std::size_t>>> innermost_loops(
+    const std::vector<Instruction>& instructions) {
+    // Per header: the last backward branch to it.
+    std::vector<std::optional<std::size_t>> last_back_edge(instructions.size());
+    for (std::size_t index = 0; index < instructions.size(); ++index) {
+        const auto& inst = instructions[index];
+        if (!is_branch(inst.opcode)) continue;
+        const auto target = static_cast<int64_t>(index) + 1 + inst.imm / 8;
+        if (target < 0 || target > static_cast<int64_t>(index)) continue;
+        last_back_edge[static_cast<std::size_t>(target)] = index;
+    }
+    std::vector<std::optional<std::pair<std::size_t, std::size_t>>> loops(instructions.size());
+    for (std::size_t first = 0; first < instructions.size(); ++first) {
+        if (!last_back_edge[first].has_value()) continue;
+        const auto last = *last_back_edge[first];
+        for (auto i = first; i <= last; ++i) {
+            if (!loops[i].has_value() || last - first < loops[i]->second - loops[i]->first) loops[i] = {{first, last}};
+        }
+    }
+    return loops;
 }
 
 // The different vector registers an instruction's issue reads, as places.
@@ -562,6 +591,7 @@ void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile) 
         std::vector<std::string> rebuilt_notes;
         std::vector<std::size_t> new_index(instructions.size(), 0); // of an old instruction's first new one
         std::vector<int64_t> target(instructions.size(), -1);       // a displacement's old target
+        const auto loops = innermost_loops(instructions);
         for (std::size_t index = 0; index < instructions.size(); ++index) {
             if (has_displacement(instructions[index].opcode)) {
                 target[index] = static_cast<int64_t>(index) + 1 + instructions[index].imm / 8;
@@ -584,9 +614,33 @@ void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile) 
                     if (by_bank[bank].size() < by_bank[free_bank].size()) free_bank = bank;
                 }
                 if (crowded == banks) break;
-                // The last of the crowded bank's registers in operand order
-                // moves; the others stay.
-                const auto victim = by_bank[crowded].back();
+                // One of the crowded bank's registers moves; the others stay.
+                // Inside a loop, the last in operand order that the innermost
+                // loop around the instruction does not write (its copy could
+                // be made once, before the loop); else the last.
+                const auto& loop = loops[index];
+                const auto written_in_loop = [&](uint8_t place) {
+                    if (program.vector_registers[place].scratch) return true;
+                    for (auto i = loop->first; i <= loop->second; ++i) {
+                        const auto slots = register_slots(instructions[i]);
+                        for (std::size_t slot = 0; slot < 4; ++slot) {
+                            if (slots[slot].kind != Kind::vector || !slots[slot].written) continue;
+                            const uint32_t first = field(instructions[i], slot);
+                            if (place >= first && place < first + slots[slot].width) return true;
+                        }
+                    }
+                    return false;
+                };
+                auto victim = by_bank[crowded].back();
+                bool invariant = false;
+                if (loop.has_value()) {
+                    for (auto it = by_bank[crowded].rbegin(); it != by_bank[crowded].rend(); ++it) {
+                        if (written_in_loop(*it)) continue;
+                        victim = *it;
+                        invariant = true;
+                        break;
+                    }
+                }
                 const auto place = scratch_place(free_bank, taken_here[free_bank]++, inst.line);
                 const auto& victim_entry = program.vector_registers[victim];
                 const auto& scratch_entry = program.vector_registers[place];
@@ -602,14 +656,18 @@ void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile) 
                 copy.imm = 0;
                 copy.line = inst.line;
                 copy.text = "addi " + percent(scratch_entry) + ", " + percent(victim_entry) + ", 0";
-                const bool in_loop = depth[index] != 0;
+                std::string advice;
+                if (invariant) {
+                    advice = "; it is inside a loop that does not write " + percent(victim_entry) + ": copying it into "
+                        "a second name before the loop, and reading that name here, avoids it";
+                } else if (loop.has_value()) {
+                    advice = "; it is inside a loop that writes " + percent(victim_entry) + " and " + beside +
+                        ", so a copy made before the loop would not hold their values here: the copy stays";
+                }
                 program.warnings.push_back(
                     "line " + std::to_string(inst.line) + ": '" + inst.text + "' reads " + percent(victim_entry) +
                     " and " + beside + " from one register-file bank; qtxc inserted a copy of " +
-                    percent(victim_entry) + " before it (one more instruction each time it runs" +
-                    (in_loop ? "; it is inside a loop: copying " + percent(victim_entry) +
-                         " into a second name before the loop, and reading that name here, avoids it"
-                             : std::string()) + ")");
+                    percent(victim_entry) + " before it (one more instruction each time it runs" + advice + ")");
                 rebuilt.push_back(std::move(copy));
                 rebuilt_flags.push_back(0);
                 rebuilt_notes.push_back("qtxc: a copy of " + percent(victim_entry) + ", which shares a bank with " +

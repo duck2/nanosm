@@ -215,7 +215,13 @@ using Config = DeviceProfile;
 
 DeviceProfile load_device_profile(const std::string& path);
 DeviceProfile parse_device_profile(std::string_view source);
-uint64_t device_profile_fingerprint(const DeviceProfile& profile);
+// The stamp a kernel carries (assembly's and hex's `.profile NAME, 0x...`, a
+// launch image's profile.fingerprint) and every reader compares with its own:
+// a hash of the profile's every field and of the instruction set's revision
+// (src/isa.hpp isa_revision), so a kernel built for another profile or for
+// another instruction set is refused. (Another `revision` gives the stamp a
+// reader of that revision carries, for a test.)
+uint64_t device_profile_fingerprint(const DeviceProfile& profile, uint32_t revision = isa_revision);
 std::string format_profile_fingerprint(uint64_t fingerprint);
 void validate_device_profile(const DeviceProfile& profile);
 

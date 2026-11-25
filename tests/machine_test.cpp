@@ -1,10 +1,20 @@
 // Machine-level basics: nonblocking lds, bank rounds, the device profile (validation, its optional fields, the
-// stamp a kernel carries), the trace.
+// stamp a kernel carries), the instruction words' reserved bits, the trace.
 #include "test_support.hpp"
+
+#include "image.hpp"
+
+#include <iomanip>
 
 namespace {
 
 using namespace nanosm_test;
+
+std::string replaced(std::string text, const std::string& from, const std::string& to) {
+    const auto found = text.find(from);
+    require(found != std::string::npos, "the text has no '" + from + "'");
+    return text.replace(found, from.size(), to);
+}
 
 // A test that must write a file writes it here: the system temp directory
 // plus this process's id and a per-process counter, so overlapping runs of
@@ -195,6 +205,78 @@ TEST(Machine, profile_stamp_rejects_mismatch) {
         "assembly scheduled for another profile");
     expect_error<nanosm::SimError>([&] { nanosm::Machine machine(other, kernel, launch_warps(1)); },
         {"does not match simulator"}, "a kernel for another profile in the simulator");
+}
+
+// The stamp is also the instruction set's revision (src/isa.hpp
+// isa_revision): a kernel stamped for another revision, in assembly, hex or a
+// saved launch image, is refused under the same profile.
+TEST(Machine, isa_revision_in_the_stamp) {
+    const auto& profile = canonical_profile();
+    const auto here = nanosm::device_profile_fingerprint(profile);
+    const auto elsewhere = nanosm::device_profile_fingerprint(profile, nanosm::isa_revision + 1);
+    require(here != elsewhere, "the revision is not in the fingerprint");
+    const auto assembly = nanosm::emit_asm(qtx_program("mov r0, 1\nhalt", profile));
+    const auto stamp = "0x" + nanosm::format_profile_fingerprint(here);
+    const auto restamped_asm = replaced(assembly, stamp, "0x" + nanosm::format_profile_fingerprint(elsewhere));
+    expect_error<nanosm::SimError>([&] { (void)nanosm::assemble_asm(restamped_asm, profile); },
+        {"does not match", "instruction-set revision"}, "assembly for another revision");
+    auto kernel = nanosm::assemble_asm(assembly, profile);
+    kernel.profile_fingerprint = elsewhere;
+    const auto from_hex = nanosm::load_hex(nanosm::emit_hex(kernel));
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(profile, from_hex, launch_warps(1)); },
+        {"does not match simulator", "instruction-set revision"}, "hex for another revision");
+    const auto image = nanosm::load_launch_image(nanosm::emit_launch_image({kernel, launch_warps(1)}));
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(profile, image.kernel, image.launch); },
+        {"does not match simulator"}, "a launch image for another revision");
+}
+
+// A bit a word's form does not define (src/isa.hpp reserved_bit) is refused
+// at kernel load, from hex and from a launch image, naming the pc and the
+// bit. The bits each form does define are accepted.
+TEST(Machine, reserved_bits_refused) {
+    const auto& profile = canonical_profile();
+    const auto kernel = compile("mov r0, 1\nex2 r1, r0\nhalt\n", profile);
+    require(!nanosm::reserved_bit(kernel.words.at(1)).has_value(), "a clean ex2 has a reserved bit");
+    auto stray = kernel;
+    stray.words.at(1) |= 1;  // ex2 has no U bit: bit 0 is reserved
+    const std::vector<std::string_view> needles = {"kernel pc 8", "sets bit 0, which its form does not define"};
+    expect_error<nanosm::SimError>([&] { nanosm::Machine machine(profile, stray, launch_warps(1)); },
+        {needles[0], needles[1]}, "a stray bit at kernel load");
+    expect_error<nanosm::SimError>([&] { (void)nanosm::load_hex(nanosm::emit_hex(stray)); },
+        {needles[0], needles[1]}, "a stray bit in hex");
+    const auto clean_image = nanosm::emit_launch_image({kernel, launch_warps(1)});
+    const auto hex_word = [](uint64_t word) {
+        std::ostringstream out;
+        out << "0x" << std::hex << std::setw(16) << std::setfill('0') << word;
+        return out.str();
+    };
+    expect_error<nanosm::SimError>(
+        [&] { (void)nanosm::load_launch_image(replaced(clean_image, hex_word(kernel.words.at(1)),
+                  hex_word(stray.words.at(1)))); },
+        {needles[0], needles[1]}, "a stray bit in a launch image");
+
+    const auto word_of = [](nanosm::Opcode opcode) { return uint64_t{static_cast<uint8_t>(opcode)} << 56; };
+    // Reserved: add's bits 1..13, fma's 1..5, mbar.arrive's second register
+    // field, anything in a nop's payload.
+    require(nanosm::reserved_bit(word_of(nanosm::Opcode::add) | 2) == 1u, "add bit 1");
+    require(nanosm::reserved_bit(word_of(nanosm::Opcode::add) | (1u << 13)) == 13u, "add bit 13");
+    require(nanosm::reserved_bit(word_of(nanosm::Opcode::fma) | (1u << 5)) == 5u, "fma bit 5");
+    require(nanosm::reserved_bit(word_of(nanosm::Opcode::mbar_arrive) | (1u << 22)) == 22u, "mbar.arrive bit 22");
+    require(nanosm::reserved_bit(word_of(nanosm::Opcode::nop) | (uint64_t{1} << 37)) == 37u, "nop bit 37");
+    // Defined: the U bit, fma's addend, the mma.async spacings, umov's 32-bit
+    // word, a tma's descriptor field, an atomic's offset, the control fields.
+    const uint64_t payload = (uint64_t{1} << 38) - 1;
+    for (const auto opcode : {nanosm::Opcode::umovi, nanosm::Opcode::tma_load_4d, nanosm::Opcode::atom_add_uni,
+             nanosm::Opcode::addi, nanosm::Opcode::sts, nanosm::mma_opcode(0, false)}) {
+        require(!nanosm::reserved_bit(word_of(opcode) | payload).has_value(),
+            nanosm::opcode_name(opcode) + ": a defined bit taken for reserved");
+    }
+    require(!nanosm::reserved_bit(word_of(nanosm::Opcode::add) | 1 | (payload & ~uint64_t{0x3fff})).has_value(),
+        "add's fields and U bit taken for reserved");
+    require(!nanosm::reserved_bit(word_of(nanosm::Opcode::fma) | 1 | (payload & ~uint64_t{0x3e})).has_value(),
+        "fma's fields and U bit taken for reserved");
+    require(!nanosm::reserved_bit(word_of(nanosm::Opcode::halt) | (~uint64_t{0} >> 8 & ~payload)).has_value(),
+        "a control field taken for reserved");
 }
 
 TEST(Machine, trace_attribution_and_limit) {

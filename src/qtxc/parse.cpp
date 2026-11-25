@@ -97,6 +97,10 @@ struct Names {
     std::unordered_map<std::string, std::pair<int, uint32_t>> index;
     std::string text; // the instruction being read, for a later message
     bool own = false; // qtxc is naming a register of its own (ld.param's), not reading the writer's
+    // Vector names first met as a source of an instruction that takes a
+    // uniform register only in another slot (read_source): a later use of
+    // one as a uniform register is told where a uniform register may go.
+    std::unordered_map<std::string, bool> fixed_vector_source;
 };
 
 const char* kind_name(int kind) {
@@ -152,7 +156,14 @@ uint8_t named_register(const std::string& text, bool uniform, uint32_t line) {
     auto& list = uniform ? names->program->uniform_registers : names->program->vector_registers;
     const int kind = uniform ? 1 : 0;
     if (const auto found = names->index.find(name); found != names->index.end()) {
-        if (found->second.first != kind) throw kind_conflict(*names->program, where, name, kind, found->second);
+        if (found->second.first != kind) {
+            auto error = kind_conflict(*names->program, where, name, kind, found->second);
+            if (kind == 1 && found->second.first == 0 && names->fixed_vector_source.contains(name)) {
+                throw SimError(std::string(error.what()) + "; a per-lane instruction takes a uniform register only "
+                    "as its second source (fma: as a multiplicand)");
+            }
+            throw error;
+        }
         return static_cast<uint8_t>(found->second.second);
     }
     if (list.size() >= 256) {
@@ -226,6 +237,97 @@ uint8_t parse_ureg(const std::string& text, uint32_t line, const DeviceProfile& 
             "' is outside this profile's " + std::to_string(profile.urf_registers) + " (urf.registers)");
     }
     return static_cast<uint8_t>(value);
+}
+
+// A register source of an instruction that takes a uniform source (src/isa.hpp
+// takes_uniform_source): its file and its number (assembly: `r5` or `ur5`)
+// or its place in that file's list (qtx). In qtx a name has the file the rest
+// of the kernel gives it -- a write, or a use where only one file can go. A
+// name read in a slot where a uniform register may go (`either`) and not met
+// before waits for the end of the kernel (kind -1, place_pending_sources); a
+// name met first in any other source slot is a vector register, as everywhere.
+struct Source {
+    std::string text;
+    int kind = 0; // 0 vector register, 1 uniform register, -1 not decided yet
+    uint8_t place = 0;
+};
+
+Source read_source(const std::string& text, bool either, uint32_t line, const DeviceProfile& profile) {
+    Source source;
+    source.text = text;
+    if (names == nullptr) {
+        static const std::regex uniform(R"(^[uU][rR][0-9]+$)");
+        if (std::regex_match(text, uniform)) {
+            source.kind = 1;
+            source.place = parse_ureg(text, line, profile);
+        } else {
+            source.place = parse_reg(text, line);
+        }
+        return source;
+    }
+    static const std::regex pattern(R"(^%([A-Za-z_][A-Za-z0-9_]*)$)");
+    std::smatch match;
+    if (std::regex_match(text, match, pattern)) {
+        const auto name = match[1].str();
+        // Before the lookup: qtxc's own names are in the index too (ld.param's).
+        refuse_reserved(name, "line " + std::to_string(line) + ": ");
+        const auto found = names->index.find(name);
+        if (found != names->index.end() && found->second.first != 2) {
+            source.kind = found->second.first;
+            source.place = static_cast<uint8_t>(found->second.second);
+            return source;
+        }
+        const bool predicate = name.size() == 2 && name[0] == 'p' && name[1] >= '0' && name[1] <= '6';
+        if (either && found == names->index.end() && !predicate) {
+            source.kind = -1;
+            return source;
+        }
+        if (found == names->index.end() && !predicate) names->fixed_vector_source[name] = true;
+    }
+    source.place = named_register(text, false, line); // refuses what is not a vector register name
+    return source;
+}
+
+// The sources of an instruction that takes a uniform source, all decided, into
+// its fields: at most one uniform register, as the second source -- of fma
+// either multiplicand, moved into that slot (a x b commutes; the text follows
+// so the assembly reads as the machine does). A uniform first source, a
+// uniform addend and two uniform sources are refused. `args` are the
+// operands as written, the destination first.
+void place_sources(Instruction& inst, const std::vector<Source>& sources, const std::vector<std::string>& args) {
+    const auto where = "line " + std::to_string(inst.line) + ": '" + inst.text + "' reads ";
+    const auto name = opcode_name(inst.opcode);
+    const auto form = name + (is_setp(inst.opcode) ? " p, x, U" : " d, x, U");
+    const bool fma = inst.opcode == Opcode::fma;
+    std::vector<std::string> uniform;
+    for (std::size_t i = 0; i < (fma ? 2u : sources.size()); ++i) {
+        if (sources[i].kind == 1) uniform.push_back(sources[i].text);
+    }
+    const std::string copy = "; ur2r copies a uniform register into a vector register for every other place";
+    if (fma && sources[2].kind == 1) {
+        throw SimError(where + "the uniform register " + sources[2].text + " as its addend; fma takes a uniform "
+            "register only as a multiplicand (fma d, a, U, c or fma d, U, b, c)" + copy);
+    }
+    if (uniform.size() > 1) {
+        throw SimError(where + "two uniform registers, " + uniform[0] + " and " + uniform[1] + "; a per-lane "
+            "instruction takes one, as its second source (" + (fma ? std::string("fma: a multiplicand") : form) + ")" +
+            copy);
+    }
+    if (!fma && sources[0].kind == 1) {
+        throw SimError(where + "the uniform register " + sources[0].text + " as its first source; " + name +
+            " takes a uniform register only as its second source (" + form +
+            (inst.opcode == Opcode::fsub ? ": x minus U" : "") + ")" + copy);
+    }
+    std::size_t a = 0;
+    std::size_t b = 1;
+    if (fma && sources[0].kind == 1) {
+        std::swap(a, b);
+        inst.text = "fma " + args[0] + ", " + args[2] + ", " + args[1] + ", " + args[3];
+    }
+    inst.src0 = sources[a].place;
+    inst.src1 = sources[b].place;
+    inst.src1_uniform = sources[b].kind == 1;
+    if (fma) inst.src2 = sources[2].place;
 }
 
 int32_t parse_value(
@@ -613,6 +715,23 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         uint32_t line = 0;
     };
     std::vector<PendingBranch> pending_branches;
+    // The instructions with a source whose file the rest of the kernel
+    // decides (read_source), placed after the last line.
+    struct PendingSources {
+        std::size_t instruction = 0;
+        std::vector<Source> sources;
+        std::vector<std::string> args;
+    };
+    std::vector<PendingSources> pending_sources;
+    const auto with_uniform_source = [&](Instruction& inst, std::vector<Source> sources,
+                                         const std::vector<std::string>& args) {
+        const bool decided = std::all_of(sources.begin(), sources.end(), [](const Source& s) { return s.kind >= 0; });
+        if (decided) {
+            place_sources(inst, sources, args);
+        } else {
+            pending_sources.push_back({program.instructions.size(), std::move(sources), args});
+        }
+    };
     std::istringstream input{std::string(source)};
     std::string raw;
     uint32_t line_number = 0;
@@ -1060,8 +1179,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             expect_count(args, 3, line_number);
             inst.opcode = op == "add" ? Opcode::add : Opcode::fadd;
             inst.dst = parse_reg(args[0], line_number);
-            inst.src0 = parse_reg(args[1], line_number);
-            inst.src1 = parse_reg(args[2], line_number);
+            with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
+                read_source(args[2], true, line_number, profile)}, args);
         } else if (op == "and" || op == "or" || op == "xor" || op == "shl" || op == "shr") {
             expect_count(args, 3, line_number);
             inst.opcode = op == "and" ? Opcode::and_
@@ -1070,8 +1189,8 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 : op == "shl" ? Opcode::shl
                 : Opcode::shr;
             inst.dst = parse_reg(args[0], line_number);
-            inst.src0 = parse_reg(args[1], line_number);
-            inst.src1 = parse_reg(args[2], line_number);
+            with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
+                read_source(args[2], true, line_number, profile)}, args);
         } else if (op == "fmul" || op == "fsub" || op == "fmax" || op == "cvt.pack.f16x2") {
             expect_count(args, 3, line_number);
             inst.opcode = op == "fmul" ? Opcode::fmul
@@ -1079,15 +1198,17 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 : op == "fmax" ? Opcode::fmax
                 : Opcode::cvt_pack;
             inst.dst = parse_reg(args[0], line_number);
-            inst.src0 = parse_reg(args[1], line_number);
-            inst.src1 = parse_reg(args[2], line_number);
+            with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
+                read_source(args[2], true, line_number, profile)}, args);
         } else if (op == "fma") {
+            // fma d, a, b, c (a x b + c): a uniform multiplicand may be
+            // written as a or as b; it goes in the b slot (place_sources).
             expect_count(args, 4, line_number);
             inst.opcode = Opcode::fma;
             inst.dst = parse_reg(args[0], line_number);
-            inst.src0 = parse_reg(args[1], line_number);
-            inst.src1 = parse_reg(args[2], line_number);
-            inst.src2 = parse_reg(args[3], line_number);
+            with_uniform_source(inst, {read_source(args[1], true, line_number, profile),
+                read_source(args[2], true, line_number, profile), read_source(args[3], false, line_number, profile)},
+                args);
         } else if (op == "ex2" || op == "rcp") {
             expect_count(args, 2, line_number);
             inst.opcode = op == "ex2" ? Opcode::ex2 : Opcode::rcp;
@@ -1100,13 +1221,17 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 throw SimError("line " + std::to_string(line_number) + ": setp destination must be p0..p6");
             }
             inst.dst = predicate;
-            inst.src0 = parse_reg(args[1], line_number);
-            const bool immediate = !is_register(args[2]);
+            const bool immediate = !is_register(args[2]) && !is_uniform_register(args[2]);
             inst.opcode = parse_setp_opcode(op, false, immediate, line_number);
             // The text names the opcode: eq / ne written .s32 reads .u32.
             inst.text = opcode_name(inst.opcode) + clean.substr(op.size());
-            if (immediate) inst.imm = parse_value(args[2], constants, line_number);
-            else inst.src1 = parse_reg(args[2], line_number);
+            if (immediate) {
+                inst.src0 = parse_reg(args[1], line_number);
+                inst.imm = parse_value(args[2], constants, line_number);
+            } else {
+                with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
+                    read_source(args[2], true, line_number, profile)}, args);
+            }
         } else if (op.starts_with("usetp.")) {
             // The uniform compare: uniform registers (a vector register is
             // refused by parse_ureg), the same comparisons as setp.
@@ -1140,7 +1265,9 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             // the reader and stands for the two instructions a parameter read
             // is: umov of the parameter's shared address into a uniform
             // register qtxc names (%qtxc_param), then lds.uni through it. The
-            // umov names the parameter, so it waits for the launch's bytes.
+            // lds.uni is the read, so it is the one that waits for the
+            // launch's bytes (the parameter's launch flag); the umov only
+            // loads a constant and goes ahead.
             if (allow_control) {
                 throw SimError("line " + std::to_string(line_number) +
                     ": ld.param is qtx; assembly writes the umov and the lds.uni it stands for");
@@ -1178,7 +1305,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             name_table.own = false;
             address.imm = static_cast<int32_t>(param->address);
             address.text = "umov %qtxc_param, " + param->name;
-            program.named_flags.push_back(flags_named(param->name));
+            program.named_flags.push_back(0);
             program.instructions.push_back(std::move(address));
             inst.opcode = Opcode::lds_uni;
             inst.dst = parse_reg(args[0], line_number);
@@ -1187,7 +1314,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             name_table.own = false;
             inst.imm = 0;
             inst.text = "lds.uni " + args[0] + ", [%qtxc_param]";
-            names_text.clear();
+            names_text = param->name; // its launch flag, below
         } else if (op == "lds" || op == "lds.uni" || op == "ldg" || op == "ldg.v8" || op == "ldg.uni") {
             expect_count(args, 2, line_number);
             inst.opcode = op == "lds" ? Opcode::lds
@@ -1407,6 +1534,26 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
         program.instructions.push_back(std::move(inst));
     }
     if (program.instructions.empty()) throw SimError("kernel contains no instructions");
+    // A name read where a vector or a uniform register may go has, by now,
+    // the file the rest of the kernel gave it -- or none, which is refused.
+    for (auto& pending : pending_sources) {
+        auto& inst = program.instructions[pending.instruction];
+        for (auto& source : pending.sources) {
+            if (source.kind >= 0) continue;
+            const auto name = source.text.substr(1);
+            const auto found = name_table.index.find(name);
+            const auto where = "line " + std::to_string(inst.line) + ": ";
+            if (found == name_table.index.end()) {
+                throw SimError(where + "'" + inst.text + "' reads " + source.text + " where a vector or a uniform "
+                    "register may go, and nothing else in the kernel says which it is: a write to it or a use where "
+                    "only one of them can go decides (umov makes a uniform register, mov a vector register)");
+            }
+            if (found->second.first == 2) throw kind_conflict(program, where, name, 0, found->second);
+            source.kind = found->second.first;
+            source.place = static_cast<uint8_t>(found->second.second);
+        }
+        place_sources(inst, pending.sources, pending.args);
+    }
     for (const auto& branch : pending_branches) {
         const auto target = labels.find(branch.target);
         if (target == labels.end()) {

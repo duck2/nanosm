@@ -220,6 +220,20 @@ TEST(TmaOperands, uniform_reader_refused_during_the_rounds) {
     require(!umovs.empty() && umovs.back() == tma.at(0) + 2, "the uniform write that reads nothing waited");
     require(free_ports.trace().summary().urf_read_ports_held == 0, "nothing was refused");
 
+    // A per-lane instruction with a uniform second source reads the URF in
+    // its round as a uniform reader does: refused at T + 1 and T + 2 behind
+    // the .4d, it issues at T + 3.
+    nanosm::Machine per_lane(profile, compile("mov r1, 2\n" + setup + R"(
+        tma.load.4d [ur0], [4096, ur8], [ur1]
+        add  r3, r1, ur2
+    )" + wait_on("ur1", "loaded") + "halt\n"), tensor_launch(1, 2, 1, 64), {.timeline = true});
+    per_lane.run(20000);
+    const auto behind = issues_named(per_lane, "tma.load.4d");
+    require(issues_named(per_lane, "add") == std::vector<uint64_t>{behind.at(0) + 3},
+        "the add with a uniform source behind the .4d did not issue at T + 3");
+    require(per_lane.trace().summary().urf_read_ports_held == 2, "two refused warp-cycles for the add");
+    for (uint32_t lane = 0; lane < 16; ++lane) require(per_lane.read_reg(0, lane, 3) == 7, "the add's result");
+
     nanosm::Machine two_warps(profile, compile(R"(
         usread ur0, WARP_ID
         ushli ur1, ur0, 8

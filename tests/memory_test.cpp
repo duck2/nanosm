@@ -69,11 +69,12 @@ TEST(Memory, objects_place_and_compute) {
     require(buf.address == 640 && buf.stride == 64, "a plain buffer starts on the next multiple of 64");
     require(acc.tmem && acc.address == 0 && acc.size == 48 && acc.stride == 64 && acc.alignment == 32,
         "a tmem tile is in words, on four of its rows, its stride padded to that");
-    // The launch flag: an instruction that names a parameter waits; one that
-    // names an object does not, whatever the expression.
+    // The launch flag: ld.param waits at its lds.uni, the read (the umov
+    // before it only loads the parameter's address, and goes ahead); an
+    // instruction that names an object does not, whatever the expression.
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
-        const bool names_param = program.instructions[index].text.find("BIAS") != std::string::npos;
-        require((program.named_flags[index] != 0) == names_param,
+        const bool reads_param = program.instructions[index].opcode == nanosm::Opcode::lds_uni;
+        require((program.named_flags[index] != 0) == reads_param,
             "launch-flag wait on the wrong instruction: " + program.instructions[index].text);
     }
     // Assembly carries each object with its address and reads back to the same kernel.
@@ -196,6 +197,16 @@ TEST(Memory, placement_and_name_edge_cases) {
     qtx_refused(".reg %qtxc_copy<8>\nhalt\n", "names beginning %qtxc_ are qtxc's own", "a group named like qtxc's copies");
     qtx_refused("mov %a, 1\nsetp.ne.u32 %qtxc_p, %a, 0\nhalt\n", "names beginning %qtxc_ are qtxc's own",
         "a predicate with qtxc's prefix");
+    // ... also read as a source where a uniform register may go, before or
+    // after an ld.param has named it (each source slot).
+    for (const std::string read : {"add %ans, %v, %qtxc_param", "add %ans, %qtxc_param, %v",
+             "fma %ans, %v, %v, %qtxc_param"}) {
+        const std::string load = "ld.param.u32 %x, [N]\n";
+        const std::string before = ".param u32 N\nsread %v, LANE_ID\n" + read + "\n" + load + "halt\n";
+        const std::string after = ".param u32 N\n" + load + "sread %v, LANE_ID\n" + read + "\nhalt\n";
+        qtx_refused(before, "%qtxc_param: names beginning %qtxc_ are qtxc's own", "'" + read + "' before an ld.param");
+        qtx_refused(after, "%qtxc_param: names beginning %qtxc_ are qtxc's own", "'" + read + "' after an ld.param");
+    }
     // 3. Nothing wraps: a product is checked before it is made, and an
     // array's extent is 64 bits wide until it has been checked to fit.
     qtx_refused(".equ N, (1 << 32) * (1 << 32)\nhalt\n", "the value is out of range", "a product past 64 bits");

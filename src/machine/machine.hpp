@@ -445,7 +445,9 @@ private:
     // executes: its operand latches. Its pc is (S) PANIC text; its active
     // mask is its result's lane enables (16 bits): the issue cycle's active
     // mask, ANDed with the instruction's write mask at the sample; its uniform
-    // read is ur2r's.
+    // read, when it has one, is ur2r's source or the uniform second source
+    // (src1, the U bit) of an ALU / FPU instruction (takes_uniform_source),
+    // sampled with the round.
     //
     // DispatchEntry: a memory / engine / mbar instruction between accepted issue and its
     // unit: the issue register and the

@@ -54,7 +54,8 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
         throw SimError(
             "assembly profile '" + program.profile_name + "@" +
             format_profile_fingerprint(program.profile_fingerprint) + "' does not match '" +
-            profile.name + "@" + format_profile_fingerprint(expected) + "'");
+            profile.name + "@" + format_profile_fingerprint(expected) + "' (the fingerprint stamps the device "
+            "profile and the instruction-set revision, " + std::to_string(isa_revision) + " here)");
     }
     Kernel kernel;
     kernel.register_count = register_count(program);

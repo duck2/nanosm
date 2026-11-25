@@ -110,6 +110,18 @@ TEST(Urf, write_and_read_timing) {
     require(scheduled.instructions[0].control.stall == 4, "qtxc: uniform write -> uniform read is not 4 cycles");
     require(scheduled.instructions[1].control.stall == 4, "qtxc: uniform write -> ur2r is not 4 cycles");
     require(scheduled.instructions[2].control.stall == 6, "qtxc: ur2r -> vector read is not 6 cycles (like mov)");
+    // A uniform second source is read like ur2r's: 4 after its writer. One
+    // cycle sooner is the sanitizer's PANIC.
+    const auto uniform_b = qtx_program("umov ur2, 7\nadd r3, r1, ur2\nhalt\n", profile);
+    require(uniform_b.instructions[0].control.stall == 4, "qtxc: uniform write -> add's uniform source is not 4 cycles");
+    nanosm::Machine at_distance(profile, compile("umov ur2, 7\nadd r3, r1, ur2\nhalt\n"), launch_warps(1));
+    at_distance.run(20000);
+    require(at_distance.read_reg(0, 5, 3) == 7, "add read its uniform source wrong");
+#if NANOSM_SANITIZER
+    nanosm::Machine early(profile, nanosm::assemble_asm(hand_asm(profile,
+        "umov ur2, 7 {pred=PT, stall=3, set=-, wait=-}\nadd r3, r1, ur2\nhalt"), profile), launch_warps(1));
+    expect_panic(early, {"URF RAW hazard: missing stall for ur2"}, "add three cycles after its uniform source");
+#endif
 
     nanosm::Machine machine(profile, compile(R"(
         usread ur0, WARP_ID
