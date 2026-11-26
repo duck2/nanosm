@@ -8,9 +8,10 @@ files is at the top of `src/machine/machine.cpp`.
 
 ```
  instruction memory
-        |   fetch: one packet a cycle, round robin over the warps
+        |   fetch: one packet a cycle, round robin over the warps;
+        |   each word is decoded once, as its packet lands
         v
- instruction buffers, one per warp
+ instruction buffers, one per warp (decoded instructions)
         |
         v
       ISSUE ------------------------------> branch

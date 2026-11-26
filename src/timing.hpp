@@ -69,8 +69,8 @@
 // memory read per cycle, one packet (the two words at an aligned 16-byte
 // address), fixed at one cycle: a fetch granted at f (its
 // address sampled at f's edge) has its packet at the memory output at f + 1,
-// written into the warp's FIFO at that edge, and its words can issue from
-// f + 2. Fetch decides from registered state only (the FIFO's valid packets
+// decoded there and written into the warp's FIFO at that edge, and its
+// instructions can issue from f + 2. Fetch decides from registered state only (the FIFO's valid packets
 // and the fetches in flight), so a packet popped by the issue of its second
 // word at t is refilled by a fetch at t + 1 at the earliest. A packet is a
 // credit that goes round in fetch_to_issue + 2 cycles carrying two words, so

@@ -1,6 +1,6 @@
 // Small pure functions that more than one of the machine's files uses. Included by
 // src/machine/*.cpp only; each file gets its own copy (an anonymous namespace). The opcode
-// classes are src/isa.hpp's.
+// classes not below are src/isa.hpp's.
 #pragma once
 
 #include "machine/machine.hpp"
@@ -61,6 +61,20 @@ inline bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     case Opcode::usetpi_ge_s32: return signed_lhs >= signed_rhs;
     default: throw SimError("internal non-setp comparison");
     }
+}
+
+// Opcode classes by the unit that takes the instruction.
+inline bool is_lsu_opcode(Opcode opcode) {
+    return opcode == Opcode::ldg || opcode == Opcode::stg || opcode == Opcode::ldg_v8 ||
+        opcode == Opcode::stg_v8 || opcode == Opcode::ldg_uni;
+}
+
+inline bool is_mma_command(Opcode opcode) {
+    return is_mma_async(opcode) || opcode == Opcode::mma_commit;
+}
+
+inline bool is_acc_transfer(Opcode opcode) {
+    return is_acc_load(opcode) || opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8;
 }
 
 inline uint32_t beats_per_sector(const Config& config) {

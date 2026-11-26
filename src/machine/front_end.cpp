@@ -1,7 +1,8 @@
-// The front end: fetch, the instruction memory's output, packets, redirects.
+// The front end: fetch, the instruction memory's output and its decoder, packets, redirects.
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
+#include "machine/internal.hpp"
 #include "machine/machine.hpp"
 
 namespace nanosm {
@@ -45,9 +46,10 @@ Machine::FetchGrant Machine::decide_fetch() const {
 // The packet at the instruction memory's output now, for the read in
 // flight: the memory's read port, at the address its register sampled (an
 // asynchronous read of the registered address): the kernel's two words
-// there, zero past the kernel's words (whatever the memory holds there, no
-// such word may have an effect unless it reaches issue, which reports it:
-// head_instruction). Whether it enters its warp's buffer is
+// there, each through the decoder (predecode). A word past the kernel's last
+// is no instruction (the memory holds zero there): its entry stays empty, and
+// it has no effect unless it becomes a warp's next instruction, which issue
+// reports (head_entry). Whether the packet enters its warp's buffer is
 // step_front_end's choice.
 std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() {
     const auto& read = fetch_read_.cur();
@@ -58,9 +60,75 @@ std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() {
     const std::size_t row = read->pc / 16;
     if (row < instruction_memory_.rows()) {
         const auto words = instruction_memory_.read(0, row, "fetch: the instruction memory's output", 0);
-        packet.words = {words[0], words[1]};
+        for (std::size_t half = 0; half < 2; ++half) {
+            if (2 * row + half < kernel_.words.size()) packet.words[half] = predecode(words[half]);
+        }
     }
     return packet;
+}
+
+// The decoder between the instruction memory's output and the buffers: the
+// word's fields, and what issue will ask of the instruction (IssuePlan), from
+// the word and the profile alone -- which of issue's paths it takes, its one
+// read round (src/timing.hpp; kernel load refused any round that does not fit
+// its banks' read ports) of vector and uniform registers, each vector
+// register's bank, and a fixed result's write. acc.st reads only its uniform
+// coordinates at issue (its data beat by beat), and the shared and global
+// memory forms no vector register (their collect stage or command slot reads
+// them, later).
+Machine::BufferedInstruction Machine::predecode(uint64_t word) const {
+    const Instruction inst = decode(word);
+    const auto opcode = inst.opcode;
+    BufferedInstruction entry;
+    entry.instruction = inst;
+    auto& plan = entry.plan;
+    const bool lsu = is_lsu_opcode(opcode);
+    const bool shmem_write = opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
+    const bool shmem_read = is_shared_load(opcode) || is_mbar_predicate_writer(opcode);
+    if (uses_arithmetic_pipeline(inst)) {
+        plan.kind = IssueKind::arithmetic;
+    } else if (uses_urf_pipeline(opcode)) {
+        plan.kind = IssueKind::uniform;
+    } else if (opcode == Opcode::bra || opcode == Opcode::bra_uni || opcode == Opcode::ssy || opcode == Opcode::sync) {
+        plan.kind = IssueKind::control;
+    } else if (opcode == Opcode::fence_sh) {
+        plan.kind = IssueKind::fence;
+    } else if (opcode == Opcode::nop) {
+        plan.kind = IssueKind::nop;
+    } else if (opcode == Opcode::halt) {
+        plan.kind = IssueKind::halt;
+    } else if (is_tma_opcode(opcode)) {
+        plan.kind = IssueKind::tma;
+    } else if (is_mma_command(opcode)) {
+        plan.kind = IssueKind::mma;
+    } else if (is_acc_transfer(opcode)) {
+        plan.kind = is_acc_load(opcode) ? IssueKind::acc_load : IssueKind::acc_store;
+    } else if (shmem_write || shmem_read) {
+        plan.kind = shmem_write ? IssueKind::shmem_write : IssueKind::shmem_read;
+    } else if (lsu) {
+        plan.kind = IssueKind::lsu;
+    } else {
+        throw SimError("internal: an instruction with no path through issue (kernel load checks every word)");
+    }
+    plan.sfu = opcode == Opcode::ex2 || opcode == Opcode::rcp;
+    auto sources = source_registers(inst);
+    if (opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8 || opcode == Opcode::lds || opcode == Opcode::sts || lsu) {
+        sources.clear();
+    }
+    plan.reads = rf_read_round(sources);
+    for (const auto reg : plan.reads) plan.read_banks.push_back(static_cast<uint8_t>(reg % config_.rf_banks));
+    // The issue round's uniform registers: round 0 of src/timing.hpp's plan (a
+    // tma's and an mma.async's later rounds are the round counter's).
+    const auto rounds = uniform_read_rounds(inst);
+    if (!rounds.empty()) plan.uniform_reads = rounds.front();
+    plan.later_uniform_rounds = rounds.size() > 1;
+    const auto destination = destination_register(inst);
+    if (plan.kind == IssueKind::arithmetic && destination.has_value()) {
+        plan.write_reg = destination;
+        plan.write_bank = static_cast<uint8_t>(*destination % config_.rf_banks);
+        plan.write_delay = issue_to_port(inst, config_);
+    }
+    return entry;
 }
 
 // Every warp's front end after this cycle, in one calculation per warp
@@ -69,8 +137,8 @@ std::optional<Machine::FetchedPacket> Machine::instruction_memory_output() {
 //   - issue: issue accepted the warp's next instruction (captured into the
 //     issue register at this edge); pc moves to the next word, and the head
 //     packet pops if that instruction was its second half;
-//   - landing: the packet at the instruction memory's output joins the buffer
-//     behind the valid packets ([A, B] with A's last word accepted and C
+//   - landing: the packet at the instruction memory's output, decoded, joins
+//     the buffer behind the valid packets ([A, B] with A's last word accepted and C
 //     landing -> [B, C]), unless a redirect or a halt clears the buffer now, or
 //     the warp halted earlier (its read was granted in the halt's cycle);
 //   - halt accepted now: the buffer is cleared and the warp stops;
@@ -165,8 +233,8 @@ void Machine::drive_fetch(const Wires& w) {
     if (next != fetch_read_.cur()) fetch_read_.set_next(next, "drive_fetch");
 }
 
-// The word pc names in the head packet: pc bit 3 selects its half.
-Instruction Machine::head_instruction(const Warp& warp) const {
+// The instruction pc names in the head packet: pc bit 3 selects its half.
+const Machine::BufferedInstruction& Machine::head_entry(const Warp& warp) const {
     const auto& slot = front_end_.cur().at(warp.id);
     if (slot.pc % 8 != 0) throw SimError("unaligned PC in warp " + std::to_string(warp.id));
     if (slot.pc / 8 >= kernel_.words.size()) {
@@ -174,7 +242,7 @@ Instruction Machine::head_instruction(const Warp& warp) const {
             "warp " + std::to_string(warp.id) + " fell off kernel at pc " +
             std::to_string(slot.pc));
     }
-    return decode(slot.buffer.head()[slot.pc / 8 % 2]);
+    return slot.buffer.head()[slot.pc / 8 % 2];
 }
 
 } // namespace nanosm

@@ -99,17 +99,53 @@ struct LsuEdgeEvent {
 // Admission. Whether an instruction issues this
 // cycle is decided from its metadata and resource state only -- never from
 // register, predicate or memory contents. depbar_wait and structural_refusal
-// are free functions of the decoded instruction, its IssuePlan (metadata and
-// profile) and a ResourceView (flags); no argument can hold an operand value.
-// Operands are captured after acceptance (Machine::accept).
+// are free functions of the instruction's wait mask, its IssuePlan (metadata
+// and profile) and a ResourceView (flags); no argument can hold an operand
+// value. Operands are captured after acceptance (Machine::accept).
 // ===========================================================================
 
-// What an instruction books if it is accepted, from metadata and the profile.
+// Which of issue's paths an instruction takes: what admission asks for it
+// and where acceptance sends it.
+enum class IssueKind : uint8_t {
+    none,        // no instruction: a word past the kernel's last
+    arithmetic,  // the fixed-latency pipeline: ALU, FPU, SFU (mov, sread, setp, ur2r included)
+    uniform,     // the URF write pipeline: uniform arithmetic, r2ur, usetp
+    control,     // bra, bra.uni, ssy, sync: the issue register's branch
+    fence,       // fence.sh
+    nop,
+    halt,
+    tma,         // through the URF round counter into the TMA's queue
+    mma,         // mma.async, mma.commit: the dispatch pipeline, the tensor core's queue
+    acc_load,    // acc.ld, acc.ld.v8: the dispatch pipeline, the acc.ld engine
+    acc_store,   // acc.st, acc.st.v8: the dispatch pipeline, the acc.st engine
+    shmem_read,  // lds, lds.uni, the mbar probes: shared memory's read queue
+    shmem_write, // sts, the barrier changes, the atomics: its write queue
+    lsu,         // ldg, stg, ldg.v8, stg.v8, ldg.uni: the load / store unit's queue
+};
+
+// What issue asks of an instruction, from its word and the profile alone. It
+// is worked out once, when the instruction's packet lands in its warp's
+// buffer (Machine::predecode), and held there beside the word's fields; issue
+// reads it and decodes nothing.
 struct IssuePlan {
-    std::vector<uint8_t> reads;         // its one RF read round: each register sampled at issue + issue_to_sample (src/timing.hpp)
-    std::vector<uint8_t> uniform_reads; // the same round's uniform registers (distinct; at most the URF's two read ports)
-    std::optional<uint8_t> write_reg;   // a fixed RF-write booking (arithmetic with an RF destination)
-    uint64_t write_cycle = 0;           // the cycle that result enters its bank's write port
+    IssueKind kind = IssueKind::none;
+    bool sfu = false;                    // an SFU operation: the unit must be free
+    // Its one RF read round: each register sampled at issue + issue_to_sample
+    // (src/timing.hpp), and the bank of each.
+    Bounded<uint8_t, limits::round_reads> reads;
+    Bounded<uint8_t, limits::round_reads> read_banks;
+    // The same round's uniform registers (distinct; at most the URF's two
+    // read ports), and whether more rounds follow it (a tma, an mma.async:
+    // the URF's round counter).
+    Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;
+    bool later_uniform_rounds = false;
+    // A fixed RF-write booking (arithmetic with an RF destination): the
+    // register, its bank, and how many cycles after issue the result enters
+    // that bank's write port (the write calendar's tap).
+    std::optional<uint8_t> write_reg;
+    uint8_t write_bank = 0;
+    uint32_t write_delay = 0;
+    bool operator==(const IssuePlan&) const = default;
 };
 
 // Resource state as issue sees it this cycle: Q, plus what this cycle's
@@ -148,9 +184,9 @@ enum class Refusal : uint8_t {
 };
 
 // The first depbar in the instruction's wait mask that is still nonzero.
-std::optional<uint8_t> depbar_wait(const Instruction& inst, const std::array<uint32_t, 6>& depbar);
+std::optional<uint8_t> depbar_wait(uint8_t wait_mask, const std::array<uint32_t, 6>& depbar);
 // The first structural reason the instruction cannot be accepted now.
-std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePlan& plan, const ResourceView& view);
+std::optional<Refusal> structural_refusal(const IssuePlan& plan, const ResourceView& view);
 
 // One RF bank's choice among ready async writers:
 // scan from `cursor`, skip holders not ready for this bank, grant up to
@@ -278,10 +314,22 @@ private:
         uint32_t id = 0;
     };
 
+    // An instruction as the buffer holds it: decoded. The word's fields (as
+    // every later stage carries them) and what issue asks of it (IssuePlan).
+    // The decoder sits between the instruction memory's output and the
+    // buffer: both are written at the edge the packet lands at
+    // (Machine::predecode), so no raw word is kept and issue decodes nothing.
+    struct BufferedInstruction {
+        DecodedInstruction instruction;
+        IssuePlan plan;
+        bool operator==(const BufferedInstruction&) const = default;
+    };
+
     // One warp slot's front end, one
     // of core.warps. Its instruction buffer holds up to
     // core.instruction_buffer_packets fetch packets: a packet is the two
-    // 64-bit words at an aligned 16-byte address, read together. Only valid
+    // 64-bit words at an aligned 16-byte address, read together and decoded
+    // as they land. Only valid
     // entries are held, head first (the valid bits are a thermometer,
     // buffer.size() is the occupancy). The warp's next instruction is the head
     // packet's word that pc names: pc bit 3 selects the half, so no other
@@ -294,7 +342,7 @@ private:
     // PCs (32 bits; the instruction memory's address width in hardware).
     // While the warp runs, fetch_pc = pc rounded down to 16 + 16 x (valid
     // packets + its read in flight): step_front_end checks it every cycle.
-    using FetchPacket = std::array<uint64_t, 2>;
+    using FetchPacket = std::array<BufferedInstruction, 2>;
     // The instruction buffer: a few registers in a row (two packets at the
     // canonical profile), not a memory. Its operations are the front end's:
     // the head packet is read by issue, popped when its second half issues;
@@ -2094,7 +2142,7 @@ private:
     };
     struct FetchedPacket {
         uint32_t warp = 0;
-        FetchPacket words{};          // the memory output (zero past the kernel's words)
+        FetchPacket words{};          // the memory output, decoded (no instruction past the kernel's words)
     };
     struct BranchResolution {
         uint32_t warp = 0;
@@ -2463,7 +2511,7 @@ private:
     // The front end: per warp slot its FIFO,
     // PCs and halted bit; the instruction memory's read in flight; the fetch
     // round-robin cursor (4 bits at 16 warps); the issue register's branch.
-    Regs<WarpFrontEnd> front_end_{clocked_,Unit::front_end, "instruction buffers and PCs"}; // per warp slot
+    Regs<WarpFrontEnd> front_end_{clocked_,Unit::front_end, "instruction buffers (decoded instructions) and PCs"}; // per warp slot
     Reg<std::optional<FetchRead>> fetch_read_{clocked_,Unit::front_end, "instruction memory read (address, tag)"};
     Reg<uint32_t> fetch_cursor_{clocked_,Unit::front_end, "fetch round-robin cursor"};
     Reg<std::optional<IssuedBranch>> issue_branch_{clocked_,Unit::branches, "issue register: branch"};
@@ -2743,6 +2791,9 @@ private:
     // ---- the front end, from Q only: fetch, the memory output, the branch ----
     [[nodiscard]] FetchGrant decide_fetch() const;
     [[nodiscard]] std::optional<FetchedPacket> instruction_memory_output();
+    // The decoder at the memory's output: one word's buffer entry, from the
+    // word and the profile.
+    [[nodiscard]] BufferedInstruction predecode(uint64_t word) const;
     [[nodiscard]] std::optional<BranchResolution> resolve_branch() const;
     [[nodiscard]] std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_memory_output();
     void land_divergence_push(const Wires& w);
@@ -2863,9 +2914,7 @@ private:
     // ---- issue (the scheduler): admission, then acceptance ----
     void decide_issue(Wires& w);
     IssueAttempt try_issue(Warp& warp, Wires& w);
-    [[nodiscard]] IssuePlan issue_plan(const Instruction& inst) const;
-    [[nodiscard]] ResourceView resource_view(
-        const Warp& warp, const Instruction& inst, const IssuePlan& plan, const Wires& w) const;
+    [[nodiscard]] ResourceView resource_view(const Warp& warp, const IssuePlan& plan, const Wires& w) const;
     IssueAttempt refuse(Refusal refusal);
     void accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     void accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
@@ -2970,11 +3019,12 @@ private:
     [[nodiscard]] std::optional<uint64_t> pending_tma_completion_mbar(uint32_t mbar, const Wires& w) const;
 
     // The RF write calendar. Issue books its fixed write (at issue +
-    // issue_to_port), a future cycle; the async writers take the current
-    // write port's free ports (decide_rf_writes).
-    [[nodiscard]] bool write_slot_free(uint8_t reg, uint64_t at_cycle) const;
-    void reserve_write(uint8_t reg, uint64_t at_cycle, Wires& w);
-    [[nodiscard]] std::size_t write_calendar_stage(uint64_t at_cycle) const;
+    // issue_to_port), a future cycle, by the bank and delay its buffer entry
+    // holds; the async writers take the current write port's free ports
+    // (decide_rf_writes).
+    [[nodiscard]] bool write_slot_free(uint32_t bank, uint32_t delay) const;
+    void reserve_write(uint32_t bank, uint32_t delay, Wires& w);
+    [[nodiscard]] std::size_t write_calendar_stage(uint32_t delay) const;
 
     // depbar: completions recorded as they happen; issue sees the counters'
     // Q only (a completion presented at t is visible to issue at t + 1).
@@ -3097,9 +3147,10 @@ private:
     [[nodiscard]] TmaWalker tma_walker_start(const TmaCommand& command, const TmaDescriptor& descriptor) const;
 
     // Issue.
-    // The warp's FIFO head (Q), decoded; "fell off kernel" if its pc is past
-    // the kernel's words (a word fetched there is reported only here).
-    [[nodiscard]] Instruction head_instruction(const Warp& warp) const;
+    // The warp's FIFO head (Q), as it was decoded when it landed; "fell off
+    // kernel" if its pc is past the kernel's words (a word fetched there is
+    // reported only here).
+    [[nodiscard]] const BufferedInstruction& head_entry(const Warp& warp) const;
     [[nodiscard]] uint32_t head_pc(uint32_t warp) const { return front_end_.cur().at(warp).pc; }
     // The VECTOR registers an instruction reads and writes (its uniform ones:
     // uniform_sources / uniform_destination, src/isa.hpp).

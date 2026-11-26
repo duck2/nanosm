@@ -225,6 +225,7 @@ struct Control {
     // counter set_depbar names.
     uint8_t read_depbar = 7;
     uint8_t wait_mask = 0;   // bits 0..5
+    bool operator==(const Control&) const = default;
 };
 
 struct Instruction {
@@ -272,6 +273,7 @@ struct DecodedInstruction {
         inst.imm = imm;
         return inst;
     }
+    bool operator==(const DecodedInstruction&) const = default;
 };
 
 // A kernel's signature (docs/qtx.md "Launch"): the `.param` lines of its qtx, in

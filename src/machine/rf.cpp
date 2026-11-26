@@ -39,27 +39,26 @@ namespace nanosm {
 // write PRESENTED at the port lands at the clock edge Wd cycles later and is
 // visible to samples from the next cycle (no same-edge forwarding).
 
-// The calendar's stage that holds the bookings for `at_cycle`: the last stage
-// is this cycle, each stage before it one cycle later.
-std::size_t Machine::write_calendar_stage(uint64_t at_cycle) const {
-    const auto ahead = at_cycle - cycle_;
-    if (at_cycle < cycle_ || ahead >= write_calendar_.stages()) {
-        throw SimError("internal RF write booking beyond the write calendar");
-    }
-    return write_calendar_.stages() - 1 - static_cast<std::size_t>(ahead);
+// The calendar's stage that holds the bookings for the cycle `delay` cycles
+// from now: the last stage is this cycle, each stage before it one cycle
+// later. An instruction's delay is fixed by its opcode and the profile, so
+// its stage is the same at every attempt.
+std::size_t Machine::write_calendar_stage(uint32_t delay) const {
+    if (delay >= write_calendar_.stages()) throw SimError("internal RF write booking beyond the write calendar");
+    return write_calendar_.stages() - 1 - delay;
 }
 
-bool Machine::write_slot_free(uint8_t reg, uint64_t at_cycle) const {
-    const auto& booked = write_calendar_.stage(write_calendar_stage(at_cycle));
-    return !booked.has_value() || booked->at(reg % config_.rf_banks) < config_.rf_write_ports_per_bank;
+bool Machine::write_slot_free(uint32_t bank, uint32_t delay) const {
+    const auto& booked = write_calendar_.stage(write_calendar_stage(delay));
+    return !booked.has_value() || booked->at(bank) < config_.rf_write_ports_per_bank;
 }
 
 // The booking enters the calendar at this edge (drive_write_calendar), at the
 // stage of its cycle.
-void Machine::reserve_write(uint8_t reg, uint64_t at_cycle, Wires& w) {
-    if (at_cycle <= cycle_) throw SimError("internal RF write booking for the current cycle");
-    if (!write_slot_free(reg, at_cycle)) throw SimError("internal RF write booking over a full port");
-    w.issue.rf_write_stage = write_calendar_stage(at_cycle);
+void Machine::reserve_write(uint32_t bank, uint32_t delay, Wires& w) {
+    if (delay == 0) throw SimError("internal RF write booking for the current cycle");
+    if (!write_slot_free(bank, delay)) throw SimError("internal RF write booking over a full port");
+    w.issue.rf_write_stage = write_calendar_stage(delay);
 }
 
 // The calendar's last stage: a bank's writes booked (in earlier cycles) for

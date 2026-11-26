@@ -7,7 +7,8 @@
 //                      register drivers' order, and the host's read accessors.
 //   launch_copy.cpp    the launch copy: the block the host placed in global memory is copied into the
 //                      parameter area of shared memory while the warps already run.
-//   front_end.cpp      the front end: fetch, the instruction memory's output, packets, redirects.
+//   front_end.cpp      the front end: fetch, the instruction memory's output and its decoder, packets,
+//                      redirects.
 //   branch.cpp         branch resolution (bra, bra.uni, ssy, sync) and the divergence stack.
 //   issue.cpp          issue: admission, the scheduler, wait masks and depbar counters, accept, and the checks
 //                      made when an instruction issues.
@@ -49,7 +50,7 @@
 //   state.hpp          what a register may hold: a payload of a fixed size (checked when this compiles).
 //   fixed.hpp          Bounded<T, N>, a payload field of at most N items: N places and a count.
 //   internal.hpp       small pure functions that more than one unit uses (setp's comparison, a sector's
-//                      bus beats). The opcode classes are src/isa.hpp's.
+//                      bus beats, which unit takes an opcode). The other opcode classes are src/isa.hpp's.
 //
 // What the machine shares with the toolchain (src/, beside src/qtxc/) and which unit it goes with:
 //   limits.hpp         the architectural maxima a profile may give the knobs that size state.
