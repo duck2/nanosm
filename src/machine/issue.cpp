@@ -30,33 +30,26 @@ bool is_acc_transfer(Opcode opcode) {
     return is_acc_load(opcode) || opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8;
 }
 
-// The SIMT shmem users: accesses (load / store slots), mbar probes (the probe
-// register), mbar RMWs and uniform atomics (the RMW engine; an atomic also
-// holds a load slot for its old value).
+// The shared-memory instructions, which wait in a queue (src/machine/shmem.cpp):
+// the read side's (lds, lds.uni, the mbar probes) and the write side's (sts,
+// the barrier changes, the atomics).
 bool uses_shmem(Opcode opcode) {
     return is_shared_load(opcode) || opcode == Opcode::sts || is_mbar_rmw(opcode) ||
         is_mbar_predicate_writer(opcode) || is_atomic(opcode);
 }
 
-// A SIMT shmem instruction's admission: first the warp's own order -- a read
-// waits for the warp's unserviced writes, a write (sts, an RMW, an atomic)
-// for its unserviced reads and writes; reads may pass reads -- then the
-// resources that hold the operation. So a SIMT RMW enters the SIMT RMW
-// register (and later the engine, whose store pause would block them) only
-// once its warp's own lds / sts are serviced. A uniform atomic needs its
-// RETURN load slot as well as the SIMT RMW register: it
-// is admitted with both or not at all, so it never takes the store pause with
-// nowhere to put its old value. (A warp's active mask is never empty: every
-// lds / sts has at least one active lane.)
+bool shmem_write_side(Opcode opcode) {
+    return opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
+}
+
+// A shared-memory instruction's admission, from registers: the warp's own
+// order between the two sides -- a read waits for the warp's unserviced
+// writes, a write for its unserviced reads (each side keeps a warp's
+// accesses in order by itself) -- then a free entry in its queue.
 std::optional<Refusal> shmem_refusal(Opcode opcode, const ResourceView& view) {
-    const bool write = opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
-    if (view.unserviced_write || (write && view.unserviced_read)) return Refusal::shmem_ordered;
-    if ((is_shared_load(opcode) || is_atomic(opcode)) && !view.load_slot_free) return Refusal::load_slots_full;
-    if (opcode == Opcode::sts && !view.store_slot_free) return Refusal::store_slots_full;
-    if (is_mbar_predicate_writer(opcode) && !view.probe_register_free) return Refusal::probe_register_busy;
-    if ((is_mbar_rmw(opcode) || is_atomic(opcode)) && !view.simt_rmw_register_free) {
-        return Refusal::simt_rmw_register_busy;
-    }
+    const bool write = shmem_write_side(opcode);
+    if (write ? view.unserviced_read : view.unserviced_write) return Refusal::shmem_ordered;
+    if (!view.shmem_queue_room) return write ? Refusal::write_queue_full : Refusal::read_queue_full;
     return std::nullopt;
 }
 
@@ -98,7 +91,6 @@ std::optional<Refusal> structural_refusal(const Instruction& inst, const IssuePl
         if (plan.write_reg.has_value() && view.write_inhibited) return Refusal::rf_write_inhibited;
         return std::nullopt;
     }
-    if (is_mbar_try_wait(opcode) && !view.wait_slot_free) return Refusal::wait_slots_full;
     if (is_tma_opcode(opcode) && !view.tma_queue_room) return Refusal::tma_queue_full;
     if (is_mma_command(opcode) && !view.mma_queue_room) return Refusal::mma_queue_full;
     if (is_acc_transfer(opcode) && !view.acc_engine_free) return Refusal::acc_engine_busy;
@@ -183,7 +175,7 @@ void Machine::decide_issue(Wires& w) {
             states[index] = {WarpState::mbar_wait, "mbar probe"};
             continue;
         }
-        if (waiting_slot_of(w, warp.id).has_value()) {
+        if (warp_waiting_in_slot(warp.id)) {
             states[index] = {WarpState::mbar_wait, "mbar phase"};
             continue;
         }
@@ -350,11 +342,13 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
 // read round (src/timing.hpp; kernel load refused any round that does not fit
 // its banks' read ports), vector and uniform registers, and a fixed result's
 // write. acc.st reads only its uniform coordinates at issue (its data beat by
-// beat) and stg.v8 only its base (its data in the LSU's RF read stage).
+// beat), lds / sts none (their collect stage reads them, later) and stg.v8
+// only its base (its data in the LSU's RF read stage).
 IssuePlan Machine::issue_plan(const Instruction& inst) const {
     IssuePlan plan;
     auto sources = source_registers(inst);
-    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) {
+    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 || inst.opcode == Opcode::lds ||
+        inst.opcode == Opcode::sts) {
         sources.clear();
     } else if (inst.opcode == Opcode::stg_v8) {
         sources = {inst.src0};
@@ -375,9 +369,10 @@ IssuePlan Machine::issue_plan(const Instruction& inst) const {
 // The resource state admission may see, as this cycle leaves it (c): the RF
 // write calendar and this cycle's RF read / write decisions, unit occupancy,
 // queue and slot space less what the dispatch pipeline's instructions will
-// take (dispatch_claims). Instruction fields select WHICH resource (a
-// register number's bank, an accumulator's tmem bank); no register content
-// is read.
+// take (dispatch_claims). A shared-memory instruction's terms are registers
+// only: its queue's occupancy and the warp's counts. Instruction fields
+// select WHICH resource (a register number's bank, an accumulator's tmem
+// bank, the queue); no register content is read.
 ResourceView Machine::resource_view(
     const Warp& warp, const Instruction& inst, const IssuePlan& plan, const Wires& w) const {
     const auto claims = dispatch_claims();
@@ -390,7 +385,6 @@ ResourceView Machine::resource_view(
         view.write_slot_free = write_slot_free(*plan.write_reg, plan.write_cycle);
         view.write_inhibited = w.rf_write.banks.at(*plan.write_reg % config_.rf_banks).inhibit_simt;
     }
-    view.wait_slot_free = free_wait_slot_count(w) > claims.wait_slots;
     // A queue slot is counted as taken from a tma's accept: the queue after
     // this cycle, the command its operand read pushes now, the commands it
     // still holds. So the push always fits.
@@ -402,15 +396,13 @@ ResourceView Machine::resource_view(
         const bool load = is_acc_load(inst.opcode);
         view.acc_engine_free = acc_engine_available(w, load) && claims.acc[load ? 0 : 1] == 0;
     }
-    view.unserviced_read = warp_unserviced_read(w, warp.id);
-    view.unserviced_write = warp_unserviced_write(w, warp.id);
-    if (inst.opcode == Opcode::fence_sh) view.own_shmem_at_ram = own_shmem_at_ram(w, warp.id);
-    view.load_slot_free = free_load_slot_count() > claims.load_slots;
-    view.store_slot_free = free_store_slot_count(w) > claims.store_slots;
-    view.probe_register_free =
-        (!mbar_probe_.cur().has_value() || w.shmem.a_read.user == AReadUser::probe) && claims.probes == 0;
-    view.simt_rmw_register_free =
-        (!simt_rmw_.cur().has_value() || w.shmem.simt_rmw_started) && claims.simt_rmw == 0;
+    const auto& counts = shmem_counts_.cur().at(warp.id);
+    view.unserviced_read = counts.reads != 0;
+    view.unserviced_write = counts.writes != 0;
+    view.own_shmem_at_ram = counts.not_at_ram == 0;
+    view.shmem_queue_room = shmem_write_side(inst.opcode)
+        ? write_queue_.cur().size() < config_.shmem_write_queue_entries
+        : read_queue_.cur().size() < config_.shmem_read_queue_entries;
     view.lsu_slot_free = lsu_commands_.cur().size() - w.released_lsu_commands.size() + claims.lsu_commands <
         config_.lsu_active_commands;
     // A scalar store's data lands in the store buffer at its dispatch, so it
@@ -436,7 +428,6 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     case Refusal::rf_write_inhibited:
         trace_->rf_simt_inhibited();
         return {false, WarpState::structural, "RF write inhibited"};
-    case Refusal::wait_slots_full: return {false, WarpState::mbar_wait_slot, "mbar wait slots full"};
     case Refusal::tma_queue_full: return {false, WarpState::structural, "tma command queue full"};
     case Refusal::mma_queue_full: return {false, WarpState::structural, "MMA command queue full"};
     case Refusal::acc_engine_busy: return {false, WarpState::structural, "acc transfer engine busy"};
@@ -447,14 +438,12 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
     // ordered behind the warp's own accesses), told apart by its detail; it
     // is not counted in the summary's shmem "ordered=" (section 4 refusals).
     case Refusal::shmem_fence: return {false, WarpState::shmem_order, "fence.sh: own accesses not at the RAM"};
-    case Refusal::load_slots_full:
-        trace_->shmem_load_slot_wait();
-        return {false, WarpState::shmem_slot, "load slots full"};
-    case Refusal::store_slots_full:
-        trace_->shmem_store_slot_wait();
-        return {false, WarpState::shmem_slot, "store slots full"};
-    case Refusal::probe_register_busy: return {false, WarpState::structural, "mbar probe register busy"};
-    case Refusal::simt_rmw_register_busy: return {false, WarpState::structural, "SIMT RMW register busy"};
+    case Refusal::read_queue_full:
+        trace_->shmem_queue_full(false);
+        return {false, WarpState::shmem_queue, "read queue full"};
+    case Refusal::write_queue_full:
+        trace_->shmem_queue_full(true);
+        return {false, WarpState::shmem_queue, "write queue full"};
     case Refusal::lsu_slot:
         ++trace_->lsu_counters().lsu_no_slot_cycles;
         return {false, WarpState::structural, "LSU command slot"};
@@ -471,8 +460,9 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
 // resolves next cycle (resolve_branch); a halt stops the warp's front end now
 // (its FIFO is cleared, nothing more is fetched or issued; halting inside an
 // arm, with stack entries left or a partial mask, is the sanitizer's PANIC);
-// fence.sh and nop are complete now; everything else books its operand reads
-// and enters the dispatch pipeline.
+// fence.sh and nop are complete now; a shared-memory instruction enters its
+// queue; everything else books its operand reads and enters the dispatch
+// pipeline.
 void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     w.issue.popped = warp.id;
     if (uses_arithmetic_pipeline(inst)) {
@@ -517,7 +507,11 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
         // through the TMA operand read, an mma.async through the dispatch
         // pipeline like every other unit's instruction.
         if (uniform_read_rounds(inst).size() > 1) load_urf_rounds(warp, inst, w);
-        if (!is_tma_opcode(inst.opcode)) accept_for_dispatch(warp, inst, plan, w);
+        if (uses_shmem(inst.opcode)) {
+            accept_shmem(warp, inst, plan, w);
+        } else if (!is_tma_opcode(inst.opcode)) {
+            accept_for_dispatch(warp, inst, plan, w);
+        }
         break;
     }
     check_issue_latency(warp, inst);
@@ -607,15 +601,13 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
 // space.
 void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     const auto opcode = inst.opcode;
-    const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_lsu_opcode(opcode) ||
-        is_acc_transfer(opcode) || is_mma_async(opcode) || is_atomic(opcode);
+    const bool sets_depbar = is_lsu_opcode(opcode) || is_acc_transfer(opcode) || is_mma_async(opcode);
     if (sets_depbar && inst.control.set_depbar >= 6) {
         if (is_mma_async(opcode)) {
             panic(warp, inst, opcode_name(opcode, &config_.mma_shapes) + " has no operand-consumed depbar");
         }
         if (is_acc_transfer(opcode)) panic(warp, inst, "accumulator transfer has no depbar");
-        if (is_lsu_opcode(opcode)) panic(warp, inst, "global memory operation has no depbar");
-        panic(warp, inst, opcode_name(opcode) + " has no depbar");
+        panic(warp, inst, "global memory operation has no depbar");
     }
     if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
     const auto not_ready = std::numeric_limits<uint64_t>::max();
@@ -623,7 +615,6 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
         const auto width = opcode == Opcode::acc_ld_v8 || opcode == Opcode::ldg_v8 ? 8u : 1u;
         for (uint32_t j = 0; j < width; ++j) sanitizer_.record_reg_ready(warp.id, *dst + j, not_ready); // until written
     }
-    if (is_mbar_predicate_writer(opcode)) sanitizer_.record_pred_ready(warp.id, inst.dst, not_ready); // until the probe returns
     // WAR protection: a source read beat by beat stays read-owned until its beat.
     if (opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8 || opcode == Opcode::stg_v8) {
         const auto width = opcode == Opcode::acc_st ? 1u : 8u;
@@ -651,6 +642,45 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     w.issue.dispatch = std::move(entry);
 }
 
+// A shared-memory instruction accepted now enters its side's queue at this
+// edge (src/machine/shmem.cpp), with the active mask; it samples its
+// predicate and uniform registers next cycle, and reads no vector register
+// at issue (its collect stage reads an lds's address and an sts's address
+// and data later). What depends on metadata alone happens now: the depbar it
+// sets, its warp's counts (drive_shmem_counts), the sanitizer's records for
+// its destination (not ready until written) and its vector sources
+// (read-owned until the collect stage reads them). Slot w of the mbar wait
+// slots is warp w's: a try_wait by a warp past the last slot is a PANIC.
+void Machine::accept_shmem(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
+    const auto opcode = inst.opcode;
+    if (is_mbar_try_wait(opcode) && warp.id >= config_.mbar_wait_slots) {
+        panic(warp, inst, "mbar.try_wait by warp " + std::to_string(warp.id) + ": the profile has " +
+            std::to_string(config_.mbar_wait_slots) + " wait slots (sync.mbar_wait_slots), one for each of the first " +
+            std::to_string(config_.mbar_wait_slots) + " warps");
+    }
+    const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_atomic(opcode);
+    if (sets_depbar && inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(opcode) + " has no depbar");
+    if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
+    const auto not_ready = std::numeric_limits<uint64_t>::max();
+    if (const auto dst = destination_register(inst); dst.has_value()) sanitizer_.record_reg_ready(warp.id, *dst, not_ready);
+    if (is_mbar_predicate_writer(opcode)) sanitizer_.record_pred_ready(warp.id, inst.dst, not_ready); // until the probe returns
+    if (opcode == Opcode::lds || opcode == Opcode::sts) sanitizer_.record_async_reader_add(warp.id, inst.src0);
+    if (opcode == Opcode::sts && inst.src1 != inst.src0) sanitizer_.record_async_reader_add(warp.id, inst.src1);
+    ShmemEntry entry;
+    entry.warp = warp.id;
+    entry.pc = head_pc(warp.id);
+    entry.lanes = active_mask(warp.id);
+    entry.instruction = inst;
+    entry.uniform_reads = plan.uniform_reads;
+    // A try_wait's uniform operands must be at the URF output as it leaves
+    // the queue (its wait slot); anything else's when its collect stage
+    // starts, the cycle after it leaves.
+    const auto lu = config_.urf_read_latency_cycles;
+    entry.wait = plan.uniform_reads.empty() ? 0 : static_cast<uint8_t>(is_mbar_try_wait(opcode) ? lu : lu - 1);
+    w.issue.shmem = std::move(entry);
+    w.issue.shmem_write_side = shmem_write_side(opcode);
+}
+
 // A tma or an mma.async accepted now: it loads the
 // URF's round counter, whose round 0 samples next cycle (the issue
 // register's) and whose later rounds one per cycle after that. A tma from now
@@ -675,11 +705,6 @@ Machine::DispatchClaims Machine::dispatch_claims() const {
     for (const auto& stage : dispatch_pipe_.cur()) {
         if (!stage.has_value()) continue;
         const auto opcode = stage->instruction.opcode;
-        if (is_shared_load(opcode) || is_atomic(opcode)) ++claims.load_slots;
-        if (opcode == Opcode::sts) ++claims.store_slots;
-        if (is_mbar_rmw(opcode) || is_atomic(opcode)) ++claims.simt_rmw;
-        if (is_mbar_predicate_writer(opcode)) ++claims.probes;
-        if (is_mbar_try_wait(opcode)) ++claims.wait_slots;
         if (is_lsu_opcode(opcode)) ++claims.lsu_commands;
         if (opcode == Opcode::stg || opcode == Opcode::stg_v8) ++claims.lsu_stores;
         if (is_mma_command(opcode)) ++claims.mma_commands;

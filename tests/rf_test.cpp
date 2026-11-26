@@ -26,13 +26,15 @@ void check_read_capacity(const nanosm::Machine& machine, const nanosm::DevicePro
 }
 
 // The RF write-decision scenarios keep their cycles at any shmem depths:
-// every cycle after an lds.uni moves by X = lds_shift (D + Lb +
-// issue_to_dispatch), so the lds.uni's stall is 1 + X, and a fadd booking
-// placed against its result needs latency base + D + Lb (the fadd's booking
-// already moves by issue_to_dispatch). The address register ur1 is zero
-// from launch. The first instruction issues at fetch_to_issue.
+// every cycle after an lds.uni moves by X = lds_shift (D + Lb + its issue to
+// grant - 1), so the lds.uni's stall is 1 + X, and a fadd booking placed
+// against its result needs latency base + D + Lb + its issue to grant -
+// issue_to_dispatch - 1 (the fadd's booking already moves by
+// issue_to_dispatch). The address register ur1 is zero from launch. The
+// first instruction issues at fetch_to_issue.
 uint8_t shifted_fadd_latency(const nanosm::DeviceProfile& profile, uint32_t base) {
-    return static_cast<uint8_t>(base + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles);
+    return static_cast<uint8_t>(base + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
+        issue_to_shmem_grant(profile) - nanosm::issue_to_dispatch(profile) - 1);
 }
 
 // The RF depths the timing tests run at. r2ur reads its source through the
@@ -176,8 +178,8 @@ TEST(RfSlow, rf_seeded_competing_warps) {
 // after their port.
 TEST(Rf, lds_issue_ignores_its_rounds) {
     auto profile = canonical_profile();
-    const auto dispatch = nanosm::issue_to_dispatch(profile);
-    const auto one_round_port = dispatch + 1 + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
+    const auto one_round_port =
+        issue_to_shmem_grant(profile, true) + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1;
     const auto fadd_before_lds = alu_distance(profile) - 1; // shli, fadd, (stall), lds
     profile.timing.fadd = static_cast<uint8_t>(fadd_before_lds + one_round_port + 1 -
         nanosm::issue_register_stages - profile.rf_read_latency_cycles);
@@ -475,19 +477,20 @@ TEST(Rf, acc_ld_pipeline_freeze) {
         "beats launched or written more than once");
 }
 
-// Load slots (shmem.load_slots = 2). Two lds.uni hold both slots, their
-// results complete and waiting for the RF (eight fadds keep bank 0 booked
-// over them); a third is refused for load slots through the cycle the RF
-// write decision grants slot 0, and issues the cycle after (issue counts the
-// slots empty in Q). Meanwhile port A serves a store. Relative to the first
-// lds.uni at L0: the results reach the RF port at L0 + 9 and L0 + 10 and
-// slot 0's write is granted at G0 = L0 + 16. The sts is ordered behind the
-// second load until its round is granted (issue L0 + 5) and reaches the RAM
-// at L0 + 11, while both results wait; the third lds.uni is ordered behind
-// the sts, then refused for load slots from L0 + 9 through G0.
-TEST(Rf, load_slots) {
+// The write-back buffer (shmem.writeback_entries = 2). Two lds.uni hold both
+// entries, their words back and waiting for the RF (eight fadds keep bank 0
+// booked over them); a third lds.uni waits in the read side's serve stage --
+// it is not an A-read requester -- until the cycle after the RF write
+// decision grants entry 0 (an entry is free in Q from then). Meanwhile port
+// A serves a store. Relative to the first lds.uni at L0 (canonical): its
+// round is granted at L0 + 3 and its word written at the RF port at
+// L0 + 8; the second's one cycle later. Entry 0's write is granted at G0,
+// which the fadds hold off; the third load's round is granted at G0 + 1.
+// The sts issues after the second load's round is granted (its warp's
+// unserviced read) and reaches the RAM while both results wait; the third
+// lds.uni issues after the sts's round is granted.
+TEST(Rf, writeback_buffer) {
     auto profile = canonical_profile();
-    const auto x = lds_shift(profile);
     const auto wd = profile.rf_write_depth_cycles;
     profile.timing.fadd = shifted_fadd_latency(profile, 9);
     auto machine = debug_machine(profile, R"(
@@ -513,44 +516,32 @@ TEST(Rf, load_slots) {
         if (!store_cycle.has_value() && machine->read_shmem_u32(1024) == 7) store_cycle = cycle;
     });
     const auto log = " | issues" + issue_log(*machine);
-    const auto lds = [&](uint32_t n) { return issued_at(*machine, (11 + n) * 8 + (n == 2 ? 8 : 0)); };
-    require(lds(0).size() == 1 && lds(1) == std::vector<uint64_t>{lds(0)[0] + 1}, "the first two lds.uni" + log);
-    const auto l0 = lds(0)[0];
-    const auto g0 = l0 + 16;
-    require(issued_at(*machine, 13 * 8) == std::vector<uint64_t>{l0 + 5},
-        "the sts did not issue as the second load's round was granted" + log);
-    // The sts behind the second load (L0 + 2 .. L0 + 4), the third load behind
-    // the sts (L0 + 6 .. L0 + 8): issue_to_dispatch cycles each.
-    const auto t = nanosm::issue_to_dispatch(profile);
-    require(refusals(*machine, 0, "ordered behind own access") == Slices{{l0 + 2, t}, {l0 + 6, t}},
-        "ordered behind own access" + describe(refusals(*machine, 0, "ordered behind own access")) + log);
-    require(refusals(*machine, 0, "load slots full") == Slices{{l0 + 9, g0 + 1 - l0 - 9}},
-        "the third lds.uni was not refused for load slots from L0 + 9 through slot 0's write grant (G0):" +
-            describe(refusals(*machine, 0, "load slots full")) + log);
-    require(machine->trace().summary().shmem_load_slot_waits == g0 + 1 - l0 - 9, "the refusals were not counted");
-    require(lds(2) == std::vector<uint64_t>{g0 + 1} && written.at(3) == std::vector<uint64_t>{g0 + wd},
-        "the third lds.uni did not take slot 0 the cycle after its write was granted" + log);
-    require(written.at(6) == std::vector<uint64_t>{g0 + 1 + wd} &&
-            written.at(9) == std::vector<uint64_t>{g0 + 1 + x + 2 + wd},
-        "results" + log);
+    const auto reads = grant_cycles(*machine, "A-read", "simt");
+    require(reads.size() == 3, "three A-read rounds" + log);
+    const auto g0 = written.at(3).at(0) - wd; // entry 0's RF write grant
+    require(written.at(6).at(0) == g0 + 1 + wd, "the second load's write did not follow the first's" + log);
+    require(reads[2] == g0 + 1, "the third load's round was not granted the cycle after entry 0's RF write grant" + log);
+    require(store_cycle.has_value() && *store_cycle < g0, "port A did not serve the sts while both entries held words" + log);
     require(machine->read_reg(0, 7, 9) == 0x102, "the third load's word");
-    require(store_cycle == l0 + 11, "port A did not serve the sts while both load slots held results" + log);
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(1024 + 4 * lane) == 7, "sts data");
 }
+
 
 // The helper contract: for an add, an fadd, an SFU op, an lds, an sts and
 // an acc.ld, the cycles the trace shows -- the samples, the port, the RAM
 // (the register's landing edge), the visibility (a depbar waiter's issue) --
 // are src/timing.hpp's, relative to each instruction's accepted issue i, at
-// Lr/Wd 1/1, 2/2 and 3/1 (t = issue_to_dispatch):
+// Lr/Wd 1/1, 2/2 and 3/1 (t = issue_to_dispatch; g = issue_to_shmem_grant
+// of an lds / sts, 3 + Lr):
 //   fixed:  samples i + issue_to_sample, port i + issue_to_port, RAM port +
 //           Wd;
-//   lds:    address sampled at i + 1; A-read grant i + t + 1; the words at
-//           port A's output D + Lb later; the RF port the cycle after; RAM
-//           + Wd; its depbar clears at the visibility, when the waiting add
-//           issues (the counter is 1 through the RAM cycle, 0 from RAM + 1);
-//   sts:    address and data sampled at i + 1; A-write grant i + t + 1, the
-//           word at the shmem RAM D later;
+//   lds:    in its queue at i + 1, its collect stage at i + 2, which samples
+//           its address; A-read grant i + g; the words at port A's output
+//           D + Lb later; the RF port the cycle after; RAM + Wd; its depbar
+//           clears at the visibility, when the waiting add issues (the
+//           counter is 1 through the RAM cycle, 0 from RAM + 1);
+//   sts:    address and data sampled by its collect stage at i + 2; A-write
+//           grant i + g, the word at the shmem RAM D later;
 //   acc.ld: its tmem pointer (a uniform register) sampled from the URF at i + 1,
 //           no RF read; tmem read (beat 0) at i + t + 1 + Dt; RF port Lt
 //           later; RAM + Wd; the waiting add at RAM + 1.
@@ -625,10 +616,10 @@ TEST(Rf, helper_contract) {
         {
             const auto i = issue(12);
             const auto name = what + "lds: ";
-            require(sampled_once(6, i + nanosm::issue_register_stages),
-                name + "the address was not sampled after the issue register");
+            require(sampled_once(6, i + 2), name + "the address was not sampled by the collect stage at i + 2" + log);
             const auto reads = grants_of(*machine, "A-read");
-            require(reads.size() == 1 && reads[0].cycle == i + t + 1, name + "A-read grant:" + describe(reads));
+            require(reads.size() == 1 && reads[0].cycle == i + issue_to_shmem_grant(profile, true),
+                name + "A-read grant:" + describe(reads));
             const auto port = reads[0].cycle + read_return(profile) + 1;
             require(rf_events(*machine, "RF write", 7) == std::vector<uint64_t>{port},
                 name + "not presented at the RF port the cycle after its words" + log);
@@ -643,10 +634,11 @@ TEST(Rf, helper_contract) {
         {
             const auto i = issue(13);
             const auto name = what + "sts: ";
-            require(sampled_once(4, i + nanosm::issue_register_stages) && sampled_once(6, i + nanosm::issue_register_stages),
-                name + "the address and data were not sampled after the issue register" + log);
+            require(sampled_once(4, i + 2) && sampled_once(6, i + 2),
+                name + "the address and data were not sampled together by the collect stage at i + 2" + log);
             const auto writes = grants_of(*machine, "A-write");
-            require(writes.size() == 1 && writes[0].cycle == i + t + 1, name + "A-write grant:" + describe(writes));
+            require(writes.size() == 1 && writes[0].cycle == i + issue_to_shmem_grant(profile, true),
+                name + "A-write grant:" + describe(writes));
             require(stored == writes[0].cycle + profile.shmem_port_a_depth, name + "the word did not reach the RAM D after the grant");
         }
 
@@ -795,57 +787,6 @@ TEST(Rf, async_writer_vs_fixed_booking) {
     }
 }
 
-// Slots are claimed at admission and held while the operands travel (the
-// unit takes the instruction issue_to_dispatch later). One load slot:
-// lds.uni A accepted at a; lds.uni B, tried from a + 1, is refused "load
-// slots full" until the cycle after A's RF write is granted (Wd before it
-// lands): 2 + lds_shift cycles. One store slot, two warps: warp 1's sts,
-// tried the cycle after warp 0's, is refused "store slots full".
-TEST(Rf, slots_claimed_while_operands_travel) {
-    auto profile = canonical_profile();
-    profile.shmem_load_slots = 1;
-    profile.shmem_store_slots = 1;
-    {
-        auto machine = debug_machine(profile, R"(
-            lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
-            lds.uni r6, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
-            halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
-        )");
-        const auto written = watch_registers(*machine, {3, 6});
-        const auto a = issued_at(*machine, 0).at(0);
-        const auto refused = refusals(*machine, 0, "load slots full");
-        require(refused == Slices{{a + 1, 2 + lds_shift(profile)}},
-            "B was not refused from a + 1 until the one slot freed:" + describe(refused));
-        require(written.at(3).size() == 1 &&
-                issued_at(*machine, 8) == std::vector<uint64_t>{written.at(3)[0] - profile.rf_write_depth_cycles + 1},
-            "B did not take the slot the cycle after A's write grant (Wd before it lands)");
-        require(machine->read_reg(0, 0, 6) == 0x101, "B's word");
-    }
-    {
-        auto machine = debug_machine(profile, R"(
-            sread r0, LANE_ID
-            usread ur1, WARP_ID
-            ur2r r1, ur1
-            shli r0, r0, 2
-            shli r1, r1, 6
-            add r0, r0, r1
-            sts [r0 + 1024], r1 {pred=PT, stall=0, set=sb0, wait=-}
-            halt {pred=PT, stall=0, set=-, wait=sb0}
-        )", 2);
-        machine->run();
-        const auto issues = issued_at(*machine, 6 * 8);
-        require(issues.size() == 2 && issues[1] > issues[0], "two sts:" + issue_log(*machine));
-        const auto refused = refusals(*machine, 1, "store slots full");
-        require(!refused.empty() && refused.front().first == issues[0] + 1,
-            "warp 1's sts was not refused for the slot warp 0's travelling sts claimed:" + describe(refused) +
-                issue_log(*machine));
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_shmem_u32(1024 + 4 * lane) == 0 && machine->read_shmem_u32(1024 + 64 + 4 * lane) == 64,
-                "sts data");
-        }
-    }
-}
-
 // The longest fixed dependency must fit the five-bit stall field
 // (src/profile.cpp): Lr + E + Wd + 1 <= 31, E the longest fixed execution.
 // (A longer Lr also needs the uniform writers' path urf.issue_to_port_cycles
@@ -863,13 +804,15 @@ TEST(Rf, profile_fields) {
 }
 
 // Back-to-back same-bank reads. Nine independent instructions issue in
-// consecutive cycles: eight read RF bank 0 (r0, r3, r6, r9: two-source adds,
-// a repeated register, xori, addi, stg, lds, setp) and an lds.uni among them
-// reads only its uniform base (ur0, no RF read). No refusal, no bubble; bank
-// 0 is sampled in every cycle of the run but the lds.uni's, each
-// instruction's sources at its own issue + issue_to_sample; the data are
-// right. Then four warps run the arithmetic part of it: their issues
-// interleave one per cycle with no gap, and bank 0 is sampled once per cycle.
+// consecutive cycles: seven read RF bank 0 in their issue round (r0, r3, r6,
+// r9: two-source adds, a repeated register, xori, addi, stg, setp), an
+// lds.uni among them reads only its uniform base (ur0, no RF read) and an
+// lds reads its r9 later, in its collect stage (after the run). No refusal,
+// no bubble; bank 0 is sampled in every cycle of the run but the lds.uni's
+// and the lds's, each instruction's sources at its own issue +
+// issue_to_sample; the data are right. Then four warps run the arithmetic
+// part of it: their issues interleave one per cycle with no gap, and bank 0
+// is sampled once per cycle.
 TEST(Rf, back_to_back_same_bank_reads) {
     const std::string setup = R"(
         sread r9, LANE_ID
@@ -887,7 +830,7 @@ TEST(Rf, back_to_back_same_bank_reads) {
     )";
     // The run, from pc 96: (each instruction's distinct vector sources).
     const std::vector<std::vector<uint32_t>> mixed_sources{
-        {0, 1}, {3, 2}, {6}, {9}, {}, {9, 1}, {6}, {9}, {9}};
+        {0, 1}, {3, 2}, {6}, {9}, {}, {9, 1}, {6}, {}, {9}};
     const std::string mixed = setup + R"(
         add r10, r0, r1
         add r11, r3, r2
@@ -991,7 +934,9 @@ TEST(Rf, back_to_back_same_bank_reads) {
 // round, one read port per bank): qtxc repairs it with a copy of one source
 // into another bank and a warning; the hand assembler and kernel load refuse
 // it, in both builds, naming the instruction and the registers. The rows
-// cover two- and three-source arithmetic, setp, and sts's base and value.
+// cover two- and three-source arithmetic and setp. (An sts's base and value
+// are read by its collect stage, one after the other when they share a bank:
+// Shmem.sts_registers_in_one_bank.)
 // The assembler and kernel-load cases carry words a looser profile (more
 // read ports) produced, restamped for the profile under test. The atomic, the
 // mbar register forms and mma.async's two addresses take uniform registers,
@@ -1003,7 +948,6 @@ TEST(Rf, same_bank_sources_are_malformed) {
         {"add r2, r0, r3", "r0 and r3"},
         {"fma r1, r2, r5, r8", "r2, r5 and r8"},
         {"setp.eq.u32 p0, r0, r3", "r0 and r3"},
-        {"sts [r3 + 64], r6", "r3 and r6"},
     };
     const auto mentions = [](const std::string& message, const std::string& where, const std::string& registers) {
         return message.rfind(where, 0) == 0 && message.find(": malformed instruction '") != std::string::npos &&
@@ -1313,11 +1257,9 @@ TEST(Rf, async_readers_round_robin) {
 // uniform registers (WARP_ID through usread, the mbar address), WARP_ID /
 // THREAD_ID, a depbar (lds), its shmem order (lds behind its own sts), the
 // stall count, an mbar arrival and a try_wait on a barrier all 16 arrive at
-// (more waiters than the 8 wait slots this test gives the profile), and its
-// trace track.
+// (each in its own wait slot), and its trace track.
 TEST(Rf, sixteen_warps) {
-    auto profile = canonical_profile();
-    profile.mbar_wait_slots = 8;
+    const auto& profile = canonical_profile();
     auto launch = launch_warps(16);
     write_mbar(image_bytes(launch.test_shmem, 8192), 4096, mbar_state(16, 16));
     nanosm::Machine machine(profile, compile(R"(
@@ -1362,6 +1304,4 @@ TEST(Rf, sixteen_warps) {
     uint64_t warp_cycles = 0;
     for (const auto cycles : summary.warp_cycles) warp_cycles += cycles;
     require(warp_cycles == summary.cycles * 16, "warp attribution does not cover 16 warps");
-    require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait_slot)] != 0,
-        "16 waiters never found the 8 wait slots full");
 }

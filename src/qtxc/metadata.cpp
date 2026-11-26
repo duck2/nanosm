@@ -164,10 +164,14 @@ uint16_t register_count(const AssemblyProgram& program) {
 }
 
 // The vector registers an instruction's issue reads (acc.st reads its data
-// beat by beat and its coordinates from uniform registers: nothing here;
+// beat by beat and its coordinates from uniform registers, lds and sts are
+// read by their shared-memory collect stage after issue: nothing here;
 // stg.v8 only its base).
 std::vector<uint8_t> issue_sources(const Instruction& inst) {
-    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8) return {};
+    if (inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 || inst.opcode == Opcode::lds ||
+        inst.opcode == Opcode::sts) {
+        return {};
+    }
     if (inst.opcode == Opcode::stg_v8) return {inst.src0};
     return sources(inst);
 }

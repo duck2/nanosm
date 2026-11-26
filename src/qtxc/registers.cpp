@@ -203,6 +203,15 @@ std::vector<std::optional<std::pair<std::size_t, std::size_t>>> innermost_loops(
 // The different vector registers an instruction's issue reads, as places.
 std::vector<uint8_t> issue_places(const Instruction& inst) { return rf_read_round(issue_sources(inst)); }
 
+// The places whose banks the chooser spreads: the issue round's, and an
+// sts's address and data, which its collect stage reads in one cycle when
+// their banks differ (one after the other when they do not: no copy is
+// needed, so only the chooser prefers them apart).
+std::vector<uint8_t> preferred_places(const Instruction& inst) {
+    if (inst.opcode == Opcode::sts) return rf_read_round({inst.src0, inst.src1});
+    return issue_places(inst);
+}
+
 // ---- 1. banks ----
 
 // One instruction's read round: its members must spread over the banks.
@@ -536,7 +545,7 @@ void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile) 
         state.rounds_of.assign(vectors.nodes.size(), {});
         state.bank.assign(vectors.nodes.size(), -1);
         for (std::size_t index = 0; index < instructions.size(); ++index) {
-            const auto places = issue_places(instructions[index]);
+            const auto places = preferred_places(instructions[index]);
             if (places.size() <= ports) continue;
             if (places.size() > uint64_t{banks} * ports) {
                 throw SimError("line " + std::to_string(instructions[index].line) + ": '" + instructions[index].text +

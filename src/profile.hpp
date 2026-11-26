@@ -88,12 +88,15 @@ struct DeviceProfile {
     uint32_t urf_issue_to_port_cycles = 3;
     uint32_t shmem_bytes = 0;
     uint32_t shmem_banks = 0;
-    // Load slots: an admitted lds / lds.uni holds one from
-    // admission until the RF write path accepts its gathered vector. >= 1.
-    uint32_t shmem_load_slots = 2;
-    // Store slots: an admitted sts holds one from admission
-    // until its last write round is granted. >= 1.
-    uint32_t shmem_store_slots = 2;
+    // The read queue (lds, lds.uni, the barrier probes) and the write queue
+    // (sts, the barrier changes, the atomics): an issued instruction holds an
+    // entry from its issue until it leaves for its side's collect stage.
+    // 1..16.
+    uint32_t shmem_read_queue_entries = 4;
+    uint32_t shmem_write_queue_entries = 4;
+    // The write-back buffer: a load holds an entry from its first round's
+    // grant until the RF write path accepts its words. >= 1.
+    uint32_t shmem_writeback_entries = 2;
     // D: register stages from a shmem grant to the RAM --
     // the read's sample, the write's edge. The same for A-read, A-write and the
     // port-B write, so accesses reach the RAM in grant order. >= 1.

@@ -84,6 +84,10 @@ uint64_t Machine::full_mask() const {
     throw_issue_panic(site(warp, inst), reason);
 }
 
+[[noreturn]] void Machine::panic(const ShmemEntry& entry, const std::string& reason) const {
+    throw_issue_panic(site(entry), reason);
+}
+
 [[noreturn]] void Machine::panic(const DispatchEntry& op, const std::string& reason) const {
     throw_issue_panic(site(op), reason);
 }

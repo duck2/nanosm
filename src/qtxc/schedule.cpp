@@ -403,9 +403,20 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
+            // An lds's address is read by its collect stage after issue: a
+            // later writer of it waits for the load's depbar (the machine has
+            // no counter for "read"; the depbar is the conservative one).
+            if (inst.opcode == Opcode::lds) pending_async_read_mask[inst.src0] |= static_cast<uint8_t>(1u << bar);
         } else if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg || inst.opcode == Opcode::stg_v8) {
             if (!store_barrier.has_value()) store_barrier = allocate(inst);
             inst.control.set_depbar = *store_barrier;
+            // An sts's address and data are read by its collect stage after
+            // issue: a later writer of either waits for the stores' depbar.
+            if (inst.opcode == Opcode::sts) {
+                for (const auto reg : {inst.src0, inst.src1}) {
+                    pending_async_read_mask[reg] |= static_cast<uint8_t>(1u << *store_barrier);
+                }
+            }
             if (inst.opcode == Opcode::stg_v8) {
                 for (unsigned j = 0; j < 8; ++j)
                     pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);

@@ -40,13 +40,6 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
     case Opcode::acc_st_v8:
         dispatch_acc_transfer(op, w);
         break;
-    case Opcode::lds:
-    case Opcode::lds_uni:
-        dispatch_shared_load(op, w);
-        break;
-    case Opcode::sts:
-        dispatch_shared_store(op, w);
-        break;
     case Opcode::ldg:
     case Opcode::stg:
     case Opcode::ldg_v8:
@@ -54,40 +47,22 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
     case Opcode::ldg_uni:
         dispatch_lsu(op, w);
         break;
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive:
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_arrive_expect_tx_r:
-        dispatch_mbar_rmw(op, w);
-        break;
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_i:
-    case Opcode::mbar_try_wait_r:
-        dispatch_mbar_wait(op, w);
-        break;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni:
-        dispatch_atomic(op, w);
-        break;
     default:
         panic(op, "unknown opcode");
     }
 }
 
-// A masked lds / sts / ldg / stg whose write mask turned every active lane
-// off. Issue could not know: it took its slot (the
+// A masked ldg / stg (or their v8 forms) whose write mask turned every active
+// lane off. Issue could not know: it took its slot (the
 // admission's claim), set its depbar and booked its read round like any.
-// Here it completes with zero accesses: no load or store slot, no LSU
+// Here it completes with zero accesses: no LSU
 // command, no buffer, no request; its depbar is decremented now,
 // so a waiting instruction sees it zero from the next cycle (issue +
 // issue_to_dispatch + 1, canonical issue + 4). A load's destination keeps
 // every lane's old value and is not in flight from then on. Only a
 // write mask can leave no lane: the divergence stack's active mask is never
-// empty, and every other dispatched instruction refuses to be masked.
+// empty, and every other dispatched instruction refuses to be masked. (A
+// masked lds / sts never reaches dispatch: src/machine/shmem.cpp drop_queued.)
 void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     if (!can_be_masked(inst.opcode)) {
@@ -133,9 +108,8 @@ std::vector<uint32_t> Machine::capture(const DispatchEntry& op, uint8_t reg) con
     throw SimError("internal: r" + std::to_string(reg) + " used at dispatch but not read at issue");
 }
 
-// A uniform-register operand (lds.uni / ldg.uni bases, atom.*.uni address
-// and operand, acc.ld / acc.st tmem pointers, mbar addresses and values, MMA
-// addresses and result pointer, mma.commit's mbar), as its round latched it
+// A uniform-register operand (ldg.uni bases, acc.ld / acc.st tmem pointers,
+// MMA addresses and result pointer, mma.commit's mbar), as its round latched it
 // at its sample (step_rf_reads). Uniform by construction: no lane check. The
 // uniform operation's partial-mask rule stays (the sanitizer's PANIC).
 uint32_t Machine::uniform_operand(const DispatchEntry& op, uint8_t ureg) const {

@@ -65,13 +65,13 @@ struct IssueSite {
     uint64_t cycle, uint32_t address, const std::string& reason, const IssueSite* requester);
 
 // Which async reader of a register finished (selects the internal-underflow text).
-enum class AsyncReader : uint8_t { acc_st, stg_v8 };
+enum class AsyncReader : uint8_t { acc_st, stg_v8, shmem_collect };
 
-// Where a SIMT shmem access waits for its grants:
-// a load slot, a store slot (by slot index), the probe register or the SIMT
-// RMW register / engine (by warp: a warp has at most one probe and one SIMT
-// RMW outstanding).
-enum class SimtShmemHolder : uint8_t { load_slot, store_slot, probe, rmw };
+// Where a SIMT shmem access is granted: shared memory's read side (lds,
+// lds.uni, probes) or write side (sts, barrier changes, atomics: an RMW at
+// its final write). Each side serves its accesses one at a time, in the
+// order they were recorded.
+enum class SimtShmemHolder : uint8_t { read_side, write_side };
 
 // A tmem region an instruction touches (src/layout.hpp): `rows` x `columns`
 // of the region at `pointer` (a logical word) whose rows are row_words words,
@@ -213,7 +213,8 @@ public:
     // ---- missing fence.sh / race ----
     // A shadow of every SIMT shmem access until it REACHES THE RAM (a write's
     // edge, a read's sample: its round's grant + D). An access is recorded
-    // when issue accepts it -- an lds / lds.uni / sts with its bank rounds'
+    // at its issue + 1, while it waits in its queue (its words are the ones
+    // its registers name then) -- an lds / lds.uni / sts with its bank rounds'
     // word addresses (access_bytes 4), a probe or a SIMT mbar RMW as one
     // 8-byte round, a uniform atomic as one 4-byte round (a write: it reads
     // and writes the word) -- and each round's grant then records when it
@@ -229,7 +230,8 @@ public:
     // unfenced command whose warp's accesses already reached the RAM passes.
     void record_simt_shmem_issue(const IssueSite& site, SimtShmemHolder holder, uint32_t index,
         const std::vector<std::vector<uint32_t>>& rounds, uint32_t access_bytes, bool write);
-    // The next round of the access in (holder, index) is granted now (cycle);
+    // The next round of the oldest access in (holder, index) with rounds left
+    // is granted now (cycle);
     // it reaches the RAM at ram_cycle. An sts round is also checked against
     // the live mbars (below).
     void record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, uint32_t index, uint64_t ram_cycle);
@@ -436,8 +438,8 @@ private:
         std::optional<uint64_t> ram_cycle; // granted: the cycle it reaches the RAM (grant + D)
     };
     struct SimtShmemAccess {
-        SimtShmemHolder holder = SimtShmemHolder::load_slot;
-        uint32_t index = 0;                // slot index, or the warp (probe, RMW)
+        SimtShmemHolder holder = SimtShmemHolder::read_side;
+        uint32_t index = 0;                // 0 (one access at a time per side)
         uint32_t warp = 0;
         uint32_t pc = 0;
         uint64_t issue_cycle = 0;

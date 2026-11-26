@@ -18,8 +18,8 @@
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
 //   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, black boxes with
 //                      their contracts.
-//   shmem.cpp          shared memory: ports A and B, the selects, load and store slots, bank rounds, and what
-//                      issue sees of them.
+//   shmem.cpp          shared memory: ports A and B, the two sides (queues, collect and serve stages), the
+//                      write-back buffer, the selects, bank rounds, and what issue sees of them.
 //   barriers.cpp       barriers (mbar): probes, the read-modify-write engine, atomics, and the try-wait slots.
 //   tma.cpp            the TMA: its operand read, the command queue, the walker, requests and completions.
 //   tma_ports.cpp      the TMA's rounds on the shared-memory ports: descriptor and store reads, placement
@@ -139,8 +139,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         acc_engines_.poke(AccEngines{});
         acc_ld_pipe_.build(config_.tmem_port_depth + config_.tmem_read_latency_cycles);
         acc_st_pipe_.build(config_.rf_read_latency_cycles + config_.tmem_port_depth);
-        load_slots_.build(config_.shmem_load_slots);
-        store_slots_.build(config_.shmem_store_slots);
+        writeback_.build(config_.shmem_writeback_entries);
+        shmem_counts_.build(config_.core_warps);
         a_read_pipe_.build(config_.shmem_port_a_depth + config_.shmem_read_latency_cycles);
         a_write_pipe_.build(config_.shmem_port_a_depth);
         b_write_pipe_.build(config_.shmem_port_a_depth);
@@ -270,18 +270,21 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // and their v8 forms, acc.ld / acc.st, mma.async; nothing else sets
         // a depbar) until its decrement, and all that time it is in exactly
         // one of these places, each of which holds only so many:
-        //   shmem.load_slots    an lds, lds.uni or atomic: its load slot, or
-        //                       its claim on one in the dispatch pipeline,
-        //                       until the register-file write decision
-        //                       grants its write;
-        //   shmem.store_slots   an sts: its store slot or its claim on one,
-        //                       until its last round is granted (a store
-        //                       whose lanes are all off is decremented at
-        //                       dispatch, still holding its claim; so for a
-        //                       load);
+        //   shmem.read_queue_entries + shmem.write_queue_entries
+        //                       an lds, lds.uni, sts or atomic in its queue
+        //                       (one whose lanes are all off is decremented
+        //                       there, at its issue + 1);
+        //   4                   the two collect stages and the two serve
+        //                       stages, one access each (an atomic until
+        //                       its RMW starts);
+        //   shmem.writeback_entries + 1
+        //                       a load in its write-back entry, an atomic
+        //                       in the old-word register, until the
+        //                       register-file write decision grants its
+        //                       write;
         //   shmem.port_a_depth  an sts's last round on its way to the RAM:
         //                       one round per A-write stage, decremented at
-        //                       the last (its slot is free meanwhile);
+        //                       the last (it has left serve);
         //   lsu.active_commands an ldg or stg: its command slot or its claim
         //                       on one, a load's until its last register
         //                       write is granted, a store's until its last
@@ -308,11 +311,11 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         //                       cycle and is write_depth_cycles on the way;
         //   1                   a launch flag, counted from the launch until
         //                       the copy passes its cut.
-        depbar_counter_max_ = config_.shmem_load_slots + config_.shmem_store_slots + config_.shmem_port_a_depth +
+        depbar_counter_max_ = config_.shmem_read_queue_entries + config_.shmem_write_queue_entries + 4 +
+            config_.shmem_writeback_entries + 1 + config_.shmem_port_a_depth +
             config_.lsu_active_commands + store_ack_records_detached_ + config_.mma_queue_commands + 2 +
             config_.tmem_port_depth + config_.tmem_read_latency_cycles +
             config_.rf_banks * config_.rf_write_ports_per_bank * config_.rf_write_depth_cycles + 1;
-        shmem_to_ram_.build(config_.core_warps);
         declare_black_boxes();
         sanitizer_.record_launch(config_, kernel_, launch.active_warps);
     } catch (const std::bad_alloc&) {
@@ -372,24 +375,22 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          return reach issue through their registers, the next cycle.
 //      (c) Issue looks ahead: an instruction accepted at t occupies its
 //          resources from t+1, so issue sees the space this cycle frees
-//          (queue entries, slots freed by this cycle's grants, the SIMT RMW
-//          register emptied by an RMW start, the store buffer) and the
-//          warp's shmem accesses as this cycle's grants leave them -- less
-//          the space the dispatch pipeline's
-//          instructions will take (dispatch_claims). Not the load slots
-//          (an lds's or an atomic's return slot): issue counts the slots
-//          empty in Q, so a slot whose RF write is granted at t is free for
-//          a new admission from t + 1 (RF winner -> slot space -> winning
-//          warp would be the longest path through issue). The RF write
-//          decision's fairness inhibit, the LSU command slot its grant
+//          (queue entries, the store buffer) -- less the space the dispatch
+//          pipeline's instructions will take (dispatch_claims). Not shared
+//          memory: a shared-memory instruction's questions (its queue's
+//          free entries, its warp's counts, fence.sh's count) read Q only,
+//          so an entry or an order freed at t is seen from t + 1. The RF
+//          write decision's fairness inhibit, the LSU command slot its grant
 //          releases, and
 //          the acc.ld engine its grant lets advance are still seen at t.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
-//          t (the load and store buffers, a load slot whose RF write is granted
-//          at t -- by dispatch, which issue admitted earlier against the
-//          slots' Q -- the TMA sector / store registers, the MMA event register,
-//          an LSU slot or acc slot reallocated by dispatch). The refill's
-//          data is visible at t+1; nothing passes through.
+//          t (the load and store buffers, a shared-memory collect or serve
+//          stage whose access moves on at t, the TMA sector / store
+//          registers, the MMA event register, an LSU slot or acc slot
+//          reallocated by dispatch). The refill's data is visible at t+1;
+//          nothing passes through. (Not the write-back buffer or the
+//          old-word register: an entry whose RF write is granted at t is
+//          free from t + 1.)
 //      (e) A dispatched stg.v8 may make its first RF read beat in its
 //          dispatch cycle.
 //      (f) Inside the MMA: a step whose tile's previous result lands at this
@@ -407,8 +408,8 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          start (A-write's alternation lets it begin, the engine takes the
 //          request from its register) and its read grant may share a cycle:
 //          select_a_read sees the start (shmem wire order: A-write, RMW
-//          admission, A-read). A SIMT access or RMW accepted at issue sits in
-//          its slot / register and is served from the next cycle. A new MMA
+//          admission, A-read). A SIMT access or RMW enters its side's serve
+//          stage at an edge and is served from the next cycle. A new MMA
 //          fetch serves its first port-B round in the cycle it starts.
 //      (i) None from issue into fetch: the fetch decision reads registers
 //          only (the
@@ -548,12 +549,13 @@ bool Machine::done() const {
     const auto all_empty = [](const auto& group) {
         return std::all_of(group.cur().begin(), group.cur().end(), [](const auto& slot) { return !slot.has_value(); });
     };
-    // The slots in every state, the probe register, the RMW
-    // engine (its SIMT RMW register, operation and ALU stages) and the
-    // services' pipelines (a store whose slot is free may still be travelling
-    // to its write edge).
-    const bool shmem_idle = all_empty(load_slots_) && all_empty(store_slots_) && empty(mbar_probe_) &&
-        empty(simt_rmw_) &&
+    // Both sides (queues, collect and serve stages), the write-back buffer
+    // and the old-word register, the RMW engine (its operation and ALU
+    // stages) and the services' pipelines (a store that has left serve may
+    // still be travelling to its write edge).
+    const bool shmem_idle = read_queue_.cur().empty() && write_queue_.cur().empty() && empty(read_collect_) &&
+        empty(write_collect_) && empty(read_serve_) && empty(write_serve_) && all_empty(writeback_) &&
+        empty(atomic_return_) &&
         !rmw_.cur().active.has_value() && rmw_alu_.empty() && a_read_pipe_.empty() &&
         a_write_pipe_.empty() && b_write_pipe_.empty() && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
@@ -647,7 +649,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 46> canonical = {
+    static constexpr std::array<Driver, 47> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -655,15 +657,16 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_depbar,
         &Machine::drive_scheduler,
         &Machine::drive_wait_slots,
-        &Machine::drive_load_slots,
-        &Machine::drive_store_slots,
-        &Machine::drive_mbar_probe,
-        &Machine::drive_simt_rmw,
+        &Machine::drive_shmem_queues,
+        &Machine::drive_shmem_collects,
+        &Machine::drive_shmem_serves,
+        &Machine::drive_writeback,
+        &Machine::drive_atomic_return,
+        &Machine::drive_shmem_counts,
         &Machine::drive_rmw_engine,
         &Machine::drive_a_read_pipe,
         &Machine::drive_write_pipes,
         &Machine::drive_shmem_arbiters,
-        &Machine::drive_shmem_to_ram,
         &Machine::drive_tma_event,
         &Machine::drive_mma_event,
         &Machine::drive_mma,

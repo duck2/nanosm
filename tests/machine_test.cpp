@@ -175,8 +175,9 @@ TEST(Machine, optional_profile_fields) {
     check_optional_field("urf", "write_depth_cycles", 1, &P::urf_write_depth_cycles, 1, 8);
     check_optional_field("urf", "alu_latency_cycles", 1, &P::urf_alu_latency_cycles, 1, 8, later_uniform_port);
     check_optional_field("urf", "issue_to_port_cycles", 3, &P::urf_issue_to_port_cycles, 1, 30);
-    check_optional_field("shmem", "load_slots", 2, &P::shmem_load_slots, 1, 1024);
-    check_optional_field("shmem", "store_slots", 2, &P::shmem_store_slots, 1, 1024);
+    check_optional_field("shmem", "read_queue_entries", 4, &P::shmem_read_queue_entries, 1, 16);
+    check_optional_field("shmem", "write_queue_entries", 4, &P::shmem_write_queue_entries, 1, 16);
+    check_optional_field("shmem", "writeback_entries", 2, &P::shmem_writeback_entries, 1, 1024);
     check_optional_field("shmem", "port_a_depth", 2, &P::shmem_port_a_depth, 1, 64);
     check_optional_field("shmem", "read_latency_cycles", 2, &P::shmem_read_latency_cycles, 1, 64);
     check_optional_field("shmem", "rmw_compute_cycles", 2, &P::shmem_rmw_compute_cycles, 1, 64);

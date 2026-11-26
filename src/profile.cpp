@@ -52,8 +52,9 @@ json profile_json(const DeviceProfile& p) {
         {"shmem", {
             {"bytes", p.shmem_bytes},
             {"banks", p.shmem_banks},
-            {"load_slots", p.shmem_load_slots},
-            {"store_slots", p.shmem_store_slots},
+            {"read_queue_entries", p.shmem_read_queue_entries},
+            {"write_queue_entries", p.shmem_write_queue_entries},
+            {"writeback_entries", p.shmem_writeback_entries},
             {"port_a_depth", p.shmem_port_a_depth},
             {"read_latency_cycles", p.shmem_read_latency_cycles},
             {"rmw_compute_cycles", p.shmem_rmw_compute_cycles},
@@ -266,8 +267,11 @@ void validate_device_profile(const DeviceProfile& p) {
     if (p.core_divergence_stack_entries > 64) {
         throw ProfileError("device profile: core divergence_stack_entries must be in 0..64");
     }
-    if (p.shmem_load_slots == 0 || p.shmem_store_slots == 0) {
-        throw ProfileError("device profile: shmem load and store slots must be at least 1");
+    within("shmem read_queue_entries", p.shmem_read_queue_entries, limits::shmem_queue_entries);
+    within("shmem write_queue_entries", p.shmem_write_queue_entries, limits::shmem_queue_entries);
+    if (p.shmem_read_queue_entries == 0 || p.shmem_write_queue_entries == 0 || p.shmem_writeback_entries == 0) {
+        throw ProfileError("device profile: shmem read_queue_entries, write_queue_entries and writeback_entries "
+            "must be at least 1");
     }
     // Every latency is a nonzero number of register stages.
     if (p.shmem_port_a_depth == 0 || p.shmem_port_a_depth > 64 ||
@@ -532,8 +536,9 @@ DeviceProfile parse_device_profile(std::string_view source) {
     p.shmem_banks = field<uint32_t>(shmem, "banks");
     // Optional (absent: the struct's canonical default); present: an integer
     // in [low, high]. A 0 is rejected here and again by validation.
-    optional_field(shmem, "shmem", "load_slots", 1, 1024, p.shmem_load_slots);
-    optional_field(shmem, "shmem", "store_slots", 1, 1024, p.shmem_store_slots);
+    optional_field(shmem, "shmem", "read_queue_entries", 1, 16, p.shmem_read_queue_entries);
+    optional_field(shmem, "shmem", "write_queue_entries", 1, 16, p.shmem_write_queue_entries);
+    optional_field(shmem, "shmem", "writeback_entries", 1, 1024, p.shmem_writeback_entries);
     optional_field(shmem, "shmem", "port_a_depth", 1, 64, p.shmem_port_a_depth);
     optional_field(shmem, "shmem", "read_latency_cycles", 1, 64, p.shmem_read_latency_cycles);
     optional_field(shmem, "shmem", "rmw_compute_cycles", 1, 64, p.shmem_rmw_compute_cycles);

@@ -513,9 +513,23 @@ inline uint32_t read_return(const nanosm::DeviceProfile& profile) {
     return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
 }
 
-// An lds's result is written to the RF D + Lb + issue_to_dispatch after its issue.
-inline uint32_t lds_shift(const nanosm::DeviceProfile& profile = canonical_profile()) {
-    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + nanosm::issue_to_dispatch(profile);
+// Accepted issue -> an uncontended queued shared-memory access's first grant
+// (src/machine/shmem.cpp): it enters its queue at the issue's edge and may
+// leave it at issue + 1 (its uniform operands, if any, at the URF output by
+// the time its collect stage uses them: issue + Lu), is in the collect stage
+// the cycle after leaving, and enters serve when its registers are at the RF
+// output (at once without vector registers; Lr after its collect stage's
+// sample for an lds / sts), granted the cycle after. Canonical: 3 for
+// lds.uni, a probe, a barrier change, an atomic; 5 for lds and sts.
+inline uint32_t issue_to_shmem_grant(const nanosm::DeviceProfile& profile, bool reads_registers = false) {
+    return reads_registers ? 3 + profile.rf_read_latency_cycles : 2 + profile.urf_read_latency_cycles;
+}
+
+// An lds's result is written to the RF D + Lb + (issue to grant) - 1 after
+// its issue (vector_address: an lds; else an lds.uni).
+inline uint32_t lds_shift(const nanosm::DeviceProfile& profile = canonical_profile(), bool vector_address = false) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
+        issue_to_shmem_grant(profile, vector_address) - 1;
 }
 
 // An RMW's write is granted D + Lb + C cycles after its read (the read's

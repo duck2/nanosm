@@ -285,20 +285,22 @@ TEST(FrontEnd, prefetch_through_waits) {
             lds.uni r20, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
             mov r1, 1 {pred=PT, stall=0, set=-, wait=sb0}
         )" + independent_movs(3) + "halt\n");
-        const auto release = nanosm::fetch_to_issue + nanosm::issue_to_dispatch(profile) + 1 +
+        const auto release = nanosm::fetch_to_issue + issue_to_shmem_grant(profile) +
             profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles + 1;
         check(*machine, 8, release, "depbar");
     }
-    {   // A refused head: one load slot; the second lds.uni is refused until
-        // the first's RF write frees the slot (the cycle after its grant,
-        // 2 + lds_shift cycles after the refusal starts).
+    {   // A refused head: one read queue entry; the second lds.uni is refused
+        // while the first holds it -- the first is in the queue the cycle
+        // after its issue and leaves it then (its uniform operand at the URF
+        // output as its collect stage starts), so the second issues two
+        // cycles after the first.
         auto one = profile;
-        one.shmem_load_slots = 1;
+        one.shmem_read_queue_entries = 1;
         auto machine = machine_as_written(one, R"(
             lds.uni r20, [ur1] {pred=PT, stall=0, set=sb0, wait=-}
             lds.uni r22, [ur1 + 4] {pred=PT, stall=0, set=sb1, wait=-}
         )" + independent_movs(3) + "halt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n");
-        check(*machine, 8, nanosm::fetch_to_issue + 1 + 2 + lds_shift(one), "refused head");
+        check(*machine, 8, nanosm::fetch_to_issue + 2, "refused head");
     }
 }
 

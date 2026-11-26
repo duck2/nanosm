@@ -569,16 +569,17 @@ TEST(Stepping, buffer_reuse_load_to_scalar_store) {
 
 // A depbar completion and an admission on one counter in one cycle are one
 // calculation, 1 - 1 + 1 = 1; neither is deferred. The lds.uni on sb0
-// completes when its RF write lands: its dispatch (issue + issue_to_dispatch),
-// its A-read grant one cycle later, D + Lb to its word, one cycle to the RF
-// write decision, Wd to the write. `pad` movs put the ldg, which sets sb0
-// without waiting on it, at that cycle. The lds.uni reads the umov's ur0 at
-// the uniform distance; the ldg's base r0 is never written (0).
+// completes when its RF write lands: its A-read grant (issue +
+// issue_to_shmem_grant: its queue, collect and serve stages), D + Lb to its
+// word, one cycle to the RF write decision, Wd to the write. `pad` movs put
+// the ldg, which sets sb0 without waiting on it, at that cycle. The lds.uni
+// reads the umov's ur0 at the uniform distance; the ldg's base r0 is never
+// written (0).
 TEST(Stepping, simultaneous_depbar_completion_and_admission) {
     const auto& profile = canonical_profile();
     const uint64_t lds_issue = nanosm::fetch_to_issue + nanosm::issue_to_urf_visible(profile) -
         nanosm::issue_register_stages;
-    const auto completion_cycle = lds_issue + nanosm::issue_to_dispatch(profile) + 1 + profile.shmem_port_a_depth +
+    const auto completion_cycle = lds_issue + issue_to_shmem_grant(profile) + profile.shmem_port_a_depth +
         profile.shmem_read_latency_cycles + 1 + profile.rf_write_depth_cycles;
     const auto pad = completion_cycle - lds_issue - 1;
     std::string body = "umov ur0, 0\nlds.uni r1, [ur0] {pred=PT, stall=0, set=sb0, wait=-}\n";

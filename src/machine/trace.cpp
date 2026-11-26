@@ -65,9 +65,8 @@ std::string warp_state_name(WarpState state) {
     case WarpState::stall_count: return "stall count";
     case WarpState::depbar: return "depbar";
     case WarpState::mbar_wait: return "mbar wait";
-    case WarpState::mbar_wait_slot: return "mbar wait slot";
     case WarpState::structural: return "structural";
-    case WarpState::shmem_slot: return "no free slot";
+    case WarpState::shmem_queue: return "shmem queue full";
     case WarpState::shmem_order: return "ordered behind own access";
     case WarpState::no_instruction: return "waiting for instruction";
     case WarpState::halted: return "halted";
@@ -200,7 +199,6 @@ void TraceRecorder::close_warp_interval(uint32_t warp, uint64_t end_cycle) {
 
 void TraceRecorder::warp_state(uint64_t cycle, uint32_t warp, WarpState state, std::string detail) {
     ++summary_.warp_cycles.at(static_cast<std::size_t>(state));
-    if (state == WarpState::mbar_wait_slot) ++summary_.mbar_slot_full_stalls;
     auto& interval = warp_intervals_.at(warp);
     if (interval.active && interval.state == state && interval.detail == detail) return;
     close_warp_interval(warp, cycle);
@@ -589,10 +587,14 @@ std::string TraceRecorder::summary_text() const {
     }
     out << "shmem: requests=" << summary_.shmem_requests
         << " rounds=" << summary_.shmem_rounds
-        << " load_slot_full=" << summary_.shmem_load_slot_waits
-        << " store_slot_full=" << summary_.shmem_store_slot_waits
+        << " read_queue_full=" << summary_.shmem_read_queue_full
+        << " write_queue_full=" << summary_.shmem_write_queue_full
         << " ordered=" << summary_.shmem_order_waits
         << " store_paused=" << summary_.shmem_store_paused << '\n';
+    out << "shmem sides: read_head_wait=" << summary_.shmem_read_head_waits
+        << " write_head_wait=" << summary_.shmem_write_head_waits
+        << " read_bank_wait=" << summary_.shmem_read_bank_waits
+        << " write_bank_wait=" << summary_.shmem_write_bank_waits << '\n';
     out << "shmem grants: a_read_simt=" << summary_.shmem_a_read_simt
         << " a_read_probe=" << summary_.shmem_a_read_probe
         << " a_read_rmw=" << summary_.shmem_a_read_rmw
@@ -609,7 +611,6 @@ std::string TraceRecorder::summary_text() const {
         << " phase_changes=" << summary_.mbar_phase_changes
         << " probes=" << summary_.mbar_initial_probes
         << " immediate=" << summary_.mbar_immediate_successes
-        << " slot_full=" << summary_.mbar_slot_full_stalls
         << " sleeps=" << summary_.mbar_sleeps
         << " wakes=" << summary_.mbar_wakes
         << " timeouts=" << summary_.mbar_timeouts

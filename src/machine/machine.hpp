@@ -39,8 +39,9 @@
 //   - class Machine, public: construction, tick / run, the host's and the
 //     tests' read accessors
 //   - "Machine structures": what each unit's state is made of (wait slots,
-//     front end, divergence, the dispatch entry, load and store slots, the
-//     tensor core, the memory controller and the load / store unit, the TMA)
+//     front end, divergence, the dispatch entry, shared memory's two sides,
+//     the tensor core, the memory controller and the load / store unit, the
+//     TMA)
 //   - "Register contents that change together": the structs one Reg holds
 //   - "Wires": this cycle's decisions, one struct per decision
 //   - "State": the memories, then every Reg, then unit-internal state
@@ -118,19 +119,15 @@ struct ResourceView {
     bool sfu_free = false;           // the SFU is free by this op's execution start
     bool write_slot_free = false;    // the write booking's (bank, cycle) has a free port
     bool write_inhibited = false;    // the RF write decision inhibits new bookings to that bank
-    bool wait_slot_free = false;     // an mbar wait slot
     bool tma_queue_room = false;     // counting the commands the TMA operand read holds
     bool urf_ports_held = false;     // a tma's or an mma.async's uniform read has rounds still to start after this cycle
     bool mma_queue_room = false;
     bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
-    // shmem, as this cycle's grants leave it:
-    bool unserviced_read = false;    // the warp holds a load slot with rounds not yet granted
-    bool unserviced_write = false;   // ... a store slot, or a SIMT RMW (mbar op or atomic) whose write is not yet granted
-    bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM by now
-    bool load_slot_free = false;     // an lds's slot, or an atomic's return slot
-    bool store_slot_free = false;
-    bool probe_register_free = false;
-    bool simt_rmw_register_free = false; // the SIMT RMW register is empty after this cycle
+    // shmem, from the warp's counts and the queues (Q):
+    bool unserviced_read = false;    // the warp has a read (lds, lds.uni, probe) whose last round is not granted
+    bool unserviced_write = false;   // ... a write (sts, barrier change, atomic) whose last write is not granted
+    bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM
+    bool shmem_queue_room = false;   // the instruction's queue (read or write) has a free entry
     bool lsu_slot_free = false;
     bool store_buffer_free = false;  // a scalar stg: no store still has data to move into the egress FIFO
 };
@@ -141,16 +138,13 @@ enum class Refusal : uint8_t {
     sfu_busy,
     rf_write_booked,
     rf_write_inhibited,
-    wait_slots_full,
     tma_queue_full,
     mma_queue_full,
     acc_engine_busy,
     shmem_ordered,
     shmem_fence,
-    load_slots_full,
-    store_slots_full,
-    probe_register_busy,
-    simt_rmw_register_busy,
+    read_queue_full,
+    write_queue_full,
     lsu_slot,
     lsu_store_buffer,
 };
@@ -506,10 +500,10 @@ private:
         std::optional<uint32_t> value;    // the result, from its execution on
     };
 
-    // A SIMT shmem access's lanes and its bank rounds, in the slot's
-    // registers: the lanes that access (the ACTIVE lanes of an lds / sts; an
-    // lds.uni's one access is lane 0's), each one's byte address and the round
-    // it is in, set once when the slot is filled (round r serves, in every
+    // A SIMT shmem access's lanes and its bank rounds, in its side's serve
+    // register: the lanes that access (the lanes of an lds / sts; an lds.uni's
+    // one access is lane 0's), each one's byte address and the round it is
+    // in, set once when the access enters serve (round r serves, in every
     // bank, that bank's r-th accessing lane in ascending lane order: the
     // rounds are the most lanes on any one bank), the number of rounds and how
     // many A-read / A-write has granted. A round's lanes are on different
@@ -525,40 +519,82 @@ private:
         [[nodiscard]] bool in_round(uint32_t lane, uint32_t r) const { return (lanes >> lane & 1) != 0 && round[lane] == r; }
     };
 
-    // A load slot: one lds / lds.uni from admission until
-    // the RF write decision grants its write. Secured at admission (a claim
-    // in the dispatch pipeline), installed at dispatch with the captured
-    // operands, so it is ready for A-read from the next cycle.
-    // Serviced when its last round is granted; complete when every round's
-    // words are back in `words`, the 64 B gather register -- then it is a
-    // ready async RF writer.
-    // Or a uniform atomic's RETURN slot, reserved
-    // at the atomic's admission: no rounds of its own (never an A-read
-    // requester, never an unserviced read); the RMW engine fills it once, with
-    // the word's old value for every lane, and then it waits for the RF like
-    // any lds.uni.
-    struct LoadSlot {
+    // ---- shared memory's two sides (src/machine/shmem.cpp) ----
+    // A queued instruction, narrow: its warp, the instruction, its lanes and
+    // its uniform operands. It enters its side's queue at its issue's edge
+    // with the issue cycle's active mask; in the next cycle (its issue + 1,
+    // `sampled` still false) it samples its predicate -- lanes = the active
+    // mask AND the write mask -- and its uniform registers, which are at the
+    // URF output Lu cycles after that sample. `wait`: cycles until it may
+    // leave the queue (its uniform operands at the URF output by the time
+    // its collect stage uses them; a try_wait's at the URF output as it
+    // leaves, where its wait slot is installed). Widths: valid, warp (4 bits
+    // at 16 warps), the instruction word's fields, 16 lanes, two 32-bit
+    // operands, a small count.
+    struct ShmemEntry {
         uint32_t warp = 0;
-        bool uniform = false;      // lds.uni / an atomic: its one word goes to every lane
-        uint64_t mask = 0;         // the active lanes: its RF write's lane enables
-        SlotRounds access;
-        uint8_t dst = 0;
-        uint8_t depbar = 0;
-        LaneWords words;
-        uint32_t returned = 0;     // rounds whose words are in `words`
-        bool engine_filled = false; // an atomic's return slot: one fill from the RMW engine
-        [[nodiscard]] bool complete() const { return returned == (engine_filled ? 1 : access.rounds); }
+        uint32_t pc = 0;                  // (S) PANIC text
+        uint64_t lanes = 0;
+        DecodedInstruction instruction;
+        Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;
+        Bounded<uint32_t, limits::round_uniform_reads> uniform_operands; // by uniform read, from the sample
+        uint8_t wait = 0;
+        bool sampled = false;
+    };
+    // A queue: its entries in issue order, head first (a few registers in a
+    // row; shmem.read_queue_entries or shmem.write_queue_entries of them).
+    using ShmemQueue = Bounded<ShmemEntry, limits::shmem_queue_entries>;
+
+    // A side's collect stage: one access at a time, reading its vector
+    // registers through the RF's async read ports -- an lds its address, an
+    // sts its address and its data (both in one cycle when both banks have a
+    // port, else the address first). A register sampled at t is at the RF
+    // output at t + Lr; `wait` counts down to the cycle the latest sample is
+    // there. The wide state: a 16-lane latch per register.
+    struct ShmemCollect {
+        ShmemEntry entry;
+        bool address_read = false;
+        bool data_read = false;
+        uint8_t wait = 0;
+        LaneWords address; // lds / sts: src0, every lane, from its sample
+        LaneWords data;    // sts: src1
     };
 
-    // A store slot: one sts from admission until its last
-    // round is granted, with each accessing lane's word (its 64 B data
-    // register). From each grant the A-write pipeline owns that round's
-    // addresses, data and (last round) depbar completion for D cycles.
-    struct StoreSlot {
+    // One entry of the write-back buffer: a load from its first round's grant
+    // until the RF write decision grants its write. Its rounds' words come
+    // back into `words` (16 words); complete when every round is back, then
+    // it is a ready async RF writer.
+    struct WritebackEntry {
         uint32_t warp = 0;
-        SlotRounds access;
-        std::array<uint32_t, limits::lanes> data{};
+        uint8_t dst = 0;
+        uint64_t mask = 0;
         uint8_t depbar = 0;
+        uint32_t rounds = 0;
+        uint32_t returned = 0;
+        LaneWords words;
+        [[nodiscard]] bool complete() const { return returned == rounds; }
+    };
+
+    // The atomic's old-word register: reserved at the atomic's RMW start,
+    // filled by its read's word at the port output, an async RF writer then
+    // (the word to every lane), free at its RF write grant.
+    struct AtomicReturn {
+        uint32_t warp = 0;
+        uint8_t dst = 0;
+        uint64_t mask = 0;
+        uint8_t depbar = 0;
+        std::optional<uint32_t> word;
+    };
+
+    // A warp's shared-memory counts: its reads (lds, lds.uni, probes) and
+    // writes (sts, barrier changes, atomics) issued and not yet serviced (the
+    // last round granted; an RMW's final write), and its accesses whose last
+    // round has not reached the RAM (fence.sh). Each goes up at issue.
+    struct ShmemWarpCounts {
+        uint32_t reads = 0;
+        uint32_t writes = 0;
+        uint32_t not_at_ram = 0;
+        bool operator==(const ShmemWarpCounts&) const = default;
     };
 
     // One beat in the acc.ld engine's pipeline: one column of the transfer
@@ -731,16 +767,15 @@ private:
     // the mbar's CURRENT phase. Which phase the sender meant is sanitizer
     // metadata only: the TMA command id (its completion mbar's phase was
     // peeked at accept) or the host's stated parity.
-    // A uniform atomic is a SIMT request like an mbar operation: its address,
-    // its 32-bit operand in `value`, and the load slot its old value returns
-    // through.
+    // A uniform atomic is a SIMT request like an mbar operation: its address
+    // and its 32-bit operand in `value`; its old value returns through the
+    // old-word register.
     struct MbarRmwRequest {
         MbarRmwOperation operation = MbarRmwOperation::arrive;
         uint32_t byte_address = 0;
         uint32_t value = 0;
         std::optional<uint32_t> warp;   // a SIMT operation's warp (its own shmem order); none: an engine event
-        std::optional<uint32_t> return_slot; // an atomic: its return load slot
-        uint8_t parity = 0;             // (S) the host's complete_tx (complete_mbar_tx): the phase it says it completes
+        uint8_t parity = 0;            // (S) the host's complete_tx (complete_mbar_tx): the phase it says it completes
         std::optional<uint64_t> tma_command; // (S) a TMA's complete_tx: its command (the accept-time phase peek)
         uint32_t pc = 0;                // (S) PANIC text
         DecodedInstruction instruction;        // (S) PANIC text
@@ -781,6 +816,40 @@ private:
         uint8_t parity = 0;
         uint32_t pc = 0;                // (S) PANIC text
         DecodedInstruction instruction;        // (S) PANIC text
+    };
+
+    // The read side's serve stage: the one access whose rounds A-read grants
+    // -- a load (lds, lds.uni) or a probe. A load reserves a write-back
+    // entry at its first grant; its rounds carry that entry and their lanes
+    // to the port output. Free from its last round's grant.
+    struct ReadServe {
+        uint32_t warp = 0;
+        uint32_t pc = 0;                   // (S)
+        DecodedInstruction instruction;    // (S) / (T)
+        SlotRounds access;
+        bool uniform = false;              // lds.uni: its one word to every lane
+        uint8_t dst = 0;
+        uint64_t mask = 0;                 // the load's RF write lane enables
+        uint8_t depbar = 0;
+        std::optional<uint32_t> writeback; // from its first grant
+        std::optional<MbarReadRequest> probe;
+    };
+
+    // The write side's serve stage: one store (its rounds on A-write, with
+    // each accessing lane's word: its 64 B data register), free from its last
+    // round's grant; or one barrier change / atomic, the RMW engine's SIMT
+    // requester, free from its RMW's start. An atomic starts only with the
+    // old-word register free, which it reserves then (dst, mask, depbar).
+    struct WriteServe {
+        uint32_t warp = 0;
+        uint32_t pc = 0;                   // (S)
+        DecodedInstruction instruction;    // (S) / (T)
+        SlotRounds access;
+        std::array<uint32_t, limits::lanes> data{};
+        uint8_t depbar = 0;
+        std::optional<MbarRmwRequest> rmw;
+        uint8_t dst = 0;                   // an atomic's
+        uint64_t mask = 0;                 // an atomic's
     };
 
     // ---- gmem controller (placeholder) + LSU ----
@@ -1435,18 +1504,24 @@ private:
 
     // One granted A-read round in the read pipeline: D stages to the RAM
     // sample, then Lb stages to the port output, where its requester takes the
-    // words. Its return context says where they go: a load slot or a TMA
-    // store register (by index), the TMA frontend latch (the TMA read
+    // words. Its return context says where they go: a write-back entry (with
+    // the lane of each word: a load's lane map rides with its rounds) or a
+    // TMA store register (by index), the TMA frontend latch (the TMA read
     // transaction, held until its words are back), the RMW engine's ALU, or a
-    // probe -- whose register frees at its grant, so the request rides along.
-    enum class ReadClient : uint8_t { load_slot, probe, rmw, tma_frontend, tma_store };
+    // probe -- whose serve stage frees at its grant, so the request rides
+    // along. A SIMT access's last round names its warp: at the RAM sample
+    // that warp's access has reached the RAM (fence.sh's count).
+    enum class ReadClient : uint8_t { load, probe, rmw, tma_frontend, tma_store };
     struct ReadBeat {
-        ReadClient client = ReadClient::load_slot;
-        uint32_t slot = 0;                    // load_slot / tma_store: which load slot / store register
-        std::size_t round = 0;                // load_slot / tma_*: the transaction's round
+        ReadClient client = ReadClient::load;
+        uint32_t slot = 0;                    // load / tma_store: which write-back entry / store register
+        std::size_t round = 0;                // tma_*: the transaction's round
         Bounded<uint32_t, limits::shmem_banks> addresses;      // word-aligned byte addresses, at most one per bank
         Bounded<uint32_t, limits::shmem_banks> words;          // their contents, read at the RAM sample
+        Bounded<uint8_t, limits::shmem_banks> lanes;           // load: each word's lane
+        bool uniform = false;                 // load: lds.uni, its one word to every lane
         std::optional<MbarReadRequest> probe; // probe: the request
+        std::optional<uint32_t> last_of_warp; // a SIMT read's last round: its warp
     };
 
     struct MbarWake {
@@ -1473,6 +1548,7 @@ private:
         std::optional<DepbarEvent> sts_done;   // an sts's last round: its depbar clears
         std::optional<MbarWake> wake;          // an RMW write that flips the phase wakes the waiters
         std::optional<PlacementEnd> placed;    // a TMA placement's last round: its load write ends
+        std::optional<uint32_t> last_of_warp;  // a SIMT write's last round (an RMW's write): its warp
     };
 
     // What the RMW engine's ALU computed from the word(s) it read, in its ALU
@@ -1517,14 +1593,12 @@ private:
         std::array<uint8_t, tma_descriptor_bytes> latch{};
     };
 
-    // The A-read and A-write round-robin pointers. A-read
-    // requesters in order: load slots 0..L-1, the probe register, the TMA;
-    // A-write: store slots 0..S-1. A pointer moves past the requester it
-    // grants, only on a grant. And A-write's alternation bit between RMW
-    // starts and store transactions.
+    // The A-read round-robin pointer over its new requesters, in order: the
+    // read side, the TMA. It moves past the requester it grants, only on a
+    // grant. And A-write's alternation bit between RMW starts and store
+    // transactions.
     struct ShmemArbiters {
         uint32_t a_read = 0;
-        uint32_t a_write = 0;
         // The last start on A-write was an RMW (true) or a store transaction
         // (false). When an RMW and a store both wait to start, the one that did
         // not start last goes: one store transaction between consecutive RMWs.
@@ -1674,12 +1748,13 @@ private:
     // =======================================================================
 
     // The async RF writers: holders of a complete result
-    // vector that waits for its bank's write port. Round-robin order: load
-    // slots, then the load buffer, then the acc.ld engine's pipeline output.
-    enum class AsyncWriter : uint8_t { load_slot, lsu_buffer, acc_ld };
+    // vector that waits for its bank's write port. Round-robin order: the
+    // write-back buffer's entries, the atomic's old-word register, then the
+    // load buffer, then the acc.ld engine's pipeline output.
+    enum class AsyncWriter : uint8_t { writeback, atomic_return, lsu_buffer, acc_ld };
     struct AsyncWrite {
-        AsyncWriter writer = AsyncWriter::load_slot;
-        uint32_t index = 0;   // load slot / load_buffer / 0 (the acc.ld engine)
+        AsyncWriter writer = AsyncWriter::writeback;
+        uint32_t index = 0;   // write-back entry / 0 / load_buffer / 0 (the acc.ld engine)
         uint32_t warp = 0;
         uint8_t reg = 0;
     };
@@ -1709,12 +1784,15 @@ private:
     // The async RF readers: each wants a read
     // port of one bank in the CURRENT cycle, where the issue register's
     // instruction owns the ports it samples.
-    // Round-robin order: the acc.st engine's next beat, then the LSU's
-    // store-data read (vector stores).
-    enum class RfReader : uint8_t { acc_st, lsu_store };
+    // Round-robin order: the acc.st engine's next beat, the LSU's store-data
+    // read (vector stores), the read side's collect stage, the write side's.
+    // The write side's second register (an sts's data, read with its
+    // address) is last and outside the round-robin: it takes a port only if
+    // one is left on its bank.
+    enum class RfReader : uint8_t { acc_st, lsu_store, read_collect, write_collect, write_collect_data };
     struct RfReadRequest {
         RfReader reader = RfReader::acc_st;
-        uint32_t index = 0;          // 0 (the acc.st engine)
+        uint32_t index = 0;          // 0 (the acc.st engine, a collect stage)
         uint32_t warp = 0;
         uint8_t reg = 0;
         uint64_t lsu_command = 0;    // lsu_store
@@ -1739,9 +1817,9 @@ private:
         [[nodiscard]] bool granted_to(RfReader reader, uint32_t index) const;
     };
 
-    // A-read's port output -> a load slot's gather register (one round's words).
-    struct LoadFill {
-        uint32_t slot = 0;
+    // A-read's port output -> a write-back entry (one round's words).
+    struct WritebackFill {
+        uint32_t entry = 0;
         std::vector<std::pair<uint32_t, uint32_t>> lanes; // (lane, word)
     };
 
@@ -1815,25 +1893,29 @@ private:
         std::optional<LsuRead> new_lsu_read;       // an LSU read accepted now: its read record
     };
 
+    // A slot's number and what goes into it.
+    template <typename T>
+    struct IntoSlot {
+        uint32_t slot;
+        T contents;
+    };
+
     // The shmem grants of this cycle: one select per service.
-    enum class AReadUser : uint8_t { none, load_slot, probe, rmw, tma };
+    enum class AReadUser : uint8_t { none, read_side, rmw, tma };
     struct AReadGrant {
         AReadUser user = AReadUser::none;
-        uint32_t slot = 0;                // load_slot: which
         bool tma_start = false;           // tma: a new transaction, round 0 now (bypass (h))
         std::optional<uint32_t> pointer_after; // a round-robin grant: the A-read pointer's next value
-        static AReadGrant to(AReadUser user, uint32_t slot = 0) {
+        static AReadGrant to(AReadUser user) {
             AReadGrant grant;
             grant.user = user;
-            grant.slot = slot;
             return grant;
         }
     };
-    enum class AWriteUser : uint8_t { none, store_slot, rmw };
+    enum class AWriteUser : uint8_t { none, store, rmw };
     struct AWriteGrant {
         AWriteUser user = AWriteUser::none;
-        uint32_t slot = 0;                // store_slot: which
-        std::optional<uint32_t> pointer_after; // a round-robin grant (a new store transaction): the A-write pointer's next value
+        bool store_start = false;         // store: its first round (a store transaction starts)
         bool rmw_start = false;           // A-write's alternation lets an RMW start now: its store PAUSE begins
     };
     enum class BWriteUser : uint8_t { none, tma_continue, tma_start };
@@ -1853,16 +1935,33 @@ private:
         std::optional<WriteBeat> a_write_beat;
         std::optional<WriteBeat> b_write_beat;
         ShmemArbiters arbiters;                      // the round-robin pointers after the grants
-        // The warp whose own access A-read / A-write grants a round of now: an
-        // lds / sts round, a probe, its SIMT RMW's read / write (none: idle, a
-        // TMA read, an engine event's RMW). It reaches the RAM D cycles later.
-        std::optional<uint32_t> a_read_warp;
-        std::optional<uint32_t> a_write_warp;
+        // A warp's own read / write whose LAST round A-read / A-write grants
+        // now (an RMW: its final write): it is serviced (the warp's counts).
+        std::optional<uint32_t> read_serviced;
+        std::optional<uint32_t> write_serviced;
+        // A warp's own access whose last round is at the RAM now (a read's
+        // sample, a write's landing): fence.sh's count.
+        std::optional<uint32_t> read_at_ram;
+        std::optional<uint32_t> write_at_ram;
         // What the grants and returns do to their requesters.
-        std::optional<LoadFill> load_fill;           // a load round's words for its gather register
+        std::optional<uint32_t> writeback_reserved;  // the write-back entry a load's first grant takes now
+        std::optional<WritebackFill> writeback_fill; // a load round's words for its write-back entry
+        std::optional<uint32_t> atomic_fill;         // an atomic's old word, into the old-word register
+        std::optional<AtomicReturn> atomic_reserved; // an atomic's RMW starts now: the old-word register is its
         std::optional<RmwUpdate> rmw_update;         // the RMW's update, from its read's words: enters ALU stage 0
         std::optional<ActiveMbarRmw> rmw_started;    // the operation the RMW engine takes now (from rmw_start's register)
-        bool simt_rmw_started = false;               // rmw_start empties the SIMT RMW register
+        bool simt_rmw_started = false;               // rmw_start takes the write side's barrier change / atomic
+        // The two sides' stages this cycle (advance_shmem_sides): an entry
+        // leaves a queue for its collect stage; a collect stage's access
+        // moves into serve (wide: its round plan and data); a try_wait
+        // installs its wait slot as it leaves the queue.
+        bool read_queue_pop = false;
+        bool write_queue_pop = false;
+        std::optional<ReadServe> read_serve_in;
+        std::optional<WriteServe> write_serve_in;
+        bool read_collect_out = false;
+        bool write_collect_out = false;
+        std::optional<IntoSlot<MbarWaitSlot>> wait_slot;
         bool tma_event_claimed = false;              // ... the TMA's event register
         bool mma_event_claimed = false;              // ... the MMA's event register
         bool tma_read_changed = false;               // tma_read_after is the TMA read transaction's next value
@@ -1965,24 +2064,14 @@ private:
         std::optional<ArithmeticRead> arithmetic;        // a fixed-latency instruction enters the arithmetic pipeline
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
         std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
+        std::optional<ShmemEntry> shmem;                 // a shared-memory instruction enters its queue
+        bool shmem_write_side = false;                   // ... the write queue (else the read queue)
         std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
         std::optional<UrfReadRounds> urf_rounds;         // a tma or an mma.async loads the URF's round counter
     };
 
-    // A slot's number and what goes into it.
-    template <typename T>
-    struct IntoSlot {
-        uint32_t slot;
-        T contents;
-    };
-
     // Everything a dispatched instruction hands to its unit (the unit takes it now).
     struct DispatchDecision {
-        std::optional<IntoSlot<LoadSlot>> load_slot;     // lds: (slot, its new contents)
-        std::optional<IntoSlot<StoreSlot>> store_slot;   // sts: (slot, its new contents)
-        std::optional<MbarRmwRequest> rmw;               // SIMT mbar RMW: into the SIMT RMW register
-        std::optional<MbarReadRequest> mbar_probe;
-        std::optional<IntoSlot<MbarWaitSlot>> wait_slot; // try-wait: (slot, record)
         std::optional<MmaCommand> mma;
         struct AccAdmission { bool load = false; AccTransfer transfer; };
         std::optional<AccAdmission> acc;
@@ -1996,11 +2085,6 @@ private:
     // The space the instructions in the dispatch pipeline will take when
     // they reach their units (admission secured it at their issue).
     struct DispatchClaims {
-        uint32_t load_slots = 0;
-        uint32_t store_slots = 0;
-        uint32_t simt_rmw = 0;
-        uint32_t probes = 0;
-        uint32_t wait_slots = 0;
         uint32_t lsu_commands = 0;
         uint32_t lsu_stores = 0;     // stg / stg.v8: their data is still to move through the store buffer
         uint32_t mma_commands = 0;
@@ -2087,6 +2171,23 @@ private:
         RfReadDecision rf_read;
         std::optional<AccStBeat> acc_st_read;               // the acc.st engine's beat read now
         LsuRfRead lsu_rf_read;                              // the LSU store-data beat read now
+        // The collect stages' registers sampled now, every lane (at the RF
+        // output Lr cycles later).
+        std::optional<LaneWords> read_collect_address;
+        std::optional<LaneWords> write_collect_address;
+        std::optional<LaneWords> write_collect_data;
+        // The newest queue entry's sample at its issue + 1 (step_rf_reads):
+        // its lanes (the active mask AND the write mask) and its uniform
+        // operands. No lane left: it leaves its queue now, giving back what
+        // it took at issue.
+        struct ShmemSample {
+            bool write_side = false;
+            uint32_t warp = 0;
+            uint64_t lanes = 0;
+            Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;
+            bool dropped = false;
+        };
+        std::optional<ShmemSample> shmem_sample;
         // Issue.
         IssueDecision issue;
         // The front ends after this cycle (step_front_end, after issue).
@@ -2292,21 +2393,25 @@ private:
     // The acknowledgement records beyond the command slots (Machine::Machine).
     uint32_t store_ack_records_detached_ = 0;
     Regs<std::optional<MbarWaitSlot>> mbar_wait_slots_{clocked_,Unit::barriers, "mbar wait slots"};
-    // shmem: the SIMT service slots, the probe register, the RMW
-    // engine and its three requester registers, the services' pipelines and
-    // arbiters. Each requester holds at most one pending RMW in its own
-    // one-entry register:
-    //   SIMT: one mbar.init / arrive / arrive.expect_tx or one uniform
-    //         atomic, accepted at issue (machine-wide; a warp waits at issue
-    //         while it is held).
+    // shmem: the two sides (each a queue, a collect stage and a serve
+    // stage), the write-back buffer and the atomic's old-word register, the
+    // warps' counts, the RMW engine, the services' pipelines and arbiters.
+    // The RMW engine's requesters: the write side's serve stage (one barrier
+    // change or atomic), and the engines' one-entry registers:
     //   TMA:  complete_tx {address, bytes} (TMA data complete, or the host's
     //         complete_mbar_tx). An engine stalls only on its own register.
     //   MMA:  a commit's arrive {address}.
     // A request written at t is visible to the RMW engine from t + 1.
-    Regs<std::optional<LoadSlot>> load_slots_{clocked_,Unit::shared_memory, "load slots"};    // shmem.load_slots
-    Regs<std::optional<StoreSlot>> store_slots_{clocked_,Unit::shared_memory, "store slots"}; // shmem.store_slots
-    Reg<std::optional<MbarReadRequest>> mbar_probe_{clocked_,Unit::barriers, "SIMT mbar probe"};
-    Reg<std::optional<MbarRmwRequest>> simt_rmw_{clocked_,Unit::barriers, "SIMT RMW register"};
+    Reg<ShmemQueue> read_queue_{clocked_,Unit::shared_memory, "read queue"};    // shmem.read_queue_entries
+    Reg<ShmemQueue> write_queue_{clocked_,Unit::shared_memory, "write queue"};  // shmem.write_queue_entries
+    Reg<std::optional<ShmemCollect>> read_collect_{clocked_,Unit::shared_memory, "read side: collect stage"};
+    Reg<std::optional<ShmemCollect>> write_collect_{clocked_,Unit::shared_memory, "write side: collect stage"};
+    Reg<std::optional<ReadServe>> read_serve_{clocked_,Unit::shared_memory, "read side: serve stage"};
+    Reg<std::optional<WriteServe>> write_serve_{clocked_,Unit::shared_memory, "write side: serve stage"};
+    Regs<std::optional<WritebackEntry>> writeback_{clocked_,Unit::shared_memory, "write-back buffer"}; // shmem.writeback_entries
+    Reg<std::optional<AtomicReturn>> atomic_return_{clocked_,Unit::barriers, "atomic old-word register"};
+    // Per warp slot (core.warps).
+    Regs<ShmemWarpCounts> shmem_counts_{clocked_,Unit::shared_memory, "per-warp shmem counts"};
     Reg<RmwEngine> rmw_{clocked_,Unit::barriers, "RMW engine"};
     // A-read: D stages to the RAM, where the round's words are sampled (stage
     // D - 1), then Lb to the port output (the last stage). A-write and port-B
@@ -2320,12 +2425,6 @@ private:
     // output, and its write is granted then.
     Pipe<RmwUpdate> rmw_alu_{clocked_,Unit::barriers, "RMW engine: ALU stages"};
     Reg<ShmemArbiters> shmem_arbiters_{clocked_,Unit::shared_memory, "shmem A-read / A-write arbiters"};
-    // fence.sh, per warp: how many cycles from now until
-    // the warp's latest granted shmem round reaches the RAM (a write's edge,
-    // a read's sample: grant + D). A grant at g sets it to D - 1 at g + 1; it
-    // counts down to 0, the cycle that round is at the RAM. 0..D-1:
-    // ceil(log2(D)) bits per warp slot (core.warps).
-    Regs<uint32_t> shmem_to_ram_{clocked_,Unit::shared_memory, "per-warp shmem cycles to the RAM"};
     Reg<std::optional<MbarRmwRequest>> tma_mbar_event_{clocked_,Unit::barriers, "TMA mbar event register"};
     Reg<std::optional<MbarRmwRequest>> mma_mbar_event_{clocked_,Unit::barriers, "MMA mbar event register"};
     // MMA and accumulator transfers.
@@ -2638,13 +2737,26 @@ private:
     void complete_without_lanes(const DispatchEntry& op, Wires& w);
     void dispatch_mma(const DispatchEntry& op, Wires& w);
     void dispatch_acc_transfer(const DispatchEntry& op, Wires& w);
-    void dispatch_shared_load(const DispatchEntry& op, Wires& w);
-    void dispatch_shared_store(const DispatchEntry& op, Wires& w);
     void dispatch_lsu(const DispatchEntry& op, Wires& w);
-    void dispatch_mbar_rmw(const DispatchEntry& op, Wires& w);
-    void dispatch_atomic(const DispatchEntry& op, Wires& w);
-    void dispatch_mbar_wait(const DispatchEntry& op, Wires& w);
     [[nodiscard]] DispatchClaims dispatch_claims() const;
+    // ---- shared memory's two sides (src/machine/shmem.cpp) ----
+    // The newest queue entry's issue + 1 sample: predicate, uniform
+    // registers, the drop of an instruction left with no lane, and the
+    // sanitizer's record of the access.
+    void sample_shmem_entry(Wires& w, uint32_t& uniform_reads);
+    void record_queued_access(const ShmemEntry& entry, bool write_side);
+    void drop_queued(const ShmemEntry& entry, bool write_side, Wires& w);
+    // The queues, collect and serve stages after this cycle's grants.
+    void advance_shmem_sides(Wires& w);
+    [[nodiscard]] bool entry_may_leave(const ShmemEntry& entry) const;
+    [[nodiscard]] bool collect_ready(const ShmemCollect& collect) const;
+    [[nodiscard]] ReadServe read_serve_from(const ShmemCollect& collect) const;
+    [[nodiscard]] WriteServe write_serve_from(const ShmemCollect& collect) const;
+    [[nodiscard]] MbarWaitSlot wait_slot_for(const ShmemEntry& entry) const;
+    [[nodiscard]] std::optional<RfReadRequest> collect_read_request(bool write_side, bool data) const;
+    [[nodiscard]] bool read_serve_requests() const;
+    [[nodiscard]] std::optional<uint32_t> free_writeback_entry() const;
+    [[nodiscard]] bool write_serve_rmw_ready() const;
     // ---- the async RF readers (the read ports free now), before issue ----
     RfReadDecision decide_rf_reads(Wires& w);
     [[nodiscard]] std::optional<RfReadRequest> lsu_store_read_request(const Wires& w) const;
@@ -2664,6 +2776,9 @@ private:
     // (depbar, the sanitizer's destination and reader records), its read
     // round's bank use, its entry into the dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
+    // An accepted shared-memory instruction: its metadata work now, its
+    // entry into its side's queue.
+    void accept_shmem(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     // An accepted tma or mma.async: it loads the URF's round counter.
     void load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w);
     void panic_if_malformed(const Warp& warp, const Instruction& inst) const;
@@ -2687,14 +2802,16 @@ private:
     void drive_depbar(const Wires& w);
     void drive_scheduler(const Wires& w);
     void drive_wait_slots(const Wires& w);
-    void drive_store_slots(const Wires& w);
-    void drive_mbar_probe(const Wires& w);
-    void drive_simt_rmw(const Wires& w);
+    void drive_shmem_queues(const Wires& w);
+    void drive_shmem_collects(const Wires& w);
+    void drive_shmem_serves(const Wires& w);
+    void drive_writeback(const Wires& w);
+    void drive_atomic_return(const Wires& w);
+    void drive_shmem_counts(const Wires& w);
     void drive_rmw_engine(const Wires& w);
     void drive_a_read_pipe(const Wires& w);
     void drive_write_pipes(const Wires& w);
     void drive_shmem_arbiters(const Wires& w);
-    void drive_shmem_to_ram(const Wires& w);
     void drive_tma_event(const Wires& w);
     void drive_mma_event(const Wires& w);
     void drive_mma(const Wires& w);
@@ -2716,7 +2833,6 @@ private:
     void drive_rf_write_pipes(const Wires& w);
     void drive_store_acks(const Wires& w);
     void drive_predicates(const Wires& w);
-    void drive_load_slots(const Wires& w);
     void drive_acc_ld_pipe(const Wires& w);
     void drive_rf_write_policy(const Wires& w);
     void drive_rf_read_policy(const Wires& w);
@@ -2733,6 +2849,10 @@ private:
     // go only to sanitizer_.
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] IssueSite site(const DispatchEntry& op) const;
+    [[nodiscard]] IssueSite site(const ShmemEntry& entry) const;
+    // An lds / sts's register as a sample now would read it, every lane (the
+    // sanitizer's record of a queued access at its issue + 1).
+    [[nodiscard]] LaneWords rf_peek(uint32_t warp, uint8_t reg) const;
     [[nodiscard]] std::vector<uint32_t> access_addresses(const SlotRounds& access) const;
     [[nodiscard]] std::vector<std::vector<uint32_t>> round_addresses(const SlotRounds& access) const;
     [[nodiscard]] std::optional<std::pair<uint32_t, uint32_t>> mma_operand_span(
@@ -2754,29 +2874,12 @@ private:
     void record_depbar_completion(Wires& w, uint32_t warp, uint8_t bar, const std::string& underflow);
     [[nodiscard]] uint32_t depbar_after_completions(const Wires& w, uint32_t warp, uint8_t bar) const;
     void admit_depbar(Wires& w, uint32_t warp, uint8_t bar);
-    // mbar wait slots: a warp parked in one (Q); the space issue may take.
+    // mbar wait slots (slot w is warp w's): a warp parked in its slot (Q).
     [[nodiscard]] bool wait_slot_completed(const Wires& w, uint32_t slot) const;
-    [[nodiscard]] std::optional<uint32_t> waiting_slot_of(const Wires& w, uint32_t warp) const;
-    [[nodiscard]] std::optional<uint32_t> free_mbar_wait_slot(const Wires& w) const;
+    [[nodiscard]] bool warp_waiting_in_slot(uint32_t warp) const;
     void complete_mbar_try_wait(Wires& w, uint32_t slot, bool result);
 
-    // Service slots and the warp's shmem order, as issue sees them after this
-    // cycle's grants (look-ahead (c), reuse (d)) -- except the load slots'
-    // count, which is Q only (a slot whose RF write is granted at t counts
-    // for issue from t + 1).
-    [[nodiscard]] std::optional<uint32_t> free_load_slot(const Wires& w) const;
-    [[nodiscard]] std::optional<uint32_t> free_store_slot(const Wires& w) const;
-    [[nodiscard]] uint32_t free_load_slot_count() const;
-    [[nodiscard]] uint32_t free_store_slot_count(const Wires& w) const;
-    [[nodiscard]] uint32_t free_wait_slot_count(const Wires& w) const;
-    // The warp has an instruction in the dispatch pipeline that will read /
-    // write shmem / probe an mbar.
-    [[nodiscard]] bool warp_dispatching(uint32_t warp, bool reads, bool writes, bool probes) const;
-    [[nodiscard]] bool load_rounds_left(const Wires& w, uint32_t slot) const;
-    [[nodiscard]] bool store_slot_released(const Wires& w, uint32_t slot) const;
-    [[nodiscard]] bool warp_unserviced_read(const Wires& w, uint32_t warp) const;
-    [[nodiscard]] bool warp_unserviced_write(const Wires& w, uint32_t warp) const;
-    [[nodiscard]] bool own_shmem_at_ram(const Wires& w, uint32_t warp) const;
+    // The warp's probe has not come back (queued or travelling).
     [[nodiscard]] bool probe_in_flight(uint32_t warp) const;
     [[nodiscard]] uint64_t full_mask() const;
 
@@ -2784,14 +2887,14 @@ private:
     [[nodiscard]] bool store_pause() const;
     [[nodiscard]] bool rmw_requester_held() const;
     [[nodiscard]] bool rmw_awaits_read(const Wires& w) const;
-    [[nodiscard]] std::optional<uint32_t> load_slot_in_service() const;
-    [[nodiscard]] std::optional<uint32_t> store_slot_in_service() const;
-    [[nodiscard]] bool store_slot_waiting() const;
+    [[nodiscard]] bool read_side_in_service() const;
+    [[nodiscard]] bool store_in_service() const;
+    [[nodiscard]] bool store_waiting() const;
     [[nodiscard]] bool tma_read_in_service() const;
     [[nodiscard]] AReadGrant a_read_round_robin(const Wires& w) const;
-    ReadBeat load_round(uint32_t slot);
+    ReadBeat read_side_round(Wires& w);
     ReadBeat tma_read_round(const TmaPortRequest& request, bool start, uint32_t store_register);
-    WriteBeat store_round(uint32_t slot);
+    WriteBeat store_round();
     RmwUpdate rmw_update(const ReadBeat& read);
     [[nodiscard]] static bool is_atomic_operation(MbarRmwOperation operation);
     [[nodiscard]] static RmwUpdate atomic_update(const MbarRmwRequest& request, uint32_t old_word);
@@ -2904,6 +3007,13 @@ private:
     // uniform by construction (the partial-mask rule still applies).
     [[nodiscard]] uint32_t uniform_operand(const DispatchEntry& op, uint8_t ureg) const;
     [[nodiscard]] uint32_t mbar_address_operand(const DispatchEntry& op) const;
+    // A queued instruction's uniform operand (from its issue + 1 sample),
+    // its mbar address (8-byte aligned in shmem: PANIC otherwise), a
+    // probe's parity, a barrier change's or an atomic's request.
+    [[nodiscard]] uint32_t entry_uniform(const ShmemEntry& entry, uint8_t ureg) const;
+    [[nodiscard]] uint32_t entry_mbar_address(const ShmemEntry& entry) const;
+    [[nodiscard]] uint8_t entry_parity(const ShmemEntry& entry) const;
+    [[nodiscard]] MbarRmwRequest entry_rmw_request(const ShmemEntry& entry) const;
     [[nodiscard]] MbarState load_mbar(uint32_t byte_address) const;
     // Where a warp's vector register is in the register file's three
     // memories (rf_address, src/machine/rf.cpp), and a read of every lane of
@@ -2919,20 +3029,23 @@ private:
     [[nodiscard]] std::size_t urf_row(uint32_t warp, uint32_t reg) const {
         return std::size_t{warp} * config_.urf_registers + reg;
     }
-    // SIMT shmem bank rounds (lds/sts by bank decode; lds.uni: one access),
-    // from the captured operands.
-    [[nodiscard]] SlotRounds build_shmem_rounds(const DispatchEntry& op) const;
-    [[nodiscard]] SlotRounds build_uniform_shmem_round(const DispatchEntry& op) const;
+    // SIMT shmem bank rounds (lds/sts by bank decode of each lane's base +
+    // the immediate; lds.uni: one access). `checked`: an address that
+    // overflows, is unaligned or is out of bounds PANICs; unchecked (the
+    // sanitizer's record), such an access has no rounds (nullopt).
+    [[nodiscard]] std::optional<SlotRounds> shmem_rounds(const ShmemEntry& entry, const LaneWords& bases, bool checked) const;
+    [[nodiscard]] std::optional<SlotRounds> uniform_shmem_round(const ShmemEntry& entry, uint32_t base, bool checked) const;
     // The lanes in round `round` of an access, in bank order (one per bank
     // at most): the round's words at the RAM.
     [[nodiscard]] Bounded<uint8_t, limits::shmem_banks> round_lanes(const SlotRounds& access, uint32_t round) const;
-    [[nodiscard]] uint32_t shmem_address(const DispatchEntry& op, uint32_t base) const;
+    [[nodiscard]] std::optional<uint32_t> shmem_address(const ShmemEntry& entry, uint32_t base, bool checked) const;
     void apply_image(
         std::vector<uint8_t>& memory,
         const std::vector<ImageSegment>& image,
         const std::string& name);
     [[noreturn]] void panic(const Warp& warp, const Instruction& inst, const std::string& reason) const;
     [[noreturn]] void panic(const DispatchEntry& op, const std::string& reason) const;
+    [[noreturn]] void panic(const ShmemEntry& entry, const std::string& reason) const;
     [[noreturn]] void mbar_rmw_panic(
         const MbarRmwRequest& request, const std::string& reason) const;
 

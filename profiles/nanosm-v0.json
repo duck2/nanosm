@@ -19,8 +19,9 @@
   "shmem": {
     "bytes": 65536,
     "banks": 16,
-    "load_slots": 2,
-    "store_slots": 2,
+    "read_queue_entries": 4,
+    "write_queue_entries": 4,
+    "writeback_entries": 2,
     "port_a_depth": 2,
     "read_latency_cycles": 2,
     "rmw_compute_cycles": 2

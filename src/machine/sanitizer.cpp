@@ -116,8 +116,9 @@ void Sanitizer::record_async_reader_add(uint32_t warp, uint32_t reg) {
 void Sanitizer::record_async_reader_done(uint32_t warp, uint32_t reg, AsyncReader reader) {
     auto& readers = warps_.at(warp).async_readers[reg];
     if (readers == 0) {
-        throw SimError(reader == AsyncReader::acc_st
-            ? "internal acc.st reader underflow" : "internal stg.v8 reader underflow");
+        throw SimError(reader == AsyncReader::acc_st ? "internal acc.st reader underflow"
+            : reader == AsyncReader::stg_v8 ? "internal stg.v8 reader underflow"
+            : "internal shared-memory collect reader underflow");
     }
     --readers;
 }
@@ -425,7 +426,7 @@ void Sanitizer::record_simt_shmem_grant(uint64_t cycle, SimtShmemHolder holder, 
     if (access == simt_shmem_.end()) throw SimError("internal sanitizer: a SIMT shmem grant has no recorded access");
     auto& round = access->rounds.at(access->granted++);
     round.ram_cycle = ram_cycle;
-    if (holder != SimtShmemHolder::store_slot) return;
+    if (holder != SimtShmemHolder::write_side || access->inst.opcode != Opcode::sts) return;
     // An sts round writing a live mbar, at its grant.
     std::vector<std::pair<uint32_t, uint32_t>> written;
     for (const auto address : round.addresses) written.emplace_back(address, address + 4);

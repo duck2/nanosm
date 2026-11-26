@@ -117,14 +117,17 @@ nanosm::Launch tma_into_an_arrival_mbar() {
 // after the RMW's final write GRANT, not after its commit -- and still reaches
 // the RAM after the RMW's write (the mbar lands at the edge of w + D, the
 // store's first round at w + 1 + D). Reads continue meanwhile. store_paused
-// counts the cycles a store waits in its slot under the pause.
+// counts the cycles a store waits in the write side's serve stage under the
+// pause.
 //   One warp, D = 2 and 3: sts X (sixteen rounds, one bank) granted from g,
-//   the event held from g + 4; the younger sts Y, admitted at X's last grant,
-//   waits in its slot from g + 16 + t to w.
+//   the event held from g + 4; the younger sts Y, issued right after X (the
+//   write side keeps their order), enters serve after X's last grant and
+//   waits there from g + 16 to w.
 //   Two warps, each a sixteen-round sts then an lds of other words: the event
 //   is held from g + 2 (warp 0's first round g); warp 0's lds, ordered behind
-//   its sts until its last round and then dispatched, is granted from read +
-//   t, during the RMW; warp 1's sts waits in its slot from the start to w.
+//   its sts until its last round (admitted the cycle after), is granted from
+//   read + issue_to_shmem_grant, during the RMW; warp 1's sts, behind warp
+//   0's on the write side, waits in serve from g + 16 to w.
 TEST(Rmw, store_pause_sequence) {
     for (const uint32_t d : {2u, 3u}) {
         auto profile = canonical_profile();
@@ -140,9 +143,9 @@ TEST(Rmw, store_pause_sequence) {
             sts [r0 + 12], r5 {pred=PT, stall=0, set=sb1, wait=-}
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )", 1, event_mbars());
-        const auto t = nanosm::issue_to_dispatch(profile);
         // X issues after sread -> shli and the mov's r5 (2 alu_distance + 1).
-        const auto g = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 1 + t + 1;
+        const auto x = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 1;
+        const auto g = x + issue_to_shmem_grant(profile, true);
         run_until(*machine, g + 4);
         host_rmw_event(*machine);
         std::optional<uint64_t> mbar_landed; // the cycle at whose clock edge the RMW's write landed
@@ -162,11 +165,11 @@ TEST(Rmw, store_pause_sequence) {
         for (const auto cycle : sixteen_rounds(w + 1)) expected.push_back(cycle); // Y
         require(grant_cycles(*machine, "A-write", "simt") == expected,
             what + "store rounds (X g..g + 15, Y from w + 1):" + describe(grants_of(*machine, "A-write")));
-        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{g + 15}, what + "Y was not admitted at X's last grant");
+        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{x + 1}, what + "Y did not issue right after X");
         require(mbar_landed == w + d && y_landed == w + 1 + d,
             what + "the RMW's write did not land at w + D, or Y's first round at w + 1 + D");
-        require(machine->trace().summary().shmem_store_paused == w - (g + 15 + t),
-            what + "store_paused should count g + 16 + t .. w (Y waiting in its slot under the pause)");
+        require(machine->trace().summary().shmem_store_paused == w - (g + 15),
+            what + "store_paused should count g + 16 .. w (Y waiting in serve under the pause)");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_shmem_u32(64 * lane + 8) == 0x5a && machine->read_shmem_u32(64 * lane + 12) == 0x5a,
                 what + "store data");
@@ -202,13 +205,13 @@ TEST(Rmw, store_pause_sequence) {
         "two warps: the RMW's read was not granted the cycle after the store's last round, or its write D + Lb + C "
         "later:" + describe(grants));
     require(std::vector<uint64_t>(loads.begin(), loads.begin() + 16) ==
-            sixteen_rounds(read + nanosm::issue_to_dispatch(profile)),
+            sixteen_rounds(read + issue_to_shmem_grant(profile, true)),
         "two warps: reads did not continue during the RMW: warp 0's lds was not granted from read + "
-        "issue_to_dispatch:" + describe(grants));
+        "issue_to_shmem_grant:" + describe(grants));
     require(std::vector<uint64_t>(stores.begin() + 16, stores.end()) == sixteen_rounds(write + 1),
         "two warps: warp 1's paused sts was not granted from the cycle after the RMW's write grant:" + describe(grants));
-    require(machine->trace().summary().shmem_store_paused == write - start,
-        "two warps: store_paused should count every pause cycle with warp 1's sts waiting");
+    require(machine->trace().summary().shmem_store_paused == write - (g + 15),
+        "two warps: store_paused should count every pause cycle with warp 1's sts waiting in serve");
     require(machine->read_mbar_state(event_mbar).phase, "two warps: the RMW's update was lost");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_shmem_u32(64 * lane + 4) == 0x5a, "two warps: sts data");
@@ -216,13 +219,15 @@ TEST(Rmw, store_pause_sequence) {
     }
 }
 
-// Reads continue during an RMW. The host's event is placed at the lds.uni's
-// dispatch e (nothing waits on A: the RMW starts and reads at e); its write
+// Reads continue during an RMW. The host's event is placed at the cycle the
+// lds.uni would be granted, e = its issue + issue_to_shmem_grant (nothing
+// waits on A: the RMW starts and reads at e, before the lds.uni); its write
 // is granted at e + D + Lb + C. In between A-read serves warp 0's lds.uni (e +
 // 1), the TMA's descriptor read (e + 2: the tma's command reaches the TMA at
-// its issue + 3) and warp 0's probe (e + 4: it reads a uniform register, so
+// its issue + 3) and warp 0's probe (e + 3: it reads a uniform register, so
 // issue refuses it in the cycle after the tma, whose coordinate round holds
-// the URF read ports).
+// the URF read ports; it issues at e and is granted issue_to_shmem_grant
+// later).
 TEST(Rmw, reads_during_an_rmw) {
     const auto& profile = canonical_profile();
     auto launch = launch_warps(1);
@@ -242,7 +247,7 @@ TEST(Rmw, reads_during_an_rmw) {
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )"), profile), std::move(launch), nanosm::TraceOptions{.timeline = true, .debug = true});
     // The lds.uni is the sixth instruction, issued at fetch_to_issue + 5.
-    const uint64_t e = nanosm::fetch_to_issue + 5 + nanosm::issue_to_dispatch(profile);
+    const uint64_t e = nanosm::fetch_to_issue + 5 + issue_to_shmem_grant(profile);
     run_until(machine, e);
     host_rmw_event(machine);
     machine.run();
@@ -253,7 +258,7 @@ TEST(Rmw, reads_during_an_rmw) {
     auto reads = grants_of(machine, "A-read");
     reads.resize(std::min<std::size_t>(reads.size(), 4));
     require(reads == std::vector<Grant>{{e, "A-read", "rmw", 0}, {e + 1, "A-read", "simt", 0},
-                         {e + 2, "A-read", "tma", 0}, {e + 4, "A-read", "probe", 0}} && reads.back().cycle < w,
+                         {e + 2, "A-read", "tma", 0}, {e + 3, "A-read", "probe", 0}} && reads.back().cycle < w,
         "A-read did not serve an lds, the TMA and a probe between the RMW's read and its write:" + describe(reads) +
             " | issues" + issue_log(machine));
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine.read_reg(0, lane, 3) == 0x100 + 16, "lds.uni data");
@@ -298,55 +303,58 @@ TEST(Rmw, read_first_at_rmw_write) {
 }
 
 // The alternation between RMW starts and store transactions: whenever both
-// wait, the one that did not start last goes. Warps 0 and 2 issue four
-// mbar.arrive each (while one's RMW runs, the other's waits in the SIMT RMW
-// register, so after every RMW both classes wait); warp 1 issues eight
-// one-round sts on the same words (each waits for the previous one's grant).
-// The waiting store starts at w + 1 (the RMW's write grant + 1) and the next
-// RMW at w + 2, reading at once: the starts go R, S, R, S, ... -- back-to-back
-// RMWs do not starve the stores -- and no store round is granted between an
-// RMW's read and its write. The arrive warps' umov stalls 10 cycles so that
-// warp 1's first store reaches its slot under the first RMW's pause.
+// wait, the one that did not start last goes. The host keeps the TMA's event
+// register full (eight complete_tx, one refilled as soon as the RMW engine
+// takes the last); warp 0 issues eight one-round sts on the same words, which
+// the write side serves in order, one entering serve every Lr + 1 cycles (its
+// collect stage). The waiting store starts at w + 1 (the RMW's write grant +
+// 1) and the next RMW at w + 2, reading at once: from the first store on the
+// starts go S, R, S, R, ... -- back-to-back RMWs do not starve the stores --
+// and no store round is granted between an RMW's read and its write.
 TEST(Rmw, rmw_store_alternation) {
     const auto& profile = canonical_profile();
-    std::string arrives;
     std::string stores;
-    for (int i = 0; i < 8; ++i) {
-        if (i < 4) arrives += "mbar.arrive [ur4]\n";
-        stores += "sts [r20 + 2048], r21 {pred=PT, stall=0, set=sb0, wait=-}\n";
-    }
+    for (int i = 0; i < 8; ++i) stores += "sts [r20 + 2048], r21 {pred=PT, stall=0, set=sb0, wait=-}\n";
     auto machine = debug_machine(profile, R"(
-        usread ur9, WARP_ID
-        ur2r r29, ur9
-        setp.eq.u32 p6, r29, 1
-        bra.uni stores {pred=p6, stall=0, set=-, wait=-}
-        umov ur4, 4160 {pred=PT, stall=10, set=-, wait=-}
-    )" + arrives + R"(
-        halt
-    stores: sread r20, LANE_ID
+        sread r20, LANE_ID
         shli r20, r20, 2
         mov r21, 0x33
     )" + stores + R"(
         halt {pred=PT, stall=0, set=-, wait=sb0}
-    )", 3, {{4160, mbar_state(8, 8)}});
-    machine->run();
+    )", 1, {{event_mbar, mbar_state(1, 0, 8 * 64)}});
+    for (uint32_t events = 0; !machine->done() || events < 8;) {
+        if (events < 8 && !machine->tma_mbar_event_held()) {
+            host_rmw_event(*machine);
+            ++events;
+        }
+        tick_capped(*machine);
+    }
     const auto rmws = rmw_slices(*machine);
-    const auto starts_of_stores = store_starts(*machine);
+    const auto all_stores = store_starts(*machine);
+    require(rmws.size() == 8 && all_stores.size() == 8, "eight RMWs and eight stores:" + describe(rmws));
     std::vector<std::pair<uint64_t, char>> starts;
-    for (const auto& rmw : rmws) starts.emplace_back(rmw.start, 'R');
-    for (const auto start : starts_of_stores) starts.emplace_back(start, 'S');
+    std::map<uint64_t, uint64_t> write_of; // an RMW's start -> its write grant
+    for (const auto& rmw : rmws) {
+        starts.emplace_back(rmw.start, 'R');
+        write_of[rmw.start] = rmw.write;
+    }
+    for (const auto start : all_stores) starts.emplace_back(start, 'S');
     std::sort(starts.begin(), starts.end());
     std::string order;
     for (const auto& [cycle, kind] : starts) order += kind;
-    require(order == "RSRSRSRSRSRSRSRS", "RMW (R) and store (S) starts did not alternate: " + order + describe(rmws));
-    for (std::size_t k = 0; k < 8; ++k) {
-        require(starts_of_stores[k] == rmws[k].write + 1, "store " + std::to_string(k) +
-            " did not start the cycle after RMW " + std::to_string(k) + "'s write grant:" + describe(rmws));
-        if (k + 1 < 8) {
-            require(rmws[k + 1].start == rmws[k].write + 2 && rmws[k + 1].read == rmws[k + 1].start,
-                "RMW " + std::to_string(k + 1) + " did not start (and read) at w + 2:" + describe(rmws));
-        }
+    // From the first store until the host's last event the starts alternate:
+    // a store at an RMW's write grant + 1, the next RMW the cycle after.
+    const auto first_store = order.find('S');
+    const auto last_rmw = order.rfind('R');
+    require(first_store != std::string::npos && first_store > 0 && first_store + 2 < last_rmw,
+        "the stores did not meet the RMWs: " + order);
+    for (auto i = first_store; i < last_rmw; ++i) {
+        require(order[i] != order[i + 1], "RMW (R) and store (S) starts did not alternate: " + order + describe(rmws));
+        if (order[i] != 'S') continue;
+        require(starts[i].first == write_of.at(starts[i - 1].first) + 1 && starts[i + 1].first == starts[i].first + 1,
+            "a store did not start at the RMW's write grant + 1, or the next RMW at + 2: " + order + describe(rmws));
     }
+    for (const auto& rmw : rmws) require(rmw.read == rmw.start, "an RMW did not read in its start cycle:" + describe(rmws));
     for (const auto cycle : grant_cycles(*machine, "A-write", "simt")) {
         for (const auto& rmw : rmws) {
             require(cycle < rmw.read || cycle > rmw.write,
@@ -354,29 +362,32 @@ TEST(Rmw, rmw_store_alternation) {
                     describe(rmws));
         }
     }
-    require(machine->read_mbar_state(4160).phase, "the eight arrives did not complete the phase");
+    require(machine->read_mbar_state(event_mbar).phase, "the eight events did not complete the phase");
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(2048 + 4 * lane) == 0x33, "store data");
 }
 
-// A SIMT RMW takes the engine only when its warp has no unserviced lds /
-// sts: it waits at issue, BEFORE the SIMT RMW register and the engine, so its
-// own store pause can never hold them (no deadlock). t = issue_to_dispatch.
+// A SIMT RMW and its warp's own stores: both on the write side, which keeps
+// them in order, so the arrive issues at once and takes the engine only
+// after the sts's last round (its own store pause can never hold the sts: no
+// deadlock). Across the sides the order waits at issue. g = issue_to_shmem_grant
+// of an lds / sts, u = of an arrive.
 //   Paused sts: the host's event is placed as the sts issues (at s; its RMW
 //   reads at k = s + 1 and writes at w = k + D + Lb + C), and its pause holds
-//   the sts in its slot until w: granted w + 1 .. w + 16. The arrive is
-//   ordered behind it from s + 1, admitted at its last grant (w + 16), and
-//   starts (reads) at its dispatch + 1, w + t + 17.
+//   the sts in serve until w: granted w + 1 .. w + 16. The arrive issues at
+//   s + 1, waits behind the sts, enters serve after its last grant and
+//   starts (reads) at w + 17.
 //   sts, lds, arrive, all lanes on one bank, at canonical and two
-//   noncanonical depths: the sts's rounds s + t + 1 .. s + t + 16; the lds
-//   over the same words, ordered behind it from s + 1 (t + 15 cycles), is
-//   granted from s + 2t + 17 and reads the stored words; the arrive, ordered
-//   behind the lds (again t + 15 cycles), is admitted at s + 2t + 32 and read
-//   at s + 3t + 33.
+//   noncanonical depths: the sts's rounds s + g .. s + g + 15; the lds over
+//   the same words, ordered behind it from s + 1 (g + 15 cycles: its warp's
+//   unserviced write), is admitted at s + g + 16, granted from s + 2g + 16
+//   and reads the stored words; the arrive, ordered behind the lds (again
+//   g + 15 cycles: its unserviced read), is admitted at s + 2g + 32 and read
+//   at s + 2g + 32 + u.
 TEST(Rmw, simt_rmw_waits_for_own_stores) {
     {
         const auto& profile = canonical_profile();
         const uint64_t rmw = read_return(profile) + profile.shmem_rmw_compute_cycles; // read to write
-        const uint64_t t = nanosm::issue_to_dispatch(profile);
+        const uint64_t g = issue_to_shmem_grant(profile, true);
         auto machine = debug_machine(profile, R"(
             sread r0, LANE_ID
             shli r0, r0, 6
@@ -390,7 +401,7 @@ TEST(Rmw, simt_rmw_waits_for_own_stores) {
         const uint64_t s = nanosm::fetch_to_issue + 2 * alu_distance(profile) + 2;
         const uint64_t k = s + 1;
         const uint64_t w = k + rmw;
-        require(s + t < w, "the sts would not reach its slot under the pause");
+        require(s + g < w, "the sts would not reach serve under the pause");
         run_until(*machine, k);
         host_rmw_event(*machine);
         machine->run();
@@ -400,13 +411,12 @@ TEST(Rmw, simt_rmw_waits_for_own_stores) {
             "the host event's RMW:" + describe(rmws));
         require(grant_cycles(*machine, "A-write", "simt") == sixteen_rounds(w + 1),
             "the sts did not resume at the event's write grant + 1:" + describe(grants_of(*machine)));
-        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{w + 16} &&
-                refusals(*machine, 0, "ordered behind own access") ==
-                    std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, w + 16 - (s + 1)}},
-            "the arrive was not ordered behind its own sts until the sts's last grant (s + 1 .. w + 15, admitted w + 16)");
-        require(rmws[1].detail == "arrive, address=4160" && rmws[1].start == w + t + 17 && rmws[1].read == w + t + 17 &&
-                rmws[1].write == w + t + 17 + rmw,
-            "the arrive's RMW did not start and read at w + t + 17:" + describe(rmws));
+        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + 1} &&
+                refusals(*machine, 0, "ordered behind own access").empty(),
+            "the arrive did not issue right behind its own sts");
+        require(rmws[1].detail == "arrive, address=4160" && rmws[1].start == w + 17 && rmws[1].read == w + 17 &&
+                rmws[1].write == w + 17 + rmw,
+            "the arrive's RMW did not start and read at w + 17, after the sts's last round:" + describe(rmws));
         require(machine->read_mbar_state(4160).remaining == 1, "the arrive was lost");
     }
 
@@ -427,23 +437,24 @@ TEST(Rmw, simt_rmw_waits_for_own_stores) {
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )", 1, {{4160, mbar_state(2, 2)}});
         machine->run();
-        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto g = issue_to_shmem_grant(profile, true);
+        const auto u = issue_to_shmem_grant(profile);
         const auto s = nanosm::fetch_to_issue + 2 + 2 * alu_distance(profile); // sread, shli; umov ur4, mov r5; the sts
         const auto issues = " | issues" + issue_log(*machine);
         require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s}, what + "the sts did not issue at s:" + issues);
-        require(grant_cycles(*machine, "A-write", "simt") == sixteen_rounds(s + t + 1) &&
-                grant_cycles(*machine, "A-read", "simt") == sixteen_rounds(s + 2 * t + 17),
-            what + "sts rounds not from s + t + 1 or lds rounds not from s + 2t + 17:" + describe(grants_of(*machine)) +
+        require(grant_cycles(*machine, "A-write", "simt") == sixteen_rounds(s + g) &&
+                grant_cycles(*machine, "A-read", "simt") == sixteen_rounds(s + 2 * g + 16),
+            what + "sts rounds not from s + g or lds rounds not from s + 2g + 16:" + describe(grants_of(*machine)) +
                 issues);
-        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + t + 16} &&
-                issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s + 2 * t + 32},
-            what + "the lds was not admitted at the sts's last grant, or the arrive at the lds's");
+        require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + g + 16} &&
+                issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s + 2 * g + 32},
+            what + "the lds was not admitted the cycle after the sts's last grant, or the arrive after the lds's");
         const auto ordered = refusals(*machine, 0, "ordered behind own access");
-        require(ordered == std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, t + 15}, {s + t + 17, t + 15}},
+        require(ordered == std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, g + 15}, {s + g + 17, g + 15}},
             what + "ordered refusals:" + describe(ordered));
-        require(grant_cycles(*machine, "A-read", "rmw") == std::vector<uint64_t>{s + 3 * t + 33} &&
-                grant_cycles(*machine, "A-write", "rmw") == std::vector<uint64_t>{s + 3 * t + 33 + d + lb + c},
-            what + "the RMW was not read at s + 3t + 33 and written D + Lb + C later");
+        require(grant_cycles(*machine, "A-read", "rmw") == std::vector<uint64_t>{s + 2 * g + 32 + u} &&
+                grant_cycles(*machine, "A-write", "rmw") == std::vector<uint64_t>{s + 2 * g + 32 + u + d + lb + c},
+            what + "the RMW was not read at s + 2g + 32 + u and written D + Lb + C later");
         for (uint32_t lane = 0; lane < 16; ++lane) {
             require(machine->read_reg(0, lane, 6) == 0x5a, what + "RAW: the lds missed the sts");
         }
@@ -451,21 +462,22 @@ TEST(Rmw, simt_rmw_waits_for_own_stores) {
     }
 }
 
-// The RMW engine's admission (implementer choice): the SIMT RMW register and
-// the engines' event registers alternate by class -- the class that did not
-// start last goes; at the first tie, SIMT. Admission reads registered state.
+// The RMW engine's admission (implementer choice): the write side (its serve
+// stage's barrier change or atomic) and the engines' event registers
+// alternate by class -- the class that did not start last goes; at the first
+// tie, SIMT. Admission reads registered state.
 //   Fairness: the host keeps the TMA's event register full (zero-byte
 //   complete_tx events on 4168, which change nothing) while warps 0 and 1
-//   issue two mbar.arrive each on 4160 (while one's arrive runs, the other's
-//   waits in the register). Feeding starts one busy period before the first
-//   arrive is held (at its issue + issue_to_dispatch + 1), so the starts
-//   alternate TMA, SIMT, ... one busy period apart: an endless supply of
-//   engine events cannot starve the warps.
+//   issue two mbar.arrive each on 4160 (while one's arrive runs, the next
+//   waits in the write side's serve stage). Feeding starts one busy period
+//   before the first arrive is held (at its issue + issue_to_shmem_grant), so
+//   the starts alternate TMA, SIMT, ... one busy period apart: an endless
+//   supply of engine events cannot starve the warps.
 //   First tie: an mma.commit issued at m presents its arrive into the MMA's
-//   event register at P = m + issue_to_dispatch + 1, the cycle the warp's
-//   mbar.arrive (issued at m + 1) reaches the SIMT RMW register; both are held
-//   at P + 1, the SIMT arrive is served first and the commit's a busy period
-//   later.
+//   event register at P = m + issue_to_dispatch + 1, the cycle before the
+//   warp's mbar.arrive (issued at m + 2) reaches the write side's serve stage
+//   (m + 2 + issue_to_shmem_grant); both are held at P + 1, the SIMT arrive
+//   is served first and the commit's a busy period later.
 TEST(Rmw, rmw_admission_fairness) {
     const auto& profile = canonical_profile();
     const auto busy = rmw_busy_cycles(profile);
@@ -475,8 +487,7 @@ TEST(Rmw, rmw_admission_fairness) {
         mbar.arrive [ur4]
         halt
     )", 2, {{4160, mbar_state(5, 5)}, {4168, mbar_state(1, 1)}});
-    const uint64_t f =
-        nanosm::fetch_to_issue + uniform_distance(profile) + nanosm::issue_to_dispatch(profile) + 1 - busy;
+    const uint64_t f = nanosm::fetch_to_issue + uniform_distance(profile) + issue_to_shmem_grant(profile) - busy;
     while (!machine->done()) {
         const auto cycle = machine->cycle();
         if (cycle >= f && cycle < f + 9 * busy && !machine->tma_mbar_event_held()) {
@@ -500,6 +511,7 @@ TEST(Rmw, rmw_admission_fairness) {
         umov ur4, 4160
         umov ur5, 4168
         mma.commit [ur4]
+        umov ur6, 0
         mbar.arrive [ur5]
         halt
     )", 1, {{4160, mbar_state(1, 1)}, {4168, mbar_state(2, 2)}});
@@ -507,8 +519,9 @@ TEST(Rmw, rmw_admission_fairness) {
     // The commit needs the first umov's ur4 (the first umov issues at fetch_to_issue).
     const auto m = nanosm::fetch_to_issue + uniform_distance(profile);
     const auto p = m + nanosm::issue_to_dispatch(profile) + 1;
-    require(issued_at(*tie, 2 * 8) == std::vector<uint64_t>{m} && issued_at(*tie, 3 * 8) == std::vector<uint64_t>{m + 1},
-        "first tie: the commit did not issue at m or the arrive at m + 1 (dispatched in the cycle the commit was "
+    require(m + 2 + issue_to_shmem_grant(profile) == p + 1, "the tie is built for the canonical depths");
+    require(issued_at(*tie, 2 * 8) == std::vector<uint64_t>{m} && issued_at(*tie, 4 * 8) == std::vector<uint64_t>{m + 2},
+        "first tie: the commit did not issue at m or the arrive at m + 2 (in serve the cycle after the commit was "
         "presented)");
     require(mbar_rmw_services(*tie) == std::vector<RmwService>{{p + 1, "arrive, address=4168"},
                                            {p + 1 + busy, "arrive (mma.commit), address=4160"}},
@@ -701,13 +714,15 @@ TEST(Rmw, sanitizer_nonzero_tx_at_kernel_end) {
 
 // ONE word per warp instruction, the update applied ONCE (the operand is ur5
 // = 0x5a5: add adds it once, not per lane), every lane's rD gets the old
-// word. The atomic reaches the SIMT RMW register at its dispatch and starts
-// the cycle after (nothing else holds A-read), reading then; its write is
-// granted D + Lb + C later and its slice ends at that write + 1. The old word
-// is at the port output at a = the read + D + Lb; rD's RF write is granted at
-// a + 1, BEFORE the word's write grant a + C, and lands Wd later. The warp's
-// next shmem access (an lds.uni of the word) is admitted only at the write
-// grant w, granted at its dispatch + 1, and reads the new word. Each op at the
+// word. The atomic reaches the write side's serve stage and starts there, at
+// its issue + issue_to_shmem_grant (nothing else holds A-read), reading then;
+// its write is granted D + Lb + C later and its slice ends at that write + 1.
+// The old word is at the port output at a = the read + D + Lb, into the
+// old-word register; rD's RF write is granted at a + 1, BEFORE the word's
+// write grant a + C, and lands Wd later. The warp's next shmem read (an
+// lds.uni of the word) is admitted the cycle after the write grant w (its
+// warp's unserviced write), granted issue_to_shmem_grant after that, and
+// reads the new word. Each op at the
 // canonical D = Lb = C = 2 (7 cycles from start to the end of the pause); add
 // also at D = 3, C = 3.
 TEST(Rmw, one_word_timeline) {
@@ -736,19 +751,20 @@ TEST(Rmw, one_word_timeline) {
         auto machine = gmem_debug_machine(profile, program_head + test.name + program_tail);
         const auto written = watch_registers(*machine, {7});
         const auto atomic = one_atomic(*machine, what);
-        const auto t = nanosm::issue_to_dispatch(profile);
+        const auto u = issue_to_shmem_grant(profile);
         const auto issue = issued_at(*machine, 16).at(0);
-        require(atomic.start == issue + t + 1, what + ": did not start the cycle after its dispatch");
+        require(atomic.start == issue + u, what + ": did not start at its issue + issue_to_shmem_grant");
         require_atomic_timeline(atomic, profile, atomic.start, what);
         const auto a = atomic.reads.at(0) + profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
         const auto w = atomic.writes.at(0);
         require(written.at(7) == std::vector<uint64_t>{a + 1 + profile.rf_write_depth_cycles} && a + 1 < w,
             what + ": rD's RF write was not granted at a + 1 (c" + std::to_string(a + 1) + "), before the write grant c" +
                 std::to_string(w) + ", landing Wd later");
-        require(issued_at(*machine, 24) == std::vector<uint64_t>{w}, what + ": the lds.uni was not admitted at the write grant");
+        require(issued_at(*machine, 24) == std::vector<uint64_t>{w + 1},
+            what + ": the lds.uni was not admitted the cycle after the write grant");
         const auto lds = grants_of(*machine, "A-read");
-        require(lds.size() == 2 && lds[1] == Grant{w + t + 1, "A-read", "simt", lds[1].slot},
-            what + ": the lds.uni's read was not granted at w + issue_to_dispatch + 1:" + describe(lds));
+        require(lds.size() == 2 && lds[1] == Grant{w + 1 + u, "A-read", "simt", lds[1].slot},
+            what + ": the lds.uni's read was not granted at w + 1 + issue_to_shmem_grant:" + describe(lds));
         const uint32_t updated = atomic_result(test.opcode, 0x300, 0x5a5);
         require(machine->read_shmem_u32(2048) == updated, what + ": the word was not updated once");
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -818,61 +834,14 @@ TEST(Rmw, add_wraps_at_the_int32_boundary) {
     require(machine->read_shmem_u32(2092) == 0x80000002u, "chain: the sum did not wrap to 0x80000002");
 }
 
-// An atomic reserves its RETURN load slot at admission; with none free it is
-// not admitted (structural, counted as a load-slot wait), so it never takes
-// the store pause with nowhere to put its old value. One load slot: the lds,
-// issued at l (it needs the shli's r1: 2 alu_distance), is granted at G = l +
-// issue_to_dispatch + 1 and holds the slot until its RF write is granted at
-// G + D + Lb + 1. The atomic, first tried at l + 1 (its ur3 is visible then),
-// is ordered behind the unserviced lds until G, then refused "load slots
-// full" G .. G + D + Lb + 1 and admitted the cycle after, when issue sees the
-// slot empty.
-TEST(Rmw, return_slot_admission) {
-    auto profile = canonical_profile();
-    profile.shmem_load_slots = 1;
-    const uint64_t back = profile.shmem_port_a_depth + profile.shmem_read_latency_cycles;
-    auto machine = gmem_debug_machine(profile, R"(
-        sread r0, LANE_ID
-        shli r1, r0, 2
-        umov ur2, 0
-        umov ur3, 5
-        lds r6, [r1 + 256] {pred=PT, stall=0, set=sb1, wait=-}
-        atom.add.uni r7, [ur2 + 1024], ur3 {pred=PT, stall=0, set=sb0, wait=-}
-        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
-    )");
-    machine->run();
-    const auto g = grants_of(*machine, "A-read").at(0);
-    const auto t = nanosm::issue_to_dispatch(profile);
-    const auto l = nanosm::fetch_to_issue + 2 * alu_distance(profile);
-    require(g.client == "simt" && issued_at(*machine, 32) == std::vector<uint64_t>{l} && g.cycle == l + t + 1,
-        "the lds was not granted the cycle after its dispatch:" + issue_log(*machine));
-    require(refusals(*machine, 0, "ordered behind own access") == std::vector<std::pair<uint64_t, uint64_t>>{{l + 1, t}},
-        "the atomic was not ordered behind the lds until its grant:" +
-            describe(refusals(*machine, 0, "ordered behind own access")));
-    require(refusals(*machine, 0, "load slots full") == std::vector<std::pair<uint64_t, uint64_t>>{{g.cycle, back + 2}} &&
-            issued_at(*machine, 40) == std::vector<uint64_t>{g.cycle + back + 2},
-        "the atomic was not refused for its return slot c" + std::to_string(g.cycle) + " .. c" +
-            std::to_string(g.cycle + back + 1) + " and admitted at c" + std::to_string(g.cycle + back + 2) + ":" +
-            describe(refusals(*machine, 0, "load slots full")));
-    require(machine->trace().summary().shmem_load_slot_waits == back + 2, "the return-slot refusals were not counted");
-    const auto atomic = one_atomic(*machine, "after the refusal");
-    require_atomic_timeline(atomic, profile, atomic.start, "after the refusal");
-    require(machine->read_shmem_u32(1024) == 0x205, "the atomic's word");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_reg(0, lane, 6) == 0x100 + 64 + lane && machine->read_reg(0, lane, 7) == 0x200,
-            "lane " + std::to_string(lane) + ": the lds or the atomic returned the wrong word");
-    }
-}
-
-// The SIMT RMW register holds ONE operation machine-wide. Three warps, one
-// atomic each on one word (operand 1): the first runs in the engine, the
-// second waits in the register, the third is refused "SIMT RMW register
-// busy" until the register empties. All three apply, one after another (each
-// reads the previous sum), and the engine runs them back to back with no
-// overlap.
-TEST(Rmw, simt_rmw_register_busy) {
-    auto profile = canonical_profile();
-    profile.shmem_load_slots = 3; // a return slot for each: the third waits only for the register
+// An atomic's old word: it goes through the old-word register, reserved at
+// the atomic's RMW start, to every active lane of rD; rD's depbar clears as
+// that RF write lands. Three warps, one atomic each on one word (operand 1),
+// on the write side one after another: the engine runs them back to back
+// with no overlap, each reads the previous sum (its old word), and no warp
+// is refused at issue (one write-queue entry each).
+TEST(Rmw, atomic_old_word) {
+    const auto& profile = canonical_profile();
     auto machine = gmem_debug_machine(profile, R"(
         umov ur1, 0
         umov ur5, 1
@@ -885,11 +854,9 @@ TEST(Rmw, simt_rmw_register_busy) {
     for (std::size_t k = 1; k < atomics.size(); ++k) {
         require(atomics[k].start >= atomics[k - 1].end, "two atomics overlapped in the engine:" + describe(atomics[k]));
     }
-    uint32_t busy = 0;
     for (uint32_t warp = 0; warp < 3; ++warp) {
-        busy += static_cast<uint32_t>(refusals(*machine, warp, "SIMT RMW register busy").size());
+        require(refusals(*machine, warp, "write queue full").empty(), "a warp was refused for the write queue");
     }
-    require(busy != 0, "no warp was refused for the busy SIMT RMW register");
     std::set<uint32_t> old_values;
     for (uint32_t warp = 0; warp < 3; ++warp) old_values.insert(machine->read_reg(warp, 0, 7));
     require(old_values == std::set<uint32_t>{0x300, 0x301, 0x302} && machine->read_shmem_u32(2048) == 0x303,
@@ -898,18 +865,18 @@ TEST(Rmw, simt_rmw_register_busy) {
 
 // An atomic is a WRITE for its warp's order and counts as unserviced until
 // its write grant.
-//   sts B; atom B: the atomic waits for the sts's grant and reads its word;
+//   sts B; atom B: both on the write side, which keeps them in order: the
+//     atomic issues at once, and its read comes after the sts's round;
 //   atom B; lds B: the lds waits until the atomic's write grant w (admitted
-//     at w) and reads the result in lane 0's word;
-//   lds A; atom A: the atomic waits for the lds's grant; the lds reads the
-//     old word (and so does the atomic: it applies after);
-//   atom A; fence.sh: admitted at the atomic's write grant + D.
-// Words B: 384 + l (sixteen banks, one round each); A: 256 + l. Three load
-// slots, so atom A's return slot is free while both lds hold theirs: only the
-// warp's order decides.
+//     at w + 1, from the warp's count) and reads the result in lane 0's word;
+//   lds A; atom A: the atomic waits for the lds's grant g (admitted at
+//     g + 1); the lds reads the old word (and so does the atomic: it applies
+//     after);
+//   atom A; fence.sh: admitted the cycle after the atomic's write reaches
+//     the RAM (its write grant + D + 1).
+// Words B: 384 + l (sixteen banks, one round each); A: 256 + l.
 TEST(Rmw, same_warp_order) {
-    auto profile = canonical_profile();
-    profile.shmem_load_slots = 3;
+    const auto& profile = canonical_profile();
     auto machine = gmem_debug_machine(profile, R"(
         sread r0, LANE_ID
         shli r1, r0, 2
@@ -935,15 +902,17 @@ TEST(Rmw, same_warp_order) {
     require(simt.size() == 3 && simt[0].service == "A-write" && simt[1].service == "A-read" &&
             simt[2].service == "A-read",
         "the SIMT rounds:" + describe(simt));
-    require(issued_at(*machine, 48) == std::vector<uint64_t>{simt[0].cycle} && atomics[0].reads.at(0) > simt[0].cycle,
-        "atom B was not admitted at the sts's grant, reading after it");
+    require(issued_at(*machine, 48) == std::vector<uint64_t>{issued_at(*machine, 40).at(0) + 1} &&
+            atomics[0].reads.at(0) > simt[0].cycle,
+        "atom B did not issue right after the sts, reading after the sts's round");
     const auto w_b = atomics[0].writes.at(0);
-    require(issued_at(*machine, 56) == std::vector<uint64_t>{w_b} && simt[1].cycle > w_b,
-        "lds B was not admitted at atom B's write grant c" + std::to_string(w_b) + ":" + describe(atomics[0]));
-    require(issued_at(*machine, 72) == std::vector<uint64_t>{simt[2].cycle} && atomics[1].reads.at(0) > simt[2].cycle,
-        "atom A was not admitted at lds A's grant");
-    require(issued_at(*machine, 80) == std::vector<uint64_t>{atomics[1].writes.at(0) + profile.shmem_port_a_depth},
-        "fence.sh was not admitted at atom A's write grant + D");
+    require(issued_at(*machine, 56) == std::vector<uint64_t>{w_b + 1} && simt[1].cycle > w_b,
+        "lds B was not admitted the cycle after atom B's write grant c" + std::to_string(w_b) + ":" +
+            describe(atomics[0]));
+    require(issued_at(*machine, 72) == std::vector<uint64_t>{simt[2].cycle + 1} && atomics[1].reads.at(0) > simt[2].cycle,
+        "atom A was not admitted the cycle after lds A's grant");
+    require(issued_at(*machine, 80) == std::vector<uint64_t>{atomics[1].writes.at(0) + profile.shmem_port_a_depth + 1},
+        "fence.sh was not admitted the cycle after atom A's write reached the RAM");
     require(machine->read_shmem_u32(1536) == 0x1013 && machine->read_shmem_u32(1024) == 0x203, "the atomics' words");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         require(machine->read_reg(0, lane, 11) == 0x1010 && machine->read_reg(0, lane, 7) == 0x200,

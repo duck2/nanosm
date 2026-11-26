@@ -23,12 +23,14 @@ namespace nanosm {
 // leaves goes to the asynchronous clients, decided from Q before issue:
 //   READS   decide_rf_reads: the issue
 //           register's instruction owns the read ports its round samples
-//           now; acc.st beats and the LSU's store-data read share the rest
-//           by round-robin. A denied reader whose bank's read_owed bit is
-//           set inhibits the acceptance of new SIMT reads of that bank, so
-//           the bank's ports are free one cycle later (the mirrored rule).
-//   WRITES  decide_rf_writes: load slots, the LSU's load buffer and the
-//           acc.ld pipelines share the current write port's unbooked ports;
+//           now; acc.st beats, the LSU's store-data read and the shared-
+//           memory collect stages share the rest by round-robin. A denied
+//           reader whose bank's read_owed bit is set inhibits the acceptance
+//           of new SIMT reads of that bank, so the bank's ports are free one
+//           cycle later (the mirrored rule).
+//   WRITES  decide_rf_writes: the shared-memory write-back buffer and
+//           old-word register, the LSU's load buffer and the acc.ld
+//           pipelines share the current write port's unbooked ports;
 //           a denied writer whose bank's async_owed bit is set inhibits new
 //           fixed write bookings to that bank.
 // A read SAMPLES the RF at its cycle and has its operand Lr cycles later; a
@@ -101,18 +103,24 @@ std::optional<uint32_t> Machine::lsu_rf_presented() const {
 }
 
 // Every async RF holder, in round-robin order, with its write when its vector
-// is complete in Q: the load slots, the load buffer on the LSU's write
-// path, then each tmem bank's acc.ld pipeline output.
+// is complete in Q: the write-back entries, the atomic's old-word register,
+// the load buffer on the LSU's write path, then each tmem bank's acc.ld
+// pipeline output.
 std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
     std::optional<uint32_t> lsu_presented) const {
     std::vector<std::optional<AsyncWrite>> holders;
-    for (uint32_t index = 0; index < load_slots_.count(); ++index) {
-        const auto& slot = load_slots_[index].cur();
-        if (slot.has_value() && slot->complete()) {
-            holders.push_back(AsyncWrite{AsyncWriter::load_slot, index, slot->warp, slot->dst});
+    for (uint32_t index = 0; index < writeback_.count(); ++index) {
+        const auto& entry = writeback_[index].cur();
+        if (entry.has_value() && entry->complete()) {
+            holders.push_back(AsyncWrite{AsyncWriter::writeback, index, entry->warp, entry->dst});
         } else {
             holders.emplace_back();
         }
+    }
+    if (const auto& old = atomic_return_.cur(); old.has_value() && old->word.has_value()) {
+        holders.push_back(AsyncWrite{AsyncWriter::atomic_return, 0, old->warp, old->dst});
+    } else {
+        holders.emplace_back();
     }
     for (uint32_t index = 0; index < lsu_buffers_.count(); ++index) {
         holders.push_back(lsu_presented == index ? lsu_buffer_rf_write(index) : std::nullopt);
@@ -172,11 +180,19 @@ Machine::RfWrite Machine::async_rf_write(const AsyncWrite& write, std::optional<
     writeback.lane_enables = full_mask();
     trace_->rf_async_write();
     switch (write.writer) {
-    case AsyncWriter::load_slot: {
-        const auto& slot = *load_slots_.at(write.index).cur();
-        writeback.values = slot.words;
-        writeback.lane_enables = slot.mask;
-        writeback.clear_depbar = slot.depbar;
+    case AsyncWriter::writeback: {
+        const auto& entry = *writeback_.at(write.index).cur();
+        writeback.values = entry.words;
+        writeback.lane_enables = entry.mask;
+        writeback.clear_depbar = entry.depbar;
+        writeback.visible_regs = {write.reg};
+        return writeback;
+    }
+    case AsyncWriter::atomic_return: {
+        const auto& old = *atomic_return_.cur();
+        writeback.values.assign(std::size_t{config_.lanes}, *old.word);
+        writeback.lane_enables = old.mask;
+        writeback.clear_depbar = old.depbar;
         writeback.visible_regs = {write.reg};
         return writeback;
     }
@@ -251,7 +267,7 @@ void Machine::count_rf_write_waits(const RfWriteDecision& decision) {
 // of its bank, and enter that port's write pipeline. A write that ends an LSU
 // command releases it now (the write pipeline owns its data from here); a
 // store whose last sector request was accepted last cycle gives up its command
-// slot now too. A load slot granted now is free for dispatch now (d).
+// slot now too. A write-back entry granted now is free from the next cycle.
 void Machine::rf_write_port(Wires& w) {
     w.rf_port_writes.assign(rf_write_pipes_.size(), std::nullopt);
     std::vector<uint32_t> port_uses(config_.rf_banks, 0);
@@ -360,9 +376,14 @@ void Machine::drive_predicates(const Wires& w) {
 // never stopped. The readers granted (round-robin from the bank's cursor)
 // sample the RF now: an acc.st beat is at the RF output Lr later and at the
 // tmem RAM tmem.port_depth after that; the LSU's beat fills the store
-// buffer Lr later. A denied
-// reader holds (an acc.st keeps its beat, the LSU its candidate; a source
-// stays read-owned). The owed bit and cursor change in drive_rf_read_policy.
+// buffer Lr later; a collect stage's register is at the RF output Lr later.
+// An sts's data, wanted with its address in one cycle, is outside the
+// round-robin: it takes a port of its bank only if one is left after it,
+// so the pair never waits on two owed bits (the address is the named
+// requester; the data is read later, as the stage's own request, if not
+// now). A denied reader holds (an acc.st keeps its beat, the LSU its
+// candidate, a collect stage its access; a source stays read-owned). The
+// owed bit and cursor change in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     RfReadDecision decision;
     const auto& store_engine = acc_engines_.cur()[1];
@@ -373,12 +394,17 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         decision.holders.emplace_back();
     }
     decision.holders.push_back(lsu_store_read_request(w));
+    decision.holders.push_back(collect_read_request(false, false));
+    decision.holders.push_back(collect_read_request(true, false));
+    const std::size_t pair_data = decision.holders.size();
+    decision.holders.push_back(collect_read_request(true, true));
     decision.granted.assign(decision.holders.size(), 0);
     decision.banks.resize(config_.rf_banks);
     const auto& policy = rf_read_policy_.cur();
     const auto& simt_read_now = issue_read_banks_.cur();
+    std::vector<uint32_t> ports_used(config_.rf_banks, 0);
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
-        std::vector<uint8_t> ready(decision.holders.size(), 0);
+        std::vector<uint8_t> ready(pair_data, 0);
         for (std::size_t holder = 0; holder < ready.size(); ++holder) {
             const auto& read = decision.holders[holder];
             ready[holder] = read.has_value() && read->reg % config_.rf_banks == bank ? 1 : 0;
@@ -386,11 +412,19 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         const auto free_ports = config_.rf_read_ports_per_bank - simt_read_now.at(bank);
         const auto choice = round_robin_grant(ready, policy.at(bank).cursor, free_ports);
         for (const auto holder : choice.granted) decision.granted[holder] = 1;
+        ports_used[bank] = simt_read_now.at(bank) + static_cast<uint32_t>(choice.granted.size());
         auto& state = decision.banks[bank];
         state.ready = std::find(ready.begin(), ready.end(), 1) != ready.end();
         state.granted = !choice.granted.empty();
         state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
+    }
+    if (const auto& data = decision.holders[pair_data]; data.has_value() && decision.granted[pair_data - 1] != 0) {
+        const auto bank = data->reg % config_.rf_banks;
+        if (ports_used[bank] < config_.rf_read_ports_per_bank) {
+            decision.granted[pair_data] = 1;
+            decision.banks[bank].granted = true;
+        }
     }
     for (std::size_t holder = 0; holder < decision.holders.size(); ++holder) {
         const auto& read = decision.holders[holder];
@@ -400,12 +434,31 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
                 ++trace_->lsu_counters().lsu_rf_read_wait_cycles;
                 ++lsu_phases_[read->lsu_command].rf_wait;
             }
+            if (read->reader == RfReader::read_collect || read->reader == RfReader::write_collect) {
+                trace_->shmem_bank_wait(read->reader == RfReader::write_collect);
+            }
             continue;
         }
         const auto& warp = warps_.at(read->warp);
         trace_->rf_read(cycle_, warp.id, read->reg, read->reg % config_.rf_banks);
+        const bool collect = read->reader == RfReader::read_collect || read->reader == RfReader::write_collect ||
+            read->reader == RfReader::write_collect_data;
         auto values = read_rf(warp.id, read->reg,
-            read->reader == RfReader::acc_st ? "RF read: acc.st beat" : "RF read: store data");
+            read->reader == RfReader::acc_st ? "RF read: acc.st beat"
+            : collect ? "RF read: a shared-memory collect stage" : "RF read: store data");
+        if (collect) {
+            sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::shmem_collect);
+            const auto& inst = (read->reader == RfReader::read_collect ? read_collect_ : write_collect_).cur()->entry.instruction;
+            if (read->reader == RfReader::read_collect) {
+                w.read_collect_address = LaneWords(values);
+            } else if (read->reader == RfReader::write_collect && read->reg == inst.src0 &&
+                       !write_collect_.cur()->address_read) {
+                w.write_collect_address = LaneWords(values);
+            } else {
+                w.write_collect_data = LaneWords(values);
+            }
+            continue;
+        }
         if (read->reader == RfReader::acc_st) {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::acc_st);
             w.acc_st_read = AccStBeat{store_engine->next_column, std::move(values)};
@@ -471,6 +524,9 @@ void Machine::step_rf_reads(Wires& w) {
         }
         w.arithmetic_sampled = std::move(sampled);
     }
+    // A shared-memory queue's newest entry, accepted last cycle, samples its
+    // predicate and uniform registers.
+    sample_shmem_entry(w, uniform_reads);
     // The dispatch pipeline's stage 0: the instruction accepted last cycle
     // samples its round.
     const auto& pipe = dispatch_pipe_.cur();

@@ -21,9 +21,8 @@ enum class WarpState : uint8_t {
     stall_count,
     depbar,
     mbar_wait,
-    mbar_wait_slot,
     structural,
-    shmem_slot,   // an lds / sts with no free load / store slot
+    shmem_queue,  // a shared-memory instruction whose queue is full
     shmem_order,  // a shmem access ordered behind the warp's own unserviced access
     // The warp has no instruction to offer issue: its instruction FIFO is
     // empty, or its branch has not resolved.
@@ -89,14 +88,20 @@ struct TraceSummary {
     // the mbar line.
     uint64_t shmem_requests = 0;
     uint64_t shmem_rounds = 0;
-    // Warp-cycles an lds / lds.uni (sts) was refused because every load
-    // (store) slot was held, and warp-cycles a shmem access was ordered behind
+    // Warp-cycles a read-side (write-side) instruction was refused because
+    // its queue was full, and warp-cycles a shmem access was ordered behind
     // the warp's own unserviced access.
-    uint64_t shmem_load_slot_waits = 0;
-    uint64_t shmem_store_slot_waits = 0;
+    uint64_t shmem_read_queue_full = 0;
+    uint64_t shmem_write_queue_full = 0;
     uint64_t shmem_order_waits = 0;
-    // Cycles a store waited to start (a store slot held, not started) while
-    // an RMW's store pause held A-write.
+    // Per side: cycles the queue's head could leave but the collect stage was
+    // busy, and cycles the collect stage asked for an RF bank and was denied.
+    uint64_t shmem_read_head_waits = 0;
+    uint64_t shmem_write_head_waits = 0;
+    uint64_t shmem_read_bank_waits = 0;
+    uint64_t shmem_write_bank_waits = 0;
+    // Cycles a store waited to start (the write side's serve holds it, not
+    // started) while an RMW's store pause held A-write.
     uint64_t shmem_store_paused = 0;
     // Rounds granted, per service and client.
     uint64_t shmem_a_read_simt = 0;
@@ -128,7 +133,6 @@ struct TraceSummary {
     uint64_t mbar_engine_waits_on_other = 0;
     uint64_t mbar_initial_probes = 0;
     uint64_t mbar_immediate_successes = 0;
-    uint64_t mbar_slot_full_stalls = 0;
     uint64_t mbar_sleeps = 0;
     uint64_t mbar_wakes = 0;
     uint64_t mbar_timeouts = 0;
@@ -265,8 +269,9 @@ public:
     void mbar_wake(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t phase);
     void mbar_timeout(uint64_t cycle, uint32_t warp, uint32_t byte_address, uint8_t parity);
 
-    void shmem_load_slot_wait() { ++summary_.shmem_load_slot_waits; }
-    void shmem_store_slot_wait() { ++summary_.shmem_store_slot_waits; }
+    void shmem_queue_full(bool write_side) { ++(write_side ? summary_.shmem_write_queue_full : summary_.shmem_read_queue_full); }
+    void shmem_head_wait(bool write_side) { ++(write_side ? summary_.shmem_write_head_waits : summary_.shmem_read_head_waits); }
+    void shmem_bank_wait(bool write_side) { ++(write_side ? summary_.shmem_write_bank_waits : summary_.shmem_read_bank_waits); }
     void shmem_order_wait() { ++summary_.shmem_order_waits; }
     void shmem_store_pause_wait() { ++summary_.shmem_store_paused; }
     void rf_async_write() { ++summary_.rf_async_writes; }

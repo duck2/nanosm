@@ -475,31 +475,37 @@ TEST(Basics, mbar_try_wait_sleeps_and_engine_completion_wakes) {
 // A probe of the mbar at 64 (one arrival expected and pending, in phase
 // `phase`): a test_wait or try_wait for phase 0 when phase 0 has completed
 // answers true at once, in every lane; a try_wait on a phase that never
-// completes times out false; with one wait slot a second warp waits for the
-// slot (a warp state of its own) and both time out.
+// completes times out false; two warps time out in their own wait slots;
+// with one wait slot the second warp's try_wait is a PANIC (slot w is warp
+// w's).
 TEST(Basics, mbar_try_wait_immediate_success) {
     struct Row {
         std::string name;
         bool phase;
         uint32_t warps;
-        uint32_t wait_slots; // 0: the canonical profile's
         uint32_t timeout;    // 0: the canonical profile's
         std::string probe;
         bool answer;
         int64_t probes, immediate, sleeps, timeouts, wakes; // the trace summary's counts; -1: not checked
-        bool slot_full;
     };
     const std::vector<Row> rows = {
-        {"test_wait on a completed phase", true, 1, 0, 0, "mbar.test_wait p0, [ur0], 0", true, -1, -1, -1, -1, -1,
-            false},
-        {"try_wait on a completed phase", true, 1, 0, 0, "umov ur2, 0\nmbar.try_wait p0, [ur0], ur2", true, 1, 1, 0,
-            -1, -1, false},
-        {"try_wait timing out", false, 1, 0, 3, "mbar.try_wait p0, [ur0], 0", false, -1, -1, -1, 1, 0, false},
-        {"two warps, one wait slot", false, 2, 1, 4, "mbar.try_wait p0, [ur0], 0", false, 2, -1, -1, 2, -1, true},
+        {"test_wait on a completed phase", true, 1, 0, "mbar.test_wait p0, [ur0], 0", true, -1, -1, -1, -1, -1},
+        {"try_wait on a completed phase", true, 1, 0, "umov ur2, 0\nmbar.try_wait p0, [ur0], ur2", true, 1, 1, 0,
+            -1, -1},
+        {"try_wait timing out", false, 1, 3, "mbar.try_wait p0, [ur0], 0", false, -1, -1, -1, 1, 0},
+        {"two warps, two wait slots", false, 2, 4, "mbar.try_wait p0, [ur0], 0", false, 2, -1, -1, 2, -1},
     };
+    {
+        auto profile = canonical_profile();
+        profile.mbar_wait_slots = 1;
+        auto launch = launch_warps(2);
+        write_mbar(image_bytes(launch.test_shmem, 128), 64, mbar_state(1, 1, 0, false));
+        nanosm::Machine machine(profile, compile("umov ur0, 64\nmbar.try_wait p0, [ur0], 0\nhalt\n", profile),
+            std::move(launch));
+        expect_panic(machine, {"mbar.try_wait by warp 1", "sync.mbar_wait_slots"}, "a try_wait past the last slot");
+    }
     for (const auto& row : rows) {
         auto profile = canonical_profile();
-        if (row.wait_slots != 0) profile.mbar_wait_slots = row.wait_slots;
         if (row.timeout != 0) profile.mbar_try_wait_timeout_cycles = row.timeout;
         auto launch = launch_warps(row.warps);
         write_mbar(image_bytes(launch.test_shmem, 128), 64, mbar_state(1, 1, 0, row.phase));
@@ -523,11 +529,6 @@ TEST(Basics, mbar_try_wait_immediate_success) {
         pin(row.sleeps, summary.mbar_sleeps, "sleeps");
         pin(row.timeouts, summary.mbar_timeouts, "timeouts");
         pin(row.wakes, summary.mbar_wakes, "exact wakes");
-        if (row.slot_full) {
-            require(summary.mbar_slot_full_stalls != 0, row.name + ": wait-slot exhaustion was not attributed");
-            require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::mbar_wait_slot)] != 0,
-                row.name + ": slot-full cycles were not a distinct warp state");
-        }
     }
 }
 
