@@ -43,7 +43,7 @@
     "numeric_model": "fp16_raw_window25_rz_v1"
   },
   "sync": {
-    "mbar_wait_slots": 8,
+    "mbar_wait_slots": 16,
     "mbar_try_wait_timeout_cycles": 65536
   },
   "tma": {

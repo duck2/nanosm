@@ -1313,9 +1313,11 @@ TEST(Rf, async_readers_round_robin) {
 // uniform registers (WARP_ID through usread, the mbar address), WARP_ID /
 // THREAD_ID, a depbar (lds), its shmem order (lds behind its own sts), the
 // stall count, an mbar arrival and a try_wait on a barrier all 16 arrive at
-// (more waiters than the 8 wait slots), and its trace track.
+// (more waiters than the 8 wait slots this test gives the profile), and its
+// trace track.
 TEST(Rf, sixteen_warps) {
-    const auto& profile = canonical_profile();
+    auto profile = canonical_profile();
+    profile.mbar_wait_slots = 8;
     auto launch = launch_warps(16);
     write_mbar(image_bytes(launch.test_shmem, 8192), 4096, mbar_state(16, 16));
     nanosm::Machine machine(profile, compile(R"(
