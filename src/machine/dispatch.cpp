@@ -56,7 +56,8 @@ void Machine::hand_over(const DispatchEntry& op, Wires& w) {
 // lane off. Issue could not know: it took its slot (the
 // admission's claim), set its depbar and booked its read round like any.
 // Here it completes with zero accesses: no LSU
-// command, no buffer, no request; its depbar is decremented now,
+// command, no buffer, no request; its depbar is decremented now (and a
+// stg.v8's read depbar; the others' fell at their issue round's sample),
 // so a waiting instruction sees it zero from the next cycle (issue +
 // issue_to_dispatch + 1, canonical issue + 4). A load's destination keeps
 // every lane's old value and is not in flight from then on. Only a
@@ -74,8 +75,9 @@ void Machine::complete_without_lanes(const DispatchEntry& op, Wires& w) {
         const uint32_t registers = inst.opcode == Opcode::ldg_v8 ? 8 : 1;
         for (uint32_t j = 0; j < registers; ++j) sanitizer_.record_reg_ready(op.warp, *dst + j, cycle_ + 1);
     }
-    if (inst.opcode == Opcode::stg_v8) { // its sources are never read
+    if (inst.opcode == Opcode::stg_v8) { // its data is never read: its read depbar is given back too
         for (uint32_t j = 0; j < 8; ++j) sanitizer_.record_async_reader_done(op.warp, inst.src1 + j, AsyncReader::stg_v8);
+        lower_read_depbar(w, op.warp, inst);
     }
 }
 

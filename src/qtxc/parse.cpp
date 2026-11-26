@@ -687,6 +687,8 @@ Control parse_control(const std::string& text, uint32_t line) {
             control.stall = static_cast<uint8_t>(stall);
         } else if (name == "set") {
             control.set_depbar = value == "-" ? 7 : parse_bar(value, line);
+        } else if (name == "read") {
+            control.read_depbar = value == "-" ? 7 : parse_bar(value, line);
         } else if (name == "wait") {
             control.wait_mask = 0;
             if (value != "-") {

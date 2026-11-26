@@ -1096,6 +1096,7 @@ private:
         uint32_t warp = 0;
         uint8_t reg = 0;            // rD (loads) / rS (vector store)
         uint8_t depbar = 0;
+        uint8_t read_depbar = 7;    // vector store: lowered by its last data read (7: none)
         // The instruction's lanes (16 bits; the active mask AND its write mask,
         // as its operands were sampled): an inactive lane makes no request, a
         // load writes only these lanes (a uniform load: all lanes).
@@ -1802,6 +1803,7 @@ private:
         uint32_t beat = 0;           // lsu_store: which of rS .. rS+7
         uint64_t lanes = 0;          // lsu_store: the group's active lanes
         bool last_group = false;     // lsu_store: the command reads this register for the last time
+        uint8_t read_depbar = 7;     // lsu_store: the command's read depbar (its last group's rS + 7 lowers it)
     };
 
     // The RF read decision of this cycle, from Q before issue:
@@ -2058,7 +2060,8 @@ private:
         bool sfu = false;                                // ... an SFU op: the unit's occupancy countdown loads
         bool halt = false;                               // ... a halt: the warp's front end stops
         std::optional<IssuedBranch> branch;              // ... a branch: into the issue register
-        std::optional<DepbarEvent> depbar_admission;
+        std::optional<DepbarEvent> depbar_admission;      // ... the depbar it sets
+        std::optional<DepbarEvent> read_depbar_admission; // ... and its read depbar (a vector memory form)
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
         std::optional<std::size_t> rf_write_stage;       // ... at this stage of the write calendar
         std::optional<ArithmeticRead> arithmetic;        // a fixed-latency instruction enters the arithmetic pipeline
@@ -2874,6 +2877,11 @@ private:
     void record_depbar_completion(Wires& w, uint32_t warp, uint8_t bar, const std::string& underflow);
     [[nodiscard]] uint32_t depbar_after_completions(const Wires& w, uint32_t warp, uint8_t bar) const;
     void admit_depbar(Wires& w, uint32_t warp, uint8_t bar);
+    // The read depbar of a vector memory form (Control::read_depbar, when it
+    // names one): raised with its admission, lowered when its last vector
+    // source has been read (or it is dropped with no lane, its sources unread).
+    void admit_read_depbar(Wires& w, uint32_t warp, const Instruction& inst);
+    void lower_read_depbar(Wires& w, uint32_t warp, const Instruction& inst);
     // mbar wait slots (slot w is warp w's): a warp parked in its slot (Q).
     [[nodiscard]] bool wait_slot_completed(const Wires& w, uint32_t slot) const;
     [[nodiscard]] bool warp_waiting_in_slot(uint32_t warp) const;

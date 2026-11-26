@@ -555,6 +555,7 @@ std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wire
         // The command's last group: no active lane above it.
         request.last_group = (request.group + 1) * width >= config_.lanes ||
             (command->lanes >> ((request.group + 1) * width)) == 0;
+        request.read_depbar = command->read_depbar;
         return request;
     }
     return std::nullopt;
@@ -791,6 +792,10 @@ void Machine::dispatch_lsu(const DispatchEntry& op, Wires& w) {
     if (!slot.has_value()) throw SimError("internal: an LSU command dispatched with no free slot");
     command.slot = *slot;
     command.depbar = inst.control.set_depbar;
+    // A stg.v8 reads its data after dispatch: its read depbar rides with the
+    // command to its last data read. (ldg, stg and ldg.v8 read every vector
+    // source in their issue round: their read depbar is lowered there.)
+    if (command.kind == LsuKind::vector_store) command.read_depbar = inst.control.read_depbar;
     if (is_store(command.kind)) command.ack_record = free_store_ack_record();
     DispatchDecision::LsuAdmission admission;
     switch (command.kind) {

@@ -13,7 +13,7 @@ namespace nanosm {
 std::string emit_asm(const AssemblyProgram& program) {
     std::ostringstream out;
     out << "; scheduled qtx assembly: controls are part of the instruction word\n";
-    out << "; {pred, stall, set, wait}; six warp-local depbar counters sb0..sb5\n\n";
+    out << "; {pred, stall, set, read, wait}; six warp-local depbar counters sb0..sb5\n\n";
     out << ".profile " << program.profile_name << ", 0x"
         << format_profile_fingerprint(program.profile_fingerprint) << "\n\n";
     // What the source declares beside the code (directives.cpp): the

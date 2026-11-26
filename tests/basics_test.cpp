@@ -117,6 +117,120 @@ TEST(Basics, encoding_round_trip) {
     expect_error([] { (void)compile("bssy J\nJ: halt\n"); }, {"unknown opcode 'bssy'"}, "bssy");
 }
 
+// The six vector memory forms carry a read depbar (bits 21..19) beside a
+// signed 19-bit immediate (bits 18..0); every other form keeps its fields.
+// The field round-trips through the word, the assembly text (printed only
+// when it names a counter) and hex. qtxc, the assembler and kernel load
+// refuse an offset past 19 bits and a read depbar naming the set depbar's
+// counter, each naming where.
+TEST(Basics, read_depbar_field) {
+    const auto& profile = canonical_profile();
+    using nanosm::Opcode;
+    namespace enc = nanosm::encoding;
+    for (const auto opcode : {Opcode::lds, Opcode::sts, Opcode::ldg, Opcode::stg, Opcode::ldg_v8, Opcode::stg_v8}) {
+        const bool store = opcode == Opcode::sts || opcode == Opcode::stg || opcode == Opcode::stg_v8;
+        const auto name = nanosm::opcode_name(opcode);
+        for (const uint8_t read : {uint8_t{7}, uint8_t{3}}) {
+            for (const int32_t imm : {enc::vector_memory_immediate_min, -4, 0, enc::vector_memory_immediate_max}) {
+                nanosm::Instruction inst;
+                inst.opcode = opcode;
+                inst.dst = store ? 0 : 200;
+                inst.src0 = 129;
+                inst.src1 = store ? 8 : 0;
+                inst.imm = imm;
+                inst.control.set_depbar = 2;
+                inst.control.read_depbar = read;
+                const auto word = nanosm::encode(inst);
+                const auto back = nanosm::decode(word);
+                require(back.control.read_depbar == read && back.control.set_depbar == 2 && back.imm == imm &&
+                        back.dst == inst.dst && back.src0 == 129 && back.src1 == inst.src1,
+                    name + " did not round-trip (read " + std::to_string(read) + ", offset " + std::to_string(imm) + ")");
+                require((word >> 19 & 7) == read, name + ": the read depbar is not bits 21..19");
+                require(!nanosm::reserved_bit(word).has_value(), name + ": a defined bit taken for reserved");
+                const auto text = nanosm::format_instruction(back);
+                require((text.find(", read=sb3,") != std::string::npos) == (read == 3), name + " prints as " + text);
+            }
+        }
+        nanosm::Instruction wide;
+        wide.opcode = opcode;
+        wide.control.set_depbar = 0;
+        wide.imm = enc::vector_memory_immediate_max + 1;
+        expect_error([&] { (void)nanosm::encode(wide); }, {"19-bit"}, name + " with a 20-bit offset");
+    }
+    // Every other form keeps its own fields: addi its 22-bit immediate (an
+    // offset of 0x40000 still fits there), and none has a read depbar.
+    nanosm::Instruction addi;
+    addi.opcode = Opcode::addi;
+    addi.imm = 0x40000;
+    require(nanosm::decode(nanosm::encode(addi)).imm == 0x40000, "addi lost its 22-bit immediate");
+    addi.control.read_depbar = 1;
+    expect_error([&] { (void)nanosm::encode(addi); }, {"no read depbar field"}, "a read depbar on addi");
+
+    // Assembly, disassembly and hex.
+    const auto kernel = nanosm::assemble_asm(hand_asm(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2 {pred=PT, stall=2, set=-, wait=-}
+        mov r5, 7
+        lds r1, [r0 + 64] {pred=PT, stall=0, set=sb0, read=sb1, wait=-}
+        sts [r0 - 4 + 260], r5 {pred=PT, stall=0, set=sb2, read=sb1, wait=-}
+        ldg r2, [r0 + 262143] {pred=PT, stall=0, set=sb3, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3}
+    )"), profile);
+    const auto lds = nanosm::decode(kernel.words.at(3));
+    const auto sts = nanosm::decode(kernel.words.at(4));
+    const auto ldg = nanosm::decode(kernel.words.at(5));
+    require(lds.control.read_depbar == 1 && sts.control.read_depbar == 1 && sts.imm == 256 &&
+            ldg.control.read_depbar == 7 && ldg.imm == 262143,
+        "the assembler lost a read depbar or an offset");
+    std::string disassembly;
+    for (const auto word : kernel.words) disassembly += nanosm::format_instruction(nanosm::decode(word)) + "\n";
+    require(disassembly.find("lds r1, [r0 + 64] {pred=PT, stall=0, set=sb0, read=sb1, wait=-}") != std::string::npos,
+        "disassembly: " + disassembly);
+    require(nanosm::assemble_asm(hand_asm(profile, disassembly), profile).words == kernel.words,
+        "the disassembly did not assemble back to the same words");
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "hex lost the read depbar");
+
+    // Refused: an offset past 19 bits, at qtxc and the assembler (by line);
+    // the two fields on one counter, a read depbar on another form, at the
+    // assembler (by line) and at kernel load (by pc). A word cannot hold an
+    // offset past 19 bits, so kernel load sees only the field's values.
+    qtx_refused("mov %p, 0\nlds %x, [%p + 262144]\nhalt\n", "line 2: lds offset 262144 does not fit its signed 19-bit",
+        "qtxc: an lds offset of 0x40000");
+    qtx_refused("mov %p, 0\nmov %v, 1\nstg [%p - 262145], %v\nhalt\n", "line 3: stg offset -262145",
+        "qtxc: a stg offset below -2^18");
+    const auto assembler_refuses = [&](const std::string& line, const std::string& needle, const std::string& what) {
+        expect_error([&] { (void)nanosm::assemble_asm(hand_asm(profile, "mov r0, 0\n" + line + "\nhalt\n"), profile); },
+            {"line 3", needle}, what);
+    };
+    assembler_refuses("ldg.v8 r8, [r0 + 262144] {pred=PT, stall=0, set=sb0, wait=-}", "does not fit its signed 19-bit",
+        "assembler: an ldg.v8 offset of 0x40000");
+    assembler_refuses("lds r1, [r0] {pred=PT, stall=0, set=sb2, read=sb2, wait=-}", "both name sb2",
+        "assembler: lds with read = set");
+    assembler_refuses("add r1, r0, r0 {pred=PT, stall=0, set=-, read=sb1, wait=-}", "add has no read depbar field",
+        "assembler: a read depbar on add");
+    auto same = kernel;
+    same.words.at(3) = (same.words.at(3) & ~(uint64_t{7} << 19)) | (uint64_t{0} << 19); // lds: read sb0 = set sb0
+    expect_error([&] { nanosm::Machine machine(profile, same, launch_warps(1)); }, {"kernel pc 24", "both name sb0"},
+        "kernel load: lds with read = set");
+    auto six = kernel;
+    six.words.at(4) |= uint64_t{7} << 19;
+    six.words.at(4) &= ~(uint64_t{1} << 19); // sts: read field 6
+    expect_error([&] { nanosm::Machine machine(profile, six, launch_warps(1)); }, {"kernel pc 32", "names no counter"},
+        "kernel load: a read depbar field of 6");
+    // The set field's 6 is refused the same way, on every form: neither a
+    // counter nor none. (The assembler's text cannot name sb6 at all.)
+    assembler_refuses("lds r1, [r0] {pred=PT, stall=0, set=sb6, wait=-}", "expected sb0..sb5",
+        "assembler: set=sb6");
+    for (const auto pc : {uint32_t{2}, uint32_t{3}}) { // the mov (no depbar of its own) and the lds
+        auto set_six = kernel;
+        set_six.words.at(pc) = (set_six.words.at(pc) & ~(uint64_t{7} << enc::set_depbar_shift)) |
+            (uint64_t{6} << enc::set_depbar_shift);
+        expect_error([&] { nanosm::Machine machine(profile, set_six, launch_warps(1)); },
+            {"kernel pc " + std::to_string(8 * pc), "set depbar field 6 names no counter"},
+            "kernel load: a set depbar field of 6 at pc " + std::to_string(8 * pc));
+    }
+}
+
 TEST(Basics, fnv1a_64_vectors) {
     require(nanosm::fnv1a_64("") == 0xcbf29ce484222325ull, "FNV-1a empty vector mismatch");
     require(nanosm::fnv1a_64("hello") == 0xa430d84680aabd0bull, "FNV-1a hello vector mismatch");
@@ -163,9 +277,10 @@ TEST(Basics, compiler_controls) {
         return nanosm::issue_to_visible(producer, profile) - nanosm::issue_register_stages;
     };
 
-    // The loads take sb0 and sb1, their consumer waits for both, the store
-    // reuses a released depbar and the halt waits for it. A producer right
-    // before its consumer stalls its full distance.
+    // The loads take sb0 and sb2 and name the one read depbar, sb1; their
+    // consumer waits for both loads, the store reuses a released depbar and
+    // names the same read depbar, and the halt waits for both. A producer
+    // right before its consumer stalls its full distance.
     const auto program = qtx_program(R"(
         mov  r0, 0
         lds  r1, [r0]
@@ -177,15 +292,20 @@ TEST(Basics, compiler_controls) {
     require(program.instructions[0].control.stall == distance(program.instructions[0]),
         "mov did not cover the lds right after it");
     require(program.instructions[1].control.set_depbar == 0, "first load did not allocate sb0");
-    require(program.instructions[2].control.set_depbar == 1, "second load did not allocate sb1");
-    require(program.instructions[3].control.wait_mask == 0b000011, "fadd did not wait for both loads");
+    require(program.instructions[1].control.read_depbar == 1, "first load did not name the read depbar sb1");
+    require(program.instructions[2].control.set_depbar == 2, "second load did not allocate sb2");
+    require(program.instructions[2].control.read_depbar == 1, "second load did not share the read depbar");
+    require(program.instructions[3].control.wait_mask == 0b000101, "fadd did not wait for both loads");
     require(program.instructions[3].control.stall == distance(program.instructions[3]),
         "fadd did not cover its one-away consumer");
     require(program.instructions[4].control.set_depbar == 0, "store did not reuse a released depbar");
-    require(program.instructions[5].control.wait_mask == 0b000001, "halt did not wait for store completion");
+    require(program.instructions[4].control.read_depbar == 1, "store did not share the read depbar");
+    require(program.instructions[5].control.wait_mask == 0b000011, "halt did not wait for the store and the reads");
 
-    // With all six depbars live, the instruction that needs a seventh waits
-    // for the oldest live one and reuses it.
+    // With all six depbars live (five loads' and the read depbar), the
+    // instruction that needs another waits for the oldest live one and reuses
+    // it: the sixth load sb0. The seventh's completion takes the next oldest,
+    // the read depbar sb1, and its read depbar then the oldest left, sb2.
     const auto seven = qtx_program(R"(
         mov r0, 0
         lds r1, [r0]
@@ -197,12 +317,19 @@ TEST(Basics, compiler_controls) {
         lds r7, [r0+24]
         halt
     )", profile);
-    for (unsigned load = 0; load < 6; ++load) {
-        require(seven.instructions[1 + load].control.set_depbar == load, "the first six loads take sb0..sb5");
-        require(seven.instructions[1 + load].control.wait_mask == 0, "the first six loads wait for nothing");
+    const std::array<uint8_t, 5> first_five = {0, 2, 3, 4, 5};
+    for (unsigned load = 0; load < 5; ++load) {
+        const auto& control = seven.instructions[1 + load].control;
+        require(control.set_depbar == first_five[load] && control.read_depbar == 1,
+            "the first five loads take sb0, sb2..sb5 and the read depbar sb1");
+        require(control.wait_mask == 0, "the first five loads wait for nothing");
     }
-    require(seven.instructions[7].control.wait_mask == 0b000001, "the seventh load did not wait for the oldest depbar");
-    require(seven.instructions[7].control.set_depbar == 0, "the seventh load did not reuse the oldest depbar");
+    require(seven.instructions[6].control.wait_mask == 0b000001, "the sixth load did not wait for the oldest depbar");
+    require(seven.instructions[6].control.set_depbar == 0 && seven.instructions[6].control.read_depbar == 1,
+        "the sixth load did not reuse the oldest depbar");
+    require(seven.instructions[7].control.wait_mask == 0b000110 && seven.instructions[7].control.set_depbar == 1 &&
+            seven.instructions[7].control.read_depbar == 2,
+        "the seventh load did not take the two oldest depbars");
     require(seven.instructions[8].control.wait_mask == 0b111111, "halt did not wait for every live depbar");
 
     // A result consumed three instructions later: only what its distance

@@ -125,9 +125,26 @@ uint32_t Machine::depbar_after_completions(const Wires& w, uint32_t warp, uint8_
     return value;
 }
 
+// (An admission's trace value is the counter's next value, written where it
+// is calculated, drive_depbar: a completion recorded later in the cycle, a
+// dropped entry's at issue + 1, is in it.)
 void Machine::admit_depbar(Wires& w, uint32_t warp, uint8_t bar) {
     w.issue.depbar_admission = DepbarEvent{warp, bar};
-    trace_->depbar(cycle_, warp, bar, depbar_after_completions(w, warp, bar) + 1);
+}
+
+void Machine::admit_read_depbar(Wires& w, uint32_t warp, const Instruction& inst) {
+    const auto bar = inst.control.read_depbar;
+    if (bar >= 6) return;
+    if (w.issue.depbar_admission.has_value() && w.issue.depbar_admission->bar == bar) {
+        throw SimError("internal: an instruction's read depbar is its set depbar (kernel load refuses it)");
+    }
+    w.issue.read_depbar_admission = DepbarEvent{warp, bar};
+}
+
+void Machine::lower_read_depbar(Wires& w, uint32_t warp, const Instruction& inst) {
+    const auto bar = inst.control.read_depbar;
+    if (bar >= 6) return;
+    record_depbar_completion(w, warp, bar, "depbar underflow on sb" + std::to_string(bar) + " (a read depbar)");
 }
 
 // ===========================================================================
@@ -592,8 +609,8 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
 }
 
 // A memory / engine / mbar instruction accepted now. What depends on
-// metadata alone happens now: the depbar it sets (so the warp's next
-// instruction sees it), the sanitizer's records for its destination (not
+// metadata alone happens now: the depbar it sets and its read depbar (so the
+// warp's next instruction sees them), the sanitizer's records for its destination (not
 // ready until written) and its asynchronously read sources (read-owned
 // until each beat). Its read round goes into the issue register (sampled at
 // issue + 1), and it enters the dispatch pipeline; at issue + 1 + Lr its
@@ -610,6 +627,7 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
         panic(warp, inst, "global memory operation has no depbar");
     }
     if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
+    admit_read_depbar(w, warp.id, inst); // ldg, stg, ldg.v8, stg.v8: lowered at their last vector source read
     const auto not_ready = std::numeric_limits<uint64_t>::max();
     if (const auto dst = destination_register(inst); dst.has_value()) {
         const auto width = opcode == Opcode::acc_ld_v8 || opcode == Opcode::ldg_v8 ? 8u : 1u;
@@ -647,7 +665,7 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
 // predicate and uniform registers next cycle, and reads no vector register
 // at issue (its collect stage reads an lds's address and an sts's address
 // and data later). What depends on metadata alone happens now: the depbar it
-// sets, its warp's counts (drive_shmem_counts), the sanitizer's records for
+// sets and its read depbar, its warp's counts (drive_shmem_counts), the sanitizer's records for
 // its destination (not ready until written) and its vector sources
 // (read-owned until the collect stage reads them). Slot w of the mbar wait
 // slots is warp w's: a try_wait by a warp past the last slot is a PANIC.
@@ -661,6 +679,7 @@ void Machine::accept_shmem(Warp& warp, const Instruction& inst, const IssuePlan&
     const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_atomic(opcode);
     if (sets_depbar && inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(opcode) + " has no depbar");
     if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
+    admit_read_depbar(w, warp.id, inst); // lds, sts: lowered when the collect stage has read their registers
     const auto not_ready = std::numeric_limits<uint64_t>::max();
     if (const auto dst = destination_register(inst); dst.has_value()) sanitizer_.record_reg_ready(warp.id, *dst, not_ready);
     if (is_mbar_predicate_writer(opcode)) sanitizer_.record_pred_ready(warp.id, inst.dst, not_ready); // until the probe returns
@@ -754,28 +773,39 @@ void Machine::drive_scheduler(const Wires& w) {
     if (next != sfu_busy_.cur()) sfu_busy_.set_next(next, "drive_scheduler");
 }
 
-// depbar: next = Q - this cycle's completions + issue's admission. (The
+// depbar: next = Q - this cycle's completions + issue's admissions (the
+// depbar it sets and its read depbar: two different counters). (The
 // completions were checked for underflow when recorded.)
 void Machine::drive_depbar(const Wires& w) {
-    if (w.depbar_completions.empty() && !w.issue.depbar_admission.has_value()) return;
+    const std::array<const std::optional<DepbarEvent>*, 2> admissions{
+        &w.issue.depbar_admission, &w.issue.read_depbar_admission};
+    if (w.depbar_completions.empty() && !admissions[0]->has_value() && !admissions[1]->has_value()) return;
     // (One calculation per warp: its counters' next values together.)
     std::vector<uint8_t> touched(depbar_.count(), 0);
     for (const auto& completion : w.depbar_completions) touched.at(completion.warp) = 1;
-    if (const auto& admission = w.issue.depbar_admission; admission.has_value()) touched.at(admission->warp) = 1;
+    for (const auto* admission : admissions) {
+        if (admission->has_value()) touched.at((*admission)->warp) = 1;
+    }
     for (uint32_t warp = 0; warp < touched.size(); ++warp) {
         if (touched[warp] == 0) continue;
         auto next = depbar_.cur()[warp];
         for (const auto& completion : w.depbar_completions) {
             if (completion.warp == warp) --next.at(completion.bar);
         }
-        if (const auto& admission = w.issue.depbar_admission; admission.has_value() && admission->warp == warp) {
-            auto& counter = next.at(admission->bar);
+        for (const auto* admission : admissions) {
+            if (!admission->has_value() || (*admission)->warp != warp) continue;
+            auto& counter = next.at((*admission)->bar);
             if (counter >= depbar_counter_max_) {
                 throw SimError("internal: warp " + std::to_string(warp) + " depbar sb" +
-                    std::to_string(admission->bar) + " would count past " + std::to_string(depbar_counter_max_) +
+                    std::to_string((*admission)->bar) + " would count past " + std::to_string(depbar_counter_max_) +
                     " (the counter's width) at cycle " + std::to_string(cycle_));
             }
             ++counter;
+        }
+        for (const auto* admission : admissions) {
+            if (admission->has_value() && (*admission)->warp == warp) {
+                trace_->depbar(cycle_, warp, (*admission)->bar, next.at((*admission)->bar));
+            }
         }
         depbar_.set_next(warp, next, "drive_depbar");
     }

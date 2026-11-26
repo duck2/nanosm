@@ -67,6 +67,33 @@ void check_v8_sector(const Instruction& inst, const DeviceProfile& profile, cons
         std::to_string(profile.gmem_sector_bytes) + "-byte sectors (gmem.sector_bytes)");
 }
 
+// The depbar fields: on every form a set depbar that is a counter (sb0..sb5)
+// or none (7). The six vector memory forms' own fields (src/isa.hpp
+// has_read_depbar_field): an offset in the signed 19-bit immediate, and a
+// read depbar that is a counter or none, never the counter the set field
+// names. No other form has a read depbar.
+void check_depbar_and_offset_fields(const Instruction& inst, const std::string& where) {
+    // The set field, on every form: a counter (sb0..sb5) or none (7); 6 is neither.
+    if (inst.control.set_depbar == 6) {
+        throw SimError(where + ": " + opcode_name(inst.opcode) + ": set depbar field 6 names no counter");
+    }
+    const auto read = inst.control.read_depbar;
+    if (!has_read_depbar_field(inst.opcode)) {
+        if (read != 7) throw SimError(where + ": " + opcode_name(inst.opcode) + " has no read depbar field");
+        return;
+    }
+    if (inst.imm < encoding::vector_memory_immediate_min || inst.imm > encoding::vector_memory_immediate_max) {
+        throw SimError(where + ": " + opcode_name(inst.opcode) + " offset " + std::to_string(inst.imm) +
+            " does not fit its signed 19-bit immediate (" + std::to_string(encoding::vector_memory_immediate_min) +
+            " .. " + std::to_string(encoding::vector_memory_immediate_max) + ")");
+    }
+    if (read == 6) throw SimError(where + ": " + opcode_name(inst.opcode) + ": read depbar field 6 names no counter");
+    if (read != 7 && read == inst.control.set_depbar) {
+        throw SimError(where + ": " + opcode_name(inst.opcode) + ": the read depbar and the set depbar both name sb" +
+            std::to_string(read) + " (they must be different counters)");
+    }
+}
+
 // ssy, sync and a predicated bra need a divergence stack, which a profile
 // with core.divergence_stack_entries = 0 does not have.
 void check_divergence_stack(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
@@ -126,6 +153,7 @@ std::optional<std::string> unsupported_by_profile(const Instruction& inst, const
 // Every rule but what the profile supports, in order.
 void check_rules(const Instruction& inst, const DeviceProfile& profile, const std::string& where) {
     check_write_mask(inst, profile, where);
+    check_depbar_and_offset_fields(inst, where);
     check_divergence_stack(inst, profile, where);
     check_rf_read_round(inst, profile, where);
     check_mma_shape(inst, profile, where);
@@ -137,7 +165,9 @@ void check_rules(const Instruction& inst, const DeviceProfile& profile, const st
 
 // The rules every instruction must pass on this profile, whoever wrote it,
 // in this order: the profile has its unit (mbar.try_wait, tma); a write mask
-// only where it can be (check_write_mask); the divergence stack; the
+// only where it can be (check_write_mask); the set depbar field, a vector
+// memory form's offset and read depbar (check_depbar_and_offset_fields); the
+// divergence stack; the
 // one-round RF read; an mma.async's shape and row spacings; an acc.ld /
 // acc.st's words per row; ldg.v8 / stg.v8's sectors. qtxc's scheduler and
 // the assembler apply it per source line (`where` is "line N"), kernel load

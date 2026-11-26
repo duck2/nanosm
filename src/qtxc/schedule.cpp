@@ -3,7 +3,8 @@
 // its fixed-latency dependencies need (FixedTimeline, distances from
 // src/timing.hpp), depbar set / wait for the asynchronous ones (with all six
 // live, an instruction that needs a new one waits for the oldest and reuses
-// it), a wait on a launch flag for an instruction that names a section of
+// it; every lds and sts also names one shared read depbar, which a later
+// writer of their vector sources waits on), a wait on a launch flag for an instruction that names a section of
 // the launch block (flag_pending below), a full drain at
 // every branch and sync, a loop body scheduled as a jump enters it (LoopEntry), and
 // qtx's wait as a nop waiting for every live depbar (no drain).
@@ -231,6 +232,12 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     uint8_t acc_load_mask = 0;
     std::optional<uint8_t> store_barrier;
     std::optional<uint8_t> mma_barrier;
+    // The read depbar every lds and sts names (one counter for all of them,
+    // as the stores share one completion counter): lowered when each one's
+    // collect stage has read its vector registers. A later writer of an
+    // lds's address or an sts's address or data waits on it, so it waits for
+    // the reads of every lds and sts still queued.
+    std::optional<uint8_t> read_barrier;
 
     // Virtual issue timeline. Consecutive same-warp issues are at least max(stall, 1)
     // apart, and real gaps only grow (scheduler contention, depbar waits, structural
@@ -260,6 +267,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         }
         if (store_barrier.has_value() && (mask & (1u << *store_barrier)) != 0) store_barrier.reset();
         if (mma_barrier.has_value() && (mask & (1u << *mma_barrier)) != 0) mma_barrier.reset();
+        if (read_barrier.has_value() && (mask & (1u << *read_barrier)) != 0) read_barrier.reset();
     };
 
     // The depbar `inst` sets: the lowest free one that is not a pending
@@ -267,21 +275,22 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     // the launch's count beside this instruction's: whoever waits on it
     // waits for both, which is only slower); with all six live, the oldest
     // live one (the earliest allocated): `inst` also waits for it, which
-    // frees it, and then sets it.
+    // frees it, and then sets it. Never `exclude`: the counter `inst`'s other
+    // field names (an lds's or sts's set and read depbars differ).
     std::array<uint64_t, 6> allocated_at{};
     uint64_t allocations = 0;
-    const auto allocate = [&](Instruction& inst) -> uint8_t {
+    const auto allocate = [&](Instruction& inst, std::optional<uint8_t> exclude = std::nullopt) -> uint8_t {
         std::optional<uint8_t> chosen;
         for (uint8_t bar = 0; bar < 6 && !chosen.has_value(); ++bar) {
-            if (!live[bar] && !flag_pending[bar]) chosen = bar;
+            if (!live[bar] && !flag_pending[bar] && bar != exclude) chosen = bar;
         }
         for (uint8_t bar = 0; bar < 6 && !chosen.has_value(); ++bar) {
-            if (!live[bar]) chosen = bar;
+            if (!live[bar] && bar != exclude) chosen = bar;
         }
         if (!chosen.has_value()) {
-            chosen = 0;
-            for (uint8_t bar = 1; bar < 6; ++bar) {
-                if (allocated_at[bar] < allocated_at[*chosen]) chosen = bar;
+            for (uint8_t bar = 0; bar < 6; ++bar) {
+                if (bar == exclude) continue;
+                if (!chosen.has_value() || allocated_at[bar] < allocated_at[*chosen]) chosen = bar;
             }
             const auto mask = static_cast<uint8_t>(1u << *chosen);
             inst.control.wait_mask |= mask;
@@ -403,18 +412,25 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
-            // An lds's address is read by its collect stage after issue: a
-            // later writer of it waits for the load's depbar (the machine has
-            // no counter for "read"; the depbar is the conservative one).
-            if (inst.opcode == Opcode::lds) pending_async_read_mask[inst.src0] |= static_cast<uint8_t>(1u << bar);
+            // An lds's address is read by its collect stage after issue: it
+            // names the read depbar, and a later writer of the address waits
+            // on that.
+            if (inst.opcode == Opcode::lds) {
+                if (!read_barrier.has_value()) read_barrier = allocate(inst, bar);
+                inst.control.read_depbar = *read_barrier;
+                pending_async_read_mask[inst.src0] |= static_cast<uint8_t>(1u << *read_barrier);
+            }
         } else if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg || inst.opcode == Opcode::stg_v8) {
             if (!store_barrier.has_value()) store_barrier = allocate(inst);
             inst.control.set_depbar = *store_barrier;
             // An sts's address and data are read by its collect stage after
-            // issue: a later writer of either waits for the stores' depbar.
+            // issue: it names the read depbar, and a later writer of either
+            // waits on that.
             if (inst.opcode == Opcode::sts) {
+                if (!read_barrier.has_value()) read_barrier = allocate(inst, *store_barrier);
+                inst.control.read_depbar = *read_barrier;
                 for (const auto reg : {inst.src0, inst.src1}) {
-                    pending_async_read_mask[reg] |= static_cast<uint8_t>(1u << *store_barrier);
+                    pending_async_read_mask[reg] |= static_cast<uint8_t>(1u << *read_barrier);
                 }
             }
             if (inst.opcode == Opcode::stg_v8) {
@@ -468,6 +484,7 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             acc_load_mask = 0;
             store_barrier.reset();
             mma_barrier.reset();
+            read_barrier.reset();
             timeline.reset();
             previous = nullptr;
             previous_vtime = 0;

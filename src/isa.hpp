@@ -14,7 +14,7 @@ namespace nanosm {
 // stamp a kernel carries (src/profile.hpp device_profile_fingerprint), so a
 // reader built for another revision refuses the kernel. It changes with any
 // change to what a word means, a reserved bit given a meaning included.
-inline constexpr uint32_t isa_revision = 1;
+inline constexpr uint32_t isa_revision = 2;
 
 enum class Opcode : uint8_t {
     sread = 0x01,
@@ -219,6 +219,11 @@ struct Control {
     bool predicate_invert = false;
     uint8_t stall = 0;
     uint8_t set_depbar = 7; // 0..5 are real depbars, 7 means none
+    // The read depbar (has_read_depbar_field: the six vector memory forms
+    // only): raised at issue with set_depbar, lowered when the instruction's
+    // last vector source register has been read. Same encoding; never the
+    // counter set_depbar names.
+    uint8_t read_depbar = 7;
     uint8_t wait_mask = 0;   // bits 0..5
 };
 
@@ -497,6 +502,10 @@ namespace encoding {
 // 6..13 of the reserved bits, below them U is free in every RRR form)
 // RRI payload: dst[8], src0[8], simm[22]
 // store payload: base[8], value[8], simm[22]
+// The six vector memory forms (has_read_depbar_field: lds, ldg, ldg.v8 in
+// the RRI shape, sts, stg, stg.v8 in the store shape) split the immediate:
+// their two register fields, read depbar[3] (bits 21..19, Control's
+// read_depbar), simm[19] (bits 18..0, vector_memory_immediate_min .. max).
 // RI payload: dst[8], reserved[8], simm[22]
 // umov urD, imm (umovi) payload: dst[6], imm[32] -- a uniform register number
 // needs at most 6 bits, which leaves a whole 32-bit word: any constant, a
@@ -547,6 +556,11 @@ inline constexpr uint64_t tma_descriptor_field_mask = 0x3fff;
 inline constexpr uint32_t tma_descriptor_field_unit = 64;
 inline constexpr int32_t atomic_immediate_min = -(1 << 13);
 inline constexpr int32_t atomic_immediate_max = (1 << 13) - 1;
+inline constexpr unsigned read_depbar_shift = 19;
+inline constexpr uint64_t read_depbar_mask = 0x07;
+inline constexpr uint64_t vector_memory_immediate_mask = 0x7ffff;
+inline constexpr int32_t vector_memory_immediate_min = -(1 << 18);
+inline constexpr int32_t vector_memory_immediate_max = (1 << 18) - 1;
 
 inline constexpr unsigned umovi_dst_shift = 32;
 inline constexpr uint64_t umovi_dst_mask = 0x3f;
@@ -681,6 +695,13 @@ inline bool has_write_mask(const Instruction& instruction) {
 // ssy, sync) refuses to be masked at qtxc, the assembler and kernel load; bra
 // and bra.uni keep their own meaning of the predicate.
 bool can_be_masked(Opcode opcode);
+
+// The forms whose word has the read depbar field and the 19-bit immediate:
+// the per-lane memory instructions lds, sts, ldg, stg, ldg.v8, stg.v8.
+inline bool has_read_depbar_field(Opcode opcode) {
+    return opcode == Opcode::lds || opcode == Opcode::sts || opcode == Opcode::ldg || opcode == Opcode::stg ||
+        opcode == Opcode::ldg_v8 || opcode == Opcode::stg_v8;
+}
 
 // The instructions that use the divergence stack: refused by qtxc, the
 // assembler and kernel load when the profile has none

@@ -473,7 +473,24 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
             w.lsu_rf_read.beat = read->beat;
             w.lsu_rf_read.lanes = read->lanes;
             w.lsu_rf_read.values = std::move(values);
+            // A stg.v8's last source read: rS + 7 for its last lane group.
+            if (read->last_group && read->beat == 7 && read->read_depbar < 6) {
+                record_depbar_completion(w, warp.id, read->read_depbar,
+                    "depbar underflow on sb" + std::to_string(read->read_depbar) + " (a read depbar)");
+            }
         }
+    }
+    // A collect stage whose last vector register is read now lowers its
+    // instruction's read depbar: an lds's address; an sts's data, or its
+    // address when the data is read with it or is the same register.
+    if (const auto& collect = read_collect_.cur(); collect.has_value() && w.read_collect_address.has_value()) {
+        lower_read_depbar(w, collect->entry.warp, collect->entry.instruction);
+    }
+    if (const auto& collect = write_collect_.cur();
+        collect.has_value() && (w.write_collect_address.has_value() || w.write_collect_data.has_value())) {
+        const auto& inst = collect->entry.instruction;
+        const bool data_read = collect->data_read || w.write_collect_data.has_value() || inst.src1 == inst.src0;
+        if (data_read) lower_read_depbar(w, collect->entry.warp, inst);
     }
     return decision;
 }
@@ -540,6 +557,13 @@ void Machine::step_rf_reads(Wires& w) {
             w.dispatch_samples.push_back({0, false, std::move(operands), 0,
                 sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front()),
                 masked ? std::optional<uint64_t>{write_mask_lanes(warps_[op.warp], op.instruction)} : std::nullopt});
+        }
+        // ldg, stg, ldg.v8: every vector source is in this round (whatever
+        // the write mask leaves), so their read depbar is lowered now. A
+        // stg.v8 reads its data later, in the LSU (decide_rf_reads).
+        const auto opcode = op.instruction.opcode;
+        if (opcode == Opcode::ldg || opcode == Opcode::stg || opcode == Opcode::ldg_v8) {
+            lower_read_depbar(w, op.warp, op.instruction);
         }
     }
     // The URF write pipeline's stage 0: uniform arithmetic samples its

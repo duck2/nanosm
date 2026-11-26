@@ -60,6 +60,14 @@ uint64_t encode(const Instruction& inst) {
     if (inst.src1_uniform && !takes_uniform_source(inst.opcode)) {
         throw SimError(opcode_name(inst.opcode) + " has no uniform source: " + format_instruction(inst));
     }
+    const bool vector_memory = has_read_depbar_field(inst.opcode);
+    if (inst.control.read_depbar > 7 || (!vector_memory && inst.control.read_depbar != 7)) {
+        throw SimError(opcode_name(inst.opcode) + " has no read depbar field: " + format_instruction(inst));
+    }
+    if (vector_memory &&
+        (inst.imm < encoding::vector_memory_immediate_min || inst.imm > encoding::vector_memory_immediate_max)) {
+        throw SimError("offset does not fit the signed 19-bit immediate: " + format_instruction(inst));
+    }
     const auto predicate = static_cast<uint64_t>(
         inst.control.predicate | (inst.control.predicate_invert ? 8 : 0));
     uint64_t word =
@@ -69,6 +77,10 @@ uint64_t encode(const Instruction& inst) {
         (static_cast<uint64_t>(inst.control.set_depbar) << encoding::set_depbar_shift) |
         (static_cast<uint64_t>(inst.control.wait_mask) << encoding::wait_mask_shift);
     const auto immediate = static_cast<uint32_t>(inst.imm) & encoding::immediate_mask;
+    // The six vector memory forms: read depbar[3], simm[19].
+    const auto read_and_offset =
+        (static_cast<uint64_t>(inst.control.read_depbar) << encoding::read_depbar_shift) |
+        (static_cast<uint32_t>(inst.imm) & encoding::vector_memory_immediate_mask);
     if (is_mma_async(inst.opcode)) {
         // urC (the result's tmem pointer), A and B base registers, A's and
         // B's row spacings (the block's opcodes share one form).
@@ -131,9 +143,6 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::xori:
     case Opcode::andi:
     case Opcode::ori:
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
     case Opcode::ldg_uni:
     case Opcode::lds_uni:
     case Opcode::acc_ld:
@@ -151,6 +160,13 @@ uint64_t encode(const Instruction& inst) {
         word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
         word |= immediate;
+        break;
+    case Opcode::lds:
+    case Opcode::ldg:
+    case Opcode::ldg_v8:
+        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
+        word |= read_and_offset;
         break;
     case Opcode::mbar_init_i:
     case Opcode::mbar_arrive_expect_tx_i:
@@ -196,6 +212,10 @@ uint64_t encode(const Instruction& inst) {
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::stg_v8:
+        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
+        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
+        word |= read_and_offset;
+        break;
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
         word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
@@ -304,6 +324,12 @@ Instruction decode(uint64_t word) {
     if ((immediate & (1u << 21)) != 0) {
         immediate |= ~static_cast<uint32_t>(encoding::immediate_mask);
     }
+    // The six vector memory forms: read depbar[3], simm[19].
+    auto memory_offset = static_cast<uint32_t>(word & encoding::vector_memory_immediate_mask);
+    if ((memory_offset & (1u << 18)) != 0) memory_offset |= ~static_cast<uint32_t>(encoding::vector_memory_immediate_mask);
+    if (has_read_depbar_field(inst.opcode)) {
+        inst.control.read_depbar = static_cast<uint8_t>((word >> encoding::read_depbar_shift) & encoding::read_depbar_mask);
+    }
     if (is_mma_async(inst.opcode)) {
         inst.src2 = reg0;
         inst.src0 = reg1;
@@ -361,9 +387,6 @@ Instruction decode(uint64_t word) {
     case Opcode::xori:
     case Opcode::andi:
     case Opcode::ori:
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
     case Opcode::ldg_uni:
     case Opcode::lds_uni:
     case Opcode::acc_ld:
@@ -381,6 +404,13 @@ Instruction decode(uint64_t word) {
         inst.dst = reg0;
         inst.src0 = reg1;
         inst.imm = static_cast<int32_t>(immediate);
+        break;
+    case Opcode::lds:
+    case Opcode::ldg:
+    case Opcode::ldg_v8:
+        inst.dst = reg0;
+        inst.src0 = reg1;
+        inst.imm = static_cast<int32_t>(memory_offset);
         break;
     case Opcode::mbar_init_i:
     case Opcode::mbar_arrive_expect_tx_i:
@@ -426,6 +456,10 @@ Instruction decode(uint64_t word) {
     case Opcode::sts:
     case Opcode::stg:
     case Opcode::stg_v8:
+        inst.src0 = reg0;
+        inst.src1 = reg1;
+        inst.imm = static_cast<int32_t>(memory_offset);
+        break;
     case Opcode::acc_st:
     case Opcode::acc_st_v8:
         inst.src0 = reg0;
@@ -796,6 +830,9 @@ std::string format_control(const Control& control) {
     out << ", stall=" << static_cast<unsigned>(control.stall) << ", set=";
     if (control.set_depbar == 7) out << '-';
     else out << "sb" << static_cast<unsigned>(control.set_depbar);
+    // The read depbar, where one is named (none is not printed: only the six
+    // vector memory forms have the field).
+    if (control.read_depbar != 7) out << ", read=sb" << static_cast<unsigned>(control.read_depbar);
     out << ", wait=";
     if (control.wait_mask == 0) {
         out << '-';

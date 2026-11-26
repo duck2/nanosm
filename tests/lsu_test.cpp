@@ -427,6 +427,56 @@ TEST(Lsu, lsu_v8_store_source_lifetime) {
     require(machine.read_reg(0, 3, 8) == 99, "the younger overwrite was lost");
 }
 
+// The machine honours a read depbar on the global forms too (qtxc names
+// none there yet): a stg.v8's falls at its last data read, an ldg's and a
+// stg's at their issue round's sample (issue + 1). A writer of a source
+// waiting on it issues while the instruction's own depbar is still raised:
+// before the stg.v8 has completed, two cycles after the ldg and the stg.
+TEST(Lsu, read_depbar_on_global_forms) {
+    const auto& profile = canonical_profile();
+    const std::string text = R"(
+        sread r1, LANE_ID
+        shli r0, r1, 5
+        shli r2, r1, 2
+        mov r8, 17
+        mov r9, 18
+        mov r10, 19
+        mov r11, 20
+        mov r12, 21
+        mov r13, 22
+        mov r14, 23
+        mov r15, 24
+        stg.v8 [r0], r8 {pred=PT, stall=0, set=sb0, read=sb1, wait=-}
+        mov r8, 99 {pred=PT, stall=0, set=-, wait=sb1}
+        ldg r3, [r0 + 1024] {pred=PT, stall=0, set=sb2, read=sb3, wait=-}
+        mov r0, 5 {pred=PT, stall=0, set=-, wait=sb3}
+        stg [r2 + 2048], r1 {pred=PT, stall=0, set=sb4, read=sb5, wait=-}
+        mov r1, 0 {pred=PT, stall=0, set=-, wait=sb5}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4|sb5}
+    )";
+    auto launch = launch_warps(1);
+    image_bytes(launch.gmem_image, 4096);
+    nanosm::Machine machine(profile, hand_assemble(hand_asm(profile, text), profile), std::move(launch),
+        {.timeline = true});
+    std::map<uint64_t, std::array<uint32_t, 6>> bars; // the counters (Q) in each cycle
+    while (!machine.done()) {
+        bars[machine.cycle()] = {machine.depbar_value(0, 0), machine.depbar_value(0, 1), machine.depbar_value(0, 2),
+            machine.depbar_value(0, 3), machine.depbar_value(0, 4), machine.depbar_value(0, 5)};
+        tick_capped(machine);
+    }
+    const auto at = [&](uint32_t index) { return issued_at(machine, 8 * index).at(0); };
+    require(bars.at(at(12))[0] == 1, "the writer of the stg.v8's data did not issue before the store completed");
+    require(at(14) == at(13) + 2 && bars.at(at(14))[2] == 1,
+        "the writer of the ldg's address did not issue two cycles after it, before its load landed");
+    require(at(16) == at(15) + 2 && bars.at(at(16))[4] == 1,
+        "the writer of the stg's data did not issue two cycles after it, before its store completed");
+    for (uint8_t bar = 0; bar < 6; ++bar) require(machine.depbar_value(0, bar) == 0, "a counter left raised");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        for (uint32_t j = 0; j < 8; ++j) require(machine.read_gmem_u32(32 * lane + 4 * j) == 17 + j, "stg.v8 data");
+        require(machine.read_gmem_u32(2048 + 4 * lane) == lane, "stg data");
+    }
+}
+
 // Two lanes of one stg.v8 naming the same sector: the sanitizer's PANIC.
 TEST(Lsu, lsu_v8_store_sector_collision) {
     NANOSM_EXPECTS_SANITIZER_PANIC();

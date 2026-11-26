@@ -1359,29 +1359,57 @@ TEST(Shmem, sts_registers_in_one_bank) {
     for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(64 + 4 * lane) == 9, "sts data");
 }
 
-// A queued lds / sts reads its vector registers late, in its collect stage.
-// Until the instruction set has a read depbar, its completion depbar stands
-// in: qtxc makes a later writer of an sts's address or data wait on the
-// stores' depbar and a later writer of an lds's address wait on the load's.
+// A queued lds / sts reads its vector registers late, in its collect stage,
+// and names a read depbar that falls when it has read them. qtxc makes a
+// later writer of an sts's address or data, or of an lds's address, wait on
+// that read depbar, not on the completion depbar. On the machine the writer
+// issues once the read is done: the mov of the sts's data before the store's
+// round is granted (so before it completes), the addi of the lds's address
+// before the load's round is granted (so before its result lands); the store
+// writes the old data and the load reads the old address.
 TEST(Shmem, writer_of_a_queued_source_waits) {
     const auto& profile = canonical_profile();
-    const auto program = qtx_program(R"(
+    const std::string source = R"(
         sread %a, LANE_ID
         shli %a, %a, 2
         mov %v, 7
         sts [%a + 256], %v
         mov %v, 8
         lds %x, [%a + 512]
-        addi %a, %a, 4
+        addi %a, %a, 64
         halt
-    )", profile);
+    )";
+    const auto program = qtx_program(source, profile);
     const auto& code = program.instructions;
     require(code.size() == 8 && code[3].opcode == nanosm::Opcode::sts && code[5].opcode == nanosm::Opcode::lds,
         "unexpected code from qtxc");
-    require((code[4].control.wait_mask >> code[3].control.set_depbar & 1) != 0,
-        "the writer of the sts's data does not wait on the stores' depbar");
-    require((code[6].control.wait_mask >> code[5].control.set_depbar & 1) != 0,
-        "the writer of the lds's address does not wait on the load's depbar");
+    for (const auto index : {3, 5}) {
+        const auto& control = code[index].control;
+        require(control.read_depbar < 6 && control.set_depbar < 6 && control.read_depbar != control.set_depbar,
+            "the sts / lds does not name a read depbar beside its own");
+    }
+    require(code[4].control.wait_mask == 1u << code[3].control.read_depbar,
+        "the writer of the sts's data does not wait on the read depbar alone");
+    require(code[6].control.wait_mask == 1u << code[5].control.read_depbar,
+        "the writer of the lds's address does not wait on the read depbar alone");
+
+    const auto kernel = compile(source, profile);
+    auto machine = debug_machine(profile, kernel);
+    machine->run();
+    const auto log = issue_log(*machine);
+    const auto store = grant_cycles(*machine, "A-write", "simt");
+    const auto load = grant_cycles(*machine, "A-read", "simt");
+    require(store.size() == 1 && issued_at(*machine, 4 * 8).at(0) < store[0],
+        "the writer of the sts's data did not issue before the store was granted" + log);
+    require(load.size() == 1 && issued_at(*machine, 6 * 8).at(0) < load[0],
+        "the writer of the lds's address did not issue before the load was granted" + log);
+    const auto x = number_of(kernel.register_names, "x");
+    const auto a = number_of(kernel.register_names, "a");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_shmem_u32(256 + 4 * lane) == 7, "the store did not write the data it was issued with");
+        require(machine->read_reg(0, lane, x) == 0x100 + 128 + lane, "the load did not use the address it was issued with");
+        require(machine->read_reg(0, lane, a) == 4 * lane + 64, "the addi");
+    }
 }
 
 // SANITIZER: a write to a queued sts's data register before its collect
@@ -1404,9 +1432,10 @@ TEST(Shmem, write_before_the_collect_read_panics) {
 // A queued instruction whose lanes are all off (its predicate sampled at
 // issue + 1) takes no register read and no access, and gives back at issue + 1
 // what it took at issue: its queue entry (one write-queue entry: the next sts,
-// refused the cycle after, issues the cycle after that), its depbar (0 from
-// issue + 2), its warp's order count (an lds behind it is refused once) and
-// its count for fence.sh (a fence behind it is admitted at issue + 2).
+// refused the cycle after, issues the cycle after that), its depbar and its
+// read depbar (0 from issue + 2), its warp's order count (an lds behind it is
+// refused once) and its count for fence.sh (a fence behind it is admitted at
+// issue + 2). A masked-off lds gives back both depbars the same way.
 TEST(Shmem, masked_off_queued_instruction_gives_back) {
     auto one_entry = canonical_profile();
     one_entry.shmem_write_queue_entries = 1;
@@ -1414,24 +1443,25 @@ TEST(Shmem, masked_off_queued_instruction_gives_back) {
         sread r0, LANE_ID
         mov r5, 7
         shli r0, r0, 2
-        sts [r0 + 256], r5 {pred=!PT, stall=0, set=sb0, wait=-}
+        sts [r0 + 256], r5 {pred=!PT, stall=0, set=sb0, read=sb2, wait=-}
     )";
     {
         auto machine = debug_machine(one_entry, head + R"(
             sts [r0 + 512], r5 {pred=PT, stall=0, set=sb1, wait=-}
-            halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+            halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2}
         )");
-        std::map<uint64_t, uint32_t> sb0; // depbar sb0 (Q) in each cycle
+        std::map<uint64_t, std::pair<uint32_t, uint32_t>> bars; // depbars sb0, sb2 (Q) in each cycle
         while (!machine->done()) {
             tick_capped(*machine);
-            sb0[machine->cycle()] = machine->depbar_value(0, 0);
+            bars[machine->cycle()] = {machine->depbar_value(0, 0), machine->depbar_value(0, 2)};
         }
         const auto s = issued_at(*machine, 3 * 8).at(0);
         require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 2} &&
                 refusals(*machine, 0, "write queue full") == std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, 1}},
             "the masked-off sts did not give its queue entry back at issue + 1:" +
                 describe(refusals(*machine, 0, "write queue full")) + issue_log(*machine));
-        require(sb0.at(s + 1) == 1 && sb0.at(s + 2) == 0, "the masked-off sts's depbar was not given back at issue + 1");
+        require(bars.at(s + 1) == std::pair<uint32_t, uint32_t>{1, 1} && bars.at(s + 2) == std::pair<uint32_t, uint32_t>{0, 0},
+            "the masked-off sts's depbar and read depbar were not given back at issue + 1");
         const auto writes = grants_of(*machine, "A-write");
         require(writes.size() == 1 && writes[0].cycle > s + 2, "the masked-off sts made an access:" + describe(writes));
         for (uint32_t lane = 0; lane < 16; ++lane) { // (the image's word w holds 0x100 + w)
@@ -1442,12 +1472,115 @@ TEST(Shmem, masked_off_queued_instruction_gives_back) {
     }
     for (const std::string& behind : {std::string("lds r6, [r0 + 512] {pred=PT, stall=0, set=sb1, wait=-}"),
              std::string("fence.sh")}) {
-        auto machine = debug_machine(canonical_profile(), head + behind + "\nhalt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n");
+        auto machine = debug_machine(canonical_profile(), head + behind + "\nhalt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2}\n");
         machine->run();
         const auto s = issued_at(*machine, 3 * 8).at(0);
         require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 2},
             "'" + behind + "' did not issue at issue + 2 of the masked-off sts:" + issue_log(*machine));
         require(grant_cycles(*machine, "A-write", "simt").empty(), "the masked-off sts made an access");
+    }
+    {
+        auto machine = debug_machine(canonical_profile(), R"(
+            sread r0, LANE_ID
+            shli r0, r0, 2
+            lds r6, [r0 + 512] {pred=!PT, stall=0, set=sb0, read=sb2, wait=-}
+            mov r0, 1 {pred=PT, stall=0, set=-, wait=sb2}
+            halt {pred=PT, stall=0, set=-, wait=sb0|sb2}
+        )");
+        std::map<uint64_t, std::pair<uint32_t, uint32_t>> bars;
+        while (!machine->done()) {
+            tick_capped(*machine);
+            bars[machine->cycle()] = {machine->depbar_value(0, 0), machine->depbar_value(0, 2)};
+        }
+        const auto s = issued_at(*machine, 2 * 8).at(0);
+        require(bars.at(s + 1) == std::pair<uint32_t, uint32_t>{1, 1} && bars.at(s + 2) == std::pair<uint32_t, uint32_t>{0, 0},
+            "the masked-off lds's depbar and read depbar were not given back at issue + 1");
+        require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{s + 2},
+            "the writer of the masked-off lds's address did not issue at its issue + 2" + issue_log(*machine));
+        require(grant_cycles(*machine, "A-read", "simt").empty(), "the masked-off lds made an access");
+    }
+}
+
+// Trace only. A masked-off sts dropped at its issue + 1 while the collect
+// stage is busy with the sts before it is not counted as a queue head
+// waiting (the same sts with its lanes on is). A masked-off lds dropped in
+// the cycle its warp issues another lds setting the same depbar: the last
+// value the trace gives that counter in that cycle is the register's next
+// value, 1 - 1 + 1.
+TEST(Shmem, trace_of_a_dropped_entry) {
+    const auto& profile = canonical_profile();
+    for (const std::string pred : {"!PT", "PT"}) {
+        auto machine = debug_machine(profile, R"(
+            sread r0, LANE_ID
+            mov r5, 7
+            shli r0, r0, 2
+            sts [r0 + 256], r5 {pred=PT, stall=0, set=sb0, wait=-}
+            sts [r0 + 512], r5 {pred=)" + pred + R"(, stall=0, set=sb0, wait=-}
+            halt {pred=PT, stall=0, set=-, wait=sb0}
+        )");
+        machine->run();
+        const auto s = issued_at(*machine, 3 * 8).at(0);
+        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 1}, "the stores did not issue back to back");
+        const auto waits = machine->trace().summary().shmem_write_head_waits;
+        require(pred == "PT" ? waits != 0 : waits == 0,
+            "write head waits " + std::to_string(waits) + " with the second store's pred=" + pred);
+    }
+    auto machine = debug_machine(profile, R"(
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        lds r6, [r0 + 512] {pred=!PT, stall=0, set=sb0, wait=-}
+        lds r7, [r0 + 516] {pred=PT, stall=0, set=sb0, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    )");
+    std::map<uint64_t, uint32_t> sb0;
+    while (!machine->done()) {
+        tick_capped(*machine);
+        sb0[machine->cycle()] = machine->depbar_value(0, 0);
+    }
+    const auto s = issued_at(*machine, 2 * 8).at(0);
+    require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{s + 1} && sb0.at(s + 2) == 1,
+        "the second lds did not issue at the drop's cycle, or sb0 is not 1 after it" + issue_log(*machine));
+    std::optional<std::string> last;
+    for (const auto& event : events_named(*machine, "depbar sb0")) {
+        if (event.start_cycle == s + 1) last = event.detail;
+    }
+    require(last == "value=1", "the trace's last sb0 value in the drop's cycle is " + last.value_or("missing"));
+}
+
+// A read depbar counts every access that names it, as the set depbar does:
+// six sts issued back to back, each setting sb0 and naming sb1 as its read
+// depbar, raise both counters past one (the write queue holds four, the
+// collect stage reads one store's pair at a time) and both are zero when the
+// run ends. The writer of the last store's data waits on sb1 and issues
+// before the last store's round is granted.
+TEST(Shmem, read_depbar_counts_each_queued_access) {
+    const auto& profile = canonical_profile();
+    std::string body = R"(
+        sread r0, LANE_ID
+        mov r5, 7
+        shli r0, r0, 2
+    )";
+    for (uint32_t k = 0; k < 6; ++k) {
+        body += "sts [r0 + " + std::to_string(256 + 64 * k) + "], r5 {pred=PT, stall=0, set=sb0, read=sb1, wait=-}\n";
+    }
+    body += "mov r5, 8 {pred=PT, stall=0, set=-, wait=sb1}\nhalt {pred=PT, stall=0, set=-, wait=sb0|sb1}\n";
+    auto machine = debug_machine(profile, body);
+    uint32_t most_set = 0;
+    uint32_t most_read = 0;
+    while (!machine->done()) {
+        tick_capped(*machine);
+        most_set = std::max(most_set, machine->depbar_value(0, 0));
+        most_read = std::max(most_read, machine->depbar_value(0, 1));
+    }
+    require(most_set > 1 && most_read > 1, "the counters did not count each queued store (sb0 " +
+        std::to_string(most_set) + ", sb1 " + std::to_string(most_read) + ")");
+    require(machine->depbar_value(0, 0) == 0 && machine->depbar_value(0, 1) == 0, "a counter left raised");
+    const auto stores = grant_cycles(*machine, "A-write", "simt");
+    require(stores.size() == 6 && issued_at(*machine, 9 * 8).at(0) < stores.back() + profile.shmem_port_a_depth,
+        "the writer of the stores' data did not issue before the last store completed:" + describe(grants_of(*machine)) +
+            issue_log(*machine));
+    for (uint32_t k = 0; k < 6; ++k) {
+        for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(256 + 64 * k + 4 * lane) == 7, "store data");
     }
 }
 

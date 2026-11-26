@@ -153,7 +153,7 @@ and compare rows, the second source (for `fma`, either multiplicand) may be a un
 | branch | `bra.uni L`; `@p bra.uni L` (every lane must agree); `halt` |
 | divergence | `ssy L`; `@p bra L`; `sync` (written by hand today: `kernels/diverge.qtx`) |
 | shared memory | `lds d, [a + imm]`; `sts [a + imm], s`; `lds.uni d, [u + imm]`; `atom.{add,and,xor,exch}.uni d, [u + imm], u2`; `fence.sh` |
-| global memory | `ldg d, [a + imm]`; `stg [a + imm], s` (a word per lane); `ldg.v8 d0, [a + imm]`; `stg.v8 [a + imm], s0` (a sector of eight words per lane); `ldg.uni d, [u + imm]` |
+| global memory | `ldg d, [a + imm]`; `stg [a + imm], s` (a word per lane); `ldg.v8 d0, [a + imm]`; `stg.v8 [a + imm], s0` (a sector of eight words per lane); `ldg.uni d, [u + imm]`. The `imm` of `lds`, `sts`, `ldg`, `stg`, `ldg.v8`, `stg.v8` is signed 19-bit (-262144 .. 262143). |
 | barriers | `mbar.init [u], count`; `mbar.arrive [u]`; `mbar.arrive.expect_tx [u], bytes`; `mbar.try_wait p, [u], parity`; `mbar.test_wait p, [u], parity` |
 | TMA | `tma.load.Nd [buffer], [DESC, coord0], [barrier]`; `tma.store.Nd [DESC, coord0], [buffer], [barrier]` |
 | tensor core | `mma.async.SHAPE [acc], [a, spacing], [b, spacing]`; `mma.async.init.SHAPE`; `mma.commit [barrier]`; `acc.ld`, `acc.st`, `acc.ld.v8`, `acc.st.v8` |

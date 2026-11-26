@@ -47,11 +47,12 @@ namespace nanosm {
 // at issue + 1 it samples its predicate (lanes = active mask AND write mask)
 // and its uniform registers (sample_shmem_entry). An lds / sts left with no
 // lane leaves the queue then, taking no register read and no access, and
-// gives back its entry, its depbar, its warp's counts. The queue's head
+// gives back its entry, its depbar and read depbar, its warp's counts. The queue's head
 // moves into the collect stage when that stage is free or moves on now; a
 // try_wait installs its wait slot as it leaves. The collect stage reads
 // the access's vector registers (an lds its address, an sts its address and
-// data) through the RF's async read ports (decide_rf_reads); when they are
+// data) through the RF's async read ports (decide_rf_reads; the read of the
+// last one lowers the instruction's read depbar); when they are
 // at the RF output, it adds the immediate and plans the bank rounds, and the
 // access moves into serve when serve is free or frees now. Issue asks only
 // for a free queue entry (Q) and the warp's order (its counts, Q).
@@ -541,6 +542,13 @@ void Machine::serve_b_write(Wires& w) {
 // moves on now. Each step uses only Q and this cycle's grants.
 void Machine::advance_shmem_sides(Wires& w) {
     auto& shmem = w.shmem;
+    // A head not yet sampled that its issue + 1 sample (sample_shmem_entry,
+    // later this cycle, from the same predicate file) leaves with no lane is
+    // dropped now: it is not waiting for the collect stage (trace only).
+    const auto dropped_now = [&](const ShmemEntry& entry) {
+        if (entry.sampled || !has_write_mask(entry.instruction)) return false;
+        return (entry.lanes & write_mask_lanes(warps_[entry.warp], entry.instruction)) == 0;
+    };
     {
         const auto& serve = read_serve_.cur();
         const bool serve_frees = !serve.has_value() ||
@@ -559,7 +567,7 @@ void Machine::advance_shmem_sides(Wires& w) {
                 if (is_mbar_try_wait(head.instruction.opcode)) {
                     shmem.wait_slot = IntoSlot<MbarWaitSlot>{head.warp, wait_slot_for(head)};
                 }
-            } else {
+            } else if (!dropped_now(queue.front())) {
                 trace_->shmem_head_wait(false);
             }
         }
@@ -578,7 +586,7 @@ void Machine::advance_shmem_sides(Wires& w) {
         if (!queue.empty() && entry_may_leave(queue.front())) {
             if (collect_frees) {
                 shmem.write_queue_pop = true;
-            } else {
+            } else if (!dropped_now(queue.front())) {
                 trace_->shmem_head_wait(true);
             }
         }
@@ -733,8 +741,8 @@ void Machine::sample_shmem_entry(Wires& w, uint32_t& uniform_reads) {
 }
 
 // An lds / sts whose write mask turned every active lane off: no register
-// read and no access. Its depbar is decremented now (a waiting instruction
-// sees it zero from the next cycle, issue + 2); a load's destination keeps
+// read and no access. Its depbar and its read depbar are decremented now (a
+// waiting instruction sees them zero from the next cycle, issue + 2); a load's destination keeps
 // every lane's old value and is not in flight from then on; its source
 // registers are no longer read; its queue entry and its warp's counts are
 // given back at this edge (drive_shmem_queues, drive_shmem_counts). Only a
@@ -747,6 +755,7 @@ void Machine::drop_queued(const ShmemEntry& entry, bool, Wires& w) {
     }
     record_depbar_completion(w, entry.warp, inst.control.set_depbar,
         "depbar underflow on sb" + std::to_string(inst.control.set_depbar));
+    lower_read_depbar(w, entry.warp, inst);
     if (inst.opcode == Opcode::lds) sanitizer_.record_reg_ready(entry.warp, inst.dst, cycle_ + 1);
     sanitizer_.record_async_reader_done(entry.warp, inst.src0, AsyncReader::shmem_collect);
     if (inst.opcode == Opcode::sts && inst.src1 != inst.src0) {

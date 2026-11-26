@@ -40,7 +40,8 @@ files is at the top of `src/machine/machine.cpp`.
 
 A warp waits in four ways: a stall count the compiler put after an instruction, a depbar
 (a per-warp counter raised by a load or a store until it completes, and by a matmul until
-it has read its operands), a
+it has read its operands; a per-lane load or store may also raise a second one, its read
+depbar, until it has read its registers), a
 barrier in shared memory (how warps wait for each other and for the engines), or a unit
 with no room.
 

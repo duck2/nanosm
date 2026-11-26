@@ -269,7 +269,13 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // counts from its admission (lds, lds.uni, sts, an atomic, ldg / stg
         // and their v8 forms, acc.ld / acc.st, mma.async; nothing else sets
         // a depbar) until its decrement, and all that time it is in exactly
-        // one of these places, each of which holds only so many:
+        // one of these places, each of which holds only so many. A vector
+        // memory form's read depbar changes nothing here: it names a counter
+        // other than its set depbar, so one instruction counts at most once
+        // on any counter, and it is lowered at the instruction's last vector
+        // source read, which comes no later than its set depbar's decrement
+        // (an lds / sts in its queue or collect stage, an ldg / stg / ldg.v8 in
+        // the dispatch pipeline, a stg.v8 in its command slot):
         //   shmem.read_queue_entries + shmem.write_queue_entries
         //                       an lds, lds.uni, sts or atomic in its queue
         //                       (one whose lanes are all off is decremented
@@ -522,8 +528,20 @@ void Machine::tick() {
     // Clock edge: every register takes D and every memory its writes.
     clocked_.commit();
     ++cycle_;
-    // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx count).
-    if (done()) sanitizer_.check_kernel_end(cycle_);
+    // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx
+    // count). Every unit is idle then, so every depbar has been lowered as
+    // often as it was raised (a set depbar, a read depbar, a launch flag).
+    if (done()) {
+        sanitizer_.check_kernel_end(cycle_);
+        for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
+            for (uint8_t bar = 0; bar < 6; ++bar) {
+                if (const auto value = depbar_.cur().at(warp).at(bar); value != 0) {
+                    throw SimError("internal: warp " + std::to_string(warp) + " ends the kernel with depbar sb" +
+                        std::to_string(bar) + " at " + std::to_string(value) + " (raised more often than lowered)");
+                }
+            }
+        }
+    }
 }
 
 void Machine::run(uint64_t cycle_limit) {
