@@ -642,8 +642,9 @@ std::string TraceRecorder::summary_text() const {
         << " sectors=" << summary_.lsu_sectors
         << " bytes=" << summary_.lsu_bytes
         << " useful_bytes=" << summary_.lsu_useful_bytes
-        << " no_slot=" << summary_.lsu_no_slot_cycles
-        << " store_buffer_wait=" << summary_.lsu_store_buffer_wait_cycles
+        << " queue_full=" << summary_.lsu_queue_full_cycles
+        << " head_no_slot=" << summary_.lsu_no_slot_cycles
+        << " head_store_buffer_wait=" << summary_.lsu_store_buffer_wait_cycles
         << " request_wait=" << summary_.lsu_request_wait_cycles
         << " ingress_full=" << summary_.lsu_ingress_full_cycles
         << " rf_write_wait=" << summary_.lsu_rf_write_wait_cycles

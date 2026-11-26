@@ -151,8 +151,9 @@ struct TraceSummary {
     uint64_t lsu_sectors = 0;           // controller requests accepted from the LSU
     uint64_t lsu_bytes = 0;             // their sector bytes on the bus
     uint64_t lsu_useful_bytes = 0;      // bytes the instructions named
-    uint64_t lsu_no_slot_cycles = 0;    // warp-cycles: LSU op ineligible, no command slot
-    uint64_t lsu_store_buffer_wait_cycles = 0; // warp-cycles: a scalar stg waits for the store buffer
+    uint64_t lsu_queue_full_cycles = 0; // warp-cycles: an LSU op refused at issue, its queue full
+    uint64_t lsu_no_slot_cycles = 0;    // cycles the queue's head waited for a command slot
+    uint64_t lsu_store_buffer_wait_cycles = 0; // cycles the queue's head (a scalar stg) waited for the store buffer
     uint64_t lsu_request_wait_cycles = 0; // LSU request ready, controller queue full
     uint64_t lsu_ingress_full_cycles = 0; // cycles a read beat was held: ingress FIFO full
     uint64_t lsu_rf_write_wait_cycles = 0;

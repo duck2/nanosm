@@ -755,10 +755,11 @@ TEST(Shmem, probe_behind_own_sts) {
 // cycle, w. The host's event is placed D + Lb + C earlier, so the RMW's write
 // is granted at w too: the probe samples at w + D, the cycle the write
 // reaches the RAM (READ_FIRST: the old phase), and the write's commit wakes
-// slot 0 in that cycle; the probe returns at w + D + Lb to a slot that is gone
-// -- or, with a second warp, to the same slot index recycled by warp 1's
-// try_wait on another mbar. The stale probe must not complete warp 1's wait:
-// warp 1 times out (r10 = 0), warp 0 woke (r9 = 1), only warp 1's probe acts.
+// its slot in that cycle; the probe returns at w + D + Lb to a slot that is
+// gone. With a second warp, warp 1's try_wait on another mbar takes its own
+// slot (one per warp in this profile) while warp 0's probe travels. The stale
+// probe must not complete warp 1's wait: warp 1 times out (r10 = 0), warp 0
+// woke (r9 = 1), only warp 1's probe acts.
 TEST(ShmemSlow, stale_probe_after_wake) {
     const auto& profile = canonical_profile();
     const uint64_t d = profile.shmem_port_a_depth;
@@ -833,9 +834,9 @@ TEST(ShmemSlow, stale_probe_after_wake) {
     require(alone.summary.mbar_wakes == 1 && alone.summary.mbar_initial_probes == 0 && alone.summary.mbar_sleeps == 0 &&
             alone.summary.mbar_timeouts == 0, "the stale probe was acted on (or the wake was lost)");
     require(alone.r9 == 1, "the woken try_wait did not return true");
-    // Two warps (warp 1's stall count swept): warp 1's try_wait takes slot 0
+    // Two warps (warp 1's stall count swept): warp 1's try_wait takes its slot
     // between the wake (w + D) and the stale probe's return (w + D + Lb).
-    uint32_t recycled = 0;
+    uint32_t overlapped = 0;
     std::string schedules;
     for (uint32_t stall = 0; stall < 32; ++stall) {
         const auto seen = run(2, stall);
@@ -844,17 +845,17 @@ TEST(ShmemSlow, stale_probe_after_wake) {
         const auto probe_return = grant + d + lb;
         schedules += " stall " + std::to_string(stall) + ": warp 0 c" + std::to_string(seen.warp0_issue) +
             ", warp 1 c" + std::to_string(seen.warp1_issue) + ";";
-        const auto warp1_slot = seen.warp1_issue + t; // its dispatch takes the lowest free slot
+        const auto warp1_slot = seen.warp1_issue + t; // about when its slot is taken
         if (warp1_slot < wake || warp1_slot >= probe_return) continue;
-        ++recycled;
+        ++overlapped;
         const auto what = "warp 1 try_wait at c" + std::to_string(seen.warp1_issue) + ": ";
         require(seen.r9 == 1, what + "warp 0's woken try_wait did not return true");
-        require(seen.r10 == 0, what + "warp 0's stale probe completed warp 1's recycled wait slot");
+        require(seen.r10 == 0, what + "warp 0's stale probe completed warp 1's wait");
         require(seen.summary.mbar_initial_probes == 1 && seen.summary.mbar_wakes == 1 &&
                 seen.summary.mbar_sleeps == 1 && seen.summary.mbar_timeouts == 1,
             what + "only warp 1's probe should act (it parks, then times out)");
     }
-    require(recycled != 0, "no warp-1 schedule recycled the slot while warp 0's probe travelled:" + schedules);
+    require(overlapped != 0, "no warp-1 schedule took its slot while warp 0's probe travelled:" + schedules);
 }
 
 // An RMW waiting for its read does not preempt an A-read transaction under

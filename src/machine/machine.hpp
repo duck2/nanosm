@@ -128,8 +128,7 @@ struct ResourceView {
     bool unserviced_write = false;   // ... a write (sts, barrier change, atomic) whose last write is not granted
     bool own_shmem_at_ram = false;   // fence.sh: every shmem access of the warp has reached the RAM
     bool shmem_queue_room = false;   // the instruction's queue (read or write) has a free entry
-    bool lsu_slot_free = false;
-    bool store_buffer_free = false;  // a scalar stg: no store still has data to move into the egress FIFO
+    bool lsu_queue_room = false;     // the load / store unit's queue has a free entry (Q)
 };
 
 enum class Refusal : uint8_t {
@@ -145,8 +144,7 @@ enum class Refusal : uint8_t {
     shmem_fence,
     read_queue_full,
     write_queue_full,
-    lsu_slot,
-    lsu_store_buffer,
+    lsu_queue_full,
 };
 
 // The first depbar in the instruction's wait mask that is still nonzero.
@@ -187,6 +185,7 @@ public:
     [[nodiscard]] const std::vector<LsuEdgeEvent>& edge_events() const { return edge_events_; }
     [[nodiscard]] uint32_t tma_sector_credits_used() const { return tma_.cur().credits_used; }
     [[nodiscard]] std::size_t lsu_commands_in_flight() const { return lsu_commands_.cur().size(); }
+    [[nodiscard]] std::size_t lsu_queue_entries_held() const { return lsu_queue_.cur().size(); }
     // Test seams: whether each engine's one-entry mbar event register is full.
     [[nodiscard]] bool tma_mbar_event_held() const { return tma_mbar_event_.cur().has_value(); }
     [[nodiscard]] bool mma_mbar_event_held() const { return mma_mbar_event_.cur().has_value(); }
@@ -429,10 +428,6 @@ private:
         uint64_t lane_enables = 0;
     };
 
-    // An instruction and its operand round, from accepted issue until its
-    // unit takes it. Two pipelines carry one, each with its own type name
-    // (the same fields):
-    //
     // ArithmeticRead: a fixed-latency instruction in the arithmetic pipeline,
     // from accepted issue until its operands are all at the RF output (issue
     // + issue_to_operands: the last stage of arithmetic_reads_), when it
@@ -442,20 +437,7 @@ private:
     // read, when it has one, is ur2r's source or the uniform second source
     // (src1, the U bit) of an ALU / FPU instruction (takes_uniform_source),
     // sampled with the round.
-    //
-    // DispatchEntry: a memory / engine / mbar instruction between accepted issue and its
-    // unit: the issue register and the
-    // RF read pipeline carry it. Its operands are latched at its RF sample
-    // (issue + 1) and reach the unit at DISPATCH (issue + 1 + Lr), where the
-    // unit takes it (hand_over). Admission secured
-    // the unit's space when it accepted the instruction: every later
-    // admission counts the entries here against that space (a credit counter
-    // per resource in hardware; dispatch_claims). The pc and the active mask
-    // are the issue cycle's; a masked lds / sts / ldg / stg's write mask is
-    // ANDed into the active mask at its sample, so from issue + 2 the field
-    // holds its lane enables. It is in stage k of dispatch_pipe_ in cycle
-    // issue + 1 + k: stage 0 is its sample, the last stage its dispatch.
-    struct DispatchEntry {
+    struct ArithmeticRead {
         uint32_t warp = 0;
         uint32_t pc = 0;                             // the instruction's own pc
         uint64_t active_mask = 0;
@@ -465,7 +447,30 @@ private:
         Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // the round's uniform registers
         Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
     };
-    using ArithmeticRead = DispatchEntry;
+
+    // DispatchEntry: an engine instruction (mma.async, mma.commit, acc.ld,
+    // acc.st and their v8 forms) between accepted issue and its unit: the
+    // issue register and the dispatch pipeline carry it. None of them reads a
+    // vector register through it (an acc.st's data is read beat by beat by its
+    // engine): it carries its uniform operands, latched at their rounds'
+    // samples (issue + 1; an mma.async's urC at issue + 2), to the unit at
+    // DISPATCH (issue_to_dispatch), where the unit takes it (hand_over).
+    // Admission secured the unit's space when it accepted the instruction:
+    // every later admission counts the entries here against that space (a
+    // credit counter per resource in hardware; dispatch_claims). The pc and
+    // the active mask are the issue cycle's (none of these may be masked). It
+    // is in stage k of dispatch_pipe_ in cycle issue + 1 + k: stage 0 is its
+    // sample, the last stage its dispatch. Widths: valid, warp, the pc, 16
+    // lanes, the instruction word's fields, up to three 32-bit uniform
+    // operands.
+    struct DispatchEntry {
+        uint32_t warp = 0;
+        uint32_t pc = 0;                             // the instruction's own pc
+        uint64_t active_mask = 0;
+        DecodedInstruction instruction;
+        Bounded<uint8_t, limits::round_uniform_reads> uniform_reads;          // every round's uniform registers
+        Bounded<uint32_t, limits::round_uniform_reads> uniform_operands;      // by uniform read, latched at the sample
+    };
 
     // One uniform-register write in the URF write pipeline (src/timing.hpp),
     // from its writer's accepted issue at t
@@ -1020,12 +1025,13 @@ private:
     // The LSU's two buffers, one on each pipe; no register serves both
     // directions (a store can then never hold the buffer returning data needs).
     //   lsu_buffers_[load_buffer]   ingress FIFO -> RF write port
-    //   lsu_buffers_[store_buffer]  RF read port (or the issue read) -> egress FIFO
+    //   lsu_buffers_[store_buffer]  RF read port -> egress FIFO
     // A buffer has an owner only while data is in it:
     //   load   from the first word plucked for a group (a v8 load's lane
     //          group; a gather's or ldg.uni's words) until that group's last
     //          RF write is granted. Filled at the pluck rate.
-    //   store  a scalar store from its dispatch (the issue read's data), a
+    //   store  a scalar store from its data read's landing (its command
+    //          slot's read), a
     //          vector store from each RF read beat's landing, until the last
     //          word of that data is pushed into the egress FIFO (at the pluck
     //          rate). NOT until the write acknowledgement.
@@ -1053,7 +1059,7 @@ private:
     //                    them when it has sixteen or more), one word each;
     //                    one RF write with those lanes enabled.
     //   ldg.uni          one word, fanned out by its one RF write.
-    //   stg (scatter)    every lane's word, from the issue read at dispatch.
+    //   stg (scatter)    every lane's word, from its command slot's data read.
     // Sizes: load buffer 8 x lsu.load_group_lanes words (256 bits per lane of
     // the group); store buffer 8 x lsu.store_group_lanes words, at least one
     // word per lane (a scatter's data). Per buffer also: owner (a command
@@ -1081,29 +1087,62 @@ private:
         uint32_t word_offset = 0;
     };
 
+    // An issued ldg / stg / ldg.v8 / stg.v8 / ldg.uni waiting in the load /
+    // store unit's queue, narrow: its warp, the instruction, its lanes and an
+    // ldg.uni's uniform base. It enters the queue at its issue's edge with
+    // the issue cycle's active mask; in the next cycle (its issue + 1,
+    // `sampled` still false) it samples its predicate -- lanes = the active
+    // mask AND the write mask -- and an ldg.uni its base register, which is
+    // at the URF output Lu cycles after that sample. `wait`: cycles until it
+    // may leave the queue (an ldg.uni's base at the URF output as it
+    // leaves). Widths: valid, warp (4 bits at 16 warps), the instruction
+    // word's fields, 16 lanes, a 32-bit base, a small count.
+    struct LsuEntry {
+        uint32_t warp = 0;
+        uint32_t pc = 0;                  // (S) PANIC text
+        uint64_t lanes = 0;
+        DecodedInstruction instruction;
+        uint32_t base = 0;                // ldg.uni: its uniform base, from the sample
+        uint8_t wait = 0;
+        bool sampled = false;
+    };
+    // The queue: its entries in issue order, head first (a few registers in
+    // a row; lsu.queue_entries of them).
+    using LsuQueue = Bounded<LsuEntry, limits::lsu_queue_entries>;
+
     // An admitted ldg/stg/ldg.v8/stg.v8/ldg.uni. Owner of one command slot
-    // (lsu.active_commands) from admission: a load until its last register
-    // write is granted, a store until the cycle after its last sector request
-    // is accepted (its acknowledgements are counted in its record,
-    // StoreAckRecord). It holds the load or the store buffer only while its
-    // data is in it.
+    // (lsu.active_commands) from the cycle it leaves the queue: a load until
+    // its last register write is granted, a store until the cycle after its
+    // last sector request is accepted (its acknowledgements are counted in
+    // its record, StoreAckRecord). Until it is `planned` it reads its vector
+    // registers through the RF's async read ports (its address; a scalar
+    // store's address and data): `address_read`, `data_read` say which reads
+    // were granted. When its address is at the RF output it adds the
+    // immediate, checks every lane and plans its requests (`sectors`); an
+    // ldg.uni is planned as it leaves the queue. It holds the load or the
+    // store buffer only while its data is in it.
     struct LsuCommand {
         static constexpr const char* unit = "LSU";                     // (CommandSlots' errors)
         static constexpr const char* capacity = "lsu.active_commands";
         uint64_t id = 0;            // the command's number (lsu_command_number_): the wires' names, the trace, the sanitizer
-        uint8_t slot = 0;           // the command slot it holds (chosen at its dispatch)
+        uint8_t slot = 0;           // the command slot it holds (chosen as it leaves the queue)
         LsuKind kind = LsuKind::vector_load;
         uint32_t warp = 0;
+        uint32_t pc = 0;            // (S) PANIC text: the instruction's own pc
+        DecodedInstruction instruction; // its registers and immediate, for its reads and its plan
         uint8_t reg = 0;            // rD (loads) / rS (vector store)
         uint8_t depbar = 0;
         uint8_t read_depbar = 7;    // vector store: lowered by its last data read (7: none)
+        bool planned = false;
+        bool address_read = false;
+        bool data_read = false;     // scalar store: its data register's read granted
         // The instruction's lanes (16 bits; the active mask AND its write mask,
-        // as its operands were sampled): an inactive lane makes no request, a
+        // as sampled at its issue + 1): an inactive lane makes no request, a
         // load writes only these lanes (a uniform load: all lanes).
         uint64_t lanes = 0;
         // One per ACTIVE lane, in lane order (ldg / stg: the lane's word; ldg.v8
         // / stg.v8: the lane's sector, word offset 0); uniform: one. Hardware:
-        // the lanes' addresses latched at admission (16 x 64 bits as held
+        // the lanes' addresses latched at the plan (16 x 64 bits as held
         // here; a sector address and a word offset each).
         Bounded<LsuSector, limits::lanes> sectors;
         uint32_t requests_total = 0;
@@ -1112,10 +1151,23 @@ private:
         uint32_t group_beats_read = 0; // v8 store: RF read beats of the current group (0..8)
         uint32_t sectors_pushed = 0; // v8 store: lanes (sectors) moved into the egress FIFO
         uint32_t words_pushed = 0; // stores: words of the current sector (v8) / sectors (scalar) in egress
-        uint32_t ack_record = 0;   // stores: the acknowledgement record taken at dispatch
+        uint32_t ack_record = 0;   // stores: the acknowledgement record taken at the plan
     };
 
-    // A store between its dispatch and its completion: the warp and depbar
+    // A command slot's register read on its way through the RF's read
+    // stages: sampled at its grant, at the RF output Lr cycles later (the
+    // last stage of lsu_collect_pipe_), where an address is planned and a
+    // scalar store's data fills the store buffer. Wide: a 16-lane latch for
+    // each of the two registers (a scalar store's address and data may be
+    // read in one cycle).
+    struct LsuOperandRead {
+        uint8_t slot = 0;
+        uint64_t command = 0;             // (T) its number: a check that the slot was not reused
+        std::optional<LaneWords> address; // src0, every lane
+        std::optional<LaneWords> data;    // a scalar store's src1, every lane
+    };
+
+    // A store between its plan and its completion: the warp and depbar
     // its last acknowledgement counts down, and the acknowledgements still
     // owed (one per sector request). In Q with none owed: its last
     // acknowledgement came last cycle, it completes now and the record is
@@ -1227,10 +1279,11 @@ private:
     };
 
     // The load / store unit's command slots: lsu.active_commands slots (2),
-    // each holding one command from its dispatch until its last register
-    // write (a load) or its last sector request (a store), and which is older. A command takes
-    // the lowest free slot (as its dispatch cycle's releases leave them).
-    // Requests, store data and register reads are chosen oldest first; a
+    // each holding one command from the cycle it leaves the queue until its
+    // last register write (a load) or its last sector request (a store), and
+    // which is older. A command takes the lowest free slot (as that cycle's
+    // releases leave them). Requests, store data and register reads are
+    // chosen oldest first; a
     // command leaves from either slot. State that refers to a command (a
     // buffer's owner, a read record, an egress slot, a read in the store-data
     // pipeline) holds its slot number; this cycle's wires name it by its
@@ -1786,19 +1839,22 @@ private:
     // port of one bank in the CURRENT cycle, where the issue register's
     // instruction owns the ports it samples.
     // Round-robin order: the acc.st engine's next beat, the LSU's store-data
-    // read (vector stores), the read side's collect stage, the write side's.
-    // The write side's second register (an sts's data, read with its
-    // address) is last and outside the round-robin: it takes a port only if
-    // one is left on its bank.
-    enum class RfReader : uint8_t { acc_st, lsu_store, read_collect, write_collect, write_collect_data };
+    // read (vector stores), the read side's collect stage, the write side's,
+    // the LSU's command slot reading its registers. The second register of a
+    // pair read with its address in one cycle (an sts's data, a scalar stg's
+    // data) is after them and outside the round-robin: it takes a port only
+    // if one is left on its bank (the write side's first, then the LSU's).
+    enum class RfReader : uint8_t {
+        acc_st, lsu_store, read_collect, write_collect, lsu_collect, write_collect_data, lsu_collect_data
+    };
     struct RfReadRequest {
         RfReader reader = RfReader::acc_st;
         uint32_t index = 0;          // 0 (the acc.st engine, a collect stage)
         uint32_t warp = 0;
         uint8_t reg = 0;
-        uint64_t lsu_command = 0;    // lsu_store
+        uint64_t lsu_command = 0;    // lsu_store, lsu_collect
         uint32_t buffer = 0;       // lsu_store
-        uint8_t lsu_slot = 0;        // lsu_store: the command's slot
+        uint8_t lsu_slot = 0;        // lsu_store, lsu_collect: the command's slot
         uint32_t group = 0;          // lsu_store: the lane group this beat is for
         uint32_t beat = 0;           // lsu_store: which of rS .. rS+7
         uint64_t lanes = 0;          // lsu_store: the group's active lanes
@@ -2066,9 +2122,10 @@ private:
         std::optional<std::size_t> rf_write_stage;       // ... at this stage of the write calendar
         std::optional<ArithmeticRead> arithmetic;        // a fixed-latency instruction enters the arithmetic pipeline
         std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
-        std::optional<DispatchEntry> dispatch;           // a memory / engine instruction enters the dispatch pipeline
+        std::optional<DispatchEntry> dispatch;           // an engine instruction enters the dispatch pipeline
         std::optional<ShmemEntry> shmem;                 // a shared-memory instruction enters its queue
         bool shmem_write_side = false;                   // ... the write queue (else the read queue)
+        std::optional<LsuEntry> lsu;                     // a global-memory instruction enters the LSU's queue
         std::optional<UrfWrite> urf_write;               // a uniform-register writer enters the URF write pipeline
         std::optional<UrfReadRounds> urf_rounds;         // a tma or an mma.async loads the URF's round counter
     };
@@ -2078,20 +2135,46 @@ private:
         std::optional<MmaCommand> mma;
         struct AccAdmission { bool load = false; AccTransfer transfer; };
         std::optional<AccAdmission> acc;
-        struct LsuAdmission {
-            LsuCommand command;
-            std::optional<std::vector<uint32_t>> store_data; // scalar stg: its issue round's read, latched
-        };
-        std::optional<LsuAdmission> lsu;
     };
 
     // The space the instructions in the dispatch pipeline will take when
     // they reach their units (admission secured it at their issue).
     struct DispatchClaims {
-        uint32_t lsu_commands = 0;
-        uint32_t lsu_stores = 0;     // stg / stg.v8: their data is still to move through the store buffer
         uint32_t mma_commands = 0;
         std::array<uint32_t, 2> acc{}; // [0 acc.ld, 1 acc.st]
+    };
+
+    // The load / store unit's front end this cycle (step_lsu_queue, and the
+    // RF read decision's grant to a command slot).
+    struct LsuFrontEnd {
+        // The newest queue entry's sample at its issue + 1: its lanes (the
+        // active mask AND the write mask), an ldg.uni's base. No lane left: it
+        // leaves the queue now, giving back what it took at issue.
+        struct Sample {
+            uint64_t lanes = 0;
+            uint32_t base = 0;
+            bool uniform_read = false;   // it read a uniform register (ldg.uni's base): one URF read port
+            bool dropped = false;
+        };
+        std::optional<Sample> sample;
+        // The queue's head leaves now: the command it becomes, in the slot it
+        // takes (an ldg.uni planned already; any other still to read its
+        // registers).
+        bool queue_pop = false;
+        std::optional<LsuCommand> entering;
+        // The command whose address is at the RF output now: its plan.
+        struct Plan {
+            uint64_t command = 0;
+            Bounded<LsuSector, limits::lanes> sectors;
+            uint32_t requests_total = 0;
+            uint32_t ack_record = 0;     // a store's acknowledgement record (free in Q)
+        };
+        std::optional<Plan> plan;
+        // A scalar store's data at the RF output now: into the store buffer.
+        std::optional<std::pair<uint8_t, LaneWords>> store_data; // (its slot, every lane)
+        // A command slot's registers sampled now (RfReader::lsu_collect and
+        // its pair): into the read stages.
+        std::optional<LsuOperandRead> read;
     };
 
     // All of a cycle's wires, in the order tick() computes them.
@@ -2166,6 +2249,8 @@ private:
         std::optional<TmaCommand> tma_pushed;
         // The dispatch pipeline's end: its unit takes an instruction now.
         bool dispatched = false;
+        // The load / store unit's queue and command slots' front end.
+        LsuFrontEnd lsu;
         // The arithmetic pipeline's stage 0: its instruction with the round
         // it sampled now.
         std::optional<ArithmeticRead> arithmetic_sampled;
@@ -2195,19 +2280,14 @@ private:
         IssueDecision issue;
         // The front ends after this cycle (step_front_end, after issue).
         std::vector<WarpFrontEnd> front_end_next;
-        // The RF read stage: dispatch entries' operands latched now (the
-        // entry's stage, operands by read, uniform operands by uniform
-        // read from position uniform_first). A later round of an mma.async
-        // (the round counter's) latches only its uniform operands.
+        // The RF read stage: dispatch entries' uniform operands latched now
+        // (the entry's stage, uniform operands by uniform read from position
+        // uniform_first): stage 0's issue round, or a later round of an
+        // mma.async (the round counter's).
         struct DispatchSample {
             std::size_t stage = 0;
-            bool later_round = false;
-            Bounded<LaneWords, limits::round_reads> operands;
             std::size_t uniform_first = 0;
             std::vector<uint32_t> uniform_operands;
-            // A masked entry's write mask as lanes, sampled from the
-            // predicate file now: ANDed into its active mask.
-            std::optional<uint64_t> write_mask_lanes;
         };
         std::vector<DispatchSample> dispatch_samples;
         // The URF write pipeline: the write at the RAM now (it lands at this
@@ -2246,9 +2326,10 @@ private:
     // rf.rows_per_bank rows, a row one lane-wide register (lanes x 32 bits,
     // a write enables lanes one by one); rf.read_ports_per_bank read ports
     // and rf.write_ports_per_bank write ports per bank. A read sampled at S
-    // has its words at the output S + Lr later (the pipelines that carry
-    // them: the arithmetic and dispatch pipelines, the acc.st and store-data
-    // read pipelines); a write lands at the edge of its RAM cycle (read
+    // has its words at the output S + Lr later (what carries them: the
+    // arithmetic pipeline, the URF write pipeline for r2ur, the acc.st,
+    // store-data and LSU command-slot read pipelines, the shared-memory
+    // collect stages' latches); a write lands at the edge of its RAM cycle (read
     // first, src/timing.hpp). Warp w's register r is at rf_address(w, r).
     Memory<uint32_t> rf_{clocked_,Unit::register_file, "vector register file"};
     [[nodiscard]] MemoryShape rf_shape() const {
@@ -2258,7 +2339,8 @@ private:
     }
     [[nodiscard]] BlackBoxDeclaration rf_black_box() const {
         return memory_blackbox(rf_, "rf.read_latency_cycles",
-            "the issue register's round, the acc.st and store-data readers (in the open)",
+            "the issue register's round; the shared-memory collect stages, the load / store unit's command-slot "
+            "reads and store-data beats, the acc.st beats (the async readers, in the open)",
             "the RF write pipelines' last stages (in the open)");
     }
     // A warp's rows in each bank: the kernel's register count over the banks,
@@ -2485,16 +2567,19 @@ private:
     Pipe<TmaReadPair> tma_read_pairs_{clocked_,Unit::tma, "TMA operand read: URF read stages and tags"};
     Reg<std::optional<TmaReadHolding>> tma_holding_{clocked_,Unit::tma, "TMA operand read: holding register"};
     // LSU.
-    // Sizes: command slots lsu.active_commands (2; checked in
-    // drive_lsu_commands); one load buffer and one store buffer (LsuBuffer);
+    // Sizes: the queue lsu.queue_entries (4); command slots
+    // lsu.active_commands (2; checked in drive_lsu_commands); one load
+    // buffer and one store buffer (LsuBuffer);
     // the ingress FIFO (IngressWord), the egress FIFO (EgressOpenSlot and its
     // two FIFOs) and the read records (LsuRead, TmaRun) as their comments
     // say, each built from the profile (a push past one is an internal
     // error); free-ID tags lsu.sectors_in_flight bits (16, fixed).
+    Reg<LsuQueue> lsu_queue_{clocked_,Unit::load_store, "LSU queue"};
     Reg<LsuCommandSlots> lsu_commands_{clocked_,Unit::load_store, "LSU command slots"};
     // The next LSU command's number: the slots' releases, the read records
-    // and the write acknowledgements name their command by it. dispatch_lsu
-    // takes Q; drive_lsu_commands advances it when the command enters.
+    // and the write acknowledgements name their command by it. The queue's
+    // head takes Q as it leaves; drive_lsu_commands advances it when the
+    // command enters.
     Reg<uint64_t> lsu_command_number_{clocked_,Unit::load_store, "LSU command number"};
     Regs<LsuBuffer> lsu_buffers_{clocked_,Unit::load_store, "LSU load and store buffers"}; // [load_buffer], [store_buffer]
     static constexpr uint32_t load_buffer = 0;
@@ -2511,7 +2596,7 @@ private:
     Reg<uint32_t> lsu_read_received_{clocked_,Unit::load_store, "read records: LSU stream head's bytes consumed"};
     Regs<uint8_t> free_id_tags_{clocked_,Unit::load_store, "free-ID tags"}; // lsu.sectors_in_flight bits; 1 = in flight
     // The stores whose acknowledgements are not all in: one record each, from
-    // the store's dispatch until the cycle after its last acknowledgement,
+    // the store's plan until the cycle after its last acknowledgement,
     // when its depbar counts down at the RF's RAM stage (the memory controller
     // is decided after that stage). The store's command slot is free long
     // before: from the cycle after its last sector request is accepted. How
@@ -2547,8 +2632,8 @@ private:
     // port; zero when nothing was accepted). It owns those read ports this
     // cycle; the async readers take the rest (decide_rf_reads).
     Regs<uint8_t> issue_read_banks_{clocked_,Unit::issue, "issue register: RF read bank use"}; // per bank
-    // Issue -> units: the issue register and the RF read pipeline
-    // (issue_to_dispatch stages), carrying memory / engine instructions.
+    // Issue -> units: the issue register and the dispatch pipeline
+    // (issue_to_dispatch stages), carrying engine instructions (DispatchEntry).
     // issue_to_dispatch stages: an instruction accepted at t is in stage k at
     // t + 1 + k and dispatches from the last stage.
     Pipe<DispatchEntry> dispatch_pipe_{clocked_,Unit::dispatch, "dispatch pipeline"};
@@ -2556,6 +2641,9 @@ private:
     // Lr read stages. A read granted at t is in stage 0 at t + 1 and at the RF
     // output, the last stage, at t + Lr.
     Pipe<LsuRfRead> lsu_read_pipe_{clocked_,Unit::load_store, "LSU store-data read pipeline"};
+    // The command slots' register reads (their addresses, a scalar store's
+    // data) travelling to the RF output the same way: Lr stages.
+    Pipe<LsuOperandRead> lsu_collect_pipe_{clocked_,Unit::load_store, "LSU command slots' read pipeline"};
     // The URF write pipeline (UrfWrite): L + Wu stages, the uniform ALU's and
     // r2ur's path from the issue register to the URF RAM.
     Pipe<UrfWrite> urf_pipe_{clocked_,Unit::uniform_file, "URF write pipeline"};
@@ -2734,14 +2822,23 @@ private:
     // cycle (the issue register's): its Q, or the write landing at this
     // cycle's edge. The sanitizer's issue-time look at a tmem pointer.
     [[nodiscard]] uint32_t uniform_at_next_sample(uint32_t warp, uint8_t reg) const;
-    // ---- dispatch: the RF read pipeline's end, the unit takes it ----
+    // ---- dispatch: the dispatch pipeline's end, the unit takes it ----
     void dispatch_issued(Wires& w);
     void hand_over(const DispatchEntry& op, Wires& w);
-    void complete_without_lanes(const DispatchEntry& op, Wires& w);
     void dispatch_mma(const DispatchEntry& op, Wires& w);
     void dispatch_acc_transfer(const DispatchEntry& op, Wires& w);
-    void dispatch_lsu(const DispatchEntry& op, Wires& w);
     [[nodiscard]] DispatchClaims dispatch_claims() const;
+    // ---- the load / store unit's queue and command slots (src/machine/lsu.cpp) ----
+    // The newest entry's issue + 1 sample (and the drop of one left with no
+    // lane), the head's move into a command slot, the plan of the command
+    // whose address is at the RF output now.
+    void step_lsu_queue(Wires& w);
+    void sample_lsu_entry(Wires& w);
+    void drop_lsu_entry(const LsuEntry& entry, Wires& w);
+    void advance_lsu_queue(Wires& w);
+    [[nodiscard]] LsuCommand lsu_command_from(const LsuEntry& entry, uint64_t lanes) const;
+    void plan_arriving_address(Wires& w);
+    [[nodiscard]] std::optional<RfReadRequest> lsu_collect_read_request(bool data) const;
     // ---- shared memory's two sides (src/machine/shmem.cpp) ----
     // The newest queue entry's issue + 1 sample: predicate, uniform
     // registers, the drop of an instruction left with no lane, and the
@@ -2775,10 +2872,13 @@ private:
     // An accepted uniform-register writer (uniform arithmetic, r2ur): its
     // write enters the URF write pipeline; r2ur's vector read joins the round.
     void accept_uniform(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
-    // An accepted memory / engine / mbar instruction: its metadata work now
-    // (depbar, the sanitizer's destination and reader records), its read
-    // round's bank use, its entry into the dispatch pipeline.
+    // An accepted engine instruction: its metadata work now (depbar, the
+    // sanitizer's destination and reader records), its entry into the
+    // dispatch pipeline.
     void accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
+    // An accepted global-memory instruction: its metadata work now, its
+    // entry into the load / store unit's queue.
+    void accept_lsu(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     // An accepted shared-memory instruction: its metadata work now, its
     // entry into its side's queue.
     void accept_shmem(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
@@ -2826,6 +2926,7 @@ private:
     void drive_tma_store_registers(const Wires& w);
     void drive_tma_returns(const Wires& w);
     void drive_tma_operand_read(const Wires& w);
+    void drive_lsu_queue(const Wires& w);
     void drive_lsu_commands(const Wires& w);
     void drive_lsu_buffers(const Wires& w);
     void drive_ingress(const Wires& w);
@@ -2844,6 +2945,7 @@ private:
     void drive_arithmetic_reads(const Wires& w);
     void drive_write_calendar(const Wires& w);
     void drive_lsu_read_pipe(const Wires& w);
+    void drive_lsu_collect_pipe(const Wires& w);
     void drive_urf_pipe(const Wires& w);
     void run_drivers(const Wires& w);
 
@@ -2853,6 +2955,8 @@ private:
     [[nodiscard]] IssueSite site(const Warp& warp, const Instruction& inst) const;
     [[nodiscard]] IssueSite site(const DispatchEntry& op) const;
     [[nodiscard]] IssueSite site(const ShmemEntry& entry) const;
+    [[nodiscard]] IssueSite site(const LsuEntry& entry) const;
+    [[nodiscard]] IssueSite site(const LsuCommand& command) const;
     // An lds / sts's register as a sample now would read it, every lane (the
     // sanitizer's record of a queued access at its issue + 1).
     [[nodiscard]] LaneWords rf_peek(uint32_t warp, uint8_t reg) const;
@@ -3002,9 +3106,6 @@ private:
     [[nodiscard]] std::vector<uint8_t> source_registers(const Instruction& inst) const;
     [[nodiscard]] std::optional<uint8_t> destination_register(const Instruction& inst) const;
     void check_register_hazards(const Warp& warp, const Instruction& inst) const;
-    // A dispatched instruction's operand: every lane of one register, as its
-    // RF read latched it at its sample.
-    [[nodiscard]] std::vector<uint32_t> capture(const DispatchEntry& op, uint8_t reg) const;
     // A conditional branch's predicate, every lane, read from the predicate
     // file in the issue register's cycle (resolve_branch).
     [[nodiscard]] std::vector<uint32_t> capture_predicate(const Warp& warp, uint8_t predicate) const;
@@ -3054,6 +3155,7 @@ private:
     [[noreturn]] void panic(const Warp& warp, const Instruction& inst, const std::string& reason) const;
     [[noreturn]] void panic(const DispatchEntry& op, const std::string& reason) const;
     [[noreturn]] void panic(const ShmemEntry& entry, const std::string& reason) const;
+    [[noreturn]] void panic(const LsuCommand& command, const std::string& reason) const;
     [[noreturn]] void mbar_rmw_panic(
         const MbarRmwRequest& request, const std::string& reason) const;
 
@@ -3064,7 +3166,9 @@ private:
     void finish_gmem_write(GmemSectorRequest request);
     void deliver_write_acks(Wires& w);
     [[nodiscard]] static bool is_store(LsuKind kind);
-    LsuCommand plan_lsu_command(const DispatchEntry& op) const;
+    // A command's requests from its lanes' bases (or ldg.uni's one base):
+    // base + immediate, every check, one LsuSector per request.
+    [[nodiscard]] LsuFrontEnd::Plan plan_lsu_command(const LsuCommand& command, const LaneWords& bases) const;
     [[nodiscard]] static bool store_has_data_left(const LsuCommand& command);
     [[nodiscard]] bool store_buffer_free() const;
     [[nodiscard]] uint32_t lsu_group_width(const LsuCommand& command) const;

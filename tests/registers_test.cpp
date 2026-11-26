@@ -215,6 +215,30 @@ L:      add    %t0, %x, %y
     }
 }
 
+// A one-word store's address and data are read one after the other when the
+// register file cannot serve both in a cycle, so a file of one bank and one
+// read port takes sts and stg as written: no refusal, no copy.
+TEST(Registers, one_bank_store) {
+    auto profile = canonical_profile();
+    profile.rf_rows_per_bank *= profile.rf_banks;
+    profile.rf_banks = 1;
+    nanosm::validate_device_profile(profile);
+    for (const std::string store : {"sts", "stg"}) {
+        const std::string source = "sread %lane, LANE_ID\nshli %addr, %lane, 2\nmov %value, 37\n" + store +
+                                   " [%addr], %value\nhalt\n";
+        const auto program = nanosm::compile_qtx(source, profile);
+        require(program.copies == 0 && program.warnings.empty(), store + " on one bank got a copy or a warning");
+        auto launch = launch_warps(1);
+        (void)image_bytes(launch.gmem_image, 64);
+        nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
+        machine.run();
+        for (uint32_t lane = 0; lane < 16; ++lane) {
+            const auto word = store == "sts" ? machine.read_shmem_u32(4 * lane) : machine.read_gmem_u32(4 * lane);
+            require(word == 37, store + " on one bank stored the wrong word");
+        }
+    }
+}
+
 // One source of a per-lane ALU / FPU instruction may be a uniform register
 // (src/isa.hpp takes_uniform_source). A name in that slot has the file the
 // rest of the kernel gives it, also from a line below; a uniform multiplier

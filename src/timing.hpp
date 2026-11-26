@@ -32,7 +32,8 @@
 // accepted per cycle, so the reads of two instructions never meet in one
 // cycle: the accepted instruction's bank use, carried by the issue
 // register, owns the RF read ports in its sample cycle, and the asynchronous
-// readers (acc.st beats, the LSU's store data) take the ports it leaves free.
+// readers (acc.st beats, the LSU's store data and command slots, the
+// shared-memory collect stages) take the ports it leaves free.
 // No future read is booked anywhere. An instruction whose distinct source
 // registers need more of one bank's read ports than the bank has is
 // MALFORMED for this machine (rf_read_port_conflict); nothing serializes it.
@@ -55,10 +56,13 @@
 // dependent add sampling from c7 sees it -- it issues at c6, six cycles
 // later.
 //
-// Everything else (memory, engines, mbar operations) reads its operands the
-// same way and reaches its unit at DISPATCH, when its operands exist:
+// The engines' instructions (mma.async, mma.commit, acc.ld, acc.st) read
+// their uniform operands the same way and reach their unit at DISPATCH:
 // c0 + 1 + Lr, unless the profile's URF is as slow as its RF (then one later:
-// issue_to_dispatch).
+// issue_to_dispatch). The shared and global memory instructions enter their
+// unit's queue at issue, sample their predicate (and uniform registers) at
+// c0 + 1, and read their vector registers later, through the RF's async read
+// ports (src/machine/shmem.cpp, src/machine/lsu.cpp).
 //
 // The front end: every warp issues from its
 // instruction FIFO's head packet, the half its pc names. One instruction-
@@ -179,8 +183,10 @@ inline constexpr uint32_t branch_not_taken_interval = issue_to_branch_resolve + 
 inline constexpr uint32_t branch_taken_interval = issue_to_branch_resolve + 1 + fetch_to_issue;
 
 // Accepted issue -> the sample of every register the instruction reads (its
-// one round). A source read later, beat by beat (acc.st / stg.v8 data), is
-// read-owned from here too: the conservative answer for a RAW check.
+// one round). A source read later (acc.st / stg.v8 data beat by beat, the
+// shared and global memory forms' registers by their collect stage or
+// command slot) is read-owned from here too: the conservative answer for a
+// RAW check.
 inline constexpr uint32_t issue_to_sample = issue_register_stages;
 
 // Fixed-latency ALU/FPU/SFU work (MOV/SREAD and setp included) runs through
@@ -206,13 +212,12 @@ inline uint32_t issue_to_operands(const DeviceProfile& profile) {
 // holding register, not the dispatch pipeline.
 inline constexpr uint32_t dispatch_uniform_rounds = 2;
 
-// Accepted issue -> a memory / engine instruction reaches its unit, with
-// every operand: its vector operands at the RF output (issue + 1 + Lr), its
-// uniform operands at the URF output (round r's at issue + 1 + r + Lu). The
-// dispatch pipeline is one fixed depth for every instruction (it keeps issue
-// order), so it covers the matmul's second round: 1 + max(Lr, Lu + 1).
-// Canonical (Lr 2, Lu 1): issue + 3, whatever the round; only a profile
-// with Lu = Lr dispatches one cycle later than its vector operands arrive.
+// Accepted issue -> an engine instruction reaches its unit with its uniform
+// operands at the URF output (round r's at issue + 1 + r + Lu). The dispatch
+// pipeline is one fixed depth for every instruction (it keeps issue order),
+// so it covers the matmul's second round, and it is never shorter than the
+// RF's read (though nothing it carries reads the vector file):
+// 1 + max(Lr, Lu + 1). Canonical (Lr 2, Lu 1): issue + 3, whatever the round.
 inline uint32_t issue_to_dispatch(const DeviceProfile& profile) {
     return issue_to_sample + std::max(profile.rf_read_latency_cycles,
         profile.urf_read_latency_cycles + dispatch_uniform_rounds - 1);

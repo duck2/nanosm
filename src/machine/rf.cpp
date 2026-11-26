@@ -23,8 +23,10 @@ namespace nanosm {
 // leaves goes to the asynchronous clients, decided from Q before issue:
 //   READS   decide_rf_reads: the issue
 //           register's instruction owns the read ports its round samples
-//           now; acc.st beats, the LSU's store-data read and the shared-
-//           memory collect stages share the rest by round-robin. A denied
+//           now; acc.st beats, the LSU's store-data read, the shared-
+//           memory collect stages and the LSU's command slots (their
+//           addresses, a scalar store's data) share the rest by
+//           round-robin. A denied
 //           reader whose bank's read_owed bit is set inhibits the acceptance
 //           of new SIMT reads of that bank, so the bank's ports are free one
 //           cycle later (the mirrored rule).
@@ -376,14 +378,16 @@ void Machine::drive_predicates(const Wires& w) {
 // never stopped. The readers granted (round-robin from the bank's cursor)
 // sample the RF now: an acc.st beat is at the RF output Lr later and at the
 // tmem RAM tmem.port_depth after that; the LSU's beat fills the store
-// buffer Lr later; a collect stage's register is at the RF output Lr later.
-// An sts's data, wanted with its address in one cycle, is outside the
-// round-robin: it takes a port of its bank only if one is left after it,
-// so the pair never waits on two owed bits (the address is the named
-// requester; the data is read later, as the stage's own request, if not
-// now). A denied reader holds (an acc.st keeps its beat, the LSU its
-// candidate, a collect stage its access; a source stays read-owned). The
-// owed bit and cursor change in drive_rf_read_policy.
+// buffer Lr later; a collect stage's or a command slot's register is at the
+// RF output Lr later. The second register of a pair wanted with its address
+// in one cycle (an sts's data, a scalar stg's data) is outside the
+// round-robin: it takes a port of its bank only if one is left after it
+// (the write side's pair first), so the pair never waits on two owed bits
+// (the address is the named requester; the data is read later, as the
+// requester's own read, if not now). A denied reader holds (an acc.st keeps
+// its beat, the LSU its candidate, a collect stage its access, a command
+// slot its read; a source stays read-owned). The owed bit and cursor change
+// in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     RfReadDecision decision;
     const auto& store_engine = acc_engines_.cur()[1];
@@ -395,16 +399,23 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     }
     decision.holders.push_back(lsu_store_read_request(w));
     decision.holders.push_back(collect_read_request(false, false));
+    const std::size_t write_collect = decision.holders.size();
     decision.holders.push_back(collect_read_request(true, false));
-    const std::size_t pair_data = decision.holders.size();
+    const std::size_t lsu_collect = decision.holders.size();
+    decision.holders.push_back(lsu_collect_read_request(false));
+    const std::size_t round_robin = decision.holders.size();
     decision.holders.push_back(collect_read_request(true, true));
+    decision.holders.push_back(lsu_collect_read_request(true));
+    // Each pair's second register and its named requester.
+    const std::array<std::pair<std::size_t, std::size_t>, 2> pairs{{
+        {round_robin, write_collect}, {round_robin + 1, lsu_collect}}};
     decision.granted.assign(decision.holders.size(), 0);
     decision.banks.resize(config_.rf_banks);
     const auto& policy = rf_read_policy_.cur();
     const auto& simt_read_now = issue_read_banks_.cur();
     std::vector<uint32_t> ports_used(config_.rf_banks, 0);
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
-        std::vector<uint8_t> ready(pair_data, 0);
+        std::vector<uint8_t> ready(round_robin, 0);
         for (std::size_t holder = 0; holder < ready.size(); ++holder) {
             const auto& read = decision.holders[holder];
             ready[holder] = read.has_value() && read->reg % config_.rf_banks == bank ? 1 : 0;
@@ -419,11 +430,14 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
     }
-    if (const auto& data = decision.holders[pair_data]; data.has_value() && decision.granted[pair_data - 1] != 0) {
+    for (const auto& [data_holder, named] : pairs) {
+        const auto& data = decision.holders[data_holder];
+        if (!data.has_value() || decision.granted[named] == 0) continue;
         const auto bank = data->reg % config_.rf_banks;
         if (ports_used[bank] < config_.rf_read_ports_per_bank) {
-            decision.granted[pair_data] = 1;
+            decision.granted[data_holder] = 1;
             decision.banks[bank].granted = true;
+            ++ports_used[bank];
         }
     }
     for (std::size_t holder = 0; holder < decision.holders.size(); ++holder) {
@@ -443,9 +457,31 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         trace_->rf_read(cycle_, warp.id, read->reg, read->reg % config_.rf_banks);
         const bool collect = read->reader == RfReader::read_collect || read->reader == RfReader::write_collect ||
             read->reader == RfReader::write_collect_data;
+        const bool slot_read = read->reader == RfReader::lsu_collect || read->reader == RfReader::lsu_collect_data;
         auto values = read_rf(warp.id, read->reg,
             read->reader == RfReader::acc_st ? "RF read: acc.st beat"
-            : collect ? "RF read: a shared-memory collect stage" : "RF read: store data");
+            : collect ? "RF read: a shared-memory collect stage"
+            : slot_read ? "RF read: a load / store unit command slot" : "RF read: store data");
+        if (slot_read) {
+            // A command slot's address, or a scalar store's data (read with
+            // its address now, or after it; the address register when the
+            // two are one).
+            sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::lsu);
+            const auto& command = lsu_commands_.cur().in_slot(read->lsu_slot, read->lsu_command);
+            auto& sampled = w.lsu.read;
+            if (!sampled.has_value()) sampled = LsuOperandRead{read->lsu_slot, read->lsu_command, {}, {}};
+            const auto& inst = command.instruction;
+            bool data = true;
+            if (read->reader == RfReader::lsu_collect && !command.address_read) {
+                sampled->address = LaneWords(values);
+                data = command.kind == LsuKind::scalar_store && inst.src1 == inst.src0;
+            }
+            if (data) {
+                sampled->data = LaneWords(values);
+                probe(LsuEdge::rf_read_beat, command.id, read->reg, config_.lanes * 4); // the store buffer's data
+            }
+            continue;
+        }
         if (collect) {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::shmem_collect);
             const auto& inst = (read->reader == RfReader::read_collect ? read_collect_ : write_collect_).cur()->entry.instruction;
@@ -492,6 +528,16 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         const bool data_read = collect->data_read || w.write_collect_data.has_value() || inst.src1 == inst.src0;
         if (data_read) lower_read_depbar(w, collect->entry.warp, inst);
     }
+    // A command slot whose last vector register is read now lowers its
+    // instruction's read depbar likewise: an ldg's or ldg.v8's address, a
+    // scalar stg's data (or its address when the data is read with it or is
+    // the same register). A stg.v8's falls at its last data beat (above).
+    if (const auto& read = w.lsu.read; read.has_value()) {
+        const auto& command = lsu_commands_.cur().in_slot(read->slot, read->command);
+        const bool last = command.kind == LsuKind::scalar_store ? read->data.has_value()
+            : command.kind != LsuKind::vector_store;
+        if (last) lower_read_depbar(w, command.warp, command.instruction);
+    }
     return decision;
 }
 
@@ -500,7 +546,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
 // writes land at its edge (READ_FIRST). An arithmetic instruction whose
 // operands are all at the RF output now (issue + issue_to_operands)
 // executes, and its result is on its way to the write port it booked. A
-// dispatch entry's samples are latched into the entry (the RF output
+// dispatch entry's uniform samples are latched into the entry (the dispatch
 // pipeline carries them to its dispatch). Each bank's samples -- the round's
 // and the async readers' (decide_rf_reads) -- never exceed its read ports,
 // and the round's are exactly the issue register's bank use. The round's
@@ -542,28 +588,18 @@ void Machine::step_rf_reads(Wires& w) {
         w.arithmetic_sampled = std::move(sampled);
     }
     // A shared-memory queue's newest entry, accepted last cycle, samples its
-    // predicate and uniform registers.
+    // predicate and uniform registers; the LSU queue's newest (an ldg.uni's
+    // base: sampled in step_lsu_queue, counted here).
     sample_shmem_entry(w, uniform_reads);
+    if (w.lsu.sample.has_value() && w.lsu.sample->uniform_read) ++uniform_reads;
     // The dispatch pipeline's stage 0: the instruction accepted last cycle
-    // samples its round.
+    // samples its round's uniform registers (none of these reads a vector
+    // register or may be masked).
     const auto& pipe = dispatch_pipe_.cur();
     if (const auto& first = pipe.front(); first.has_value()) {
         const auto& op = *first;
-        const bool masked = has_write_mask(op.instruction);
-        if (!(op.reads.empty() && op.uniform_reads.empty() && !masked)) {
-            auto operands = op.operands;
-            for (std::size_t i = 0; i < op.reads.size(); ++i) operands[i] = sample(op.warp, op.reads[i]);
-            const auto rounds = uniform_read_rounds(op.instruction);
-            w.dispatch_samples.push_back({0, false, std::move(operands), 0,
-                sample_uniform(op.warp, rounds.empty() ? std::vector<uint8_t>{} : rounds.front()),
-                masked ? std::optional<uint64_t>{write_mask_lanes(warps_[op.warp], op.instruction)} : std::nullopt});
-        }
-        // ldg, stg, ldg.v8: every vector source is in this round (whatever
-        // the write mask leaves), so their read depbar is lowered now. A
-        // stg.v8 reads its data later, in the LSU (decide_rf_reads).
-        const auto opcode = op.instruction.opcode;
-        if (opcode == Opcode::ldg || opcode == Opcode::stg || opcode == Opcode::ldg_v8) {
-            lower_read_depbar(w, op.warp, op.instruction);
+        if (const auto rounds = uniform_read_rounds(op.instruction); !rounds.empty()) {
+            w.dispatch_samples.push_back({0, 0, sample_uniform(op.warp, rounds.front())});
         }
     }
     // The URF write pipeline's stage 0: uniform arithmetic samples its
@@ -614,7 +650,7 @@ void Machine::step_rf_reads(Wires& w) {
                 values.push_back(read_urf(rounds->header.warp, reg, "URF read: an mma.async's later round"));
             }
             uniform_reads += static_cast<uint32_t>(registers.size());
-            w.dispatch_samples.push_back({stage, true, {}, first, std::move(values), std::nullopt});
+            w.dispatch_samples.push_back({stage, first, std::move(values)});
         }
     }
     if (uniform_reads > urf_read_ports) {

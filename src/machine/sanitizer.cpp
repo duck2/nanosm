@@ -118,6 +118,7 @@ void Sanitizer::record_async_reader_done(uint32_t warp, uint32_t reg, AsyncReade
     if (readers == 0) {
         throw SimError(reader == AsyncReader::acc_st ? "internal acc.st reader underflow"
             : reader == AsyncReader::stg_v8 ? "internal stg.v8 reader underflow"
+            : reader == AsyncReader::lsu ? "internal load / store unit command slot reader underflow"
             : "internal shared-memory collect reader underflow");
     }
     --readers;

@@ -21,8 +21,10 @@ files is at the top of `src/machine/machine.cpp`.
         |
         +--> arithmetic: ALU, FPU, special-function unit --> register write
         |
-        +--> dispatch to one unit:
-                 shared memory | barriers | load / store unit | TMA | tensor core
+        +--> a unit's queue (the vector registers are read there, later):
+        |        shared memory and barriers | load / store unit
+        |
+        +--> dispatch to one unit: TMA | tensor core
 ```
 
 ```

@@ -3,8 +3,8 @@
 // its fixed-latency dependencies need (FixedTimeline, distances from
 // src/timing.hpp), depbar set / wait for the asynchronous ones (with all six
 // live, an instruction that needs a new one waits for the oldest and reuses
-// it; every lds and sts also names one shared read depbar, which a later
-// writer of their vector sources waits on), a wait on a launch flag for an instruction that names a section of
+// it; every lds, sts and per-lane global load or store also names one shared
+// read depbar, which a later writer of their vector sources waits on), a wait on a launch flag for an instruction that names a section of
 // the launch block (flag_pending below), a full drain at
 // every branch and sync, a loop body scheduled as a jump enters it (LoopEntry), and
 // qtx's wait as a nop waiting for every live depbar (no drain).
@@ -232,11 +232,12 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
     uint8_t acc_load_mask = 0;
     std::optional<uint8_t> store_barrier;
     std::optional<uint8_t> mma_barrier;
-    // The read depbar every lds and sts names (one counter for all of them,
-    // as the stores share one completion counter): lowered when each one's
-    // collect stage has read its vector registers. A later writer of an
-    // lds's address or an sts's address or data waits on it, so it waits for
-    // the reads of every lds and sts still queued.
+    // The read depbar every lds, sts, ldg, stg, ldg.v8 and stg.v8 names (one
+    // counter for all of them, as the stores share one completion counter):
+    // lowered when each one has read its vector registers (a shared-memory
+    // collect stage, the LSU's command slot, a stg.v8's last data beat). A
+    // later writer of one of their vector sources waits on it, so it waits
+    // for the reads of every one still queued.
     std::optional<uint8_t> read_barrier;
 
     // Virtual issue timeline. Consecutive same-warp issues are at least max(stall, 1)
@@ -412,10 +413,10 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
             inst.control.set_depbar = bar;
             const auto width = inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
             for (unsigned j = 0; j < width; ++j) pending_register[inst.dst + j] = bar;
-            // An lds's address is read by its collect stage after issue: it
-            // names the read depbar, and a later writer of the address waits
-            // on that.
-            if (inst.opcode == Opcode::lds) {
+            // An lds's or ldg's address is read after issue (the collect
+            // stage, the LSU's command slot): it names the read depbar, and
+            // a later writer of the address waits on that.
+            if (inst.opcode == Opcode::lds || inst.opcode == Opcode::ldg || inst.opcode == Opcode::ldg_v8) {
                 if (!read_barrier.has_value()) read_barrier = allocate(inst, bar);
                 inst.control.read_depbar = *read_barrier;
                 pending_async_read_mask[inst.src0] |= static_cast<uint8_t>(1u << *read_barrier);
@@ -423,20 +424,16 @@ AssemblyProgram compile_qtx(std::string_view source, const DeviceProfile& profil
         } else if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg || inst.opcode == Opcode::stg_v8) {
             if (!store_barrier.has_value()) store_barrier = allocate(inst);
             inst.control.set_depbar = *store_barrier;
-            // An sts's address and data are read by its collect stage after
-            // issue: it names the read depbar, and a later writer of either
-            // waits on that.
-            if (inst.opcode == Opcode::sts) {
-                if (!read_barrier.has_value()) read_barrier = allocate(inst, *store_barrier);
-                inst.control.read_depbar = *read_barrier;
-                for (const auto reg : {inst.src0, inst.src1}) {
-                    pending_async_read_mask[reg] |= static_cast<uint8_t>(1u << *read_barrier);
-                }
-            }
-            if (inst.opcode == Opcode::stg_v8) {
-                for (unsigned j = 0; j < 8; ++j)
-                    pending_async_read_mask[inst.src1 + j] |= static_cast<uint8_t>(1u << *store_barrier);
-            }
+            // A store's address and data are read after issue (an sts's and
+            // a stg's by their collect stage or command slot, a stg.v8's data
+            // in beats, its read depbar falling at the last): it names the
+            // read depbar, and a later writer of any of them waits on that.
+            if (!read_barrier.has_value()) read_barrier = allocate(inst, *store_barrier);
+            inst.control.read_depbar = *read_barrier;
+            const auto bit = static_cast<uint8_t>(1u << *read_barrier);
+            pending_async_read_mask[inst.src0] |= bit;
+            const unsigned data_registers = inst.opcode == Opcode::stg_v8 ? 8u : 1u;
+            for (unsigned j = 0; j < data_registers; ++j) pending_async_read_mask[inst.src1 + j] |= bit;
         } else if (inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8) {
             const auto bar = allocate(inst);
             inst.control.set_depbar = bar;

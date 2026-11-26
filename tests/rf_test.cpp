@@ -804,15 +804,17 @@ TEST(Rf, profile_fields) {
 }
 
 // Back-to-back same-bank reads. Nine independent instructions issue in
-// consecutive cycles: seven read RF bank 0 in their issue round (r0, r3, r6,
-// r9: two-source adds, a repeated register, xori, addi, stg, setp), an
-// lds.uni among them reads only its uniform base (ur0, no RF read) and an
-// lds reads its r9 later, in its collect stage (after the run). No refusal,
-// no bubble; bank 0 is sampled in every cycle of the run but the lds.uni's
-// and the lds's, each instruction's sources at its own issue +
-// issue_to_sample; the data are right. Then four warps run the arithmetic
-// part of it: their issues interleave one per cycle with no gap, and bank 0
-// is sampled once per cycle.
+// consecutive cycles: six read RF bank 0 in their issue round (r0, r3, r6,
+// r9: two-source adds, a repeated register, xori, addi, setp), an lds.uni
+// among them reads only its uniform base (ur0, no RF read), a stg reads its
+// r9 and r1 later, in its command slot, and an lds its r9 later, in its
+// collect stage (after the run). No refusal, no bubble; bank 0 is sampled in
+// every cycle of the run but the lds.uni's and the stg's, each instruction's
+// sources at its own issue + issue_to_sample, and the stg's r9 in the lds's
+// round (its command slot is denied bank 0 the cycle before, in the add's
+// round); the data are right. Then four warps run the arithmetic part of
+// it: their issues interleave one per cycle with no gap, and bank 0 is
+// sampled once per cycle.
 TEST(Rf, back_to_back_same_bank_reads) {
     const std::string setup = R"(
         sread r9, LANE_ID
@@ -830,7 +832,7 @@ TEST(Rf, back_to_back_same_bank_reads) {
     )";
     // The run, from pc 96: (each instruction's distinct vector sources).
     const std::vector<std::vector<uint32_t>> mixed_sources{
-        {0, 1}, {3, 2}, {6}, {9}, {}, {9, 1}, {6}, {}, {9}};
+        {0, 1}, {3, 2}, {6}, {9}, {}, {}, {6}, {}, {9}};
     const std::string mixed = setup + R"(
         add r10, r0, r1
         add r11, r3, r2
@@ -899,6 +901,8 @@ TEST(Rf, back_to_back_same_bank_reads) {
                 for (std::size_t i = 1; i < issues.size(); ++i) {
                     require(issues[i] == issues[0] + i, what + "the run did not issue back to back" + log);
                 }
+                // The stg's command slot reads r9 in the lds's round.
+                bank0_rounds.insert(issues[7] + 1);
             }
             for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
                 const auto base = 4 * lane + 64 * warp;

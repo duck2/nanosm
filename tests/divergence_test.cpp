@@ -353,9 +353,9 @@ B:          halt
 // lane and in none: every instruction issues at the same cycle (the
 // special-function unit takes its full cycles, depbars are set and waited
 // for alike). With no lane on, the ldg / lds / stg / sts make no request and
-// leave memory and registers alone; each completes at its dispatch, so the
-// consumer waiting for the ldg's depbar issues 4 cycles after it (issue +
-// issue_to_dispatch + 1 at canonical depths). Nor on the active mask: two
+// leave memory and registers alone; each leaves its queue at its issue + 1
+// (its predicate's sample), giving back its depbars, so the consumer waiting
+// for the ldg's depbar issues 2 cycles after it. Nor on the active mask: two
 // back-to-back SFU operations, and an arithmetic write and its consumer, are
 // as far apart under one active lane as under sixteen.
 TEST(Divergence, timing_ignores_the_write_mask) {
@@ -399,8 +399,8 @@ TEST(Divergence, timing_ignores_the_write_mask) {
         const auto ldg = issues_named(machine, "ldg");
         const auto addi = issues_named(machine, "addi");
         require(ldg.size() == 1 && addi.size() == 3, "the ldg and the three addis did not issue once each");
-        require(addi[1] == ldg[0] + 4,
-            "the ldg's consumer issued " + std::to_string(addi[1] - ldg[0]) + " cycles after it (want 4)");
+        require(addi[1] == ldg[0] + 2,
+            "the ldg's consumer issued " + std::to_string(addi[1] - ldg[0]) + " cycles after it (want 2)");
     }
     // The fixed instructions (ex2, ex2, addi, then the two consumers, which
     // wait for depbars) at the same cycles both ways: only the first three.

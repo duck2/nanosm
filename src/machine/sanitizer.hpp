@@ -65,7 +65,7 @@ struct IssueSite {
     uint64_t cycle, uint32_t address, const std::string& reason, const IssueSite* requester);
 
 // Which async reader of a register finished (selects the internal-underflow text).
-enum class AsyncReader : uint8_t { acc_st, stg_v8, shmem_collect };
+enum class AsyncReader : uint8_t { acc_st, stg_v8, shmem_collect, lsu };
 
 // Where a SIMT shmem access is granted: shared memory's read side (lds,
 // lds.uni, probes) or write side (sts, barrier changes, atomics: an RMW at

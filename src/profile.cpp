@@ -108,6 +108,7 @@ json profile_json(const DeviceProfile& p) {
         }},
         {"lsu", {
             {"active_commands", p.lsu_active_commands},
+            {"queue_entries", p.lsu_queue_entries},
             {"load_group_lanes", p.lsu_load_group_lanes},
             {"store_group_lanes", p.lsu_store_group_lanes},
             {"read_streams", p.lsu_read_streams},
@@ -205,7 +206,8 @@ void validate_device_profile(const DeviceProfile& p) {
     }
     // The uniform register file (src/timing.hpp). Its depths are nonzero register
     // stages; a uniform operand must reach its unit no later than the vector
-    // operands read in the same round (dispatch is issue + 1 + Lr); every
+    // operands read in the same round (an arithmetic instruction's are at its
+    // unit at issue + 1 + Lr); every
     // writer presents at issue + L, so L covers the longest writer (r2ur
     // through the vector RF, or the uniform ALU through the URF) and a
     // dependent uniform reader, d = L + Wu cycles later, fits the stall field.
@@ -254,6 +256,7 @@ void validate_device_profile(const DeviceProfile& p) {
     within("mma queue_commands", p.mma_queue_commands, limits::mma_queue_commands);
     within("tma queue_commands", p.tma_queue_commands, limits::tma_queue_commands);
     within("lsu active_commands", p.lsu_active_commands, limits::lsu_active_commands);
+    within("lsu queue_entries", p.lsu_queue_entries, limits::lsu_queue_entries);
     within("mma core_m x core_n", uint64_t{p.mma_core_m} * p.mma_core_n, limits::mma_block);
     within("mma core_m x core_k", uint64_t{p.mma_core_m} * p.mma_core_k, limits::mma_block);
     within("mma core_n x core_k", uint64_t{p.mma_core_n} * p.mma_core_k, limits::mma_block);
@@ -464,9 +467,10 @@ void validate_device_profile(const DeviceProfile& p) {
             "device profile: lsu needs sectors <= 64 B dividing a lane-wide register and a "
             "bus beat of whole words");
     }
-    if (p.lsu_active_commands == 0 || p.lsu_pluck_words_per_cycle == 0 || p.lsu_sectors_in_flight == 0) {
+    if (p.lsu_active_commands == 0 || p.lsu_queue_entries == 0 || p.lsu_pluck_words_per_cycle == 0 ||
+        p.lsu_sectors_in_flight == 0) {
         throw ProfileError(
-            "device profile: lsu active_commands, pluck_words_per_cycle and "
+            "device profile: lsu active_commands, queue_entries, pluck_words_per_cycle and "
             "sectors_in_flight must be nonzero");
     }
     const auto group_ok = [&](uint32_t lanes) {
@@ -480,7 +484,7 @@ void validate_device_profile(const DeviceProfile& p) {
     if (8 * p.lsu_store_group_lanes < p.lanes) {
         throw ProfileError(
             "device profile: lsu store_group_lanes x 8 words must hold a scalar store's lanes "
-            "(the store buffer takes a stg's data at its dispatch)");
+            "(the store buffer takes a stg's data from its command slot's read)");
     }
     // Two ordered read streams exist: the TMA's and the load / store unit's
     // (every load returns in request order, for the one load buffer). The
@@ -606,6 +610,8 @@ DeviceProfile parse_device_profile(std::string_view source) {
     if (!document.contains("lsu")) throw ProfileError("device profile: missing 'lsu' section");
     const auto& lsu = document.at("lsu");
     p.lsu_active_commands = field<uint32_t>(lsu, "active_commands");
+    // Optional (absent: the canonical 4); present: an integer in [1, 16].
+    optional_field(lsu, "lsu", "queue_entries", 1, 16, p.lsu_queue_entries);
     p.lsu_load_group_lanes = field<uint32_t>(lsu, "load_group_lanes");
     p.lsu_store_group_lanes = field<uint32_t>(lsu, "store_group_lanes");
     p.lsu_read_streams = field<uint32_t>(lsu, "read_streams");

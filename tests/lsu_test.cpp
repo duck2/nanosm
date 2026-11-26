@@ -427,11 +427,15 @@ TEST(Lsu, lsu_v8_store_source_lifetime) {
     require(machine.read_reg(0, 3, 8) == 99, "the younger overwrite was lost");
 }
 
-// The machine honours a read depbar on the global forms too (qtxc names
-// none there yet): a stg.v8's falls at its last data read, an ldg's and a
-// stg's at their issue round's sample (issue + 1). A writer of a source
-// waiting on it issues while the instruction's own depbar is still raised:
-// before the stg.v8 has completed, two cycles after the ldg and the stg.
+// The read depbar on the global forms: a stg.v8's falls at its last data
+// read, an ldg's and a stg's when their command slot's read of their last
+// register is granted (canonical, with a slot free: the queue at issue + 1,
+// the slot's read at issue + 2, the counter zero from issue + 3). A writer of
+// a source waiting on it issues while the instruction's own depbar is still
+// raised: before the stg.v8 has completed, three cycles after the ldg, and
+// the cycle after the stg's data read (the stg waits in the queue for the
+// store buffer, which the stg.v8's data holds; its address and data sit in
+// different banks and are read in one cycle).
 TEST(Lsu, read_depbar_on_global_forms) {
     const auto& profile = canonical_profile();
     const std::string text = R"(
@@ -458,6 +462,7 @@ TEST(Lsu, read_depbar_on_global_forms) {
     image_bytes(launch.gmem_image, 4096);
     nanosm::Machine machine(profile, hand_assemble(hand_asm(profile, text), profile), std::move(launch),
         {.timeline = true});
+    machine.enable_edge_probe();
     std::map<uint64_t, std::array<uint32_t, 6>> bars; // the counters (Q) in each cycle
     while (!machine.done()) {
         bars[machine.cycle()] = {machine.depbar_value(0, 0), machine.depbar_value(0, 1), machine.depbar_value(0, 2),
@@ -466,10 +471,14 @@ TEST(Lsu, read_depbar_on_global_forms) {
     }
     const auto at = [&](uint32_t index) { return issued_at(machine, 8 * index).at(0); };
     require(bars.at(at(12))[0] == 1, "the writer of the stg.v8's data did not issue before the store completed");
-    require(at(14) == at(13) + 2 && bars.at(at(14))[2] == 1,
-        "the writer of the ldg's address did not issue two cycles after it, before its load landed");
-    require(at(16) == at(15) + 2 && bars.at(at(16))[4] == 1,
-        "the writer of the stg's data did not issue two cycles after it, before its store completed");
+    require(at(14) == at(13) + 3 && bars.at(at(14))[2] == 1,
+        "the writer of the ldg's address did not issue three cycles after it, before its load landed");
+    std::optional<uint64_t> data_read; // the stg's data (r1) into the store buffer
+    for (const auto& event : machine.edge_events()) {
+        if (event.edge == LsuEdge::rf_read_beat && event.aux == 1) data_read = event.cycle;
+    }
+    require(data_read.has_value() && *data_read > at(15) + 2 && at(16) == *data_read + 1 && bars.at(at(16))[4] == 1,
+        "the writer of the stg's data did not issue the cycle after its data read, before its store completed");
     for (uint8_t bar = 0; bar < 6; ++bar) require(machine.depbar_value(0, bar) == 0, "a counter left raised");
     for (uint32_t lane = 0; lane < 16; ++lane) {
         for (uint32_t j = 0; j < 8; ++j) require(machine.read_gmem_u32(32 * lane + 4 * j) == 17 + j, "stg.v8 data");
@@ -706,8 +715,8 @@ TEST(Lsu, lsu_scatter_byte_enables) {
 // The backpressure chain: RF write port blocked -> load buffer full -> (no
 // vector sector register) ingress FIFO head blocked -> FIFO full ->
 // return-ready low -> the controller holds beats -> queue full ->
-// request-ready low -> both command slots held -> the next ldg is
-// ineligible, a structural warp state. Nothing is lost.
+// request-ready low -> both command slots held -> the next ldg waits at the
+// LSU queue's head (issue took it: the queue had room). Nothing is lost.
 TEST(Lsu, lsu_backpressure_chain) {
     const auto run = [](bool storm) {
         auto config = canonical_profile();
@@ -773,9 +782,8 @@ TEST(Lsu, lsu_backpressure_chain) {
     require(summary.lsu_rf_write_wait_cycles <= 24 * (booking_horizon + 1), "a load group waited past the booking horizon");
     require(summary.lsu_ingress_full_cycles != 0, "return-ready never dropped (ingress FIFO never full)");
     require(summary.lsu_request_wait_cycles != 0, "request-ready never dropped");
-    require(summary.lsu_no_slot_cycles != 0, "the next ldg was never ineligible");
-    require(summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::structural)] >= summary.lsu_no_slot_cycles,
-        "LSU ineligibility was not a structural warp state");
+    require(summary.lsu_no_slot_cycles != 0, "the next ldg never waited at the queue's head for a slot");
+    require(summary.lsu_queue_full_cycles == 0, "issue refused an ldg while the LSU queue had room");
     require(linked, "no cycle showed ingress full, request-ready low and the slot wait together");
     const auto [control_linked, control] = run(false);
     require(!control_linked && control.lsu_ingress_full_cycles == 0 && control.lsu_rf_write_wait_cycles == 0,
@@ -1130,10 +1138,11 @@ TEST(Lsu, lsu_one_write_contract) {
 
 // A store's command slot is its own only until its last sector request is
 // accepted; its acknowledgements are counted in its record. With two command
-// slots, two stg.v8 and then an ldg.v8: the load is admitted while both
-// stores still wait for acknowledgements (their depbars still counted), and
-// each store's depbar counts down the cycle after its own last
-// acknowledgement, not before.
+// slots, two stg.v8 and then an ldg.v8: the load leaves the LSU queue for a
+// slot (in the cycle a store gives its slot up) while both stores still wait
+// for acknowledgements (their depbars still counted), and each store's
+// depbar counts down the cycle after its own last acknowledgement, not
+// before.
 TEST(Lsu, store_slot_freed_at_last_request) {
     const auto config = canonical_profile();
     require(config.lsu_active_commands == 2, "the test is written for two command slots");
@@ -1151,29 +1160,29 @@ TEST(Lsu, store_slot_freed_at_last_request) {
 
     auto launch = launch_warps(1);
     image_bytes(launch.gmem_image, 4096);
-    nanosm::Machine machine(config, compile(text), std::move(launch));
+    nanosm::Machine machine(config, compile(text), std::move(launch), {.timeline = true});
     machine.enable_edge_probe();
-    std::size_t in_flight = 0;
-    uint32_t admissions = 0;
-    uint64_t load_admitted = 0;
+    std::map<uint64_t, uint32_t> counted_at; // the stores' depbar (Q) in each cycle
     std::array<uint64_t, 2> lowered{};
     uint32_t counted = 0;
     while (!machine.done()) {
+        counted_at[machine.cycle()] = machine.depbar_value(0, bar);
         tick_capped(machine);
-        const auto now = machine.lsu_commands_in_flight();
-        require(now <= 2, "more than two LSU commands hold slots");
-        if (now > in_flight && ++admissions == 3) {
-            load_admitted = machine.cycle() - 1;
-            require(machine.depbar_value(0, bar) == 2, "the load was admitted only after a store had completed");
-        }
-        in_flight = now;
+        require(machine.lsu_commands_in_flight() <= 2, "more than two LSU commands hold slots");
         const auto value = machine.depbar_value(0, bar);
         if (value < counted) lowered.at(1 - value) = machine.cycle() - 1; // 2 -> 1: the first store; 1 -> 0: the second
         counted = value;
     }
+    // Each command's trace slice starts in the cycle it takes its slot.
+    const auto loads = trace_spans(machine, nanosm::TraceCategory::gmem, "ldg.v8");
+    const auto stores = trace_spans(machine, nanosm::TraceCategory::gmem, "stg.v8");
     std::vector<uint64_t> acks;
     for (const auto& event : machine.edge_events()) if (event.edge == LsuEdge::write_ack) acks.push_back(event.cycle);
-    require(admissions == 3 && acks.size() == 32, "expected three commands and thirty-two write acknowledgements");
+    require(loads.size() == 1 && stores.size() == 2 && acks.size() == 32,
+        "expected three commands and thirty-two write acknowledgements");
+    const auto load_admitted = loads[0].start;
+    require(load_admitted > stores[1].start && counted_at.at(load_admitted) == 2,
+        "the load took its slot only after a store had completed");
     require(load_admitted < acks[0], "the load was not admitted before the first store's first acknowledgement");
     // Writes are acknowledged in order: the first sixteen are the first store's.
     require(lowered[0] == acks[15] + 1 && lowered[1] == acks[31] + 1,
@@ -1205,4 +1214,209 @@ TEST(Lsu, dram_uses_its_own_clock) {
     const auto beats = events_named(machine, "bus beat");
     require(beats.size() == 2, "one sector did not take two 16-byte DRAM beats");
     require(beats[1].start_cycle - beats[0].start_cycle == 4, "DRAM beats advanced at the core clock");
+}
+
+// ---- the LSU's queue (src/machine/lsu.cpp: the front end) ----
+
+// One warp's stg and then an ldg of the same words, back to back: the ldg
+// issues while the store is still in flight (its depbar raised), and the
+// queue keeps them in order (requests leave in command order), so the load
+// reads what was stored.
+TEST(Lsu, stg_then_ldg_of_one_word_reads_the_store) {
+    const auto& profile = canonical_profile();
+    auto machine = gmem_debug_machine(profile, R"(
+        sread r1, LANE_ID
+        shli r0, r1, 2
+        addi r1, r1, 1000
+        stg [r0 + 512], r1 {pred=PT, stall=0, set=sb0, read=sb1, wait=-}
+        ldg r2, [r0 + 512] {pred=PT, stall=0, set=sb2, read=sb3, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3}
+    )");
+    std::map<uint64_t, uint32_t> store_bar; // sb0 (Q) in each cycle
+    while (!machine->done()) {
+        store_bar[machine->cycle()] = machine->depbar_value(0, 0);
+        tick_capped(*machine);
+    }
+    const auto load = issued_at(*machine, 4 * 8);
+    require(load.size() == 1 && store_bar.at(load[0]) == 1,
+        "the ldg did not issue while the stg was still in flight" + issue_log(*machine));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_gmem_u32(512 + 4 * lane) == 1000 + lane, "stg data");
+        require(machine->read_reg(0, lane, 2) == 1000 + lane, "the ldg did not read what the stg stored");
+    }
+}
+
+// A full LSU queue refuses issue, and only that warp: warp 0 issues five
+// ldg into a one-entry queue in front of two command slots and is refused
+// "LSU queue full" while the loads work their way through; warp 1's
+// independent arithmetic issues in those cycles.
+TEST(Lsu, full_queue_refuses_only_its_warp) {
+    auto profile = canonical_profile();
+    profile.lsu_queue_entries = 1;
+    std::string movs = "math: ";
+    for (uint32_t k = 0; k < 40; ++k) movs += "mov r" + std::to_string(10 + k % 12) + ", " + std::to_string(k) + "\n";
+    auto machine = gmem_debug_machine(profile, R"(
+        usread ur9, WARP_ID
+        ur2r r29, ur9
+        setp.eq.u32 p6, r29, 1
+        bra.uni math {pred=p6, stall=0, set=-, wait=-}
+        sread r0, LANE_ID
+        shli r0, r0, 2
+        ldg r3, [r0 + 4] {pred=PT, stall=0, set=sb0, wait=-}
+        ldg r4, [r0 + 8] {pred=PT, stall=0, set=sb1, wait=-}
+        ldg r5, [r0 + 12] {pred=PT, stall=0, set=sb2, wait=-}
+        ldg r6, [r0 + 16] {pred=PT, stall=0, set=sb3, wait=-}
+        ldg r7, [r0 + 20] {pred=PT, stall=0, set=sb4, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4}
+    )" + movs + "halt\n", 2);
+    machine->run();
+    const auto refused = refusals(*machine, 0, "LSU queue full");
+    require(!refused.empty() && machine->trace().summary().lsu_queue_full_cycles != 0,
+        "warp 0 was never refused for the full LSU queue" + issue_log(*machine));
+    uint64_t during = 0; // warp 1's movs (only warp 1 runs them, from pc 96)
+    for (uint32_t k = 0; k < 40; ++k) {
+        for (const auto cycle : issued_at(*machine, 96 + 8 * k)) {
+            for (const auto& [first, cycles] : refused) {
+                if (cycle >= first && cycle < first + cycles) ++during;
+            }
+        }
+    }
+    require(during != 0, "warp 1 issued nothing while warp 0 was refused:" + describe(refused) + issue_log(*machine));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        for (uint32_t k = 0; k < 5; ++k) {
+            require(machine->read_reg(0, lane, 3 + k) == 5 * (lane + 1 + k) + 2, "ldg data");
+        }
+    }
+}
+
+// An ldg and a stg.v8 whose lanes are all off (their predicate sampled at
+// issue + 1) take no command slot, no register read and no request, and give
+// back at issue + 1 what they took at issue: the queue entry (one entry: the
+// instruction behind each, refused the cycle after, issues the cycle after
+// that), the depbar and the read depbar (0 from issue + 2).
+TEST(Lsu, masked_off_entry_gives_back) {
+    auto profile = canonical_profile();
+    profile.lsu_queue_entries = 1;
+    auto machine = gmem_debug_machine(profile, R"(
+        sread r1, LANE_ID
+        shli r0, r1, 5
+        mov r3, 7
+        ldg r3, [r0] {pred=!PT, stall=0, set=sb0, read=sb1, wait=-}
+        stg.v8 [r0], r8 {pred=!PT, stall=0, set=sb2, read=sb3, wait=-}
+        ldg r4, [r0 + 4] {pred=PT, stall=0, set=sb4, read=sb5, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4|sb5}
+    )");
+    std::map<uint64_t, std::array<uint32_t, 6>> bars; // the counters (Q) in each cycle
+    while (!machine->done()) {
+        tick_capped(*machine);
+        bars[machine->cycle()] = {machine->depbar_value(0, 0), machine->depbar_value(0, 1), machine->depbar_value(0, 2),
+            machine->depbar_value(0, 3), machine->depbar_value(0, 4), machine->depbar_value(0, 5)};
+    }
+    const auto log = issue_log(*machine);
+    const auto s = issued_at(*machine, 3 * 8).at(0);
+    require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 2} &&
+            issued_at(*machine, 5 * 8) == std::vector<uint64_t>{s + 4} &&
+            refusals(*machine, 0, "LSU queue full") ==
+                std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, 1}, {s + 3, 1}},
+        "a masked-off entry did not give its queue entry back at its issue + 1:" +
+            describe(refusals(*machine, 0, "LSU queue full")) + log);
+    require(bars.at(s + 1)[0] == 1 && bars.at(s + 1)[1] == 1 && bars.at(s + 2)[0] == 0 && bars.at(s + 2)[1] == 0,
+        "the masked-off ldg's depbar and read depbar were not given back at its issue + 1");
+    require(bars.at(s + 3)[2] == 1 && bars.at(s + 3)[3] == 1 && bars.at(s + 4)[2] == 0 && bars.at(s + 4)[3] == 0,
+        "the masked-off stg.v8's depbar and read depbar were not given back at its issue + 1");
+    const auto& summary = machine->trace().summary();
+    require(summary.lsu_vector_stores == 0 && summary.lsu_scalar_loads == 1 && summary.lsu_sectors == 16,
+        "a masked-off entry made a command or a request");
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 3) == 7, "the masked-off ldg wrote its destination");
+        require(machine->read_gmem_u32(32 * lane) == 5 * (8 * lane) + 2, "the masked-off stg.v8 wrote memory");
+        require(machine->read_reg(0, lane, 4) == 5 * (8 * lane + 1) + 2, "ldg data");
+    }
+}
+
+// qtxc makes a writer of an ldg.v8's address wait on the read depbar alone,
+// which falls when the LSU's command slot has read the address: on the
+// machine the writer issues long before the load's data returns, and the
+// load used the address it was issued with.
+TEST(Lsu, writer_of_an_ldg_v8_address_waits_on_the_read_depbar) {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+        sread r1, LANE_ID
+        shli r0, r1, 5
+        ldg.v8 r8, [r0]
+        addi r0, r0, 512
+        halt
+    )";
+    const auto program = qtx_program(source, profile);
+    const auto& code = program.instructions;
+    require(code.size() == 5 && code[2].opcode == nanosm::Opcode::ldg_v8, "unexpected code from qtxc");
+    const auto& load = code[2].control;
+    require(load.read_depbar < 6 && load.set_depbar < 6 && load.read_depbar != load.set_depbar,
+        "the ldg.v8 does not name a read depbar beside its own");
+    require(code[3].control.wait_mask == 1u << load.read_depbar,
+        "the writer of the ldg.v8's address does not wait on the read depbar alone");
+    const auto kernel = compile(source, profile);
+    auto machine = gmem_debug_machine(profile, kernel);
+    machine->enable_edge_probe();
+    machine->run();
+    const auto loaded = issued_at(*machine, 2 * 8).at(0);
+    const auto writer = issued_at(*machine, 3 * 8).at(0);
+    uint64_t first_write = ~uint64_t{0};
+    for (const auto& event : machine->edge_events()) {
+        if (event.edge == LsuEdge::rf_write_beat) first_write = std::min(first_write, event.cycle);
+    }
+    require(writer == loaded + 3 && writer < first_write,
+        "the writer of the address did not issue three cycles after the ldg.v8, before its data came back" +
+            issue_log(*machine));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        require(machine->read_reg(0, lane, 0) == 32 * lane + 512, "the addi");
+        for (uint32_t j = 0; j < 8; ++j) {
+            require(machine->read_reg(0, lane, 8 + j) == 5 * (8 * lane + j) + 2, "ldg.v8 data");
+        }
+    }
+}
+
+// A scalar stg's address and data may share a register-file bank (r3 and
+// r6: bank 0). qtxc inserts no copy for it; the machine and the assembler
+// take it. Its command slot reads the address first and the data the cycle
+// after (one read port per bank).
+TEST(Lsu, stg_registers_in_one_bank) {
+    const auto& profile = canonical_profile();
+    const auto program = qtx_program("stg [r3 + 64], r6\nhalt\n", profile);
+    require(program.copies == 0 && program.warnings.empty(), "qtxc copied a stg's register into another bank");
+    auto machine = gmem_debug_machine(profile, R"(
+        sread r3, LANE_ID
+        mov r6, 9
+        shli r3, r3, 2
+        stg [r3 + 64], r6 {pred=PT, stall=0, set=sb0, read=sb1, wait=-}
+        halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
+    )");
+    machine->run();
+    const auto i = issued_at(*machine, 3 * 8).at(0);
+    const auto address = rf_events(*machine, "RF read", 3);
+    const auto data = rf_events(*machine, "RF read", 6);
+    require(std::count(address.begin(), address.end(), i + 2) == 1 && std::count(data.begin(), data.end(), i + 3) == 1,
+        "the command slot did not read the address at i + 2 and the data at i + 3" + issue_log(*machine));
+    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_gmem_u32(64 + 4 * lane) == 9, "stg data");
+}
+
+// ldg.uni through the queue: its base is a uniform register sampled at its
+// issue + 1; it leaves the queue for a command slot, planned, once that base
+// is at the URF output (canonical: issue + 2), with no vector register read.
+// Its word goes to every lane.
+TEST(Lsu, ldg_uni_through_the_queue) {
+    const auto& profile = canonical_profile();
+    auto machine = gmem_debug_machine(profile, R"(
+        umov ur0, 16
+        ldg.uni r1, [ur0 + 4] {pred=PT, stall=0, set=sb0, wait=-}
+        uaddi ur0, ur0, 64
+        halt {pred=PT, stall=0, set=-, wait=sb0}
+    )");
+    machine->run();
+    const auto i = issued_at(*machine, 1 * 8).at(0);
+    const auto commands = trace_spans(*machine, nanosm::TraceCategory::gmem, "ldg.uni");
+    require(commands.size() == 1 && commands[0].start == i + 1 + profile.urf_read_latency_cycles,
+        "the ldg.uni did not leave the queue for its slot once its base was at the URF output" + issue_log(*machine));
+    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_reg(0, lane, 1) == 5 * 5 + 2, "ldg.uni data");
+    require(machine->read_ureg(0, 0) == 80, "the uaddi");
 }

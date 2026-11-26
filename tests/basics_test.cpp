@@ -442,7 +442,10 @@ TEST(Basics, branch_boundary_drains_async_work) {
     done:
         halt
     )", canonical_profile());
-    require(program.instructions[2].control.wait_mask == 1, "branch did not drain its live load depbar");
+    // The ldg's depbar (sb0) and its read depbar (sb1, its address read by
+    // its command slot after issue).
+    require(program.instructions[2].control.wait_mask == 0b000011,
+        "branch did not drain its live load depbar and read depbar");
 
     const auto fixed = qtx_program(R"(
         mov r0, 1
@@ -510,8 +513,9 @@ TEST(Basics, wait_on_matmul_operands) {
     const auto loads = qtx_program(load_source, profile);
     const auto& load = loads.instructions.at(1);
     const auto& load_wait = loads.instructions.at(3);
-    require(load_wait.opcode == nanosm::Opcode::nop && load_wait.control.wait_mask == 1u << load.control.set_depbar,
-        "wait does not wait for the load's depbar");
+    require(load.control.read_depbar < 6 && load_wait.opcode == nanosm::Opcode::nop &&
+            load_wait.control.wait_mask == ((1u << load.control.set_depbar) | (1u << load.control.read_depbar)),
+        "wait does not wait for the load's depbar and its read depbar");
     require(loads.instructions.at(4).control.wait_mask == 0, "the use after wait waited again");
     require(load_wait.control.stall == 0, "wait drained the fadd like a branch");
     auto load_launch = launch_warps(1);

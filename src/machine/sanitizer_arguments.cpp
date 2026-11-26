@@ -32,6 +32,16 @@ IssueSite Machine::site(const ShmemEntry& entry) const {
     return IssueSite{cycle_, entry.warp, entry.pc, entry.instruction, &config_.mma_shapes};
 }
 
+// A queued global-memory instruction's site, and its command's once it has
+// left the queue: this cycle, its issue's pc.
+IssueSite Machine::site(const LsuEntry& entry) const {
+    return IssueSite{cycle_, entry.warp, entry.pc, entry.instruction, &config_.mma_shapes};
+}
+
+IssueSite Machine::site(const LsuCommand& command) const {
+    return IssueSite{cycle_, command.warp, command.pc, command.instruction, &config_.mma_shapes};
+}
+
 // A register as a sample now reads it, every lane, through no port: a write
 // lands at its RAM cycle's edge, so the array holds what is visible now.
 Machine::LaneWords Machine::rf_peek(uint32_t warp, uint8_t reg) const {

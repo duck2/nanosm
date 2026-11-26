@@ -183,6 +183,7 @@ TEST(Machine, optional_profile_fields) {
     check_optional_field("shmem", "rmw_compute_cycles", 2, &P::shmem_rmw_compute_cycles, 1, 64);
     check_optional_field("tmem", "port_depth", 2, &P::tmem_port_depth, 1, 64);
     check_optional_field("tmem", "read_latency_cycles", 2, &P::tmem_read_latency_cycles, 1, 64);
+    check_optional_field("lsu", "queue_entries", 4, &P::lsu_queue_entries, 1, 16);
     check_optional_field("tma", "store_sector_registers", 1, &P::tma_store_sector_registers, 1, 64);
     check_optional_field("tma", "walker_start_cycles", 2, &P::tma_walker_start_cycles, 0, 8);
     check_optional_field("core", "warps", 16, &P::core_warps, 1, 64);

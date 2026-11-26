@@ -36,13 +36,13 @@ BufferAfter buffer_after(const nanosm::Machine& machine, uint32_t buffer) {
 
 struct ReuseRun {
     std::unique_ptr<nanosm::Machine> machine;
-    uint64_t reuse_cycle = 0;                                          // the second command's admission
+    uint64_t reuse_cycle = 0;                                          // the second command takes the slot
     std::map<uint64_t, std::pair<BufferAfter, BufferAfter>> after;     // (load, store) buffer after each cycle
 };
 
 // `old_load` is LSU command 0, `second` (opcode `second_name`) command 1, with
-// one command slot: the second issues in the cycle the load's final RF write
-// releases the slot and is admitted issue_to_dispatch later. gmem holds
+// one command slot: the second waits at the LSU queue's head and takes the
+// slot in the cycle the load's final RF write releases it (d). gmem holds
 // pattern words; r5 = 4 x lane, r6 = 2048 + 4 x lane, r2 = 2048 + 32 x lane,
 // r0 = 0, r24 .. r31 = 101 .. 108.
 ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::string& second,
@@ -66,9 +66,9 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
     std::optional<uint64_t> admitted;
     for (const auto& event : events_named(machine, second_name))
         if (event.category == nanosm::TraceCategory::gmem && event.id == 1) admitted = event.start_cycle;
-    run.reuse_cycle = final_drain + nanosm::issue_to_dispatch(config);
+    run.reuse_cycle = final_drain;
     require(admitted == run.reuse_cycle,
-        second_name + " was not admitted issue_to_dispatch after '" + old_load + "' made its final RF write");
+        second_name + " did not take the slot in the cycle '" + old_load + "' made its final RF write");
     return run;
 }
 
@@ -501,14 +501,16 @@ TEST(Stepping, black_boxes_are_the_listed_ten) {
 }
 
 // An LSU buffer is owned only while data is in it, one buffer per direction.
-// After a load's final RF drain, with one command slot, the next command is
-// admitted issue_to_dispatch later (run_reuse_after_final_drain) and finds the
-// load buffer empty and unowned:
-// - a scalar store owns the store buffer with sixteen valid lanes after its
-//   admission cycle (its egress reads the words without valid_count, so the
-//   output alone cannot show it);
-// - a stg.v8's first RF read is sampled in its admission cycle and fills the
-//   store buffer Lr later; the buffer has no owner until then;
+// After a load's final RF drain, with one command slot, the next command
+// takes the slot in that cycle (run_reuse_after_final_drain), reads its
+// registers from the next and finds the load buffer empty and unowned:
+// - a scalar store's address and data are read in the cycle after (their
+//   banks differ) and the data is in the store buffer, sixteen valid lanes,
+//   Lr later; not before (its egress reads the words without valid_count,
+//   so the output alone cannot show it);
+// - a stg.v8 is planned when its address is at the RF output, its first RF
+//   data read is sampled the cycle after and fills the store buffer Lr
+//   later; the buffer has no owner until then;
 // - a new load leaves the load buffer unowned until its first word returns.
 TEST(Stepping, buffer_reuse_load_to_scalar_store) {
     using Check = std::function<void(const ReuseRun&, const std::string&)>;
@@ -518,8 +520,11 @@ TEST(Stepping, buffer_reuse_load_to_scalar_store) {
         std::string second_name;
         Check check;
     };
-    const Check scalar_store = [](const ReuseRun& run, const std::string& where) {
-        const auto& [load, store] = run.after.at(run.reuse_cycle);
+    const auto lr = canonical_profile().rf_read_latency_cycles;
+    const Check scalar_store = [lr](const ReuseRun& run, const std::string& where) {
+        require(!run.after.at(run.reuse_cycle + lr).second.owner.has_value(),
+            "the store buffer is owned before the store's data read landed" + where);
+        const auto& [load, store] = run.after.at(run.reuse_cycle + 1 + lr);
         require(store.owner == 1u, "the store does not own the store buffer" + where);
         require(store.valid_count == 16 && std::count(store.valid.begin(), store.valid.begin() + 16, 1) == 16,
             "the store's valid bits were lost" + where);
@@ -529,18 +534,21 @@ TEST(Stepping, buffer_reuse_load_to_scalar_store) {
             require(run.machine->read_gmem_u32(2048 + 4 * lane) == 2048 + 4 * lane,
                 "the scalar store wrote the wrong word for lane " + std::to_string(lane) + where);
     };
-    const Check vector_store = [](const ReuseRun& run, const std::string& where) {
+    const Check vector_store = [lr](const ReuseRun& run, const std::string& where) {
+        // Its address read at reuse + 1, planned at reuse + 1 + Lr, its first
+        // data beat the cycle after.
+        const auto first_beat = run.reuse_cycle + 2 + lr;
         bool first_read_now = false;
         for (const auto& event : run.machine->edge_events())
-            if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == run.reuse_cycle) first_read_now = true;
-        require(first_read_now, "the stg.v8's first RF read was not in the reuse cycle; the test proves little" + where);
-        const auto& store = run.after.at(run.reuse_cycle).second;
+            if (event.edge == LsuEdge::rf_read_beat && event.id == 1 && event.cycle == first_beat) first_read_now = true;
+        require(first_read_now, "the stg.v8's first RF data read was not the cycle after its plan" + where);
+        const auto& store = run.after.at(first_beat).second;
         require(!store.owner.has_value() && store.valid_count == 0,
             "the store buffer is owned before the stg.v8's first beat has landed" + where);
         // The first beat brings r24 for the first group's lanes: one word a lane.
-        const auto& filled = run.after.at(run.reuse_cycle + canonical_profile().rf_read_latency_cycles).second;
+        const auto& filled = run.after.at(first_beat + lr).second;
         require(filled.owner == 1u && filled.valid_count == canonical_profile().lsu_store_group_lanes,
-            "the stg.v8's first read beat is not in the store buffer Lr after the reuse cycle" + where);
+            "the stg.v8's first read beat is not in the store buffer Lr after it" + where);
         for (uint32_t j = 0; j < 8; ++j)
             for (uint32_t lane = 0; lane < 16; ++lane)
                 require(run.machine->read_gmem_u32(2048 + 32 * lane + 4 * j) == 101 + j,

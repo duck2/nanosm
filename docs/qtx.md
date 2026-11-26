@@ -106,7 +106,8 @@ A kernel declares what a launch must give it, beside its code:
 - Every warp has its own registers. Warps share only memory and barriers.
 - The vector file is banked and an instruction's distinct sources must sit in different banks.
   qtxc arranges that; where it cannot, it inserts a copy and warns with the line. (An `sts`'s
-  address and data may share a bank: they are read one after the other, a cycle later.)
+  or a `stg`'s address and data may share a bank: they are read one after the other, a cycle
+  later.)
 - Some instructions take eight neighbouring registers and name the first. Declare the
   group: `.reg %a<8>` gives `%a0`..`%a7`; `.ureg %c<2>` is a uniform group.
 - `sread %x, LANE_ID` or `THREAD_ID`; `usread %u, WARP_ID` or `N_WARPS`.

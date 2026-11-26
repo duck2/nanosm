@@ -204,11 +204,11 @@ std::vector<std::optional<std::pair<std::size_t, std::size_t>>> innermost_loops(
 std::vector<uint8_t> issue_places(const Instruction& inst) { return rf_read_round(issue_sources(inst)); }
 
 // The places whose banks the chooser spreads: the issue round's, and an
-// sts's address and data, which its collect stage reads in one cycle when
-// their banks differ (one after the other when they do not: no copy is
-// needed, so only the chooser prefers them apart).
+// sts's or a stg's address and data, which its collect stage or command slot
+// reads in one cycle when their banks differ (one after the other when they
+// do not: no copy is needed, so only the chooser prefers them apart).
 std::vector<uint8_t> preferred_places(const Instruction& inst) {
-    if (inst.opcode == Opcode::sts) return rf_read_round({inst.src0, inst.src1});
+    if (inst.opcode == Opcode::sts || inst.opcode == Opcode::stg) return rf_read_round({inst.src0, inst.src1});
     return issue_places(inst);
 }
 
@@ -545,13 +545,18 @@ void allocate_registers(AssemblyProgram& program, const DeviceProfile& profile) 
         state.rounds_of.assign(vectors.nodes.size(), {});
         state.bank.assign(vectors.nodes.size(), -1);
         for (std::size_t index = 0; index < instructions.size(); ++index) {
-            const auto places = preferred_places(instructions[index]);
-            if (places.size() <= ports) continue;
-            if (places.size() > uint64_t{banks} * ports) {
+            // What issue reads in one round has to fit the file: a copy moves
+            // a register to another bank, it does not add a port.
+            const auto needed = issue_places(instructions[index]).size();
+            if (needed > uint64_t{banks} * ports) {
                 throw SimError("line " + std::to_string(instructions[index].line) + ": '" + instructions[index].text +
-                    "' reads " + std::to_string(places.size()) + " different registers at once; this profile's " +
+                    "' reads " + std::to_string(needed) + " different registers at once; this profile's " +
                     "register file serves " + std::to_string(uint64_t{banks} * ports) + " (rf.banks x rf.read_ports_per_bank)");
             }
+            // A store's address and data on a file too small to serve both in
+            // one cycle are read one after the other; there is nothing to spread.
+            const auto places = preferred_places(instructions[index]);
+            if (places.size() <= ports || places.size() > uint64_t{banks} * ports) continue;
             Round round;
             round.weight = uint64_t{1} << (3 * std::min<uint32_t>(depth[index], 6));
             for (const auto place : places) {

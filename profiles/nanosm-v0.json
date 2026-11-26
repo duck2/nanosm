@@ -77,8 +77,9 @@
   },
   "lsu": {
     "active_commands": 2,
+    "queue_entries": 4,
     "load_group_lanes": 4,
-    "store_group_lanes": 4,
+    "store_group_lanes": 16,
     "read_streams": 2,
     "pluck_words_per_cycle": 2,
     "ingress_sectors": 8,

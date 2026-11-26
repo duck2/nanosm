@@ -20,6 +20,7 @@ inline constexpr std::size_t instruction_buffer_packets = 16; // core "instructi
 inline constexpr std::size_t mma_queue_commands = 8;          // mma "queue_commands"
 inline constexpr std::size_t tma_queue_commands = 8;          // tma "queue_commands"
 inline constexpr std::size_t lsu_active_commands = 8;         // lsu "active_commands"
+inline constexpr std::size_t lsu_queue_entries = 16;          // lsu "queue_entries"
 inline constexpr std::size_t shmem_queue_entries = 16;        // shmem "read_queue_entries", "write_queue_entries"
 inline constexpr std::size_t mma_block = 64;                  // mma core_m x core_n, core_m x core_k, core_n x core_k
 

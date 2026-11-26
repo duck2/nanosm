@@ -11,8 +11,9 @@
 //   branch.cpp         branch resolution (bra, bra.uni, ssy, sync) and the divergence stack.
 //   issue.cpp          issue: admission, the scheduler, wait masks and depbar counters, accept, and the checks
 //                      made when an instruction issues.
-//   dispatch.cpp       dispatch: the dispatch pipeline and its end, where each unit takes an issued instruction
-//                      (a unit's own dispatch_* function is in the unit's file), and a dispatch entry's operands.
+//   dispatch.cpp       dispatch: the dispatch pipeline and its end, where the tensor core and the accumulator
+//                      engines take an issued instruction (their dispatch_* functions are in their file), and a
+//                      dispatch entry's uniform operands.
 //   rf.cpp             the vector register file: the write calendar, the read and write port decisions, the
 //                      write ports' pipelines and the RAM stage. (Its timing rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
@@ -26,8 +27,9 @@
 //                      writes, the sector register and the store registers.
 //   tensor_core.cpp    the tensor core: the MMA engine on port B, tensor memory, and the accumulator transfers.
 //   mma_numeric.cpp    the tensor core's arithmetic: what one step of the core computes (mma_numeric.hpp).
-//   lsu.cpp            the load / store unit: admission and requests, ingress, its register-file stages, the
-//                      egress write port, how a command enters (dispatch_lsu), and its register drivers.
+//   lsu.cpp            the load / store unit: its queue and command slots (their register reads and plans),
+//                      requests, ingress, its register-file stages, the egress write port, and its register
+//                      drivers.
 //   gmem.cpp           the memory controller: the request channel, the queue, the bus, write acknowledgements.
 //   sanitizer.cpp      the sanitizer (sanitizer.hpp): shadow state that only decides whether to PANIC.
 //   sanitizer_arguments.cpp what the machine hands the sanitizer: pure reads of hardware state that feed
@@ -166,6 +168,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         }
         free_id_tags_.build(config_.lsu_sectors_in_flight);
         lsu_read_pipe_.build(config_.rf_read_latency_cycles);
+        lsu_collect_pipe_.build(config_.rf_read_latency_cycles);
         dispatch_pipe_.build(issue_to_dispatch(config_));
         arithmetic_reads_.build(issue_to_operands(config_));
         // The furthest booking: the slowest fixed result's write port.
@@ -274,8 +277,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         // other than its set depbar, so one instruction counts at most once
         // on any counter, and it is lowered at the instruction's last vector
         // source read, which comes no later than its set depbar's decrement
-        // (an lds / sts in its queue or collect stage, an ldg / stg / ldg.v8 in
-        // the dispatch pipeline, a stg.v8 in its command slot):
+        // (an lds / sts in its queue or collect stage, an ldg / stg / ldg.v8 /
+        // stg.v8 in the LSU's queue or its command slot):
         //   shmem.read_queue_entries + shmem.write_queue_entries
         //                       an lds, lds.uni, sts or atomic in its queue
         //                       (one whose lanes are all off is decremented
@@ -291,10 +294,13 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         //   shmem.port_a_depth  an sts's last round on its way to the RAM:
         //                       one round per A-write stage, decremented at
         //                       the last (it has left serve);
-        //   lsu.active_commands an ldg or stg: its command slot or its claim
-        //                       on one, a load's until its last register
-        //                       write is granted, a store's until its last
-        //                       sector request is accepted;
+        //   lsu.queue_entries   an ldg or stg in the LSU's queue (one whose
+        //                       lanes are all off is decremented there, at
+        //                       its issue + 1);
+        //   lsu.active_commands an ldg or stg in its command slot, a load's
+        //                       until its last register write is granted, a
+        //                       store's until its last sector request is
+        //                       accepted;
         //   the store records beyond the command slots
         //                       a store out of its slot, until its last
         //                       acknowledgement's decrement (store_acks_,
@@ -319,7 +325,8 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         //                       the copy passes its cut.
         depbar_counter_max_ = config_.shmem_read_queue_entries + config_.shmem_write_queue_entries + 4 +
             config_.shmem_writeback_entries + 1 + config_.shmem_port_a_depth +
-            config_.lsu_active_commands + store_ack_records_detached_ + config_.mma_queue_commands + 2 +
+            config_.lsu_queue_entries + config_.lsu_active_commands + store_ack_records_detached_ +
+            config_.mma_queue_commands + 2 +
             config_.tmem_port_depth + config_.tmem_read_latency_cycles +
             config_.rf_banks * config_.rf_write_ports_per_bank * config_.rf_write_depth_cycles + 1;
         declare_black_boxes();
@@ -381,24 +388,24 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          return reach issue through their registers, the next cycle.
 //      (c) Issue looks ahead: an instruction accepted at t occupies its
 //          resources from t+1, so issue sees the space this cycle frees
-//          (queue entries, the store buffer) -- less the space the dispatch
-//          pipeline's instructions will take (dispatch_claims). Not shared
-//          memory: a shared-memory instruction's questions (its queue's
-//          free entries, its warp's counts, fence.sh's count) read Q only,
-//          so an entry or an order freed at t is seen from t + 1. The RF
-//          write decision's fairness inhibit, the LSU command slot its grant
-//          releases, and
-//          the acc.ld engine its grant lets advance are still seen at t.
+//          (the TMA, MMA and acc engines' queues and slots) -- less the
+//          space the dispatch pipeline's instructions will take
+//          (dispatch_claims). Not shared or global memory: their questions
+//          (a queue's free entries, a warp's shared-memory counts, fence.sh's
+//          count) read Q only, so an entry or an order freed at t is seen
+//          from t + 1. The RF write decision's fairness inhibit and the
+//          acc.ld engine its grant lets advance are still seen at t.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
 //          t (the load and store buffers, a shared-memory collect or serve
 //          stage whose access moves on at t, the TMA sector / store
-//          registers, the MMA event register, an LSU slot or acc slot
-//          reallocated by dispatch). The refill's data is visible at t+1;
-//          nothing passes through. (Not the write-back buffer or the
+//          registers, the MMA event register, an LSU command slot taken by
+//          the LSU queue's head as the RF write grant releases it, an acc
+//          slot reallocated by dispatch). The refill's data is visible at
+//          t+1; nothing passes through. (Not the write-back buffer or the
 //          old-word register: an entry whose RF write is granted at t is
 //          free from t + 1.)
-//      (e) A dispatched stg.v8 may make its first RF read beat in its
-//          dispatch cycle.
+//      (e) (None: a stg.v8 reads its data only once its command is planned,
+//          from Q.)
 //      (f) Inside the MMA: a step whose tile's previous result lands at this
 //          cycle's edge may start its operand fetch now; its C is read from
 //          tmem cycles after that landing (tmem itself is read first).
@@ -491,13 +498,17 @@ void Machine::tick() {
 
     // The TMA operand read's end: a tma's last words at the URF output now
     // push its command into the TMA queue. Then the dispatch pipeline's end:
-    // a memory / engine / mbar instruction whose operands arrive now goes to
-    // its unit.
+    // an engine instruction whose operands arrive now goes to its unit. The
+    // LSU's queue: its newest entry's issue + 1 sample, its head into a
+    // command slot (one the RF write grant released now included (d)), the
+    // plan of the address at the RF output now.
     arrive_tma_operands(w);
     dispatch_issued(w);
-    // The async RF readers (acc.st beats, the LSU's store-data read) take the
-    // read ports the issue register's instruction leaves free now, from Q,
-    // before issue.
+    step_lsu_queue(w);
+    // The async RF readers (acc.st beats, the LSU's stg.v8 data beats and
+    // its command slots' address and stg data reads, the shared-memory
+    // collect stages) take the read ports the issue register's instruction
+    // leaves free now, from Q, before issue.
     w.rf_read = decide_rf_reads(w);
 
     // The scheduler. Its write booking is in a future cycle and its read
@@ -579,7 +590,8 @@ bool Machine::done() const {
         empty(tma_write_txn_);
     return warps_halted && wait_slots_empty && shmem_idle && acc_ld_pipe_.empty() && acc_st_pipe_.empty() &&
         !tma_mbar_event_.cur().has_value() && !mma_mbar_event_.cur().has_value() && gmem_queue_.empty() &&
-        !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_commands_.cur().empty() &&
+        !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_queue_.cur().empty() &&
+        lsu_commands_.cur().empty() && lsu_collect_pipe_.empty() &&
         tma_reads_.empty() && lsu_reads_.empty() && ingress_.empty() && empty(egress_open_) &&
         egress_requests_.empty() && egress_data_.empty() &&
         !tma_sector_.cur().request.has_value() && all_empty(tma_store_registers_) &&
@@ -667,7 +679,7 @@ uint32_t Machine::read_ureg(uint32_t warp, uint32_t reg) const {
 // ===========================================================================
 
 void Machine::run_drivers(const Wires& w) {
-    static constexpr std::array<Driver, 47> canonical = {
+    static constexpr std::array<Driver, 49> canonical = {
         &Machine::drive_front_end,
         &Machine::drive_fetch,
         &Machine::drive_issue_branch,
@@ -697,6 +709,8 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_tma_store_registers,
         &Machine::drive_tma_returns,
         &Machine::drive_tma_operand_read,
+        &Machine::drive_lsu_queue,
+        &Machine::drive_lsu_collect_pipe,
         &Machine::drive_lsu_commands,
         &Machine::drive_lsu_buffers,
         &Machine::drive_ingress,

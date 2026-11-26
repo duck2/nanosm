@@ -183,6 +183,10 @@ struct DeviceProfile {
     // none canonical by ruling.
     // Machine-wide outstanding ldg/stg commands (vector, scalar, uniform).
     uint32_t lsu_active_commands = 0;
+    // The queue in front of the command slots: an issued ldg / stg / ldg.v8 /
+    // stg.v8 / ldg.uni holds an entry from its issue until it leaves for a
+    // command slot, in issue order. 1..16.
+    uint32_t lsu_queue_entries = 4;
     // The LSU's two buffers: one load buffer, one store buffer, each held
     // only while data is in it (machine.hpp AssemblyRegister). A v8 instruction's
     // lanes pass through them in fixed groups of this many lanes: the load

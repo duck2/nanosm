@@ -92,4 +92,8 @@ uint64_t Machine::full_mask() const {
     throw_issue_panic(site(op), reason);
 }
 
+[[noreturn]] void Machine::panic(const LsuCommand& command, const std::string& reason) const {
+    throw_issue_panic(site(command), reason);
+}
+
 } // namespace nanosm
