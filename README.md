@@ -10,7 +10,8 @@ and whistles expected from a CUTLASS device such as async MMA, TMA, atomics and 
 shared memory.
 
 It can run kernels written in "QTX", a PTX clone, which is compiled down to .asm inserting stall
-counts and depbars and then into an executable.
+counts and depbars and then into an executable. You can find a tiny Flash Attention 4 kernel
+in `kernels/fa32.qtx`.
 
 The repo includes the QTX compiler (qtxc), a sanitizer, a profiler and the reference implementation
 of the machine written in C++.
@@ -49,8 +50,8 @@ Some GPU concepts do not apply due to scale or complexity constraints:
 
 - No float64 math.
 - No L1/L2 cache.
-- No memory access coalescer.
-- Async/atomics ops are launched per warp (per-thread or elected in Nvidia)
+- No memory access coalescer (corner-turn buffer for ldg.v8/stg.v8 instead)
+- Async/atomic ops are launched per warp (per-thread or elected in Nvidia)
 - Communication between divergent threads not guaranteed (pre-Volta stack)
 
 Other differences:
@@ -59,6 +60,7 @@ Other differences:
 - Special function unit uses stall counts (uses depbars in Nvidia)
 - No constant memory or cmem[ur] path.
 - Kernel launch is a homebrew process (due to the lack of cmem[ur])
+- No `shfl` (keeps the vector CPU spirits away)
 
 ## Realism
 
@@ -67,13 +69,15 @@ tracking of register state and writers, together with my spidey senses of what c
 a long logic chain. When I couldn't tell logic or pipeline latency in a certain path I tried
 to make it adjustable in the device profile.
 
-I would give it a ~70% chance that this can be prompted into a synthesizable RTL
-existence without major changes in the design. I expect some problems in issue logic but hopefully
-it's not the end of the world.
+I would give it a ~80% chance that this can be prompted into existence as synthesizable RTL
+without major changes in the design. The machine shouldn't have any causality issues
+and I paid special attention to reducing logic levels in the issue loop which is the only
+place that would cause problems trying to add registers. The rest of the machine can be implemented
+with flexible state and latency.
 
 The code could be much shorter if written in behavioral RTL. I decided against that because
 a) models are more comfortable in C++, and b) I wanted to eventually compile to WASM and was
-afraid that going through Verilator could mess with that. As a result, a lot of the lines in
+afraid going through Verilator could mess with that. As a result, a lot of the lines in
 the simulator are spent reinventing an event model and trying to ensure causality.
 
 The microarchitecture is FPGA minded, making use of multi-port memory blocks and opting to use
@@ -91,7 +95,7 @@ depending on the sanitizer state.
 It is common knowledge that PTX is objectively the best language to write kernels in. However,
 PTX is proprietary to NVIDIA, so we have to invent a completely unrelated language called QTX.
 
-(Note how we don't have LLVM IR or anything that looks like CPU assembly in here. Begone, archetype of CPU)
+(Lowering from LLVM IR or anything that looks like CPU assembly is strictly prohibited)
 
 QTX is a high-level GPU assembly language written from one thread's point of view.
 It generally does what you expect it to do. See docs/qtx.md for a model-written overview of it.
@@ -163,6 +167,22 @@ its black boxes before the run.
 - `docs/machine.md`: the machine's parts in two pictures. (Written by models.)
 - `kernels/`: the kernels, each with a launch script that checks its answer.
 - `AGENTS.md`: for agents working in the repository.
+
+<!-- human written! -->
+
+## AI use
+
+Thanks to all the language models for putting up with my "capricious architect" roleplay in this project.
+
+In general, the implementation was done one step at a time by a single agent. Its outputs were
+reviewed carefully by me and a bunch of design agents from different model lines, which were also
+proposing design ideas and directions. Some of the ideas definitely made it into the architecture.
+
+I hand-wrote the human facing parts of the project to avoid presenting a generic LLM texture.
+
+The model names are mentioned in the "Assisted-by:" line of each commit.
+
+<!-- human written end -->
 
 ## Credits and license
 
