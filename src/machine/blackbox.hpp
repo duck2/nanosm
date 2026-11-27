@@ -64,6 +64,7 @@ struct BlackBoxDeclaration {
     uint32_t interval = 1;
     std::vector<BlackBoxPort> inputs;
     std::vector<BlackBoxPort> outputs;
+    std::string operations; // an arithmetic unit's, by name (none: not an arithmetic unit)
 };
 
 // A black box's output register, and what the inside has finished and not

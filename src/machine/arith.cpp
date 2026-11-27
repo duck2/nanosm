@@ -10,14 +10,16 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace nanosm {
 
 namespace {
 
-// A NaN single-precision result is 0x7fc00000 (fsub, fmul, fma, fmax, ex2,
-// rcp), so the host's NaN-payload propagation does not leak into the
+// A NaN single-precision result is 0x7fc00000 (fsub, fmul, fma, fmax, fmin,
+// ex2, rcp), so the host's NaN-payload propagation does not leak into the
 // machine; fadd's is the exception: its NaN is the host's single-precision
 // sum as it comes (the payload is the host's choice). cvt.pack's halves keep
 // their own rule (float_to_half_bits).
@@ -56,15 +58,47 @@ uint32_t float_max_bits(uint32_t a_bits, uint32_t b_bits) {
     return a > b ? a_bits : b_bits;
 }
 
-// The vector floating point -- the FPU's fadd, fsub, fmul, fma, fmax and
-// cvt.pack, the special-function unit's ex2 and rcp -- is this
+// IEEE minNum: one NaN yields the other operand; -0 is preferred over +0.
+uint32_t float_min_bits(uint32_t a_bits, uint32_t b_bits) {
+    const float a = bits_float(a_bits);
+    const float b = bits_float(b_bits);
+    if (std::isnan(a) && std::isnan(b)) return 0x7fc00000u;
+    if (std::isnan(a)) return b_bits;
+    if (std::isnan(b)) return a_bits;
+    if (a == 0.0f && b == 0.0f) {
+        return (std::signbit(a) || std::signbit(b)) ? float_bits(-0.0f) : a_bits;
+    }
+    return a < b ? a_bits : b_bits;
+}
+
+// The vector floating point -- the FPU's fadd, fsub, fmul, fma, fmax, fmin,
+// setp.f32 and cvt.pack, the special-function unit's ex2 and rcp -- is this
 // implementation's: the instruction set does not specify its rounding, its
 // denormals or whether fma is fused, so a kernel's check carries a tolerance
 // (docs/qtx.md). This one rounds to nearest even, fuses fma, and has no
 // subnormals. A subnormal word is zero of its sign; every single-precision
 // operation of the two units takes its inputs and gives its result through
-// this (denormals are zero in, flush to zero out). NaNs and infinities pass.
+// this (denormals are zero in, flush to zero out; setp.f32 has only inputs).
+// NaNs and infinities pass. (mul24, on the FPU, is integer arithmetic.)
 uint32_t no_subnormal(uint32_t bits) { return (bits & 0x7f800000u) == 0 ? bits & 0x80000000u : bits; }
+
+// setp.f32's comparisons, IEEE's: eq, lt, le, gt and ge are ordered (a NaN
+// makes them false), ne is not (a NaN makes it true), and -0 equals +0. A
+// subnormal input is zero of its sign, so it equals either zero.
+bool float_compare(Comparison comparison, uint32_t a_bits, uint32_t b_bits) {
+    const float a = bits_float(no_subnormal(a_bits));
+    const float b = bits_float(no_subnormal(b_bits));
+    switch (comparison) {
+    case Comparison::eq_f: return a == b;
+    case Comparison::ne_f: return a != b;
+    case Comparison::lt_f: return a < b;
+    case Comparison::le_f: return a <= b;
+    case Comparison::gt_f: return a > b;
+    case Comparison::ge_f: return a >= b;
+    default: break;
+    }
+    throw SimError("internal: an integer comparison on the FPU");
+}
 
 __extension__ typedef unsigned __int128 Wide; // GCC's: 128 bits hold any exactly aligned sum below
 
@@ -168,6 +202,32 @@ uint32_t single_precision(Operation operation, Words... words) {
     return no_subnormal(operation(no_subnormal(words)...));
 }
 
+// The operations src/isa.hpp's table gives `unit`, by name, each once (a
+// register and an immediate form share one), in opcode order; with
+// `uniform`, only those whose second source may be a uniform register.
+std::string operations_of(IssueUnit unit, bool uniform) {
+    std::vector<std::string> names;
+    for (uint32_t value = 0; value < isa_tables::opcodes.size(); ++value) {
+        const auto opcode = static_cast<Opcode>(value);
+        if (opcode_info(opcode).unit != unit || (uniform && !takes_uniform_source(opcode))) continue;
+        const auto name = opcode_name(opcode);
+        if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+    }
+    std::string list;
+    for (const auto& name : names) list += (list.empty() ? "" : ", ") + name;
+    return list;
+}
+
+// A unit that takes a setp: its results carry a tag that sends a predicate
+// to the predicate file instead of the RF write port.
+bool takes_setp(IssueUnit unit) {
+    for (uint32_t value = 0; value < isa_tables::opcodes.size(); ++value) {
+        const auto opcode = static_cast<Opcode>(value);
+        if (opcode_info(opcode).unit == unit && is_setp(opcode)) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -247,6 +307,11 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending) {
     case Opcode::add:
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
             result[lane] = operand(inst.src0, lane) + source_b(lane);
+        }
+        break;
+    case Opcode::sub:
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            result[lane] = operand(inst.src0, lane) - source_b(lane);
         }
         break;
     case Opcode::addi:
@@ -335,6 +400,31 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending) {
             result[lane] = single_precision(float_max_bits, operand(inst.src0, lane), source_b(lane));
         }
         break;
+    case Opcode::fmin:
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            result[lane] = single_precision(float_min_bits, operand(inst.src0, lane), source_b(lane));
+        }
+        break;
+    case Opcode::mul24:
+        // The low 24 bits of each source, unsigned; the low 32 bits of the
+        // 48-bit product.
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            const uint64_t a = operand(inst.src0, lane) & 0xffffffu;
+            const uint64_t b = source_b(lane) & 0xffffffu;
+            result[lane] = static_cast<uint32_t>(a * b);
+        }
+        break;
+    case Opcode::setp_eq_f32:
+    case Opcode::setp_ne_f32:
+    case Opcode::setp_lt_f32:
+    case Opcode::setp_le_f32:
+    case Opcode::setp_gt_f32:
+    case Opcode::setp_ge_f32:
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            result[lane] =
+                float_compare(opcode_info(inst.opcode).compare, operand(inst.src0, lane), source_b(lane)) ? 1u : 0u;
+        }
+        break;
     case Opcode::fma:
         // One rounding of the exact a x b + c (fused_multiply_add above).
         for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
@@ -414,16 +504,21 @@ Machine::FixedRfWrites Machine::arithmetic_rf_writes() const {
     return writes;
 }
 
-// A setp's result at the ALU's output now: its predicate, a bit per lane (the
-// lane's word nonzero), into the predicate file in its enabled lanes.
+// A setp's result at its unit's output now (the ALU's integer compares, the
+// FPU's setp.f32): its predicate, a bit per lane (the lane's word nonzero),
+// into the predicate file in its enabled lanes. Two units' setps may present
+// in one cycle; one write per predicate is ever in flight (src/timing.hpp),
+// so they are different predicates or different warps.
 void Machine::present_setp_predicate(Wires& w) const {
-    const auto& alu = arithmetic_black_boxes_[static_cast<std::size_t>(ArithmeticUnit::alu)].output();
-    if (!alu.has_value() || !alu->predicate) return;
-    uint64_t bits = 0;
-    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
-        if (alu->values[lane] != 0) bits |= uint64_t{1} << lane;
+    for (const auto& black_box : arithmetic_black_boxes_) {
+        const auto& result = black_box.output();
+        if (!result.has_value() || !result->predicate) continue;
+        uint64_t bits = 0;
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if (result->values[lane] != 0) bits |= uint64_t{1} << lane;
+        }
+        w.predicate_writes.push_back(PredicateWrite{result->warp, result->dst, bits, result->lane_enables});
     }
-    w.predicate_writes.push_back(PredicateWrite{alu->warp, alu->dst, bits, alu->lane_enables});
 }
 
 // Which unit executes a fixed-latency instruction: the one src/isa.hpp's
@@ -467,39 +562,46 @@ void Machine::declare_arithmetic_black_boxes() {
                 ? "the arithmetic pipeline's operand latches (in the open)"
                 : "the uniform register file's read registers (the memory's)"};
     };
-    const auto declare = [&](ArithmeticUnit unit, BlackBoxDeclaration black_box, uint64_t result_bits) {
+    // Each unit's operations are the opcodes the table gives it. A result is
+    // its warp, destination, lanes' words and lane enables, a valid bit, and
+    // in a unit that takes a setp the tag that sends it to the predicate
+    // file. The warp and destination travel with a result because the write
+    // port needs them: the write was booked ahead, but a booking does not say
+    // where the result goes.
+    const auto declare = [&](ArithmeticUnit unit, IssueUnit issue_unit, BlackBoxDeclaration black_box) {
         auto& at = arithmetic_black_boxes_[static_cast<std::size_t>(unit)];
+        const bool setp = takes_setp(issue_unit);
         black_box.unit = Unit::arithmetic;
-        black_box.outputs = {BlackBoxPort{"result (warp, destination, lanes' words, lane enables)", result_bits + 1,
-            at.name() + " (in the open)"}};
+        black_box.operations = operations_of(issue_unit, false);
+        black_box.outputs = {BlackBoxPort{
+            std::string("result (warp, destination, lanes' words, lane enables") + (setp ? ", predicate tag)" : ")"),
+            bits_for(c.core_warps) + 8 + lane_bits + lanes + (setp ? 1 : 0) + 1, at.name() + " (in the open)"}};
         at.build(black_box);
         black_boxes_.push_back(std::move(black_box));
     };
 
-    // The ALU (mov, sread, ur2r, the integer and logic ops, shifts, setp).
-    // The tag travels with a result because the write port needs its
-    // destination: the write was booked ahead, but a booking does not say
-    // where the result goes.
+    // The ALU: the integer ops, mov, sread, ur2r, setp's integer compares.
     {
         BlackBoxDeclaration alu("ALU");
         alu.latency = c.timing.alu;
         alu.latency_from = "core.alu_latency_cycles";
         alu.inputs = {operands(2),
-            uniform_operand("uniform operand (ur2r; the second source of add, and, or, xor, shl, shr, setp)"),
+            uniform_operand("uniform operand (ur2r's; the second source of " + operations_of(IssueUnit::alu, true) + ")"),
             control};
-        declare(ArithmeticUnit::alu, std::move(alu), bits_for(c.core_warps) + 8 + lane_bits + lanes + 1);
+        declare(ArithmeticUnit::alu, IssueUnit::alu, std::move(alu));
     }
 
-    // The FPU (fadd, fsub, fmul, fma, fmax, cvt.pack), every lane each cycle.
-    // With a uniform source an instruction's vector operands are one fewer.
+    // The FPU: the float ops, setp.f32 and mul24, every lane each cycle. With
+    // a uniform source an instruction's vector operands are one fewer.
     {
         BlackBoxDeclaration fpu("FPU");
         fpu.latency = c.timing.fadd;
         fpu.latency_from = "core.fadd_latency_cycles";
         fpu.inputs = {operands(3),
-            uniform_operand("uniform operand (the second source of fadd, fsub, fmul, fmax, cvt.pack; fma's multiplicand b)"),
+            uniform_operand("uniform operand (the second source of " + operations_of(IssueUnit::fpu, true) +
+                "; fma's is its multiplicand b)"),
             control};
-        declare(ArithmeticUnit::fpu, std::move(fpu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
+        declare(ArithmeticUnit::fpu, IssueUnit::fpu, std::move(fpu));
     }
 
     // The special-function unit (ex2, rcp). It serves sfu.lanes lanes a
@@ -514,7 +616,7 @@ void Machine::declare_arithmetic_black_boxes() {
         sfu.latency_from = "ceil(lanes / sfu.lanes) - 1 + sfu.latency_cycles";
         sfu.interval = static_cast<uint32_t>(groups);
         sfu.inputs = {operands(1), control};
-        declare(ArithmeticUnit::sfu, std::move(sfu), bits_for(c.core_warps) + 8 + lane_bits + lanes);
+        declare(ArithmeticUnit::sfu, IssueUnit::sfu, std::move(sfu));
     }
 }
 

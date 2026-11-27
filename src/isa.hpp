@@ -17,7 +17,7 @@ namespace nanosm {
 // stamp a kernel carries (src/profile.hpp device_profile_fingerprint), so a
 // reader built for another revision refuses the kernel. It changes with any
 // change to what a word means, a reserved bit given a meaning included.
-inline constexpr uint32_t isa_revision = 2;
+inline constexpr uint32_t isa_revision = 3;
 
 // ===========================================================================
 // The instruction set is two tables: the forms and the opcodes. Every fact
@@ -203,6 +203,24 @@ inline constexpr uint32_t isa_revision = 2;
     X(acc_ld_v8,                 0x51, "acc.ld.v8",              acc_load,            acc_load,     8, set, none) \
     X(acc_st,                    0x52, "acc.st",                 acc_store,           acc_store,    1, set, none) \
     X(acc_st_v8,                 0x53, "acc.st.v8",              acc_store,           acc_store,    8, set, none) \
+    /* The float compare: setp's comparisons on single-precision values, on */ \
+    /* the FPU. It compares the operands themselves (sign, magnitude, NaN and */ \
+    /* zero classes), not the rounded result of a subtract: two values one */ \
+    /* step apart order although their difference flushes to zero. A NaN makes */ \
+    /* eq, lt, le, gt, ge false and ne true; -0 equals +0; a subnormal input */ \
+    /* is zero. */ \
+    X(setp_eq_f32,               0x56, "setp.eq.f32",            vector_compare,      fpu,          1, no,  eq_f) \
+    X(setp_ne_f32,               0x57, "setp.ne.f32",            vector_compare,      fpu,          1, no,  ne_f) \
+    X(setp_lt_f32,               0x58, "setp.lt.f32",            vector_compare,      fpu,          1, no,  lt_f) \
+    X(setp_le_f32,               0x59, "setp.le.f32",            vector_compare,      fpu,          1, no,  le_f) \
+    X(setp_gt_f32,               0x5a, "setp.gt.f32",            vector_compare,      fpu,          1, no,  gt_f) \
+    X(setp_ge_f32,               0x5b, "setp.ge.f32",            vector_compare,      fpu,          1, no,  ge_f) \
+    /* IEEE minNum: one NaN yields the other operand; -0 is preferred over +0. */ \
+    X(fmin,                      0x5c, "fmin",                   vector_binary,       fpu,          1, no,  none) \
+    /* rd = the low 32 bits of (ra mod 2^24) x (rb mod 2^24), unsigned: the */ \
+    /* float multiplier's 24-bit significand array. */ \
+    X(mul24,                     0x5d, "mul24.u32",              vector_binary,       fpu,          1, no,  none) \
+    X(sub,                       0x5e, "sub",                    vector_binary,       alu,          1, no,  none) \
     X(mma_commit,                0x62, "mma.commit",             barrier,             mma,          1, no,  none) \
     /* 0x70..0x7f: the mma.async block. */ \
     /* The uniform register file: urf.registers 32-bit registers per warp */ \
@@ -293,8 +311,9 @@ enum class IssueUnit : uint8_t {
     lsu,                       // the load / store unit's queue
 };
 
-// setp's and usetp's comparisons: unsigned 32-bit, the _s ones signed.
-enum class Comparison : uint8_t { none, eq, ne, lt, le, gt, ge, lt_s, le_s, gt_s, ge_s };
+// setp's and usetp's comparisons: unsigned 32-bit, the _s ones signed, the
+// _f ones single precision (setp.f32's, on the FPU).
+enum class Comparison : uint8_t { none, eq, ne, lt, le, gt, ge, lt_s, le_s, gt_s, ge_s, eq_f, ne_f, lt_f, le_f, gt_f, ge_f };
 
 // An operand's register file (either: vector, or uniform when the U bit is
 // set) and how many registers it names from its field's (span:
@@ -752,9 +771,10 @@ inline constexpr unsigned uniform_source_shift = 0; // U: src1 is a uniform regi
 
 // The per-lane ALU and FPU instructions that may take ONE source from a
 // uniform register: always the second, src1 (the instruction's U bit), the
-// one slot the uniform value enters the datapath by. add, and, or, xor, shl,
-// shr (a uniform shift count), the register setp forms, fadd, fsub (x minus
-// the uniform value), fmul, fmax, cvt.pack (the high half) and fma (a
+// one slot the uniform value enters the datapath by. add, sub (x minus the
+// uniform value), and, or, xor, shl, shr (a uniform shift count), the
+// register setp forms (setp.f32 included), fadd, fsub (x minus the uniform
+// value), fmul, fmax, fmin, mul24, cvt.pack (the high half) and fma (a
 // multiplicand: a x U + c). The uniform register is read in the instruction's
 // one round beside its vector registers (src/timing.hpp); the vector sources
 // are the others, and only they count for the RF banks.

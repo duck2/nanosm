@@ -471,7 +471,7 @@ void Machine::tick() {
     // its grant; the RAM stage (the writes landing at this cycle's edge, and
     // their completions). Then the other completions presented from Q now: a
     // store whose last acknowledgement came last cycle, a setp's predicate at
-    // the ALU's output.
+    // the ALU's or the FPU's output.
     RfWriteRequests rf_writes;
     rf_writes.writeback = writeback_rf_writes();
     rf_writes.atomic_return = atomic_return_rf_write();

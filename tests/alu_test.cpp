@@ -433,6 +433,126 @@ TEST(Alu, uniform_second_source) {
     }
 }
 
+// The float compare (setp.f32, on the FPU), fmin, mul24 and sub in one
+// kernel. Each setp.f32 is followed at once by a mov under its predicate, so
+// the reader waits for the FPU's latency, not the ALU's. Then an FPU setp and
+// an ALU setp three issues later present their predicates in the same cycle
+// (checked from the issue cycles), each landing in its own predicate. The
+// expected compare bits and fmin words are written out by hand.
+TEST(Alu, float_compare_fmin_mul24_sub) {
+    const auto& profile = canonical_profile();
+    const std::array<uint32_t, 16> a{
+        0x3f800000u, 0x40000000u, 0x3fc00000u, 0x80000000u, // 1, 2, 1.5, -0
+        0x7fc00001u, 0x3f800000u, 0xffc00000u, 0x00000001u, // NaN, 1, NaN, 2^-149
+        0x00400000u, 0x80400000u, 0x7f800000u, 0xff800000u, // 2^-127, -2^-127, +inf, -inf
+        0xc0000000u, 0x7f7fffffu, 0x3f800000u, 0xbf800000u}; // -2, max, 1, -1
+    const std::array<uint32_t, 16> b{
+        0x40000000u, 0x3f800000u, 0x3fc00000u, 0x00000000u, // 2, 1, 1.5, +0
+        0x3f800000u, 0x7fc00000u, 0x7f800001u, 0x00000000u, // 1, NaN, NaN, +0
+        0x00000001u, 0x00000000u, 0x7f7fffffu, 0xbf800000u, // 2^-149, +0, max, -1
+        0xc0400000u, 0x7f800000u, 0x3f800001u, 0x3f800000u}; // -3, +inf, 1 + 2^-23, 1
+    // Per lane: eq ne lt le gt ge (a against b), then lt against U = 1.0.
+    const std::array<const char*, 16> compares{
+        "011100" "0", "010011" "0", "100101" "0", "100101" "1",
+        "010000" "0", "010000" "0", "010000" "0", "100101" "1",
+        "100101" "1", "100101" "1", "010011" "0", "011100" "1",
+        "010011" "1", "011100" "0", "011100" "0", "011100" "1"};
+    const std::array<uint32_t, 16> minimum{
+        0x3f800000u, 0x3f800000u, 0x3fc00000u, 0x80000000u, 0x3f800000u, 0x3f800000u, 0x7fc00000u, 0x00000000u,
+        0x00000000u, 0x80000000u, 0x7f7fffffu, 0xff800000u, 0xc0400000u, 0x7f7fffffu, 0x3f800000u, 0xbf800000u};
+    const std::string source = R"(
+        sread r0, LANE_ID
+        shli r9, r0, 2
+        lds r1, [r9]
+        lds r2, [r9+64]
+        umov ur1, 1.0
+        umov ur2, 5
+        mov r10, 0
+        mov r11, 0
+        mov r12, 0
+        mov r13, 0
+        mov r14, 0
+        mov r15, 0
+        mov r16, 0
+        mov r21, 0
+        mov r22, 0
+        setp.eq.f32 p0, r1, r2
+        @p0 mov r10, 1
+        setp.ne.f32 p1, r1, r2
+        @p1 mov r11, 1
+        setp.lt.f32 p2, r1, r2
+        @p2 mov r12, 1
+        setp.le.f32 p3, r1, r2
+        @p3 mov r13, 1
+        setp.gt.f32 p4, r1, r2
+        @p4 mov r14, 1
+        setp.ge.f32 p5, r1, r2
+        @p5 mov r15, 1
+        setp.lt.f32 p6, r1, ur1
+        @p6 mov r16, 1
+        setp.gt.f32 p0, r2, r1
+        sub r17, r1, r2
+        sub r18, r1, ur2
+        setp.lt.u32 p1, r0, ur2
+        @p0 mov r21, 1
+        @p1 mov r22, 1
+        fmin r20, r1, r2
+        mul24.u32 r19, r1, r2
+        halt
+    )";
+    const auto kernel = compile(source, profile);
+    require(nanosm::load_hex(nanosm::emit_hex(kernel)).words == kernel.words, "hex round trip");
+    auto launch = launch_warps(1);
+    auto& shmem = image_bytes(launch.test_shmem, 128);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        write_u32(shmem, lane * 4, a[lane]);
+        write_u32(shmem, 64 + lane * 4, b[lane]);
+    }
+    nanosm::Machine machine(profile, kernel, std::move(launch), nanosm::TraceOptions{.timeline = true});
+    machine.run(20000);
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        const auto at = [&](uint32_t reg) { return machine.read_reg(0, lane, reg); };
+        const std::string where = "lane " + std::to_string(lane) + ": ";
+        for (uint32_t column = 0; column < 7; ++column) {
+            require_eq(at(10 + column), static_cast<uint32_t>(compares[lane][column] - '0'),
+                where + "setp." + std::array<const char*, 7>{"eq", "ne", "lt", "le", "gt", "ge", "lt (against U)"}[column] +
+                    ".f32");
+        }
+        require_eq(at(21), static_cast<uint32_t>(compares[lane][2] - '0'), where + "setp.gt.f32 b, a");
+        require_eq(at(22), lane < 5 ? 1u : 0u, where + "the ALU setp presented beside the FPU's");
+        require_eq(at(20), minimum[lane], where + "fmin");
+        require_eq(at(17), a[lane] - b[lane], where + "sub");
+        require_eq(at(18), a[lane] - 5u, where + "sub x, U");
+        require_eq(at(19), static_cast<uint32_t>(uint64_t{a[lane] & 0xffffffu} * (b[lane] & 0xffffffu)), where + "mul24");
+    }
+    require_eq(machine.read_reg(0, 0, 17), 0xff800000u, "sub 0x3f800000 - 0x40000000 wraps");
+    require_eq(machine.read_reg(0, 7, 18), 0xfffffffcu, "sub 1 - 5 wraps");
+    require_eq(machine.read_reg(0, 13, 19), 0xff800000u, "mul24 0x7fffff x 0x800000: the low word of 46 bits");
+    require_eq(machine.read_reg(0, 15, 19), 0u, "mul24 0x800000 x 0x800000 = 2^46: its low word is 0");
+
+    // The FPU's setp.gt.f32 p0 and the ALU's setp.lt.u32 p1 reached the
+    // predicate file's input in one cycle.
+    std::optional<uint64_t> fpu_port, alu_port;
+    for (std::size_t index = 0; index < kernel.words.size(); ++index) {
+        const auto inst = nanosm::decode(kernel.words[index]);
+        const bool fpu = inst.opcode == nanosm::Opcode::setp_gt_f32 && inst.dst == 0;
+        const bool alu = inst.opcode == nanosm::Opcode::setp_lt && inst.dst == 1;
+        if (!fpu && !alu) continue;
+        for (const auto& event : machine.trace().events()) {
+            if (event.category != nanosm::TraceCategory::instruction || event.id != 8 * index) continue;
+            (fpu ? fpu_port : alu_port) = event.start_cycle + nanosm::issue_to_port(inst, profile);
+        }
+    }
+    require(fpu_port.has_value() && alu_port.has_value(), "the two setps' issues are not in the trace");
+    require_eq(*fpu_port, *alu_port, "the FPU's and the ALU's setp presented in one cycle");
+
+    // No immediate float compare; no uniform one.
+    expect_error([&] { (void)compile("sread r0, LANE_ID\nsetp.lt.f32 p0, r0, 1\nhalt\n", profile); },
+        {"compares two registers"}, "setp.f32 with an immediate");
+    expect_error([&] { (void)compile("umov ur1, 1\nusetp.lt.f32 p0, ur1, ur1\nhalt\n", profile); },
+        {"the uniform ALU has no float compare"}, "usetp.f32");
+}
+
 // The SFU: 4 lanes, so an ex2 or rcp of 16 lanes takes 4 passes and the unit
 // takes a new op every 4 cycles; qtxc schedules its effective latency
 // (occupancy 3 + latency 8 = 11). Two warps' four ex2 are admitted exactly 4

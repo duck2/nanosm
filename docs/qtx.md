@@ -147,9 +147,9 @@ and compare rows, the second source (for `fma`, either multiplicand) may be a un
 
 | what | instructions |
 |---|---|
-| integers, per lane | `mov d, a\|imm`; `add and or xor shl shr d, a, b`; `addi andi ori xori shli shri d, a, imm`. Shifts are logical. There is no subtract, multiply or divide. |
-| floats, per lane | `fadd fsub fmul fmax d, a, b`; `fma d, a, b, c` (a x b + c); `ex2 d, a` (2^a); `rcp d, a`; `cvt.pack.f16x2 d, lo, hi`. There is no float compare. |
-| compare, per lane | `setp.{eq,ne,lt,le,gt,ge}.{u32,s32} p, a, b\|imm` |
+| integers, per lane | `mov d, a\|imm`; `add sub and or xor shl shr d, a, b`; `addi andi ori xori shli shri d, a, imm`; `mul24.u32 d, a, b`. `sub` wraps. Shifts are logical. `mul24.u32` multiplies the low 24 bits of `a` and `b`, unsigned, and returns the low 32 bits of the 48-bit product (it runs on the float multiplier, at the FPU's latency). There is no divide. |
+| floats, per lane | `fadd fsub fmul fmax fmin d, a, b`; `fma d, a, b, c` (a x b + c); `ex2 d, a` (2^a); `rcp d, a`; `cvt.pack.f16x2 d, lo, hi`. `fmax` and `fmin` with one NaN return the other operand. |
+| compare, per lane | `setp.{eq,ne,lt,le,gt,ge}.{u32,s32} p, a, b\|imm`; `setp.{eq,ne,lt,le,gt,ge}.f32 p, a, b` (registers only, on the FPU: its predicate comes later than an integer compare's). A NaN makes every float compare false except `ne`, which it makes true; -0 equals +0. |
 | uniform | `umov d, a\|imm`; `uadd usub ushl ushr uand uor uxor d, a, b`; `uaddi ushli ushri uandi uori uxori d, a, imm`; `usetp.{...}.{u32,s32} p, a, b\|imm` |
 | branch | `bra.uni L`; `@p bra.uni L` (every lane must agree); `halt` |
 | divergence | `ssy L`; `@p bra L`; `sync` (written by hand today: `kernels/diverge.qtx`) |

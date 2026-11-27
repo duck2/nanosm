@@ -152,10 +152,11 @@
 //     the URF write port, and leaves the pipeline. The predicate file is
 //     flip-flops: pD is in it from c0 + L + 1 (canonical c0 + 4), so a
 //     bra.uni on it issues from c0 + L (canonical 3 cycles later; a vector
-//     setp's is 4). Its write follows the predicate file's one rule (no port,
-//     no calendar): a predicate writer issues only once the older write to
-//     the same predicate is in the file, so one write per predicate is ever in
-//     flight, and writes to different predicates are different flip-flops.
+//     setp's is 4 on the ALU, 7 for a setp.f32 on the FPU). Its write
+//     follows the predicate file's one rule (no port, no calendar): a
+//     predicate writer issues only once the older write to the same
+//     predicate is in the file, so one write per predicate is ever in flight,
+//     and writes to different predicates are different flip-flops.
 
 namespace nanosm {
 
@@ -233,7 +234,8 @@ inline uint32_t issue_to_visible(const Instruction& inst, const DeviceProfile& p
 // Accepted issue -> the first cycle a fixed predicate result is in the file.
 // A conditional branch reading it may issue issue_to_predicate_sample earlier:
 // a setp accepted at c0 (canonical, alu 1) is in the file from c5, so a
-// bra.uni on it issues from c4 and samples it at c5.
+// bra.uni on it issues from c4 and samples it at c5; a setp.f32 (the FPU's
+// latency, canonical 4) is in the file from c8.
 inline uint32_t issue_to_predicate_visible(const Instruction& inst, const DeviceProfile& profile) {
     return issue_to_port(inst, profile) + 1;
 }

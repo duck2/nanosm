@@ -13,8 +13,9 @@ namespace nanosm {
 
 namespace {
 
-// setp's and usetp's comparisons: unsigned 32-bit, the .s32 ones signed. An
-// immediate arrives sign-extended from its 22-bit field either way.
+// setp's and usetp's integer comparisons: unsigned 32-bit, the .s32 ones
+// signed. An immediate arrives sign-extended from its 22-bit field either
+// way. (setp.f32's are the FPU's: src/machine/arith.cpp float_compare.)
 inline bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     const auto signed_lhs = static_cast<int32_t>(lhs);
     const auto signed_rhs = static_cast<int32_t>(rhs);
@@ -29,6 +30,12 @@ inline bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     case Comparison::le_s: return signed_lhs <= signed_rhs;
     case Comparison::gt_s: return signed_lhs > signed_rhs;
     case Comparison::ge_s: return signed_lhs >= signed_rhs;
+    case Comparison::eq_f:
+    case Comparison::ne_f:
+    case Comparison::lt_f:
+    case Comparison::le_f:
+    case Comparison::gt_f:
+    case Comparison::ge_f: throw SimError("internal: a float comparison off the FPU");
     case Comparison::none: break;
     }
     throw SimError("internal non-setp comparison");

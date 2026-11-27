@@ -63,7 +63,8 @@ void Machine::declare_black_boxes() {
 // declaration order) with its kind, its name and its size -- a group's
 // members, a pipeline's stages, a FIFO's capacity and ports, a memory's shape.
 // Then each black box's contract: its latency and the profile settings it
-// comes from, its interval, its inputs and outputs.
+// comes from, its interval, an arithmetic unit's operations, its inputs and
+// outputs.
 // ===========================================================================
 
 std::string Machine::state_report() const {
@@ -89,6 +90,7 @@ std::string Machine::state_report() const {
     for (const auto& black_box : black_boxes_) {
         out << "  " << black_box.name << " (" << unit_name(black_box.unit) << ")\n    latency " << black_box.latency
             << " (" << black_box.latency_from << "), interval " << black_box.interval << "\n";
+        if (!black_box.operations.empty()) out << "    ops  " << black_box.operations << "\n";
         for (const auto* ports : {&black_box.inputs, &black_box.outputs}) {
             for (const auto& port : *ports) {
                 out << (ports == &black_box.inputs ? "    in   " : "    out  ") << port.name << ": " << number(port.bits)

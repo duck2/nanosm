@@ -316,7 +316,7 @@ void place_sources(Instruction& inst, const std::vector<Source>& sources, const 
     if (!fma && sources[0].kind == 1) {
         throw SimError(where + "the uniform register " + sources[0].text + " as its first source; " + name +
             " takes a uniform register only as its second source (" + form +
-            (inst.opcode == Opcode::fsub ? ": x minus U" : "") + ")" + copy);
+            (inst.opcode == Opcode::fsub || inst.opcode == Opcode::sub ? ": x minus U" : "") + ")" + copy);
     }
     std::size_t a = 0;
     std::size_t b = 1;
@@ -430,7 +430,9 @@ std::optional<Opcode> mma_async_opcode(const std::string& op, const DeviceProfil
 // compares unsigned 32-bit, .s32 signed. eq and ne are one comparison either
 // way, so .s32 on them names the .u32 opcode. Each of the four unsigned
 // opcode blocks lists eq, ne, lt, le, gt, ge in that order, each signed block
-// lt, le, gt, ge.
+// lt, le, gt, ge. setp.xx.f32 (the FPU's float compare) is its own row,
+// found by its name: register against register (a vector or a uniform one),
+// no immediate; the uniform ALU has no float compare.
 Opcode parse_setp_opcode(const std::string& written, bool uniform, bool immediate, uint32_t line) {
     const std::string family = uniform ? "usetp" : "setp";
     const auto where = "line " + std::to_string(line) + ": ";
@@ -442,9 +444,19 @@ Opcode parse_setp_opcode(const std::string& written, bool uniform, bool immediat
         throw SimError(where + "unknown " + family + " comparison '" + written + "'");
     }
     const auto untyped = family + "." + parts[1];
+    if (!uniform && parts.size() == 3 && parts[2] == "f32") {
+        if (immediate) {
+            throw SimError(where + "'" + written + "' compares two registers: umov the float constant into a "
+                "uniform register and compare against that");
+        }
+        return *opcode_for_mnemonic(written);
+    }
     if (parts.size() == 2 || (parts[2] != "u32" && parts[2] != "s32")) {
+        const auto floats = uniform ? "; the uniform ALU has no float compare (setp." + parts[1] + ".f32 compares "
+                                      "per lane, a uniform register may be its second source)"
+                                    : "; " + untyped + ".f32 compares floats";
         throw SimError(where + "'" + written + "' needs its type: " + untyped + ".u32 (unsigned) or " + untyped +
-            ".s32 (signed)");
+            ".s32 (signed)" + floats);
     }
     const auto i = static_cast<uint8_t>(found - comparisons.begin());
     if (parts[2] == "s32" && i >= 2) {

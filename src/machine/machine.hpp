@@ -421,7 +421,8 @@ private:
     // cycles later, the cycle of the RF write port it booked (a setp's: the
     // predicate file's input). Each unit has one E -- the ALU
     // core.alu_latency_cycles (setp, mov, sread and ur2r included), the FPU
-    // core.fadd_latency_cycles, the special-function unit its occupancy - 1 +
+    // core.fadd_latency_cycles (setp.f32 and mul24 included), the
+    // special-function unit its occupancy - 1 +
     // sfu.latency_cycles -- so each is a black box of latency E
     // (src/machine/blackbox.hpp; its contract is in arith.cpp): the
     // result of an instruction it takes when it executes is in the black box's
@@ -2253,10 +2254,10 @@ private:
         // vector: rf.write_ports_per_bank has no architectural maximum.)
         std::vector<std::optional<RfWrite>> rf_port_writes;
         // The predicate writes now: the file has them from the next cycle.
-        // Its inputs: the ALU's setp, the URF write port's usetp, a probe's
-        // result at shared memory's port output, and a completing try_wait
-        // per wait slot (a slot is its warp's).
-        Bounded<PredicateWrite, limits::warps + 3> predicate_writes;
+        // Its inputs: the ALU's setp, the FPU's setp.f32, the URF write
+        // port's usetp, a probe's result at shared memory's port output, and
+        // a completing try_wait per wait slot (a slot is its warp's).
+        Bounded<PredicateWrite, limits::warps + 4> predicate_writes;
         // The tmem writes at the RAM now, through each fine bank's two write
         // ports (an MMA result block, an acc.st beat): they land at this
         // cycle's clock edge, after every tmem read of this cycle (READ_FIRST,
