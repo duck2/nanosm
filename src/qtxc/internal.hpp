@@ -28,16 +28,13 @@ std::string read_file(const std::string& path);
 // where control blocks and .profile are allowed; qtx refuses both.
 AssemblyProgram parse_program(std::string_view source, bool allow_control, const DeviceProfile& profile);
 
-// The toolchain's opcode groups and instruction metadata (metadata.cpp; the
-// opcode classes the machine also uses are src/isa.hpp's).
+// The toolchain's opcode groups and a program's register count (metadata.cpp;
+// the opcode classes and register operands the machine also uses are
+// src/isa.hpp's).
 bool is_branch(Opcode opcode);
 bool transfers_control(Opcode opcode);
 bool has_displacement(Opcode opcode);
-std::vector<uint8_t> sources(const Instruction& inst);
-std::optional<uint8_t> predicate_destination(const Instruction& inst);
-std::optional<uint8_t> destination(const Instruction& inst);
 uint16_t register_count(const AssemblyProgram& program);
-std::vector<uint8_t> issue_sources(const Instruction& inst);
 
 // The directives beside the code (directives.cpp): `.warps`, the sections
 // `.param`, `.mbar`, `.data`, and `.flag`. `tail` is the line after the

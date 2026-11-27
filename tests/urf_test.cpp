@@ -84,10 +84,8 @@ TEST(Urf, uniform_arithmetic_and_moves) {
         require(ur(11) == (1000u & 993u) && ur(12) == (1000u | 993u) && ur(13) == (1000u ^ 993u),
             where + "uand / uor / uxor");
         require(ur(14) == (1000u & 255u) && ur(15) == (warp | 64u), where + "uandi / uori");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine.read_reg(warp, lane, 3) == 993 + warp && machine.read_reg(warp, lane, 4) == 500,
-                where + "ur2r writes every lane");
-        }
+        require_lanes(machine, 3, 993 + warp, where + "ur2r writes every lane", warp);
+        require_lanes(machine, 4, 500, where + "ur2r writes every lane", warp);
     }
 }
 
@@ -107,13 +105,13 @@ TEST(Urf, write_and_read_timing) {
         addi  r2, r1, 1
         halt
     )", profile);
-    require(scheduled.instructions[0].control.stall == 4, "qtxc: uniform write -> uniform read is not 4 cycles");
-    require(scheduled.instructions[1].control.stall == 4, "qtxc: uniform write -> ur2r is not 4 cycles");
-    require(scheduled.instructions[2].control.stall == 6, "qtxc: ur2r -> vector read is not 6 cycles (like mov)");
+    require_eq(scheduled.instructions[0].control.stall, 4, "qtxc: uniform write -> uniform read");
+    require_eq(scheduled.instructions[1].control.stall, 4, "qtxc: uniform write -> ur2r");
+    require_eq(scheduled.instructions[2].control.stall, 6, "qtxc: ur2r -> vector read (like mov)");
     // A uniform second source is read like ur2r's: 4 after its writer. One
     // cycle sooner is the sanitizer's PANIC.
     const auto uniform_b = qtx_program("umov ur2, 7\nadd r3, r1, ur2\nhalt\n", profile);
-    require(uniform_b.instructions[0].control.stall == 4, "qtxc: uniform write -> add's uniform source is not 4 cycles");
+    require_eq(uniform_b.instructions[0].control.stall, 4, "qtxc: uniform write -> add's uniform source");
     nanosm::Machine at_distance(profile, compile("umov ur2, 7\nadd r3, r1, ur2\nhalt\n"), launch_warps(1));
     at_distance.run(20000);
     require(at_distance.read_reg(0, 5, 3) == 7, "add read its uniform source wrong");
@@ -150,9 +148,9 @@ TEST(Urf, write_and_read_timing) {
             require(found != issues.end(), "warp " + std::to_string(warp) + " did not issue it");
             return found->cycle;
         };
-        require(of_warp(uaddis) == of_warp(usreads) + 4,
-            "warp " + std::to_string(warp) + ": the dependent uniform reader did not issue L + Wu after its writer" +
-                issue_log(machine));
+        require_eq(of_warp(uaddis), of_warp(usreads) + 4,
+            "warp " + std::to_string(warp) + ": the dependent uniform reader's issue (L + Wu after its writer)",
+            issue_log(machine));
         require(machine.read_ureg(warp, 1) == warp + 10, "uaddi read its source too early");
     }
 }
@@ -192,13 +190,11 @@ skip:
         halt
     )"), std::move(launch));
     machine.run(20000);
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 0x1234, "lds.uni from a uniform base");
-        require(machine.read_reg(0, lane, 2) == 40, "atom.add.uni returned the old word");
-        require(machine.read_reg(0, lane, 8) == 0xbeef, "ldg.uni from a uniform base");
-        require(machine.read_reg(0, lane, 5) == 1, "mbar.test_wait with a uniform parity");
-        require(machine.read_reg(0, lane, 7) == lane + 100, "acc.st / acc.ld through a uniform tmem pointer");
-    }
+    require_lanes(machine, 1, 0x1234, "lds.uni from a uniform base");
+    require_lanes(machine, 2, 40, "atom.add.uni's old word");
+    require_lanes(machine, 8, 0xbeef, "ldg.uni from a uniform base");
+    require_lanes(machine, 5, 1, "mbar.test_wait with a uniform parity");
+    require_lanes(machine, 7, [](uint32_t lane) { return lane + 100; }, "acc.st / acc.ld through a uniform tmem pointer");
     require(machine.read_shmem_u32(256) == 45, "atom.add.uni added its uniform operand");
     require(machine.read_mbar_state(512).phase, "mbar.arrive at a uniform address did not complete the phase");
 }

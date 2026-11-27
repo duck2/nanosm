@@ -68,32 +68,6 @@ void Sanitizer::record_launch(const Config& config, const Kernel& kernel, uint32
 
 void Sanitizer::record_cycle_start() {
     register_writes_.clear();
-    attempt_warp_.reset();
-    attempt_accepted_ = false;
-}
-
-// ---------------------------------------------------------------------------
-// Admission reads no operand. Issue decides from metadata
-// and resource state, then captures operands; the machine's admission
-// functions cannot see the RF at all, and this tripwire catches a capture
-// placed before the decision.
-// ---------------------------------------------------------------------------
-
-void Sanitizer::record_issue_attempt(uint32_t warp) {
-    attempt_warp_ = warp;
-    attempt_accepted_ = false;
-}
-
-void Sanitizer::record_issue_accepted() {
-    if (!attempt_warp_.has_value()) throw SimError("internal sanitizer: issue accepted without an attempt");
-    attempt_accepted_ = true;
-}
-
-void Sanitizer::check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const {
-    if (attempt_warp_ == warp && attempt_accepted_) return;
-    throw SimError("internal sanitizer: cycle " + std::to_string(cycle) + ": warp " + std::to_string(warp) +
-        " read " + (predicate ? "p" : "r") + std::to_string(reg) +
-        " in an issue attempt that admission had not accepted (a refused attempt must read nothing)");
 }
 
 // ---------------------------------------------------------------------------

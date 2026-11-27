@@ -18,63 +18,34 @@ namespace {
 inline bool compare_setp(Opcode opcode, uint32_t lhs, uint32_t rhs) {
     const auto signed_lhs = static_cast<int32_t>(lhs);
     const auto signed_rhs = static_cast<int32_t>(rhs);
-    switch (opcode) {
-    case Opcode::setp_eq:
-    case Opcode::setpi_eq:
-    case Opcode::usetp_eq:
-    case Opcode::usetpi_eq: return lhs == rhs;
-    case Opcode::setp_ne:
-    case Opcode::setpi_ne:
-    case Opcode::usetp_ne:
-    case Opcode::usetpi_ne: return lhs != rhs;
-    case Opcode::setp_lt:
-    case Opcode::setpi_lt:
-    case Opcode::usetp_lt:
-    case Opcode::usetpi_lt: return lhs < rhs;
-    case Opcode::setp_le:
-    case Opcode::setpi_le:
-    case Opcode::usetp_le:
-    case Opcode::usetpi_le: return lhs <= rhs;
-    case Opcode::setp_gt:
-    case Opcode::setpi_gt:
-    case Opcode::usetp_gt:
-    case Opcode::usetpi_gt: return lhs > rhs;
-    case Opcode::setp_ge:
-    case Opcode::setpi_ge:
-    case Opcode::usetp_ge:
-    case Opcode::usetpi_ge: return lhs >= rhs;
-    case Opcode::setp_lt_s32:
-    case Opcode::setpi_lt_s32:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetpi_lt_s32: return signed_lhs < signed_rhs;
-    case Opcode::setp_le_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetpi_le_s32: return signed_lhs <= signed_rhs;
-    case Opcode::setp_gt_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetpi_gt_s32: return signed_lhs > signed_rhs;
-    case Opcode::setp_ge_s32:
-    case Opcode::setpi_ge_s32:
-    case Opcode::usetp_ge_s32:
-    case Opcode::usetpi_ge_s32: return signed_lhs >= signed_rhs;
-    default: throw SimError("internal non-setp comparison");
+    switch (opcode_info(opcode).compare) {
+    case Comparison::eq: return lhs == rhs;
+    case Comparison::ne: return lhs != rhs;
+    case Comparison::lt: return lhs < rhs;
+    case Comparison::le: return lhs <= rhs;
+    case Comparison::gt: return lhs > rhs;
+    case Comparison::ge: return lhs >= rhs;
+    case Comparison::lt_s: return signed_lhs < signed_rhs;
+    case Comparison::le_s: return signed_lhs <= signed_rhs;
+    case Comparison::gt_s: return signed_lhs > signed_rhs;
+    case Comparison::ge_s: return signed_lhs >= signed_rhs;
+    case Comparison::none: break;
     }
+    throw SimError("internal non-setp comparison");
 }
 
 // Opcode classes by the unit that takes the instruction.
 inline bool is_lsu_opcode(Opcode opcode) {
-    return opcode == Opcode::ldg || opcode == Opcode::stg || opcode == Opcode::ldg_v8 ||
-        opcode == Opcode::stg_v8 || opcode == Opcode::ldg_uni;
+    return opcode_info(opcode).unit == IssueUnit::lsu;
 }
 
 inline bool is_mma_command(Opcode opcode) {
-    return is_mma_async(opcode) || opcode == Opcode::mma_commit;
+    return opcode_info(opcode).unit == IssueUnit::mma;
 }
 
 inline bool is_acc_transfer(Opcode opcode) {
-    return is_acc_load(opcode) || opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8;
+    const auto unit = opcode_info(opcode).unit;
+    return unit == IssueUnit::acc_load || unit == IssueUnit::acc_store;
 }
 
 inline uint32_t beats_per_sector(const Config& config) {

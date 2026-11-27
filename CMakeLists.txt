@@ -163,12 +163,14 @@ function(discover_nanosm_tests NAME PREFIX)
     gtest_discover_tests(${NAME}
         TEST_PREFIX "${PREFIX}"
         TEST_FILTER "-*Slow.*"
+        NO_PRETTY_VALUES
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         DISCOVERY_MODE PRE_TEST
         PROPERTIES LABELS "unit")
     gtest_discover_tests(${NAME}
         TEST_PREFIX "${PREFIX}"
         TEST_FILTER "*Slow.*"
+        NO_PRETTY_VALUES
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         DISCOVERY_MODE PRE_TEST
         PROPERTIES LABELS slow)
@@ -192,63 +194,17 @@ add_test(
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
-    add_test(
-        NAME nanosm_python_pipeline
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/pipeline.launch.py
-    )
-    set_tests_properties(nanosm_python_pipeline PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(
-        NAME nanosm_python_pipeline_tma
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/pipeline_tma.launch.py
-    )
-    set_tests_properties(nanosm_python_pipeline_tma PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(
-        NAME nanosm_python_pipeline_tma_wide
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/pipeline_tma_wide.launch.py
-    )
-    set_tests_properties(
-        nanosm_python_pipeline_tma_wide PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(
-        NAME nanosm_python_fa
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/fa.launch.py
-    )
-    set_tests_properties(nanosm_python_fa PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
-    add_test(
-        NAME nanosm_python_fa32
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/fa32.launch.py
-    )
-    set_tests_properties(nanosm_python_fa32 PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} LABELS slow)
-    add_test(
-        NAME nanosm_python_vadd
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/vadd.launch.py
-    )
-    set_tests_properties(nanosm_python_vadd PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(
-        NAME nanosm_python_diverge
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/diverge.launch.py
-    )
-    set_tests_properties(nanosm_python_diverge PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    add_test(
-        NAME nanosm_python_diverge_masked
-        COMMAND ${CMAKE_COMMAND} -E env
-            "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
-            ${Python3_EXECUTABLE} -B -m nanosm kernels/diverge_masked.launch.py
-    )
-    set_tests_properties(nanosm_python_diverge_masked PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # One launch script per kernel, each checking its own answer.
+    foreach(kernel pipeline pipeline_tma pipeline_tma_wide fa fa32 vadd diverge diverge_masked)
+        add_test(
+            NAME nanosm_python_${kernel}
+            COMMAND ${CMAKE_COMMAND} -E env
+                "NANOSM_LIBRARY=$<TARGET_FILE:nanosm_capi>"
+                ${Python3_EXECUTABLE} -B -m nanosm kernels/${kernel}.launch.py
+        )
+        set_tests_properties(nanosm_python_${kernel} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endforeach()
+    set_tests_properties(nanosm_python_fa nanosm_python_fa32 PROPERTIES LABELS slow)
     # The stepping discipline's regression check: register drivers run in a
     # random order every cycle (NANOSM_DRIVER_SHUFFLE_SEED); every launch's
     # stdout and Perfetto trace must be byte-identical to the unshuffled run.

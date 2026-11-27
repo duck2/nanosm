@@ -81,22 +81,10 @@ Kernel assemble_asm(std::string_view source, const DeviceProfile& profile) {
     kernel.words.reserve(program.instructions.size());
     for (std::size_t index = 0; index < program.instructions.size(); ++index) {
         const auto& inst = program.instructions[index];
-        if ((inst.opcode == Opcode::lds || inst.opcode == Opcode::sts ||
-             inst.opcode == Opcode::ldg || inst.opcode == Opcode::stg ||
-             inst.opcode == Opcode::ldg_v8 || inst.opcode == Opcode::stg_v8 ||
-             inst.opcode == Opcode::ldg_uni || inst.opcode == Opcode::lds_uni ||
-             inst.opcode == Opcode::acc_ld || inst.opcode == Opcode::acc_ld_v8 ||
-             inst.opcode == Opcode::acc_st || inst.opcode == Opcode::acc_st_v8 ||
-             is_mma_async(inst.opcode) || is_atomic(inst.opcode)) && inst.control.set_depbar >= 6) {
+        if (sets_depbar(inst.opcode) && inst.control.set_depbar >= 6) {
             throw SimError("line " + std::to_string(inst.line) + ": memory operation requires set=sb0..sb5");
         }
-        if (inst.opcode != Opcode::lds && inst.opcode != Opcode::sts &&
-            inst.opcode != Opcode::ldg && inst.opcode != Opcode::stg &&
-            inst.opcode != Opcode::ldg_v8 && inst.opcode != Opcode::stg_v8 &&
-            inst.opcode != Opcode::ldg_uni && inst.opcode != Opcode::lds_uni &&
-            inst.opcode != Opcode::acc_ld && inst.opcode != Opcode::acc_ld_v8 &&
-            inst.opcode != Opcode::acc_st && inst.opcode != Opcode::acc_st_v8 &&
-            !is_mma_async(inst.opcode) && !is_atomic(inst.opcode) && inst.control.set_depbar != 7) {
+        if (!sets_depbar(inst.opcode) && inst.control.set_depbar != 7) {
             throw SimError("line " + std::to_string(inst.line) + ": this opcode cannot set a depbar");
         }
         if ((is_setp(inst.opcode) || is_usetp(inst.opcode)) && inst.dst >= 7) {

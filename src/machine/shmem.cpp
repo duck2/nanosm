@@ -1,5 +1,7 @@
 // Shared memory: ports A and B, the two sides (queues, collect and serve stages), the
-// write-back buffer, the selects, bank rounds, and what issue sees of them.
+// write-back buffer, the selects, bank rounds, and what issue sees of them. At the register
+// file's async ports (src/machine/rf.cpp) the collect stages present reads, the write-back
+// entries and the atomic's old-word register present writes.
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
@@ -43,19 +45,20 @@ namespace nanosm {
 //          barrier change or atomic to the RMW engine (an atomic's old word
 //          into the old-word register -> the RF)
 //
-// An instruction enters its queue at its issue's edge with the active mask;
-// at issue + 1 it samples its predicate (lanes = active mask AND write mask)
-// and its uniform registers (sample_shmem_entry). An lds / sts left with no
-// lane leaves the queue then, taking no register read and no access, and
-// gives back its entry, its depbar and read depbar, its warp's counts. The queue's head
-// moves into the collect stage when that stage is free or moves on now; a
-// try_wait installs its wait slot as it leaves. The collect stage reads
-// the access's vector registers (an lds its address, an sts its address and
-// data) through the RF's async read ports (decide_rf_reads; the read of the
-// last one lowers the instruction's read depbar); when they are
-// at the RF output, it adds the immediate and plans the bank rounds, and the
-// access moves into serve when serve is free or frees now. Issue asks only
-// for a free queue entry (Q) and the warp's order (its counts, Q).
+// The queues are the memory queues of src/machine/dispatch.cpp: an
+// instruction enters at its issue's edge, samples its predicate and uniform
+// registers at issue + 1, and an lds / sts left with no lane leaves then
+// (giving back its warp's counts too). The queue's head moves into the
+// collect stage when that stage is free or moves on now; a try_wait installs
+// its wait slot as it leaves. The collect stage reads the access's vector
+// registers (an lds its address, an sts its address and data: the collect
+// rule of src/machine/dispatch.cpp) through the RF's async read ports: it
+// presents its next read (collect_rf_read) and takes the grant
+// (take_collect_reads; the read of the last one lowers the instruction's read
+// depbar); when they are at the RF output, it adds the immediate and plans
+// the bank rounds, and the access moves into serve when serve is free or
+// frees now. Issue asks only for its queue's credit and the warp's order
+// (its counts, Q).
 //
 // The order of one warp's accesses: each side keeps it by construction;
 // between the sides, issue holds a read while the warp has an unserviced
@@ -85,7 +88,7 @@ void Machine::step_shmem(Wires& w) {
     shmem_ram_stage(w.shmem);
     commit_shmem_writes(w);
     deliver_shmem_read(w);
-    w.shmem.a_write = select_a_write(w);
+    w.shmem.a_write = select_a_write();
     w.shmem.rmw_start = select_rmw_admission(w);
     w.shmem.a_read = select_a_read(w);
     w.shmem.b_write = select_b_write(w);
@@ -194,6 +197,7 @@ void Machine::deliver_shmem_read(Wires& w) {
     if (!beat.has_value()) return;
     switch (beat->client) {
     case ReadClient::probe:
+        w.shmem.probe_returned = beat->probe->warp;
         deliver_probe(*beat, w);
         return;
     case ReadClient::rmw:
@@ -298,7 +302,7 @@ bool Machine::write_serve_rmw_ready() const {
 // The alternation bit is read only here, to choose a START: from an RMW's
 // start to its final write grant the PAUSE holds every new store, so no store
 // is ever granted between an RMW's read and its write.
-Machine::AWriteGrant Machine::select_a_write(const Wires&) const {
+Machine::AWriteGrant Machine::select_a_write() const {
     AWriteGrant grant;
     const bool rmw_waiting = !store_pause() && rmw_requester_held();
     const bool stores_turn = store_waiting() && (!rmw_waiting || shmem_arbiters_.cur().rmw_started_last);
@@ -538,65 +542,41 @@ void Machine::serve_b_write(Wires& w) {
 // stage's access moves into serve when its registers are at the RF output
 // and serve is empty or frees now (the immediate added and the rounds
 // planned on the way: read_serve_from / write_serve_from); the queue's head
-// moves into the collect stage when it may leave and that stage is empty or
-// moves on now. Each step uses only Q and this cycle's grants.
+// moves into the collect stage when it may leave (head_may_leave: a head its
+// sample, later this cycle, leaves with no lane does not) and that stage is
+// empty or moves on now. Each step uses only Q and this cycle's grants.
 void Machine::advance_shmem_sides(Wires& w) {
     auto& shmem = w.shmem;
-    // A head not yet sampled that its issue + 1 sample (sample_shmem_entry,
-    // later this cycle, from the same predicate file) leaves with no lane is
-    // dropped now: it is not waiting for the collect stage (trace only).
-    const auto dropped_now = [&](const ShmemEntry& entry) {
-        if (entry.sampled || !has_write_mask(entry.instruction)) return false;
-        return (entry.lanes & write_mask_lanes(warps_[entry.warp], entry.instruction)) == 0;
-    };
-    {
-        const auto& serve = read_serve_.cur();
-        const bool serve_frees = !serve.has_value() ||
-            (shmem.a_read.user == AReadUser::read_side && serve->access.granted + 1 == serve->access.rounds);
-        const auto& collect = read_collect_.cur();
-        if (collect.has_value() && collect_ready(*collect) && serve_frees) {
-            shmem.read_serve_in = read_serve_from(*collect);
-            shmem.read_collect_out = true;
-        }
-        const bool collect_frees = !collect.has_value() || shmem.read_collect_out;
-        const auto& queue = read_queue_.cur();
-        if (!queue.empty() && entry_may_leave(queue.front())) {
-            if (collect_frees) {
-                shmem.read_queue_pop = true;
-                const auto& head = queue.front();
-                if (is_mbar_try_wait(head.instruction.opcode)) {
-                    shmem.wait_slot = IntoSlot<MbarWaitSlot>{head.warp, wait_slot_for(head)};
-                }
-            } else if (!dropped_now(queue.front())) {
-                trace_->shmem_head_wait(false);
+    const auto& read = read_serve_.cur();
+    const auto& write = write_serve_.cur();
+    const std::array<bool, shmem_sides> serve_frees{
+        !read.has_value() ||
+            (shmem.a_read.user == AReadUser::read_side && read->access.granted + 1 == read->access.rounds),
+        !write.has_value() || shmem.simt_rmw_started ||
+            (shmem.a_write.user == AWriteUser::store && write->access.granted + 1 == write->access.rounds)};
+    for (const auto queue : shmem_side_queues) {
+        const auto side = queue_index(queue);
+        const bool write_side = queue == MemoryQueue::shmem_write;
+        const auto& collect = collects_[side].cur();
+        if (collect.has_value() && collect_ready(*collect) && serve_frees[side]) {
+            if (write_side) {
+                shmem.write_serve_in = write_serve_from(*collect);
+            } else {
+                shmem.read_serve_in = read_serve_from(*collect);
             }
+            shmem.collect_out[side] = true;
+        }
+        if (!head_may_leave(queue)) continue;
+        if (collect.has_value() && !shmem.collect_out[side]) {
+            trace_->shmem_head_wait(write_side);
+            continue;
+        }
+        pop_queue(w, queue);
+        const auto& head = queues_[side].cur().front();
+        if (is_mbar_try_wait(head.instruction.opcode)) {
+            shmem.wait_slot = IntoSlot<MbarWaitSlot>{head.warp, wait_slot_for(head)};
         }
     }
-    {
-        const auto& serve = write_serve_.cur();
-        const bool serve_frees = !serve.has_value() || shmem.simt_rmw_started ||
-            (shmem.a_write.user == AWriteUser::store && serve->access.granted + 1 == serve->access.rounds);
-        const auto& collect = write_collect_.cur();
-        if (collect.has_value() && collect_ready(*collect) && serve_frees) {
-            shmem.write_serve_in = write_serve_from(*collect);
-            shmem.write_collect_out = true;
-        }
-        const bool collect_frees = !collect.has_value() || shmem.write_collect_out;
-        const auto& queue = write_queue_.cur();
-        if (!queue.empty() && entry_may_leave(queue.front())) {
-            if (collect_frees) {
-                shmem.write_queue_pop = true;
-            } else if (!dropped_now(queue.front())) {
-                trace_->shmem_head_wait(true);
-            }
-        }
-    }
-}
-
-// A queue's head may leave once its uniform operands will be where they
-// are used (its `wait`, counted down by the queue).
-bool Machine::entry_may_leave(const ShmemEntry& entry) const {
-    return entry.wait == 0;
 }
 
 // A collect stage's access has its registers at the RF output now: an lds
@@ -626,7 +606,6 @@ Machine::ReadServe Machine::read_serve_from(const ShmemCollect& collect) const {
         request.parity = entry_parity(entry);
         request.pc = entry.pc;
         request.instruction = inst;
-        if (!request.test) request.wait_slot = entry.warp;
         serve.probe = request;
         serve.access.rounds = 1;
         return serve;
@@ -667,100 +646,86 @@ Machine::WriteServe Machine::write_serve_from(const ShmemCollect& collect) const
 
 // A try_wait's wait slot (its warp's), installed as it leaves the queue: a
 // wake that comes while its probe travels finds it.
-Machine::MbarWaitSlot Machine::wait_slot_for(const ShmemEntry& entry) const {
+Machine::MbarWaitSlot Machine::wait_slot_for(const QueuedEntry& entry) const {
     MbarWaitSlot slot;
-    slot.warp = entry.warp;
     slot.byte_address = entry_mbar_address(entry);
     slot.parity = entry_parity(entry);
     slot.predicate_dst = entry.instruction.dst;
     return slot;
 }
 
-// A collect stage's next RF read, from Q: the read side's lds address; the
-// write side's sts address, then its data. `data`: the write side's data
-// read with its address in one cycle (it takes a port only if one is left).
-std::optional<Machine::RfReadRequest> Machine::collect_read_request(bool write_side, bool data) const {
-    const auto& collect = (write_side ? write_collect_ : read_collect_).cur();
+// ---- The sides' and the write-back buffer's RF ports ----
+
+// A collect stage's RF read request, from Q (next_collect_register): the
+// read side's lds address; the write side's sts address and data, a pair
+// (its data wanted with its address in one cycle).
+std::optional<Machine::RfReadRequest> Machine::collect_rf_read(MemoryQueue side) const {
+    const bool write_side = side == MemoryQueue::shmem_write;
+    const auto& collect = collects_[queue_index(side)].cur();
     if (!collect.has_value()) return std::nullopt;
     const auto& inst = collect->entry.instruction;
     if (inst.opcode != (write_side ? Opcode::sts : Opcode::lds)) return std::nullopt;
-    RfReadRequest request;
-    request.reader = !write_side ? RfReader::read_collect : data ? RfReader::write_collect_data : RfReader::write_collect;
-    request.warp = collect->entry.warp;
-    if (data) {
-        if (collect->address_read || inst.src1 == inst.src0) return std::nullopt;
-        request.reg = inst.src1;
-        return request;
-    }
-    if (!collect->address_read) {
-        request.reg = inst.src0;
-        return request;
-    }
-    if (write_side && !collect->data_read) {
-        request.reg = inst.src1;
-        return request;
-    }
-    return std::nullopt;
+    const auto next = [&](bool with_address) {
+        return next_collect_register(inst, write_side, collect->address_read, collect->data_read, with_address);
+    };
+    const auto reg = next(false);
+    if (!reg.has_value()) return std::nullopt;
+    return RfReadRequest{collect->entry.warp, *reg, next(true)};
 }
 
-// ---- The newest entry's issue + 1 sample ----
-
-// The entry that entered a queue at the last edge samples, in the issue
-// register's cycle (its issue + 1): its predicate, read from the predicate
-// file (lanes = the active mask AND the write mask), and its uniform
-// registers through the URF's read ports (counted in `uniform_reads`). The
-// uniform operation's partial-mask rule is the sanitizer's PANIC here. An
-// lds / sts with no lane left leaves the queue now (drop_queued); any other
-// entry's access is recorded for the sanitizer now (record_queued_access).
-void Machine::sample_shmem_entry(Wires& w, uint32_t& uniform_reads) {
-    for (const bool write_side : {false, true}) {
-        const auto& queue = (write_side ? write_queue_ : read_queue_).cur();
-        if (queue.empty() || queue.back().sampled) continue;
-        auto entry = queue.back();
-        const auto& inst = entry.instruction;
-        if (has_write_mask(inst)) entry.lanes &= write_mask_lanes(warps_[entry.warp], inst);
-        for (const auto reg : entry.uniform_reads) {
-            entry.uniform_operands.push_back(read_urf(entry.warp, reg, "URF read: a queued instruction's sample"));
+// Each collect stage takes its RF read grant: a denied request is a bank
+// wait (T); a granted register is read-owned no longer (the sanitizer) and
+// its words latch as the collect rule says (collect_read: the address, or
+// the data, or both for one register); the read of its last vector register
+// -- an sts's data, an lds's address -- lowers the instruction's read
+// depbar. The read side first, then the write side.
+void Machine::take_collect_reads(Wires& w) {
+    for (const auto side : shmem_side_queues) {
+        const auto request = collect_rf_read(side);
+        if (!request.has_value()) continue;
+        const auto& grant = w.rf_read.granted[collect_reader(side)];
+        if (!grant.words.has_value()) {
+            trace_->shmem_bank_wait(side == MemoryQueue::shmem_write);
+            continue;
         }
-        uniform_reads += static_cast<uint32_t>(entry.uniform_reads.size());
-        if (!entry.uniform_reads.empty()) sanitizer_.check_uniform_mask(site(entry), queue.back().lanes, full_mask());
-        Wires::ShmemSample sample;
-        sample.write_side = write_side;
-        sample.warp = entry.warp;
-        sample.lanes = entry.lanes;
-        sample.uniform_operands = entry.uniform_operands;
-        sample.dropped = entry.lanes == 0;
-        if (sample.dropped) {
-            drop_queued(entry, write_side, w);
-        } else {
-            record_queued_access(entry, write_side);
-        }
-        w.shmem_sample = std::move(sample);
-        return;
+        const auto& stage = *collects_[queue_index(side)].cur();
+        const bool write_side = side == MemoryQueue::shmem_write;
+        auto& sampled = w.collect_sampled[queue_index(side)];
+        const auto latch = [&](uint8_t reg, const LaneWords& words, bool named) {
+            sanitizer_.record_async_reader_done(stage.entry.warp, reg, AsyncReader::shmem_collect);
+            const auto got = collect_read(stage.entry.instruction, write_side, stage.address_read, named);
+            if (got.address) sampled.address = words;
+            if (got.data) sampled.data = words;
+        };
+        latch(request->reg, *grant.words, true);
+        if (grant.pair_words.has_value()) latch(*request->pair, *grant.pair_words, false);
+    }
+    for (const auto side : shmem_side_queues) {
+        const auto& sampled = w.collect_sampled[queue_index(side)];
+        if (!(side == MemoryQueue::shmem_write ? sampled.data : sampled.address).has_value()) continue;
+        const auto& entry = collects_[queue_index(side)].cur()->entry;
+        lower_read_depbar(w, entry.warp, entry.instruction);
     }
 }
 
-// An lds / sts whose write mask turned every active lane off: no register
-// read and no access. Its depbar and its read depbar are decremented now (a
-// waiting instruction sees them zero from the next cycle, issue + 2); a load's destination keeps
-// every lane's old value and is not in flight from then on; its source
-// registers are no longer read; its queue entry and its warp's counts are
-// given back at this edge (drive_shmem_queues, drive_shmem_counts). Only a
-// write mask can leave no lane: the divergence stack's active mask is never
-// empty, and every other queued instruction refuses to be masked.
-void Machine::drop_queued(const ShmemEntry& entry, bool, Wires& w) {
-    const auto& inst = entry.instruction;
-    if (!can_be_masked(inst.opcode)) {
-        throw SimError("internal: " + opcode_name(inst.opcode) + " was queued with no active lane");
+// The write-back entries' RF write requests, one per entry: a complete
+// entry's load result, its lanes enabled, its depbar cleared as it lands.
+std::vector<std::optional<Machine::RfWrite>> Machine::writeback_rf_writes() const {
+    std::vector<std::optional<RfWrite>> writes(writeback_.count());
+    for (uint32_t index = 0; index < writeback_.count(); ++index) {
+        const auto& entry = writeback_[index].cur();
+        if (!entry.has_value() || !entry->complete()) continue;
+        writes[index] = RfWrite{entry->warp, entry->dst, entry->words, entry->mask, entry->depbar, {entry->dst}};
     }
-    record_depbar_completion(w, entry.warp, inst.control.set_depbar,
-        "depbar underflow on sb" + std::to_string(inst.control.set_depbar));
-    lower_read_depbar(w, entry.warp, inst);
-    if (inst.opcode == Opcode::lds) sanitizer_.record_reg_ready(entry.warp, inst.dst, cycle_ + 1);
-    sanitizer_.record_async_reader_done(entry.warp, inst.src0, AsyncReader::shmem_collect);
-    if (inst.opcode == Opcode::sts && inst.src1 != inst.src0) {
-        sanitizer_.record_async_reader_done(entry.warp, inst.src1, AsyncReader::shmem_collect);
-    }
+    return writes;
+}
+
+// The old-word register's RF write request, once its word is in: the word to
+// every lane of the atomic's lanes, its depbar cleared as it lands.
+std::optional<Machine::RfWrite> Machine::atomic_return_rf_write() const {
+    const auto& old = atomic_return_.cur();
+    if (!old.has_value() || !old->word.has_value()) return std::nullopt;
+    return RfWrite{old->warp, old->dst, LaneWords(config_.lanes, *old->word), old->mask, old->depbar, {old->dst}};
 }
 
 // The sanitizer's record of a queued access at its issue + 1, with the
@@ -770,7 +735,7 @@ void Machine::drop_queued(const ShmemEntry& entry, bool, Wires& w) {
 // were just sampled. An address the machine will refuse at its collect stage
 // (overflow, alignment, bounds: the machine's PANIC there) is not recorded.
 // Pure reads: nothing here feeds the machine.
-void Machine::record_queued_access(const ShmemEntry& entry, bool) {
+void Machine::record_queued_access(const QueuedEntry& entry) {
     const auto& inst = entry.instruction;
     const auto at = site(entry);
     const auto operand = [&](uint8_t reg) { return entry_uniform(entry, reg); };
@@ -820,54 +785,18 @@ void Machine::record_queued_access(const ShmemEntry& entry, bool) {
 
 // ---- The registers' next values ----
 
-// Each queue, in one calculation: its head leaves for the collect stage
-// (popped) or, the newest entry, it has no lane left (dropped); the newest
-// entry takes its issue + 1 sample; every other entry's `wait` counts down;
-// issue's new entry enters at the tail.
-void Machine::drive_shmem_queues(const Wires& w) {
-    for (const bool write_side : {false, true}) {
-        auto& reg = write_side ? write_queue_ : read_queue_;
-        const bool pop = write_side ? w.shmem.write_queue_pop : w.shmem.read_queue_pop;
-        const bool push = w.issue.shmem.has_value() && w.issue.shmem_write_side == write_side;
-        const auto& sample = w.shmem_sample;
-        const bool sampled_here = sample.has_value() && sample->write_side == write_side;
-        bool changed = pop || push || sampled_here;
-        auto next = reg.cur();
-        for (auto& entry : next) {
-            if (entry.wait != 0) {
-                --entry.wait;
-                changed = true;
-            }
-        }
-        if (sampled_here) {
-            if (sample->dropped) {
-                next.resize(next.size() - 1); // the newest entry; also the head when it alone is queued
-            } else {
-                auto& newest = next.back();
-                newest.lanes = sample->lanes;
-                newest.uniform_operands = sample->uniform_operands;
-                newest.sampled = true;
-            }
-        }
-        if (pop && !(sampled_here && sample->dropped && reg.cur().size() == 1)) next.pop_front();
-        if (push) next.push_back(*w.issue.shmem);
-        if (!changed) continue;
-        reg.set_next(std::move(next), write_side ? "drive_shmem_queues: write" : "drive_shmem_queues: read");
-    }
-}
-
 // Each collect stage, in one calculation: its access leaves for serve; the
-// queue's head enters (with its issue + 1 sample if it takes it now, and not
-// at all if that sample left it no lane); the RF samples granted now latch
-// (at the RF output Lr cycles later: `wait`); the wait counts down.
+// queue's head enters (with its issue + 1 sample if it takes it now); the RF
+// samples granted now latch (at the RF output Lr cycles later: `wait`); the
+// wait counts down.
 void Machine::drive_shmem_collects(const Wires& w) {
-    for (const bool write_side : {false, true}) {
-        auto& reg = write_side ? write_collect_ : read_collect_;
-        const bool out = write_side ? w.shmem.write_collect_out : w.shmem.read_collect_out;
-        const bool pop = write_side ? w.shmem.write_queue_pop : w.shmem.read_queue_pop;
-        const auto& address = write_side ? w.write_collect_address : w.read_collect_address;
-        const auto* data = write_side ? &w.write_collect_data : nullptr;
-        const bool sampled = address.has_value() || (data != nullptr && data->has_value());
+    for (const auto queue : shmem_side_queues) {
+        const auto side = queue_index(queue);
+        auto& reg = collects_[side];
+        const bool out = w.shmem.collect_out[side];
+        const bool pop = w.queue_pops[side];
+        const auto& [address, data] = w.collect_sampled[side];
+        const bool sampled = address.has_value() || data.has_value();
         const bool counting = reg.cur().has_value() && reg.cur()->wait != 0;
         if (!out && !pop && !sampled && !counting) continue;
         auto next = reg.cur();
@@ -875,38 +804,21 @@ void Machine::drive_shmem_collects(const Wires& w) {
         if (out) next.reset();
         if (pop) {
             if (next.has_value()) throw SimError("internal: a queue's head entered a busy collect stage");
-            auto entry = (write_side ? write_queue_ : read_queue_).cur().front();
-            const auto& sample = w.shmem_sample;
-            bool dropped = false;
-            if (!entry.sampled) {
-                if (!sample.has_value() || sample->write_side != write_side) {
-                    throw SimError("internal: a queue entry left before its sample");
-                }
-                dropped = sample->dropped;
-                entry.lanes = sample->lanes;
-                entry.uniform_operands = sample->uniform_operands;
-                entry.sampled = true;
-            }
-            if (!dropped) next = ShmemCollect{entry, false, false, 0, {}, {}};
+            next = ShmemCollect{leaving_head(queue, w), false, false, 0, {}, {}};
         }
         if (sampled) {
             if (!next.has_value() || out || pop) throw SimError("internal: an RF sample for a collect stage that moved");
-            const auto& inst = next->entry.instruction;
             if (address.has_value()) {
                 next->address = *address;
                 next->address_read = true;
-                if (inst.src1 == inst.src0) {
-                    next->data = *address;
-                    next->data_read = true;
-                }
             }
-            if (data != nullptr && data->has_value()) {
-                next->data = **data;
+            if (data.has_value()) {
+                next->data = *data;
                 next->data_read = true;
             }
             next->wait = static_cast<uint8_t>(config_.rf_read_latency_cycles - 1);
         }
-        reg.set_next(std::move(next), write_side ? "drive_shmem_collects: write" : "drive_shmem_collects: read");
+        reg.set_next(std::move(next), "drive_shmem_collects");
     }
 }
 
@@ -956,7 +868,7 @@ void Machine::drive_shmem_serves(const Wires& w) {
 // come back into it.
 void Machine::drive_writeback(const Wires& w) {
     for (uint32_t index = 0; index < writeback_.count(); ++index) {
-        const bool written = w.rf_write.granted_to(AsyncWriter::writeback, index);
+        const bool written = w.rf_write.granted.writeback[index] != 0;
         const bool reserved = w.shmem.writeback_reserved == index;
         const bool filled = w.shmem.writeback_fill.has_value() && w.shmem.writeback_fill->entry == index;
         if (!written && !reserved && !filled) continue;
@@ -985,7 +897,7 @@ void Machine::drive_writeback(const Wires& w) {
 // The atomic's old-word register: its RF write granted (it leaves), an
 // atomic's RMW start reserving it, its read's old word.
 void Machine::drive_atomic_return(const Wires& w) {
-    const bool written = w.rf_write.granted_to(AsyncWriter::atomic_return, 0);
+    const bool written = w.rf_write.granted.atomic_return != 0;
     if (!written && !w.shmem.atomic_reserved.has_value() && !w.shmem.atomic_fill.has_value()) return;
     auto next = written ? std::nullopt : atomic_return_.cur();
     if (w.shmem.atomic_reserved.has_value()) {
@@ -1007,9 +919,15 @@ void Machine::drive_shmem_counts(const Wires& w) {
     const auto& cur = shmem_counts_.cur();
     for (uint32_t warp = 0; warp < cur.size(); ++warp) {
         auto next = cur[warp];
-        if (w.issue.shmem.has_value() && w.issue.shmem->warp == warp) {
-            ++(w.issue.shmem_write_side ? next.writes : next.reads);
+        if (w.shmem.probe_returned == warp) {
+            if (!next.probe) throw SimError("internal: warp " + std::to_string(warp) + "'s probe returned but was not out");
+            next.probe = false;
+        }
+        if (const auto& issued = w.issue.queued;
+            issued.has_value() && issued->queue != MemoryQueue::lsu && issued->entry.warp == warp) {
+            ++(issued->queue == MemoryQueue::shmem_write ? next.writes : next.reads);
             ++next.not_at_ram;
+            if (is_mbar_predicate_writer(issued->entry.instruction.opcode)) next.probe = true;
         }
         const auto down = [&](uint32_t& count) {
             if (count == 0) throw SimError("internal: warp " + std::to_string(warp) + "'s shmem count underflow");
@@ -1019,8 +937,9 @@ void Machine::drive_shmem_counts(const Wires& w) {
         if (w.shmem.write_serviced == warp) down(next.writes);
         if (w.shmem.read_at_ram == warp) down(next.not_at_ram);
         if (w.shmem.write_at_ram == warp) down(next.not_at_ram);
-        if (w.shmem_sample.has_value() && w.shmem_sample->dropped && w.shmem_sample->warp == warp) {
-            down(w.shmem_sample->write_side ? next.writes : next.reads);
+        if (const auto& sample = w.queue_sample; sample.has_value() && sample->queue != MemoryQueue::lsu &&
+            sample->dropped && sample->warp == warp) {
+            down(sample->queue == MemoryQueue::shmem_write ? next.writes : next.reads);
             down(next.not_at_ram);
         }
         if (next != cur[warp]) shmem_counts_.set_next(warp, next, "drive_shmem_counts");
@@ -1063,7 +982,7 @@ void Machine::drive_shmem_arbiters(const Wires& w) {
 // ---------------------------------------------------------------------------
 
 std::optional<Machine::SlotRounds> Machine::shmem_rounds(
-    const ShmemEntry& entry, const LaneWords& bases, bool checked) const {
+    const QueuedEntry& entry, const LaneWords& bases, bool checked) const {
     SlotRounds access;
     std::array<uint32_t, limits::shmem_banks> lanes_on_bank{};
     for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
@@ -1082,7 +1001,7 @@ std::optional<Machine::SlotRounds> Machine::shmem_rounds(
 // lds.uni: the address comes from a uniform register (as ldg.uni's does) and
 // makes one access, lane 0's; its word goes to every lane (deliver_shmem_read).
 std::optional<Machine::SlotRounds> Machine::uniform_shmem_round(
-    const ShmemEntry& entry, uint32_t base, bool checked) const {
+    const QueuedEntry& entry, uint32_t base, bool checked) const {
     const auto address = shmem_address(entry, base, checked);
     if (!address.has_value()) return std::nullopt;
     SlotRounds access;
@@ -1109,7 +1028,7 @@ Bounded<uint8_t, limits::shmem_banks> Machine::round_lanes(const SlotRounds& acc
 
 // One lane's address from its base and the immediate (the collect stage's
 // adder). Checked, a bad address is the machine's PANIC; unchecked, none.
-std::optional<uint32_t> Machine::shmem_address(const ShmemEntry& entry, uint32_t base, bool checked) const {
+std::optional<uint32_t> Machine::shmem_address(const QueuedEntry& entry, uint32_t base, bool checked) const {
     const auto address = static_cast<int64_t>(base) + entry.instruction.imm;
     const char* problem = nullptr;
     if (address < 0 || address > std::numeric_limits<uint32_t>::max()) {

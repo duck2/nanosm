@@ -1,4 +1,6 @@
-// The arithmetic pipeline: ALU, FPU and the special-function unit.
+// The arithmetic pipeline: its operand read in the RF read stage, the ALU, the FPU and the
+// special-function unit (black boxes), and their results at the RF write port (the writes
+// booked for this cycle) and the predicate file (a setp's).
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
@@ -171,6 +173,36 @@ uint32_t single_precision(Operation operation, Words... words) {
 // ===========================================================================
 // Arithmetic pipeline
 // ===========================================================================
+
+// The arithmetic pipeline in the RF read stage: the instruction in its last
+// stage has its operands at the RF output and executes; the one in stage 0
+// (accepted last cycle: the issue register's) samples its round -- its vector
+// registers through the read ports the round owns, its uniform ones through
+// the URF's -- and its write mask joins the round: its lanes AND the issue
+// cycle's active mask are the result's lane enables.
+void Machine::step_arithmetic_reads(Wires& w) {
+    if (const auto& ready = arithmetic_reads_.last(); ready.has_value()) execute_arithmetic(*ready);
+    const auto& first = arithmetic_reads_.stage(0);
+    if (!first.has_value()) return;
+    auto sampled = *first;
+    for (std::size_t i = 0; i < sampled.reads.size(); ++i) sampled.operands[i] = read_rf_round(w, sampled.warp, sampled.reads[i]);
+    sampled.uniform_operands =
+        read_urf_round(w, sampled.warp, sampled.uniform_reads, "URF read: the issue register's round");
+    if (has_write_mask(sampled.instruction)) {
+        sampled.active_mask &= write_mask_lanes(warps_[sampled.warp], sampled.instruction);
+    }
+    w.arithmetic_sampled = std::move(sampled);
+}
+
+// The arithmetic pipeline's operand latches: the instruction in stage 0 goes
+// on with the round it sampled now; the one in the last stage executed now
+// and leaves; issue's accepted instruction enters stage 0.
+void Machine::drive_arithmetic_reads(const Wires& w) {
+    if (w.arithmetic_sampled.has_value()) {
+        arithmetic_reads_.replace(0, w.arithmetic_sampled, "drive_arithmetic_reads: the sample");
+    }
+    if (w.issue.arithmetic.has_value()) arithmetic_reads_.push(*w.issue.arithmetic, "drive_arithmetic_reads");
+}
 
 void Machine::execute_arithmetic(const ArithmeticRead& pending) {
     auto& warp = warps_.at(pending.warp);
@@ -368,8 +400,34 @@ void Machine::execute_arithmetic(const ArithmeticRead& pending) {
         "execute_arithmetic");
 }
 
-// Which unit executes a fixed-latency instruction: the unit whose list
-// (src/isa.cpp) has its opcode, asked in the order fixed_latency asks.
+// The units' results at their output registers now, each the write it booked
+// at the RF write port for this cycle, the slowest unit's first: every lane's
+// word, its lane enables, no depbar (a fixed result's visibility is known at
+// its issue). A setp's result goes to the predicate file instead.
+Machine::FixedRfWrites Machine::arithmetic_rf_writes() const {
+    FixedRfWrites writes;
+    for (const auto unit : units_slowest_first_) {
+        const auto& result = arithmetic_black_boxes_[static_cast<std::size_t>(unit)].output();
+        if (!result.has_value() || result->predicate) continue;
+        writes.push_back(RfWrite{result->warp, result->dst, result->values, result->lane_enables, std::nullopt, {}});
+    }
+    return writes;
+}
+
+// A setp's result at the ALU's output now: its predicate, a bit per lane (the
+// lane's word nonzero), into the predicate file in its enabled lanes.
+void Machine::present_setp_predicate(Wires& w) const {
+    const auto& alu = arithmetic_black_boxes_[static_cast<std::size_t>(ArithmeticUnit::alu)].output();
+    if (!alu.has_value() || !alu->predicate) return;
+    uint64_t bits = 0;
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        if (alu->values[lane] != 0) bits |= uint64_t{1} << lane;
+    }
+    w.predicate_writes.push_back(PredicateWrite{alu->warp, alu->dst, bits, alu->lane_enables});
+}
+
+// Which unit executes a fixed-latency instruction: the one src/isa.hpp's
+// opcode table names.
 Machine::ArithmeticUnit Machine::arithmetic_unit(const Instruction& inst) {
     if (is_alu_operation(inst.opcode)) return ArithmeticUnit::alu;
     if (is_fpu_operation(inst.opcode)) return ArithmeticUnit::fpu;

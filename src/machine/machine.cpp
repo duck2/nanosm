@@ -12,14 +12,17 @@
 //   branch.cpp         branch resolution (bra, bra.uni, ssy, sync) and the divergence stack.
 //   issue.cpp          issue: admission, the scheduler, wait masks and depbar counters, accept, and the checks
 //                      made when an instruction issues.
-//   dispatch.cpp       dispatch: the dispatch pipeline and its end, where the tensor core and the accumulator
-//                      engines take an issued instruction (their dispatch_* functions are in their file), and a
-//                      dispatch entry's uniform operands.
-//   rf.cpp             the vector register file: the write calendar, the read and write port decisions, the
-//                      write ports' pipelines and the RAM stage. (Its timing rules are src/timing.hpp.)
+//   dispatch.cpp       dispatch: how an issued instruction reaches its unit. The dispatch pipeline and its end,
+//                      where the tensor core and the accumulator engines take it (their dispatch_* functions are
+//                      in their file), a dispatch entry's uniform operands; the memory queues of shared memory's
+//                      two sides and the load / store unit (an entry's sample, its drop, the head leaving).
+//   rf.cpp             the vector register file: the write calendar, the read and write port decisions over
+//                      the async clients' requests (each client presents and takes its grant in its own
+//                      file), the write ports' pipelines, the RAM stage and the predicate files. (Its timing
+//                      rules are src/timing.hpp.)
 //   urf.cpp            the uniform register file: its read rounds and its write pipeline.
-//   arith.cpp          the arithmetic pipeline: ALU, FPU and the special-function unit, black boxes with
-//                      their contracts.
+//   arith.cpp          the arithmetic pipeline: its operand read, ALU, FPU and the special-function unit
+//                      (black boxes with their contracts), their results at the RF write port.
 //   shmem.cpp          shared memory: ports A and B, the two sides (queues, collect and serve stages), the
 //                      write-back buffer, the selects, bank rounds, and what issue sees of them.
 //   barriers.cpp       barriers (mbar): probes, the read-modify-write engine, atomics, and the try-wait slots.
@@ -268,6 +271,7 @@ Machine::Machine(Config config, Kernel kernel, Launch launch, TraceOptions trace
         }
         // Per warp slot, launched or not (a slot not launched never counts).
         depbar_.build(config_.core_warps);
+        credits_.build(credit_kinds);
         stall_left_.build(config_.core_warps);
         // The most one warp can have counted on one depbar. An instruction
         // counts from its admission (lds, lds.uni, sts, an atomic, ldg / stg
@@ -388,15 +392,17 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //          slot's completion (wake, immediate success, timeout), a probe's
 //          return reach issue through their registers, the next cycle.
 //      (c) None into issue's admission: every question it asks reads Q
-//          (resource_view). A queue entry, an engine, a slot or an order
-//          freed at t is seen from t + 1 -- the TMA and MMA queues and the
-//          acc engines (less what the dispatch pipeline's instructions and
-//          the TMA operand read will take), the shared-memory queues and a
-//          warp's counts, fence.sh's count, the load / store unit's queue.
+//          (admission_refusal). A queue entry, an engine, a slot or an order
+//          freed at t is seen from t + 1 -- the credits of the queues and
+//          engines (a credit is held from the accept, through the dispatch
+//          pipeline or the TMA operand read, until the unit frees the
+//          entry), a warp's shared-memory counts and probe bit, fence.sh's
+//          count.
 //          A bank's read and write inhibits are bits of the RF policy
 //          registers, set from the RF decisions of the cycle before: an
-//          async reader or writer denied with service owed at t refuses
-//          issue's use of its bank from t + 1.
+//          async writer denied with service owed at t, or a reader denied
+//          at t while the instruction accepted at t takes every read port
+//          of its bank, refuses issue's use of the bank from t + 1.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
 //          t (the load and store buffers, a shared-memory collect or serve
 //          stage whose access moves on at t, the TMA sector / store
@@ -456,14 +462,27 @@ void Machine::tick() {
     w.branch = resolve_branch();
     w.divergence_refilled = divergence_memory_output();
 
-    // The RF write path, from Q: the one RF write decision (the ready async
-    // holders share this cycle's unbooked write ports),
-    // the write port (booked results and granted holders enter their ports'
-    // write pipelines) and the RAM stage (the writes landing at this cycle's
-    // edge, and their completions).
-    w.rf_write = decide_rf_writes();
-    rf_write_port(w);
+    // The RF write path, from Q: each async writer presents its write (the
+    // write-back entries and the old-word register of shared memory, the load
+    // / store unit's load buffer, the acc.ld pipeline's output); the one RF
+    // write decision shares this cycle's unbooked write ports among them;
+    // the write port (the arithmetic units' booked results and the granted
+    // writes enter their ports' write pipelines); the load / store unit takes
+    // its grant; the RAM stage (the writes landing at this cycle's edge, and
+    // their completions). Then the other completions presented from Q now: a
+    // store whose last acknowledgement came last cycle, a setp's predicate at
+    // the ALU's output.
+    RfWriteRequests rf_writes;
+    rf_writes.writeback = writeback_rf_writes();
+    rf_writes.atomic_return = atomic_return_rf_write();
+    rf_writes.load_buffer = load_buffer_rf_write();
+    rf_writes.acc_ld = acc_ld_rf_write();
+    w.rf_write = decide_rf_writes(rf_writes);
+    rf_write_port(arithmetic_rf_writes(), rf_writes, w);
+    take_load_buffer_grant(rf_writes.load_buffer, w);
     rf_ram_stage(w);
+    complete_stores(w);
+    present_setp_predicate(w);
     // The URF write pipeline's write port and RAM stage, from Q: nothing
     // contends for them (one writer per stage by construction).
     urf_ram_stage(w);
@@ -506,11 +525,22 @@ void Machine::tick() {
     arrive_tma_operands(w);
     dispatch_issued(w);
     step_lsu_queue(w);
-    // The async RF readers (acc.st beats, the LSU's stg.v8 data beats and
-    // its command slots' address and stg data reads, the shared-memory
-    // collect stages) take the read ports the issue register's instruction
-    // leaves free now, from Q and the egress decision.
-    w.rf_read = decide_rf_reads(w);
+    // The async RF readers present their reads (the acc.st engine's beat, the
+    // LSU's stg.v8 data beat, the shared-memory collect stages, the LSU's
+    // command slots: from Q and the egress decision); the RF read decision
+    // grants them the read ports the issue register's round leaves free now
+    // and reads them; each reader takes its grant, in that order.
+    RfReadRequests rf_reads;
+    rf_reads[RfReader::acc_st] = acc_st_rf_read();
+    rf_reads[RfReader::lsu_store] = lsu_store_rf_read(w.egress);
+    rf_reads[RfReader::read_collect] = collect_rf_read(MemoryQueue::shmem_read);
+    rf_reads[RfReader::write_collect] = collect_rf_read(MemoryQueue::shmem_write);
+    rf_reads[RfReader::lsu_collect] = lsu_collect_rf_read();
+    w.rf_read = decide_rf_reads(rf_reads, issue_read_banks_.cur());
+    take_acc_st_read(w);
+    take_lsu_store_read(w);
+    take_collect_reads(w);
+    take_lsu_collect_read(w);
 
     // The scheduler. Its admission reads Q only (c): no decision above
     // reaches it. Its write booking is in a future cycle and its read round
@@ -523,16 +553,28 @@ void Machine::tick() {
     step_front_end(w);
 
     // The RF read stage: the issue register's round samples now (vector and
-    // uniform registers). Then the URF write pipeline's work by stage: its
-    // sampled write, the uniform ALU and r2ur's results, issue's new write.
-    step_rf_reads(w);
+    // uniform registers), each unit's stage 0 its own operands -- the
+    // arithmetic pipeline (whose last stage executes now, its operands at the
+    // RF output), the shared-memory queues' newest entry, the dispatch
+    // pipeline, the URF write pipeline -- and the round counter its round;
+    // then the read ports used are checked. Then the URF write pipeline's work
+    // by stage: its sampled write, the uniform ALU and r2ur's results, issue's
+    // new write.
+    step_arithmetic_reads(w);
+    sample_newest(MemoryQueue::shmem_read, w);
+    sample_newest(MemoryQueue::shmem_write, w);
+    sample_dispatch_round(w);
+    sample_urf_pipe(w);
+    sample_urf_rounds(w);
+    check_urf_round_reads(w);
+    check_round_reads(w);
     step_urf(w);
 
     run_drivers(w);
     // The memories' writes at their RAM now, through their write ports (the
     // RF's, the URF's, shared memory's ports A and B, tmem's, the divergence
     // stack's). Each memory holds them until the clock edge.
-    land_rf_writes(w);
+    land_rf_writes();
     land_urf_write(w);
     land_shmem_writes(w);
     land_tmem_writes(w);
@@ -542,10 +584,17 @@ void Machine::tick() {
     clocked_.commit();
     ++cycle_;
     // Kernel end: the sanitizer's end-of-kernel checks (a nonzero mbar tx
-    // count). Every unit is idle then, so every depbar has been lowered as
-    // often as it was raised (a set depbar, a read depbar, a launch flag).
+    // count). Every unit is idle then, so every credit has been given back
+    // and every depbar lowered as often as it was raised (a set depbar, a
+    // read depbar, a launch flag).
     if (done()) {
         sanitizer_.check_kernel_end(cycle_);
+        for (std::size_t k = 0; k < credit_kinds; ++k) {
+            if (const auto held = credits_.cur()[k]; held != 0) {
+                throw SimError("internal: the kernel ends with " + std::to_string(held) + " of " +
+                    credit_name(static_cast<Credit>(k)) + "'s credits held (taken more often than given back)");
+            }
+        }
         for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
             for (uint8_t bar = 0; bar < 6; ++bar) {
                 if (const auto value = depbar_.cur().at(warp).at(bar); value != 0) {
@@ -580,19 +629,21 @@ bool Machine::done() const {
     const auto all_empty = [](const auto& group) {
         return std::all_of(group.cur().begin(), group.cur().end(), [](const auto& slot) { return !slot.has_value(); });
     };
-    // Both sides (queues, collect and serve stages), the write-back buffer
-    // and the old-word register, the RMW engine (its operation and ALU
-    // stages) and the services' pipelines (a store that has left serve may
-    // still be travelling to its write edge).
-    const bool shmem_idle = read_queue_.cur().empty() && write_queue_.cur().empty() && empty(read_collect_) &&
-        empty(write_collect_) && empty(read_serve_) && empty(write_serve_) && all_empty(writeback_) &&
-        empty(atomic_return_) &&
+    // The three memory queues. Shared memory's two sides (collect and serve
+    // stages), the write-back buffer and the old-word register, the RMW
+    // engine (its operation and ALU stages) and the services' pipelines (a
+    // store that has left serve may still be travelling to its write edge).
+    const bool queues_empty = std::all_of(std::begin(queues_), std::end(queues_), [](const auto& queue) {
+        return queue.cur().empty();
+    });
+    const bool shmem_idle = std::all_of(std::begin(collects_), std::end(collects_), empty) && empty(read_serve_) &&
+        empty(write_serve_) && all_empty(writeback_) && empty(atomic_return_) &&
         !rmw_.cur().active.has_value() && rmw_alu_.empty() && a_read_pipe_.empty() &&
         a_write_pipe_.empty() && b_write_pipe_.empty() && empty(tma_read_txn_) &&
         empty(tma_write_txn_);
-    return warps_halted && wait_slots_empty && shmem_idle && acc_ld_pipe_.empty() && acc_st_pipe_.empty() &&
+    return warps_halted && wait_slots_empty && queues_empty && shmem_idle && acc_ld_pipe_.empty() && acc_st_pipe_.empty() &&
         !tma_mbar_event_.cur().has_value() && !mma_mbar_event_.cur().has_value() && gmem_queue_.empty() &&
-        !gmem_bus_.has_value() && pending_write_acks_.empty() && lsu_queue_.cur().empty() &&
+        !gmem_bus_.has_value() && pending_write_acks_.empty() &&
         lsu_commands_.cur().empty() && lsu_collect_pipe_.empty() &&
         tma_reads_.empty() && lsu_reads_.empty() && ingress_.empty() && empty(egress_open_) &&
         egress_requests_.empty() && egress_data_.empty() &&
@@ -688,8 +739,9 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_divergence,
         &Machine::drive_depbar,
         &Machine::drive_scheduler,
+        &Machine::drive_credits,
         &Machine::drive_wait_slots,
-        &Machine::drive_shmem_queues,
+        &Machine::drive_queues,
         &Machine::drive_shmem_collects,
         &Machine::drive_shmem_serves,
         &Machine::drive_writeback,
@@ -711,7 +763,6 @@ void Machine::run_drivers(const Wires& w) {
         &Machine::drive_tma_store_registers,
         &Machine::drive_tma_returns,
         &Machine::drive_tma_operand_read,
-        &Machine::drive_lsu_queue,
         &Machine::drive_lsu_collect_pipe,
         &Machine::drive_lsu_commands,
         &Machine::drive_lsu_buffers,

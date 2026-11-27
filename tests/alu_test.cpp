@@ -104,18 +104,16 @@ TEST(Alu, integer_alu_menu) {
         halt
     )"), std::move(launch));
     machine.run(20000);
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 4) == (a[lane] & b[lane]), "and lane mismatch");
-        require(machine.read_reg(0, lane, 5) == (a[lane] | b[lane]), "or lane mismatch");
-        require(machine.read_reg(0, lane, 7) == (a[lane] ^ b[lane]), "xor lane mismatch");
-        require(machine.read_reg(0, lane, 8) == (a[lane] << (b[lane] & 31)), "shl lane mismatch (5-bit amount rule)");
-        require(machine.read_reg(0, lane, 10) == (a[lane] >> (b[lane] & 31)), "shr lane mismatch (5-bit amount rule)");
-        require(machine.read_reg(0, lane, 11) == (a[lane] & 255u), "andi lane mismatch");
-        require(machine.read_reg(0, lane, 13) == (a[lane] | 4080u), "ori lane mismatch");
-        require(machine.read_reg(0, lane, 14) == (a[lane] >> 5), "shri lane mismatch");
-        require(machine.read_reg(0, lane, 16) == a[lane], "shri by 0 changed the value");
-        require(machine.read_reg(0, lane, 17) == (a[lane] >> 31), "shri by 31 mismatch");
-    }
+    require_lanes(machine, 4, [&](uint32_t lane) { return a[lane] & b[lane]; }, "and");
+    require_lanes(machine, 5, [&](uint32_t lane) { return a[lane] | b[lane]; }, "or");
+    require_lanes(machine, 7, [&](uint32_t lane) { return a[lane] ^ b[lane]; }, "xor");
+    require_lanes(machine, 8, [&](uint32_t lane) { return a[lane] << (b[lane] & 31); }, "shl (5-bit amount rule)");
+    require_lanes(machine, 10, [&](uint32_t lane) { return a[lane] >> (b[lane] & 31); }, "shr (5-bit amount rule)");
+    require_lanes(machine, 11, [&](uint32_t lane) { return a[lane] & 255u; }, "andi");
+    require_lanes(machine, 13, [&](uint32_t lane) { return a[lane] | 4080u; }, "ori");
+    require_lanes(machine, 14, [&](uint32_t lane) { return a[lane] >> 5; }, "shri");
+    require_lanes(machine, 16, [&](uint32_t lane) { return a[lane]; }, "shri by 0 changed the value");
+    require_lanes(machine, 17, [&](uint32_t lane) { return a[lane] >> 31; }, "shri by 31");
 
     // An immediate shift outside 0..31 compiles and assembles, and PANICs
     // when it runs.
@@ -296,8 +294,7 @@ TEST(Alu, fa_menu_numeric_vectors) {
              Pin{14, 5, 0x7fc00000u, "fmul NaN x 1 is the canonical NaN"},
              Pin{15, 14, 0x00108000u, "cvt.pack(-2^-149, 2^-20): -0 and a half's subnormal"},
          }) {
-        const uint32_t got = machine->read_reg(0, pin.lane, pin.reg);
-        require(got == pin.bits, std::string(pin.what) + ": got " + std::to_string(got));
+        require_eq(machine->read_reg(0, pin.lane, pin.reg), pin.bits, pin.what);
     }
 }
 
@@ -346,9 +343,7 @@ TEST(Alu, fma_rounds_once) {
         }
         const auto machine = run_fpu_menu(a, b, c);
         for (std::size_t i = first; i < std::min(rows.size(), first + 16); ++i) {
-            const auto got = machine->read_reg(0, static_cast<uint32_t>(i - first), 8);
-            require(got == rows[i].expected, std::string(rows[i].what) + ": got " + std::to_string(got) +
-                ", expected " + std::to_string(rows[i].expected));
+            require_eq(machine->read_reg(0, static_cast<uint32_t>(i - first), 8), rows[i].expected, rows[i].what);
         }
     }
 }
@@ -444,7 +439,7 @@ TEST(Alu, uniform_second_source) {
 // cycles apart, while an independent ALU op issues beside the busy unit.
 TEST(Alu, sfu_unit_timing) {
     const auto& profile = canonical_profile();
-    require(profile.timing.sfu == 11, "canonical effective SFU latency is not 3 + 8");
+    require_eq(profile.timing.sfu, 11, "canonical effective SFU latency (3 + 8)");
     const auto scheduled = qtx_program(R"(
         sread r1, LANE_ID
         ex2 r2, r1
@@ -471,8 +466,7 @@ TEST(Alu, sfu_unit_timing) {
     std::vector<uint64_t> sfu_issues{first[0], first[1], second[0], second[1]};
     std::sort(sfu_issues.begin(), sfu_issues.end());
     for (std::size_t i = 1; i < sfu_issues.size(); ++i) {
-        require(sfu_issues[i] - sfu_issues[i - 1] == 4,
-            "SFU admissions were not 4 cycles apart: " + std::to_string(sfu_issues[i] - sfu_issues[i - 1]));
+        require_eq(sfu_issues[i] - sfu_issues[i - 1], 4, "cycles between SFU admissions");
     }
     const auto adds = issued_at(machine, 16);
     require(adds.size() == 2, "expected one add per warp");
@@ -482,17 +476,16 @@ TEST(Alu, sfu_unit_timing) {
     const auto& summary = machine.trace().summary();
     require(summary.sfu_ops == 4 && summary.sfu_busy_cycles == 16, "SFU counters did not record four quarter-rate ops");
     require(summary.sfu_unit_stalls > 0, "SFU contention produced no counted stalls");
-    for (uint32_t warp = 0; warp < 2; ++warp)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(warp, lane, 5) == 2 * lane, "the interleaved ALU op computed the wrong value");
+    for (uint32_t warp = 0; warp < 2; ++warp) {
+        require_lanes(machine, 5, [](uint32_t lane) { return 2 * lane; }, "the interleaved ALU op", warp);
+    }
 }
 
 TEST(Alu, sfu_profile_validation) {
     std::ifstream input("profiles/nanosm-v0.json");
     nlohmann::json document;
     input >> document;
-    require(nanosm::parse_device_profile(document.dump()).timing.sfu == 11,
-        "canonical sfu occupancy + latency did not derive 11");
+    require_eq(nanosm::parse_device_profile(document.dump()).timing.sfu, 11, "canonical sfu occupancy + latency");
     const auto refused = [&](const std::string& field, const nlohmann::json& value) {
         auto modified = document;
         modified["sfu"][field] = value;

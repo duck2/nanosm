@@ -1,3 +1,6 @@
+// The instruction set's functions, each a loop over the form and opcode
+// tables (src/isa.hpp): encode, decode, an instruction's registers, its text.
+
 #include "isa.hpp"
 
 #include "qtxc/qtxc.hpp"
@@ -8,14 +11,6 @@
 
 namespace nanosm {
 namespace {
-
-std::string reg(uint8_t value) {
-    return "r" + std::to_string(value);
-}
-
-std::string ureg(uint8_t value) {
-    return "ur" + std::to_string(value);
-}
 
 std::string special_name(int32_t value) {
     switch (static_cast<SpecialReg>(value)) {
@@ -35,24 +30,85 @@ std::string address(const std::string& base, int32_t offset) {
         std::to_string(offset > 0 ? offset : -offset) + "]";
 }
 
-std::string address(uint8_t base, int32_t offset) {
-    return address(reg(base), offset);
+// An Instruction's register fields in the forms' order: dst, src0, src1, src2.
+std::array<const uint8_t*, 4> registers_of(const Instruction& inst) {
+    return {&inst.dst, &inst.src0, &inst.src1, &inst.src2};
+}
+
+std::array<uint8_t*, 4> registers_of(Instruction& inst) {
+    return {&inst.dst, &inst.src0, &inst.src1, &inst.src2};
+}
+
+// Each operand field's place in the word: register fields 0..3, then umov's.
+constexpr std::array<unsigned, 5> field_shift = {encoding::reg0_shift, encoding::reg1_shift, encoding::reg2_shift,
+    encoding::reg3_shift, encoding::umovi_dst_shift};
+constexpr std::array<uint64_t, 5> field_mask = {encoding::register_mask, encoding::register_mask,
+    encoding::register_mask, encoding::register_mask, encoding::umovi_dst_mask};
+
+// The operand's file as this instruction uses it (an X2 operand by its U bit).
+RegisterFile file_of(const Operand& operand, const Instruction& inst) {
+    if (operand.file != RegisterFile::either) return operand.file;
+    return inst.src1_uniform ? RegisterFile::uniform : RegisterFile::vector;
+}
+
+uint32_t width_of(const Operand& operand, Opcode opcode) {
+    switch (operand.width) {
+    case OperandWidth::one: return 1;
+    case OperandWidth::span: return register_span(opcode);
+    case OperandWidth::coordinates: return tma_coordinate_count(opcode);
+    }
+    return 1;
+}
+
+std::string register_text(RegisterFile file, uint8_t value) {
+    const char* prefix = file == RegisterFile::uniform ? "ur" : file == RegisterFile::predicate ? "p" : "r";
+    return prefix + std::to_string(value);
+}
+
+int32_t sign_extended(uint64_t word, unsigned bits) {
+    const auto field = static_cast<uint32_t>(word & ((uint64_t{1} << bits) - 1));
+    const auto sign = uint32_t{1} << (bits - 1);
+    return static_cast<int32_t>((field ^ sign) - sign);
+}
+
+// The registers of the operands in `file` the instruction reads (src0, src1,
+// src2), each register of a wide operand; a tma's coordinates after the rest.
+std::vector<uint8_t> sources_in(const Instruction& inst, RegisterFile file) {
+    const auto& form = form_info(inst.opcode);
+    const auto registers = registers_of(inst);
+    std::vector<uint8_t> result;
+    for (const bool coordinates : {false, true}) {
+        for (std::size_t slot = 1; slot < 4; ++slot) {
+            const auto& operand = form.operands[slot];
+            if (file_of(operand, inst) != file || (operand.width == OperandWidth::coordinates) != coordinates) continue;
+            for (uint32_t j = 0; j < width_of(operand, inst.opcode); ++j) {
+                result.push_back(static_cast<uint8_t>(*registers[slot] + j));
+            }
+        }
+    }
+    return result;
+}
+
+std::optional<uint8_t> destination_in(const Instruction& inst, RegisterFile file) {
+    if (form_info(inst.opcode).operands[0].file == file) return inst.dst;
+    return std::nullopt;
 }
 
 } // namespace
 
 uint64_t encode(const Instruction& inst) {
+    const auto& form = form_info(inst.opcode);
+    const auto kind = form.immediate;
     if (inst.control.predicate > 7 || inst.control.stall > encoding::stall_mask ||
         inst.control.set_depbar > 7 || inst.control.wait_mask > encoding::wait_mask_mask ||
-        (inst.opcode != Opcode::umovi &&
-         (inst.imm < encoding::immediate_min || inst.imm > encoding::immediate_max))) {
+        (kind != ImmediateKind::word && (inst.imm < encoding::immediate_min || inst.imm > encoding::immediate_max))) {
         throw SimError("instruction field does not fit 64-bit encoding: " + format_instruction(inst));
     }
-    if (is_atomic(inst.opcode) &&
+    if (kind == ImmediateKind::s14 &&
         (inst.imm < encoding::atomic_immediate_min || inst.imm > encoding::atomic_immediate_max)) {
         throw SimError("atomic offset does not fit its signed 14-bit immediate: " + format_instruction(inst));
     }
-    if (is_tma_opcode(inst.opcode) &&
+    if (kind == ImmediateKind::descriptor &&
         (inst.imm < 0 || inst.imm % encoding::tma_descriptor_field_unit != 0 ||
          static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit > encoding::tma_descriptor_field_mask)) {
         throw SimError("tma descriptor address must be 64-byte aligned and below 1 MiB: " + format_instruction(inst));
@@ -60,13 +116,19 @@ uint64_t encode(const Instruction& inst) {
     if (inst.src1_uniform && !takes_uniform_source(inst.opcode)) {
         throw SimError(opcode_name(inst.opcode) + " has no uniform source: " + format_instruction(inst));
     }
-    const bool vector_memory = has_read_depbar_field(inst.opcode);
+    const bool vector_memory = kind == ImmediateKind::memory;
     if (inst.control.read_depbar > 7 || (!vector_memory && inst.control.read_depbar != 7)) {
         throw SimError(opcode_name(inst.opcode) + " has no read depbar field: " + format_instruction(inst));
     }
     if (vector_memory &&
         (inst.imm < encoding::vector_memory_immediate_min || inst.imm > encoding::vector_memory_immediate_max)) {
         throw SimError("offset does not fit the signed 19-bit immediate: " + format_instruction(inst));
+    }
+    if (kind == ImmediateKind::spacings && (inst.imm < 0 || inst.imm >= (1 << (2 * mma_spacing_field_bits)))) {
+        throw SimError("mma.async row spacings do not fit their two 7-bit fields: " + format_instruction(inst));
+    }
+    if (form.operands[0].field == 4 && inst.dst > encoding::umovi_dst_mask) {
+        throw SimError("umov's uniform register does not fit its 6-bit field: " + format_instruction(inst));
     }
     const auto predicate = static_cast<uint64_t>(
         inst.control.predicate | (inst.control.predicate_invert ? 8 : 0));
@@ -76,230 +138,24 @@ uint64_t encode(const Instruction& inst) {
         (static_cast<uint64_t>(inst.control.stall) << encoding::stall_shift) |
         (static_cast<uint64_t>(inst.control.set_depbar) << encoding::set_depbar_shift) |
         (static_cast<uint64_t>(inst.control.wait_mask) << encoding::wait_mask_shift);
-    const auto immediate = static_cast<uint32_t>(inst.imm) & encoding::immediate_mask;
-    // The six vector memory forms: read depbar[3], simm[19].
-    const auto read_and_offset =
-        (static_cast<uint64_t>(inst.control.read_depbar) << encoding::read_depbar_shift) |
-        (static_cast<uint32_t>(inst.imm) & encoding::vector_memory_immediate_mask);
-    if (is_mma_async(inst.opcode)) {
-        // urC (the result's tmem pointer), A and B base registers, A's and
-        // B's row spacings (the block's opcodes share one form).
-        if (inst.imm < 0 || inst.imm >= (1 << (2 * mma_spacing_field_bits))) {
-            throw SimError("mma.async row spacings do not fit their two 7-bit fields: " + format_instruction(inst));
-        }
-        word |= static_cast<uint64_t>(inst.src2) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        word |= static_cast<uint64_t>(inst.imm);
-        return word;
+    const auto registers = registers_of(inst);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        const auto& operand = form.operands[slot];
+        if (operand.file != RegisterFile::none) word |= uint64_t{*registers[slot]} << field_shift[operand.field];
     }
-    switch (inst.opcode) {
-    case Opcode::sread:
-    case Opcode::mov:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= immediate;
+    if (takes_uniform_source(inst.opcode) && inst.src1_uniform) word |= uint64_t{1} << encoding::uniform_source_shift;
+    const auto imm = static_cast<uint32_t>(inst.imm);
+    switch (kind) {
+    case ImmediateKind::none: break;
+    case ImmediateKind::s22: word |= imm & encoding::immediate_mask; break;
+    case ImmediateKind::memory:
+        word |= uint64_t{inst.control.read_depbar} << encoding::read_depbar_shift |
+            (imm & encoding::vector_memory_immediate_mask);
         break;
-    case Opcode::add:
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        word |= static_cast<uint64_t>(inst.src1_uniform ? 1 : 0) << encoding::uniform_source_shift;
-        break;
-    case Opcode::fma:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        word |= static_cast<uint64_t>(inst.src2) << encoding::reg3_shift;
-        word |= static_cast<uint64_t>(inst.src1_uniform ? 1 : 0) << encoding::uniform_source_shift;
-        break;
-    case Opcode::ex2:
-    case Opcode::rcp:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        break;
-    case Opcode::addi:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::andi:
-    case Opcode::ori:
-    case Opcode::ldg_uni:
-    case Opcode::lds_uni:
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= immediate;
-        break;
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= read_and_offset;
-        break;
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_arrive_expect_tx_i:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        word |= immediate;
-        break;
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive_expect_tx_r:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
-        break;
-    case Opcode::mbar_arrive:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        break;
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= immediate;
-        break;
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        break;
-    case Opcode::tma_load_1d:
-    case Opcode::tma_load_2d:
-    case Opcode::tma_load_3d:
-    case Opcode::tma_load_4d:
-    case Opcode::tma_store_1d:
-    case Opcode::tma_store_2d:
-    case Opcode::tma_store_3d:
-    case Opcode::tma_store_4d:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src2) << encoding::reg2_shift;
-        word |= static_cast<uint64_t>(inst.imm) / encoding::tma_descriptor_field_unit;
-        break;
-    case Opcode::mma_commit:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        break;
-    case Opcode::sts:
-    case Opcode::stg:
-    case Opcode::stg_v8:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
-        word |= read_and_offset;
-        break;
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg1_shift;
-        word |= immediate;
-        break;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        word |= static_cast<uint32_t>(inst.imm) & encoding::atomic_immediate_mask;
-        break;
-    case Opcode::bra:
-    case Opcode::bra_uni:
-    case Opcode::ssy:
-        word |= immediate;
-        break;
-    case Opcode::umov:
-    case Opcode::r2ur:
-    case Opcode::ur2r:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        break;
-    case Opcode::umovi:
-        // dst[6], imm[32]: the whole word.
-        if (inst.dst > encoding::umovi_dst_mask) {
-            throw SimError("umov's uniform register does not fit its 6-bit field: " + format_instruction(inst));
-        }
-        word |= static_cast<uint64_t>(inst.dst) << encoding::umovi_dst_shift;
-        word |= static_cast<uint64_t>(static_cast<uint32_t>(inst.imm));
-        break;
-    case Opcode::usread:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= immediate;
-        break;
-    case Opcode::uadd:
-    case Opcode::usub:
-    case Opcode::ushl:
-    case Opcode::ushr:
-    case Opcode::uand:
-    case Opcode::uor:
-    case Opcode::uxor:
-    case Opcode::usetp_eq:
-    case Opcode::usetp_ne:
-    case Opcode::usetp_lt:
-    case Opcode::usetp_le:
-    case Opcode::usetp_gt:
-    case Opcode::usetp_ge:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetp_ge_s32:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= static_cast<uint64_t>(inst.src1) << encoding::reg2_shift;
-        break;
-    case Opcode::uaddi:
-    case Opcode::ushli:
-    case Opcode::ushri:
-    case Opcode::uandi:
-    case Opcode::uori:
-    case Opcode::uxori:
-    case Opcode::usetpi_eq:
-    case Opcode::usetpi_ne:
-    case Opcode::usetpi_lt:
-    case Opcode::usetpi_le:
-    case Opcode::usetpi_gt:
-    case Opcode::usetpi_ge:
-    case Opcode::usetpi_lt_s32:
-    case Opcode::usetpi_le_s32:
-    case Opcode::usetpi_gt_s32:
-    case Opcode::usetpi_ge_s32:
-        word |= static_cast<uint64_t>(inst.dst) << encoding::reg0_shift;
-        word |= static_cast<uint64_t>(inst.src0) << encoding::reg1_shift;
-        word |= immediate;
-        break;
-    case Opcode::fence_sh:
-    case Opcode::sync:
-    case Opcode::nop:
-    case Opcode::halt:
-        break;
+    case ImmediateKind::s14: word |= imm & encoding::atomic_immediate_mask; break;
+    case ImmediateKind::descriptor: word |= imm / encoding::tma_descriptor_field_unit; break;
+    case ImmediateKind::spacings:
+    case ImmediateKind::word: word |= imm; break;
     }
     return word;
 }
@@ -317,232 +173,27 @@ Instruction decode(uint64_t word) {
         (word >> encoding::set_depbar_shift) & encoding::set_depbar_mask);
     inst.control.wait_mask = static_cast<uint8_t>(
         (word >> encoding::wait_mask_shift) & encoding::wait_mask_mask);
-    const auto reg0 = static_cast<uint8_t>((word >> encoding::reg0_shift) & encoding::register_mask);
-    const auto reg1 = static_cast<uint8_t>((word >> encoding::reg1_shift) & encoding::register_mask);
-    const auto reg2 = static_cast<uint8_t>((word >> encoding::reg2_shift) & encoding::register_mask);
-    auto immediate = static_cast<uint32_t>(word & encoding::immediate_mask);
-    if ((immediate & (1u << 21)) != 0) {
-        immediate |= ~static_cast<uint32_t>(encoding::immediate_mask);
+    const auto& form = form_info(inst.opcode);
+    const auto registers = registers_of(inst);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        const auto& operand = form.operands[slot];
+        if (operand.file == RegisterFile::none) continue;
+        *registers[slot] = static_cast<uint8_t>((word >> field_shift[operand.field]) & field_mask[operand.field]);
     }
-    // The six vector memory forms: read depbar[3], simm[19].
-    auto memory_offset = static_cast<uint32_t>(word & encoding::vector_memory_immediate_mask);
-    if ((memory_offset & (1u << 18)) != 0) memory_offset |= ~static_cast<uint32_t>(encoding::vector_memory_immediate_mask);
-    if (has_read_depbar_field(inst.opcode)) {
+    if (takes_uniform_source(inst.opcode)) inst.src1_uniform = ((word >> encoding::uniform_source_shift) & 1) != 0;
+    switch (form.immediate) {
+    case ImmediateKind::none: break;
+    case ImmediateKind::s22: inst.imm = sign_extended(word, 22); break;
+    case ImmediateKind::memory:
         inst.control.read_depbar = static_cast<uint8_t>((word >> encoding::read_depbar_shift) & encoding::read_depbar_mask);
-    }
-    if (is_mma_async(inst.opcode)) {
-        inst.src2 = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        inst.imm = static_cast<int32_t>(word & ((1u << (2 * mma_spacing_field_bits)) - 1));
-        return inst;
-    }
-    switch (inst.opcode) {
-    case Opcode::sread:
-    case Opcode::mov:
-        inst.dst = reg0;
-        inst.imm = static_cast<int32_t>(immediate);
+        inst.imm = sign_extended(word, 19);
         break;
-    case Opcode::add:
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        inst.src1_uniform = ((word >> encoding::uniform_source_shift) & 1) != 0;
-        break;
-    case Opcode::fma:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        inst.src2 = static_cast<uint8_t>((word >> encoding::reg3_shift) & encoding::register_mask);
-        inst.src1_uniform = ((word >> encoding::uniform_source_shift) & 1) != 0;
-        break;
-    case Opcode::ex2:
-    case Opcode::rcp:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        break;
-    case Opcode::addi:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::andi:
-    case Opcode::ori:
-    case Opcode::ldg_uni:
-    case Opcode::lds_uni:
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.imm = static_cast<int32_t>(memory_offset);
-        break;
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_arrive_expect_tx_i:
-        inst.src0 = reg0;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive_expect_tx_r:
-        inst.src0 = reg0;
-        inst.src1 = reg1;
-        break;
-    case Opcode::mbar_arrive:
-        inst.src0 = reg0;
-        break;
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        break;
-    case Opcode::tma_load_1d:
-    case Opcode::tma_load_2d:
-    case Opcode::tma_load_3d:
-    case Opcode::tma_load_4d:
-    case Opcode::tma_store_1d:
-    case Opcode::tma_store_2d:
-    case Opcode::tma_store_3d:
-    case Opcode::tma_store_4d:
-        inst.src0 = reg0;
-        inst.src1 = reg1;
-        inst.src2 = reg2;
+    case ImmediateKind::s14: inst.imm = sign_extended(word, 14); break;
+    case ImmediateKind::descriptor:
         inst.imm = static_cast<int32_t>((word & encoding::tma_descriptor_field_mask) * encoding::tma_descriptor_field_unit);
         break;
-    case Opcode::mma_commit:
-        inst.src0 = reg0;
-        break;
-    case Opcode::sts:
-    case Opcode::stg:
-    case Opcode::stg_v8:
-        inst.src0 = reg0;
-        inst.src1 = reg1;
-        inst.imm = static_cast<int32_t>(memory_offset);
-        break;
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-        inst.src0 = reg0;
-        inst.src1 = reg1;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni: {
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        auto offset = static_cast<uint32_t>(word & encoding::atomic_immediate_mask);
-        if ((offset & (1u << 13)) != 0) offset |= ~static_cast<uint32_t>(encoding::atomic_immediate_mask);
-        inst.imm = static_cast<int32_t>(offset);
-        break;
-    }
-    case Opcode::bra:
-    case Opcode::bra_uni:
-    case Opcode::ssy:
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::umov:
-    case Opcode::r2ur:
-    case Opcode::ur2r:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        break;
-    case Opcode::umovi:
-        inst.dst = static_cast<uint8_t>((word >> encoding::umovi_dst_shift) & encoding::umovi_dst_mask);
-        inst.imm = static_cast<int32_t>(static_cast<uint32_t>(word & 0xffffffffu));
-        break;
-    case Opcode::usread:
-        inst.dst = reg0;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::uadd:
-    case Opcode::usub:
-    case Opcode::ushl:
-    case Opcode::ushr:
-    case Opcode::uand:
-    case Opcode::uor:
-    case Opcode::uxor:
-    case Opcode::usetp_eq:
-    case Opcode::usetp_ne:
-    case Opcode::usetp_lt:
-    case Opcode::usetp_le:
-    case Opcode::usetp_gt:
-    case Opcode::usetp_ge:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetp_ge_s32:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.src1 = reg2;
-        break;
-    case Opcode::uaddi:
-    case Opcode::ushli:
-    case Opcode::ushri:
-    case Opcode::uandi:
-    case Opcode::uori:
-    case Opcode::uxori:
-    case Opcode::usetpi_eq:
-    case Opcode::usetpi_ne:
-    case Opcode::usetpi_lt:
-    case Opcode::usetpi_le:
-    case Opcode::usetpi_gt:
-    case Opcode::usetpi_ge:
-    case Opcode::usetpi_lt_s32:
-    case Opcode::usetpi_le_s32:
-    case Opcode::usetpi_gt_s32:
-    case Opcode::usetpi_ge_s32:
-        inst.dst = reg0;
-        inst.src0 = reg1;
-        inst.imm = static_cast<int32_t>(immediate);
-        break;
-    case Opcode::fence_sh:
-    case Opcode::sync:
-    case Opcode::nop:
-    case Opcode::halt:
-        break;
+    case ImmediateKind::spacings: inst.imm = static_cast<int32_t>(word & ((1u << (2 * mma_spacing_field_bits)) - 1)); break;
+    case ImmediateKind::word: inst.imm = static_cast<int32_t>(static_cast<uint32_t>(word)); break;
     }
     return inst;
 }
@@ -553,109 +204,29 @@ std::optional<unsigned> reserved_bit(uint64_t word) {
     return static_cast<unsigned>(std::countr_zero(stray));
 }
 
-bool takes_uniform_source(Opcode opcode) {
-    switch (opcode) {
-    case Opcode::add:
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-    case Opcode::fadd:
-    case Opcode::fsub:
-    case Opcode::fmul:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-    case Opcode::fma:
-        return true;
-    default:
-        return false;
-    }
-}
-
 std::vector<uint8_t> uniform_sources(const Instruction& inst) {
-    if (inst.src1_uniform && takes_uniform_source(inst.opcode)) return {inst.src1};
-    if (is_mma_async(inst.opcode)) return {inst.src0, inst.src1, inst.src2};
-    if (is_tma_opcode(inst.opcode)) {
-        std::vector<uint8_t> result{inst.src0, inst.src2};
-        for (uint32_t i = 0; i < tma_coordinate_count(inst.opcode); ++i) {
-            result.push_back(static_cast<uint8_t>(inst.src1 + i));
-        }
-        return result;
-    }
-    switch (inst.opcode) {
-    case Opcode::umov:
-    case Opcode::uaddi:
-    case Opcode::ushli:
-    case Opcode::ushri:
-    case Opcode::uandi:
-    case Opcode::uori:
-    case Opcode::uxori:
-    case Opcode::usetpi_eq:
-    case Opcode::usetpi_ne:
-    case Opcode::usetpi_lt:
-    case Opcode::usetpi_le:
-    case Opcode::usetpi_gt:
-    case Opcode::usetpi_ge:
-    case Opcode::usetpi_lt_s32:
-    case Opcode::usetpi_le_s32:
-    case Opcode::usetpi_gt_s32:
-    case Opcode::usetpi_ge_s32:
-    case Opcode::ur2r:
-    case Opcode::lds_uni:
-    case Opcode::ldg_uni:
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_arrive:
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i:
-    case Opcode::mma_commit:
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8: return {inst.src0};
-    case Opcode::uadd:
-    case Opcode::usub:
-    case Opcode::ushl:
-    case Opcode::ushr:
-    case Opcode::uand:
-    case Opcode::uor:
-    case Opcode::uxor:
-    case Opcode::usetp_eq:
-    case Opcode::usetp_ne:
-    case Opcode::usetp_lt:
-    case Opcode::usetp_le:
-    case Opcode::usetp_gt:
-    case Opcode::usetp_ge:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetp_ge_s32:
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni:
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive_expect_tx_r:
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r: return {inst.src0, inst.src1};
-    default: return {};
-    }
+    return sources_in(inst, RegisterFile::uniform);
 }
 
 std::optional<uint8_t> uniform_destination(const Instruction& inst) {
-    if (writes_uniform_register(inst.opcode)) return inst.dst;
-    return std::nullopt;
+    return destination_in(inst, RegisterFile::uniform);
+}
+
+std::vector<uint8_t> vector_sources(const Instruction& inst) {
+    return sources_in(inst, RegisterFile::vector);
+}
+
+std::vector<uint8_t> issue_sources(const Instruction& inst) {
+    if (form_info(inst.opcode).reads == VectorReads::after_issue) return {};
+    return vector_sources(inst);
+}
+
+std::optional<uint8_t> vector_destination(const Instruction& inst) {
+    return destination_in(inst, RegisterFile::vector);
+}
+
+std::optional<uint8_t> predicate_destination(const Instruction& inst) {
+    return destination_in(inst, RegisterFile::predicate);
 }
 
 std::string mma_shape_name(const MmaShape& shape) {
@@ -692,133 +263,19 @@ std::string opcode_name(Opcode opcode, const std::vector<MmaShape>* mma_shapes) 
         }
         return family + "slot" + std::to_string(index);
     }
-    switch (opcode) {
-    case Opcode::sread: return "sread";
-    case Opcode::mov: return "mov";
-    case Opcode::add: return "add";
-    case Opcode::addi: return "addi";
-    case Opcode::and_: return "and";
-    case Opcode::andi: return "andi";
-    case Opcode::or_: return "or";
-    case Opcode::ori: return "ori";
-    case Opcode::xor_: return "xor";
-    case Opcode::shl: return "shl";
-    case Opcode::shr: return "shr";
-    case Opcode::shli: return "shli";
-    case Opcode::shri: return "shri";
-    case Opcode::xori: return "xori";
-    case Opcode::fadd: return "fadd";
-    case Opcode::fmul: return "fmul";
-    case Opcode::fsub: return "fsub";
-    case Opcode::fmax: return "fmax";
-    case Opcode::fma: return "fma";
-    case Opcode::cvt_pack: return "cvt.pack.f16x2";
-    case Opcode::ex2: return "ex2";
-    case Opcode::rcp: return "rcp";
-    case Opcode::setp_eq:
-    case Opcode::setpi_eq: return "setp.eq.u32";
-    case Opcode::setp_ne:
-    case Opcode::setpi_ne: return "setp.ne.u32";
-    case Opcode::setp_lt:
-    case Opcode::setpi_lt: return "setp.lt.u32";
-    case Opcode::setp_le:
-    case Opcode::setpi_le: return "setp.le.u32";
-    case Opcode::setp_gt:
-    case Opcode::setpi_gt: return "setp.gt.u32";
-    case Opcode::setp_ge:
-    case Opcode::setpi_ge: return "setp.ge.u32";
-    case Opcode::setp_lt_s32:
-    case Opcode::setpi_lt_s32: return "setp.lt.s32";
-    case Opcode::setp_le_s32:
-    case Opcode::setpi_le_s32: return "setp.le.s32";
-    case Opcode::setp_gt_s32:
-    case Opcode::setpi_gt_s32: return "setp.gt.s32";
-    case Opcode::setp_ge_s32:
-    case Opcode::setpi_ge_s32: return "setp.ge.s32";
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_init_r: return "mbar.init";
-    case Opcode::mbar_arrive: return "mbar.arrive";
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_arrive_expect_tx_r: return "mbar.arrive.expect_tx";
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_test_wait_r: return "mbar.test_wait";
-    case Opcode::mbar_try_wait_i:
-    case Opcode::mbar_try_wait_r: return "mbar.try_wait";
-    case Opcode::tma_load_1d: return "tma.load.1d";
-    case Opcode::tma_load_2d: return "tma.load.2d";
-    case Opcode::tma_load_3d: return "tma.load.3d";
-    case Opcode::tma_load_4d: return "tma.load.4d";
-    case Opcode::tma_store_1d: return "tma.store.1d";
-    case Opcode::tma_store_2d: return "tma.store.2d";
-    case Opcode::tma_store_3d: return "tma.store.3d";
-    case Opcode::tma_store_4d: return "tma.store.4d";
-    case Opcode::acc_ld: return "acc.ld";
-    case Opcode::acc_ld_v8: return "acc.ld.v8";
-    case Opcode::acc_st: return "acc.st";
-    case Opcode::acc_st_v8: return "acc.st.v8";
-    case Opcode::mma_commit: return "mma.commit";
-    case Opcode::lds: return "lds";
-    case Opcode::sts: return "sts";
-    case Opcode::ldg: return "ldg";
-    case Opcode::stg: return "stg";
-    case Opcode::ldg_v8: return "ldg.v8";
-    case Opcode::stg_v8: return "stg.v8";
-    case Opcode::ldg_uni: return "ldg.uni";
-    case Opcode::lds_uni: return "lds.uni";
-    case Opcode::fence_sh: return "fence.sh";
-    case Opcode::nop: return "nop";
-    case Opcode::atom_add_uni: return "atom.add.uni";
-    case Opcode::atom_and_uni: return "atom.and.uni";
-    case Opcode::atom_xor_uni: return "atom.xor.uni";
-    case Opcode::atom_exch_uni: return "atom.exch.uni";
-    case Opcode::bra: return "bra";
-    case Opcode::bra_uni: return "bra.uni";
-    case Opcode::ssy: return "ssy";
-    case Opcode::sync: return "sync";
-    case Opcode::umov:
-    case Opcode::umovi: return "umov";
-    case Opcode::uadd: return "uadd";
-    case Opcode::uaddi: return "uaddi";
-    case Opcode::usub: return "usub";
-    case Opcode::ushl: return "ushl";
-    case Opcode::ushr: return "ushr";
-    case Opcode::ushli: return "ushli";
-    case Opcode::ushri: return "ushri";
-    case Opcode::uand: return "uand";
-    case Opcode::uor: return "uor";
-    case Opcode::uxor: return "uxor";
-    case Opcode::uandi: return "uandi";
-    case Opcode::uori: return "uori";
-    case Opcode::uxori: return "uxori";
-    case Opcode::usread: return "usread";
-    case Opcode::r2ur: return "r2ur";
-    case Opcode::ur2r: return "ur2r";
-    case Opcode::usetp_eq:
-    case Opcode::usetpi_eq: return "usetp.eq.u32";
-    case Opcode::usetp_ne:
-    case Opcode::usetpi_ne: return "usetp.ne.u32";
-    case Opcode::usetp_lt:
-    case Opcode::usetpi_lt: return "usetp.lt.u32";
-    case Opcode::usetp_le:
-    case Opcode::usetpi_le: return "usetp.le.u32";
-    case Opcode::usetp_gt:
-    case Opcode::usetpi_gt: return "usetp.gt.u32";
-    case Opcode::usetp_ge:
-    case Opcode::usetpi_ge: return "usetp.ge.u32";
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetpi_lt_s32: return "usetp.lt.s32";
-    case Opcode::usetp_le_s32:
-    case Opcode::usetpi_le_s32: return "usetp.le.s32";
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetpi_gt_s32: return "usetp.gt.s32";
-    case Opcode::usetp_ge_s32:
-    case Opcode::usetpi_ge_s32: return "usetp.ge.s32";
-    case Opcode::halt: return "halt";
-    }
+    if (const auto* mnemonic = opcode_info(opcode).mnemonic; mnemonic != nullptr) return mnemonic;
     std::ostringstream out;
     out << "opcode_0x" << std::hex << std::setw(2) << std::setfill('0')
         << static_cast<unsigned>(opcode);
     return out.str();
+}
+
+std::optional<Opcode> opcode_for_mnemonic(std::string_view mnemonic) {
+    for (uint32_t value = 0; value < isa_tables::opcodes.size(); ++value) {
+        const auto* name = isa_tables::opcodes[value].mnemonic;
+        if (name != nullptr && mnemonic == name) return static_cast<Opcode>(value);
+    }
+    return std::nullopt;
 }
 
 std::string format_control(const Control& control) {
@@ -849,228 +306,48 @@ std::string format_control(const Control& control) {
     return out.str();
 }
 
+// The mnemonic, then the form's operand text with each letter replaced
+// (src/isa.hpp, the forms).
 std::string format_instruction(
     const Instruction& inst, bool include_control, const std::vector<MmaShape>* mma_shapes) {
     std::ostringstream out;
     out << opcode_name(inst.opcode, mma_shapes);
-    // The second source: a uniform register when the U bit says so.
-    const auto source_b = [&] { return inst.src1_uniform ? ureg(inst.src1) : reg(inst.src1); };
-    if (is_mma_async(inst.opcode)) {
-        // The spacing is printed when it is not the default (as it is written).
-        const auto operand = [&](uint8_t base, bool a_operand) {
-            const auto spacing = mma_row_spacing(inst, a_operand);
-            return "[" + ureg(base) +
-                (spacing == mma_default_spacing ? std::string() : ", " + std::to_string(spacing)) + "]";
-        };
-        out << " [" << ureg(inst.src2) << "], " << operand(inst.src0, true) << ", "
-            << operand(inst.src1, false);
-        if (include_control) out << ' ' << format_control(inst.control);
-        return out.str();
-    }
-    switch (inst.opcode) {
-    case Opcode::sread:
-        out << ' ' << reg(inst.dst) << ", " << special_name(inst.imm);
-        break;
-    case Opcode::mov:
-        out << ' ' << reg(inst.dst) << ", " << inst.imm;
-        break;
-    case Opcode::add:
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << source_b();
-        break;
-    case Opcode::fma:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << source_b()
-            << ", " << reg(inst.src2);
-        break;
-    case Opcode::ex2:
-    case Opcode::rcp:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0);
-        break;
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
-            << ", " << source_b();
-        break;
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", " << reg(inst.src0)
-            << ", " << inst.imm;
-        break;
-    case Opcode::mbar_init_i:
-        out << " [" << ureg(inst.src0) << "], " << inst.imm;
-        break;
-    case Opcode::mbar_init_r:
-        out << " [" << ureg(inst.src0) << "], " << ureg(inst.src1);
-        break;
-    case Opcode::mbar_arrive:
-        out << " [" << ureg(inst.src0) << ']';
-        break;
-    case Opcode::mbar_arrive_expect_tx_i:
-        out << " [" << ureg(inst.src0) << "], " << inst.imm;
-        break;
-    case Opcode::mbar_arrive_expect_tx_r:
-        out << " [" << ureg(inst.src0) << "], " << ureg(inst.src1);
-        break;
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_try_wait_i:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
-            << "], " << inst.imm;
-        break;
-    case Opcode::mbar_test_wait_r:
-    case Opcode::mbar_try_wait_r:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", [" << ureg(inst.src0)
-            << "], " << ureg(inst.src1);
-        break;
-    case Opcode::tma_load_1d:
-    case Opcode::tma_load_2d:
-    case Opcode::tma_load_3d:
-    case Opcode::tma_load_4d:
-        out << " [" << ureg(inst.src0) << "], [" << inst.imm << ", " << ureg(inst.src1) << "], ["
-            << ureg(inst.src2) << ']';
-        break;
-    case Opcode::tma_store_1d:
-    case Opcode::tma_store_2d:
-    case Opcode::tma_store_3d:
-    case Opcode::tma_store_4d:
-        out << " [" << inst.imm << ", " << ureg(inst.src1) << "], [" << ureg(inst.src0) << "], ["
-            << ureg(inst.src2) << ']';
-        break;
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-        out << ' ' << reg(inst.dst) << ", [" << ureg(inst.src0) << ", " << inst.imm << ']';
-        break;
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-        out << " [" << ureg(inst.src0) << ", " << inst.imm << "], " << reg(inst.src1);
-        break;
-    case Opcode::mma_commit:
-        out << " [" << ureg(inst.src0) << ']';
-        break;
-    case Opcode::umov:
-    case Opcode::r2ur:
-        out << ' ' << ureg(inst.dst) << ", " << (inst.opcode == Opcode::umov ? ureg(inst.src0) : reg(inst.src0));
-        break;
-    case Opcode::ur2r:
-        out << ' ' << reg(inst.dst) << ", " << ureg(inst.src0);
-        break;
-    case Opcode::umovi:
-        // A small value as a number (addresses, counts); any other word as
-        // its 32 bits in hex (a float constant, a mask).
-        out << ' ' << ureg(inst.dst) << ", ";
-        if (inst.imm >= encoding::immediate_min && inst.imm <= encoding::immediate_max) {
-            out << inst.imm;
-        } else {
-            out << "0x" << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(inst.imm)
-                << std::dec << std::setfill(' ');
+    const auto& form = form_info(inst.opcode);
+    const auto registers = registers_of(inst);
+    const auto operand_text = [&](std::size_t slot) {
+        return register_text(file_of(form.operands[slot], inst), *registers[slot]);
+    };
+    // An mma.async operand: its spacing is printed when it is not the default.
+    const auto mma_operand = [&](uint8_t base, bool a_operand) {
+        const auto spacing = mma_row_spacing(inst, a_operand);
+        return "[" + register_text(RegisterFile::uniform, base) +
+            (spacing == mma_default_spacing ? std::string() : ", " + std::to_string(spacing)) + "]";
+    };
+    if (*form.text != '\0') out << ' ';
+    for (const char* letter = form.text; *letter != '\0'; ++letter) {
+        switch (*letter) {
+        case 'd': out << operand_text(0); break;
+        case 'a': out << operand_text(1); break;
+        case 'b': out << operand_text(2); break;
+        case 'c': out << operand_text(3); break;
+        case 'i': out << inst.imm; break;
+        case 'm': out << address(operand_text(1), inst.imm); break;
+        case 'j': out << (inst.imm >= 0 ? "+" : "") << inst.imm; break;
+        case 's': out << special_name(inst.imm); break;
+        case 'A': out << mma_operand(inst.src0, true); break;
+        case 'B': out << mma_operand(inst.src1, false); break;
+        case 'x':
+            // A small value as a number (addresses, counts); any other word as
+            // its 32 bits in hex (a float constant, a mask).
+            if (inst.imm >= encoding::immediate_min && inst.imm <= encoding::immediate_max) {
+                out << inst.imm;
+            } else {
+                out << "0x" << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(inst.imm)
+                    << std::dec << std::setfill(' ');
+            }
+            break;
+        default: out << *letter; break;
         }
-        break;
-    case Opcode::usread:
-        out << ' ' << ureg(inst.dst) << ", " << special_name(inst.imm);
-        break;
-    case Opcode::uadd:
-    case Opcode::usub:
-    case Opcode::ushl:
-    case Opcode::ushr:
-    case Opcode::uand:
-    case Opcode::uor:
-    case Opcode::uxor:
-        out << ' ' << ureg(inst.dst) << ", " << ureg(inst.src0) << ", " << ureg(inst.src1);
-        break;
-    case Opcode::uaddi:
-    case Opcode::ushli:
-    case Opcode::ushri:
-    case Opcode::uandi:
-    case Opcode::uori:
-    case Opcode::uxori:
-        out << ' ' << ureg(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
-        break;
-    case Opcode::usetp_eq:
-    case Opcode::usetp_ne:
-    case Opcode::usetp_lt:
-    case Opcode::usetp_le:
-    case Opcode::usetp_gt:
-    case Opcode::usetp_ge:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetp_ge_s32:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << ureg(inst.src1);
-        break;
-    case Opcode::usetpi_eq:
-    case Opcode::usetpi_ne:
-    case Opcode::usetpi_lt:
-    case Opcode::usetpi_le:
-    case Opcode::usetpi_gt:
-    case Opcode::usetpi_ge:
-    case Opcode::usetpi_lt_s32:
-    case Opcode::usetpi_le_s32:
-    case Opcode::usetpi_gt_s32:
-    case Opcode::usetpi_ge_s32:
-        out << " p" << static_cast<unsigned>(inst.dst) << ", " << ureg(inst.src0) << ", " << inst.imm;
-        break;
-    case Opcode::addi:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::andi:
-    case Opcode::ori:
-        out << ' ' << reg(inst.dst) << ", " << reg(inst.src0) << ", " << inst.imm;
-        break;
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-        out << ' ' << reg(inst.dst) << ", " << address(inst.src0, inst.imm);
-        break;
-    case Opcode::ldg_uni:
-    case Opcode::lds_uni:
-        out << ' ' << reg(inst.dst) << ", " << address(ureg(inst.src0), inst.imm);
-        break;
-    case Opcode::sts:
-    case Opcode::stg:
-    case Opcode::stg_v8:
-        out << ' ' << address(inst.src0, inst.imm) << ", " << reg(inst.src1);
-        break;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni:
-        out << ' ' << reg(inst.dst) << ", " << address(ureg(inst.src0), inst.imm) << ", " << ureg(inst.src1);
-        break;
-    case Opcode::bra:
-    case Opcode::bra_uni:
-    case Opcode::ssy:
-        out << ' ' << (inst.imm >= 0 ? "+" : "") << inst.imm;
-        break;
-    case Opcode::fence_sh:
-    case Opcode::sync:
-    case Opcode::nop:
-    case Opcode::halt:
-        break;
     }
     if (include_control) {
         out << ' ' << format_control(inst.control);
@@ -1078,241 +355,14 @@ std::string format_instruction(
     return out.str();
 }
 
-// The fixed-latency units' operations: which unit executes an instruction
-// (src/machine/arith.cpp) and so its latency (fixed_latency below).
-bool is_alu_operation(Opcode opcode) {
-    switch (opcode) {
-    case Opcode::sread:
-    case Opcode::mov:
-    case Opcode::add:
-    case Opcode::addi:
-    case Opcode::and_:
-    case Opcode::andi:
-    case Opcode::or_:
-    case Opcode::ori:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    // ur2r: its uniform operand, sampled with the round at issue + 1, rides
-    // the vector arithmetic pipeline to the RF write port like mov.
-    case Opcode::ur2r:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_fpu_operation(Opcode opcode) {
-    switch (opcode) {
-    case Opcode::fadd:
-    // The new float ops ride the FPU pipeline: fsub is fadd with a negation,
-    // and fmul/fma/fmax/cvt are full-width float datapaths, not 1-cycle ALU.
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::fma:
-    case Opcode::cvt_pack:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool is_sfu_operation(Opcode opcode) {
-    switch (opcode) {
-    case Opcode::ex2:
-    case Opcode::rcp:
-        return true;
-    default:
-        return false;
-    }
-}
-
 uint8_t fixed_latency(const Instruction& inst, const Timing& timing) {
-    if (is_mma_async(inst.opcode)) return 0; // asynchronous: its depbar clears at the last operand read
-    // A fixed-latency unit's operations take its latency.
-    if (is_alu_operation(inst.opcode)) return timing.alu;
-    if (is_fpu_operation(inst.opcode)) return timing.fadd;
-    if (is_sfu_operation(inst.opcode)) return timing.sfu;
-    switch (inst.opcode) {
-    // The arithmetic opcodes: each is in one unit's list above. (Named here
-    // so that this switch stays exhaustive: a new opcode is decided here.)
-    case Opcode::sread:
-    case Opcode::mov:
-    case Opcode::add:
-    case Opcode::addi:
-    case Opcode::and_:
-    case Opcode::andi:
-    case Opcode::or_:
-    case Opcode::ori:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::ur2r:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::fma:
-    case Opcode::cvt_pack:
-    case Opcode::ex2:
-    case Opcode::rcp:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-        throw SimError("internal: an arithmetic opcode in no fixed-latency unit's list");
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_test_wait_r:
-        return 1;
-    case Opcode::lds:
-    case Opcode::sts:
-    case Opcode::ldg:
-    case Opcode::stg:
-    case Opcode::ldg_v8:
-    case Opcode::stg_v8:
-    case Opcode::ldg_uni:
-    case Opcode::lds_uni:
-    case Opcode::bra:
-    case Opcode::bra_uni:
-    case Opcode::ssy:
-    case Opcode::sync:
-    case Opcode::mbar_init_i:
-    case Opcode::mbar_init_r:
-    case Opcode::mbar_arrive:
-    case Opcode::mbar_arrive_expect_tx_i:
-    case Opcode::mbar_arrive_expect_tx_r:
-    case Opcode::mbar_try_wait_i:
-    case Opcode::mbar_try_wait_r:
-    case Opcode::tma_load_1d:
-    case Opcode::tma_load_2d:
-    case Opcode::tma_load_3d:
-    case Opcode::tma_load_4d:
-    case Opcode::tma_store_1d:
-    case Opcode::tma_store_2d:
-    case Opcode::tma_store_3d:
-    case Opcode::tma_store_4d:
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8:
-    case Opcode::acc_st:
-    case Opcode::acc_st_v8:
-    case Opcode::mma_commit:
-    case Opcode::fence_sh:
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni:
-    case Opcode::nop:
-    case Opcode::halt:
-        return 0;
-    // The uniform register writers are not vector arithmetic: they present at
-    // the URF write port urf.issue_to_port_cycles after issue (src/timing.hpp).
-    // usetp rides the same pipeline and presents its predicate then.
-    case Opcode::usetp_eq:
-    case Opcode::usetp_ne:
-    case Opcode::usetp_lt:
-    case Opcode::usetp_le:
-    case Opcode::usetp_gt:
-    case Opcode::usetp_ge:
-    case Opcode::usetpi_eq:
-    case Opcode::usetpi_ne:
-    case Opcode::usetpi_lt:
-    case Opcode::usetpi_le:
-    case Opcode::usetpi_gt:
-    case Opcode::usetpi_ge:
-    case Opcode::usetp_lt_s32:
-    case Opcode::usetp_le_s32:
-    case Opcode::usetp_gt_s32:
-    case Opcode::usetp_ge_s32:
-    case Opcode::usetpi_lt_s32:
-    case Opcode::usetpi_le_s32:
-    case Opcode::usetpi_gt_s32:
-    case Opcode::usetpi_ge_s32:
-    case Opcode::umov:
-    case Opcode::umovi:
-    case Opcode::uadd:
-    case Opcode::uaddi:
-    case Opcode::usub:
-    case Opcode::ushl:
-    case Opcode::ushr:
-    case Opcode::ushli:
-    case Opcode::ushri:
-    case Opcode::uand:
-    case Opcode::uor:
-    case Opcode::uxor:
-    case Opcode::uandi:
-    case Opcode::uori:
-    case Opcode::uxori:
-    case Opcode::usread:
-    case Opcode::r2ur:
-        return 0;
+    switch (opcode_info(inst.opcode).unit) {
+    case IssueUnit::alu: return timing.alu;
+    case IssueUnit::fpu: return timing.fadd;
+    case IssueUnit::sfu: return timing.sfu;
+    case IssueUnit::none: throw SimError("latency requested for unknown opcode");
+    default: return is_mbar_test_wait(inst.opcode) ? 1 : 0;
     }
-    throw SimError("latency requested for unknown opcode");
-}
-
-// The fixed arithmetic pipeline's instructions (a nonzero fixed latency;
-// mbar.test_wait's one cycle is a probe, not arithmetic) and the four
-// per-lane memory instructions and their v8 forms (src/isa.hpp).
-bool can_be_masked(Opcode opcode) {
-    switch (opcode) {
-    case Opcode::lds:
-    case Opcode::sts:
-    case Opcode::ldg:
-    case Opcode::stg:
-    case Opcode::ldg_v8:
-    case Opcode::stg_v8:
-        return true;
-    case Opcode::mbar_test_wait_i:
-    case Opcode::mbar_test_wait_r:
-        return false;
-    default:
-        break;
-    }
-    Instruction probe;
-    probe.opcode = opcode;
-    return fixed_latency(probe, Timing{1, 1, 1}) != 0;
 }
 
 } // namespace nanosm

@@ -395,7 +395,9 @@ void Machine::deliver_write_acks(Wires& w) {
             throw SimError("internal: LSU store #" + std::to_string(ack.command) +
                 "'s write was acknowledged to a record that is not its own");
         }
-        if (++w.controller.store_acks[ack.ack_record] > record.acks_owed) {
+        auto& acks = w.controller.store_acks;
+        if (acks.empty()) acks.assign(store_acks_.count(), 0);
+        if (++acks.at(ack.ack_record) > record.acks_owed) {
             throw SimError("internal: LSU store #" + std::to_string(ack.command) +
                 " got more acknowledgements than it sent sectors");
         }

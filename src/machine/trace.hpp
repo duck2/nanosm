@@ -111,12 +111,13 @@ struct TraceSummary {
     uint64_t shmem_a_write_simt = 0;
     uint64_t shmem_a_write_rmw = 0;
     uint64_t shmem_b_write_tma = 0;
-    // The RF write decision: vector beats written by async
-    // holders (load slots, the load buffer, acc.ld pipelines); holder-cycles a
-    // ready holder was not granted; warp-cycles a SIMT instruction was refused
-    // because its result bank was inhibited (async service owed); and the
-    // mirrored read rule's: warp-cycles refused because a bank its reads
-    // book was inhibited (async read service owed).
+    // The RF write decision: vector beats written by async writers (the
+    // write-back entries, the old-word register, the load buffer, the acc.ld
+    // pipeline); writer-cycles a writer's request was not granted;
+    // warp-cycles a SIMT instruction was refused because its result bank
+    // was inhibited (async service owed); and the read side's: warp-cycles
+    // refused because a bank its reads use was inhibited (an async reader
+    // denied the cycle before).
     uint64_t rf_async_writes = 0;
     uint64_t rf_async_waits = 0;
     uint64_t rf_simt_inhibited = 0;

@@ -13,6 +13,12 @@ using namespace nanosm_test;
 
 using Slices = std::vector<std::pair<uint64_t, uint64_t>>;
 
+// An lds.uni's result is written to the RF D + Lb + (issue to grant) - 1
+// after its issue.
+uint32_t lds_shift(const nanosm::DeviceProfile& profile) {
+    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + issue_to_shmem_grant(profile) - 1;
+}
+
 void check_read_capacity(const nanosm::Machine& machine, const nanosm::DeviceProfile& profile) {
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> counts;
     require(!machine.trace().truncated(), "RF capacity check needs an untruncated trace");
@@ -100,10 +106,10 @@ TEST(Rf, rf_one_round_war_and_branch) {
     const auto& profile = canonical_profile();
     require(nanosm::issue_to_sample + 1 < nanosm::earliest_rf_visible(profile), "a younger write could land first");
     const auto fixed_writer = qtx_program("add r2, r0, r1\nmov r1, 7\nhalt", profile);
-    require(fixed_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall a fixed writer cannot need");
+    require_eq(fixed_writer.instructions[0].control.stall, 0, "qtxc's WAR stall before a fixed writer (none needed)");
     const auto source = "add r2, r0, r1\nlds r1, [r5]\nhalt";
     const auto async_writer = qtx_program(source, profile);
-    require(async_writer.instructions[0].control.stall == 0, "qtxc bought a WAR stall an async writer cannot need");
+    require_eq(async_writer.instructions[0].control.stall, 0, "qtxc's WAR stall before an async writer (none needed)");
     auto launch = launch_warps(1);
     write_u32(image_bytes(launch.test_shmem, 64), 0, 7);
     nanosm::Machine war(profile, compile(source, profile), std::move(launch));
@@ -161,10 +167,11 @@ TEST(RfSlow, rf_seeded_competing_warps) {
     source += "halt\n";
     nanosm::Machine machine(profile, compile(source, profile), launch_warps(warps), {.timeline = true, .debug = true});
     machine.run(50000);
-    for (uint32_t warp = 0; warp < warps; ++warp)
-        for (uint32_t lane = 0; lane < profile.lanes; ++lane)
-            for (uint32_t r = 0; r < expected.size(); ++r)
-                require(machine.read_reg(warp, lane, r) == expected[r], "seeded RF contention changed the sequential result");
+    for (uint32_t warp = 0; warp < warps; ++warp) {
+        for (uint32_t r = 0; r < expected.size(); ++r) {
+            require_lanes(machine, r, expected[r], "the sequential result under seeded RF contention", warp);
+        }
+    }
     check_read_capacity(machine, profile);
 }
 
@@ -206,10 +213,10 @@ TEST(Rf, lds_issue_ignores_its_rounds) {
         nanosm::Machine machine(profile, hand_assemble(hand_asm(profile, body), profile), std::move(launch),
             nanosm::TraceOptions{.timeline = true});
         const auto written = watch_registers(machine, {6});
-        for (uint32_t lane = 0; lane < 16; ++lane) {
+        require_lanes(machine, 6, [&](uint32_t lane) {
             const auto word = lane & mask;
-            require(machine.read_reg(0, lane, 6) == (word == 0 ? mask : 0x100 + word), "lds lane value");
-        }
+            return word == 0 ? mask : 0x100 + word;
+        }, "lds lane value");
         const auto issue = issued_at(machine, 6 * 8);
         require(issue.size() == 1 && written.at(6).size() == 1, "the lds issued or wrote more than once");
         return Outcome{issue[0], written.at(6)[0], shmem_request_rounds(machine)};
@@ -218,14 +225,13 @@ TEST(Rf, lds_issue_ignores_its_rounds) {
     const auto two_rounds = run(7);
     require(one_round.rounds == std::vector<uint32_t>{1, 1} && two_rounds.rounds == std::vector<uint32_t>{1, 2},
         "the masks did not give one and two bank rounds");
-    require(one_round.issue == two_rounds.issue,
-        "the lds's issue cycle depends on its own addresses: " + std::to_string(one_round.issue) + " vs " +
-            std::to_string(two_rounds.issue));
+    require_eq(one_round.issue, two_rounds.issue,
+        "the lds's issue cycle at one round, against two (it does not depend on its own addresses)");
     const auto wd = profile.rf_write_depth_cycles;
-    require(one_round.written == one_round.issue + one_round_port + wd,
-        "one round: the result did not land at issue + one_round_port + Wd");
-    require(two_rounds.written == two_rounds.issue + one_round_port + 2 + wd,
-        "two rounds: the result (ready when the fadd's booking holds bank 0) was not written one cycle later");
+    require_eq(one_round.written, one_round.issue + one_round_port + wd,
+        "one round: the result's landing (issue + one_round_port + Wd)");
+    require_eq(two_rounds.written, two_rounds.issue + one_round_port + 2 + wd,
+        "two rounds: the result's landing (ready when the fadd's booking holds bank 0: written one cycle later)");
 }
 
 // The RF write decision against fixed bookings. A ready async result denied
@@ -337,24 +343,23 @@ TEST(Rf, rf_owed_inhibits_after_denial) {
         const auto where = c.what + ": ";
         const auto log = " | issues" + issue_log(*machine);
         for (const auto& [index, cycles] : c.issues) {
-            require(issued_at(*machine, index * 8) == cycles,
-                where + "instruction " + std::to_string(index) + " did not issue at its cycle" + log);
+            require_eq(issued_at(*machine, index * 8), cycles,
+                where + "instruction " + std::to_string(index) + "'s issue cycles", log);
         }
         for (const auto& [reg, cycles] : c.writes) {
             const auto landed = written.find(reg);
-            require(landed != written.end() && landed->second == cycles,
-                where + "r" + std::to_string(reg) + " did not land at its cycle" + log);
+            require(landed != written.end(), where + "r" + std::to_string(reg) + " never landed" + log);
+            require_eq(landed->second, cycles, where + "r" + std::to_string(reg) + "'s landing cycles", log);
         }
         if (c.inhibited) {
-            require(refusals(*machine, 0, "RF write inhibited") == *c.inhibited,
-                where + "inhibited" + describe(refusals(*machine, 0, "RF write inhibited")) + log);
+            require_eq(refusals(*machine, 0, "RF write inhibited"), *c.inhibited, where + "inhibited (start, cycles)", log);
         }
         if (c.reserved) {
-            require(refusals(*machine, 0, "RF write reservation") == *c.reserved,
-                where + "refused for the port" + describe(refusals(*machine, 0, "RF write reservation")) + log);
+            require_eq(refusals(*machine, 0, "RF write reservation"), *c.reserved,
+                where + "refused for the port (start, cycles)", log);
         }
         for (const auto& [name, member, value] : c.counters) {
-            require(machine->trace().summary().*member == value, where + "the counter of " + name);
+            require_eq(machine->trace().summary().*member, value, where + "the counter of " + name);
         }
     }
 }
@@ -455,15 +460,15 @@ TEST(Rf, acc_ld_pipeline_freeze) {
         seen[cycle] = {machine->trace().summary().tmem_load_beats, machine->depbar_value(0, 1), machine->done()};
     });
     const auto log = " | issues" + issue_log(*machine);
-    require(issued_at(*machine, 19 * 8) == std::vector<uint64_t>{acc_ld_issue},
-        "acc.ld issue moved with the fadd latency; the calibration does not hold");
+    require_eq(issued_at(*machine, 19 * 8), std::vector<uint64_t>{acc_ld_issue},
+        "acc.ld's issue (the calibration: it does not move with the fadd latency)");
     // Beats 0 .. Lt - 1 sampled tmem before P; beat Lt samples at P itself.
-    require(seen.at(p - 1).tmem_reads == lt, "tmem samples before the hold");
+    require_eq(seen.at(p - 1).tmem_reads, lt, "tmem samples before the hold");
     for (uint64_t cycle = p - 1; cycle <= p + 5; ++cycle) {
         const auto& at = seen.at(cycle);
         if (cycle >= p) {
-            require(at.tmem_reads == lt + 1,
-                "a tmem read launched or sampled while the output was held (c" + std::to_string(cycle) + ")");
+            require_eq(at.tmem_reads, lt + 1,
+                "tmem samples at c" + std::to_string(cycle) + " (none launched or sampled while the output is held)");
         }
         require(at.sb1 == 1 && !at.done, "the depbar or done() moved while a beat was held");
     }
@@ -471,17 +476,16 @@ TEST(Rf, acc_ld_pipeline_freeze) {
     const std::vector<uint64_t> port{p + 6, p + 7, p + 8, p + 9, p + 10, p + 11, p + 13, p + 14};
     for (uint32_t beat = 0; beat < 8; ++beat) {
         const auto reg = 16 + beat;
-        require(written.at(reg) == std::vector<uint64_t>{port[beat] + wd},
-            "beat " + std::to_string(beat) + " was not written exactly once at P + " + std::to_string(port[beat] - p) +
-                " (landing Wd later)" + log);
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_reg(0, lane, reg) == lane + 1 + 100 * beat, "beat " + std::to_string(beat) + " data");
-        }
+        require_eq(written.at(reg), std::vector<uint64_t>{port[beat] + wd},
+            "beat " + std::to_string(beat) + "'s landing (written once at P + " + std::to_string(port[beat] - p) +
+                ", landing Wd later)", log);
+        require_lanes(*machine, reg, [&](uint32_t lane) { return lane + 1 + 100 * beat; },
+            "beat " + std::to_string(beat) + " data");
     }
     require(seen.at(port[7] + wd - 1).sb1 == 1 && seen.at(port[7] + wd).sb1 == 0,
         "the depbar did not clear exactly as the last beat's write landed");
-    require(refusals(*machine, 0, "RF write inhibited") == Slices{{p + 2, 5}},
-        "the add was not inhibited while beat 0 was denied with service owed" + log);
+    require_eq(refusals(*machine, 0, "RF write inhibited"), Slices{{p + 2, 5}},
+        "the add's inhibition while beat 0 was denied with service owed (start, cycles)", log);
     require(machine->trace().summary().tmem_load_beats == 8 && machine->trace().summary().rf_async_writes == 8,
         "beats launched or written more than once");
 }
@@ -526,13 +530,13 @@ TEST(Rf, writeback_buffer) {
     });
     const auto log = " | issues" + issue_log(*machine);
     const auto reads = grant_cycles(*machine, "A-read", "simt");
-    require(reads.size() == 3, "three A-read rounds" + log);
+    require_eq(reads.size(), 3, "A-read rounds", log);
     const auto g0 = written.at(3).at(0) - wd; // entry 0's RF write grant
-    require(written.at(6).at(0) == g0 + 1 + wd, "the second load's write did not follow the first's" + log);
-    require(reads[2] == g0 + 1, "the third load's round was not granted the cycle after entry 0's RF write grant" + log);
+    require_eq(written.at(6).at(0), g0 + 1 + wd, "the second load's landing (the cycle after the first's)", log);
+    require_eq(reads[2], g0 + 1, "the third load's round grant (the cycle after entry 0's RF write grant)", log);
     require(store_cycle.has_value() && *store_cycle < g0, "port A did not serve the sts while both entries held words" + log);
     require(machine->read_reg(0, 7, 9) == 0x102, "the third load's word");
-    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(1024 + 4 * lane) == 7, "sts data");
+    require_lanes(shmem_lanes(*machine, 1024), 7, "sts data");
 }
 
 
@@ -593,7 +597,7 @@ TEST(Rf, helper_contract) {
         });
         const auto issue = [&](uint32_t index) {
             const auto cycles = issued_at(*machine, index * 8);
-            require(cycles.size() == 1, what + "instruction " + std::to_string(index) + " did not issue once");
+            require_eq(cycles.size(), 1, what + "issues of instruction " + std::to_string(index));
             return cycles[0];
         };
         const auto inst = [&](uint32_t index) { return nanosm::decode(kernel.words.at(index)); };
@@ -616,9 +620,9 @@ TEST(Rf, helper_contract) {
                     name + "r" + std::to_string(reg) + " was not sampled at issue + issue_to_sample" + log);
             }
             const auto port = i + nanosm::issue_to_port(op, profile);
-            require(rf_events(*machine, "RF write", dst) == std::vector<uint64_t>{port},
-                name + "not presented at the RF write port at issue + issue_to_port" + log);
-            require(landed.at(dst) == std::vector<uint64_t>{port + wd}, name + "did not land at port + Wd");
+            require_eq(rf_events(*machine, "RF write", dst), std::vector<uint64_t>{port},
+                name + "presented at the RF write port (issue + issue_to_port)", log);
+            require_eq(landed.at(dst), std::vector<uint64_t>{port + wd}, name + "landed (port + Wd)");
         }
 
         // lds r7, [r6 + 256]: one round; its depbar waiter is the add r12.
@@ -630,12 +634,12 @@ TEST(Rf, helper_contract) {
             require(reads.size() == 1 && reads[0].cycle == i + issue_to_shmem_grant(profile, true),
                 name + "A-read grant:" + describe(reads));
             const auto port = reads[0].cycle + read_return(profile) + 1;
-            require(rf_events(*machine, "RF write", 7) == std::vector<uint64_t>{port},
-                name + "not presented at the RF port the cycle after its words" + log);
-            require(landed.at(7) == std::vector<uint64_t>{port + wd}, name + "did not land at port + Wd");
+            require_eq(rf_events(*machine, "RF write", 7), std::vector<uint64_t>{port},
+                name + "presented at the RF port (the cycle after its words)", log);
+            require_eq(landed.at(7), std::vector<uint64_t>{port + wd}, name + "landed (port + Wd)");
             require(sb0.at(port + wd) == 1 && sb0.at(port + wd + 1) == 0,
                 name + "the depbar did not clear at the visibility (W + Wd + 1)");
-            require(issue(15) == port + wd + 1, name + "the waiting add did not issue at the visibility" + log);
+            require_eq(issue(15), port + wd + 1, name + "the waiting add's issue (at the visibility)", log);
             require(port + wd + 1 - i >= floor, name + "visible before the floor");
         }
 
@@ -648,7 +652,7 @@ TEST(Rf, helper_contract) {
             const auto writes = grants_of(*machine, "A-write");
             require(writes.size() == 1 && writes[0].cycle == i + issue_to_shmem_grant(profile, true),
                 name + "A-write grant:" + describe(writes));
-            require(stored == writes[0].cycle + profile.shmem_port_a_depth, name + "the word did not reach the RAM D after the grant");
+            require_eq(stored, writes[0].cycle + profile.shmem_port_a_depth, name + "the word reached the RAM (D after the grant)");
         }
 
         // acc.ld r11, [ur8, 64]: one beat; its depbar waiter is the add r14.
@@ -665,15 +669,15 @@ TEST(Rf, helper_contract) {
             std::vector<uint64_t> beats;
             for (const auto& event : events_named(*machine, "acc.ld beat")) beats.push_back(event.start_cycle);
             const auto launch = i + t + 1;
-            require(beats == std::vector<uint64_t>{launch + profile.tmem_port_depth},
-                name + "the tmem sample was not at the launch (dispatch + 1) + tmem port depth");
+            require_eq(beats, std::vector<uint64_t>{launch + profile.tmem_port_depth},
+                name + "the tmem sample (the launch, dispatch + 1, + tmem port depth)");
             const auto port = launch + profile.tmem_port_depth + profile.tmem_read_latency_cycles;
             const auto presented = rf_events(*machine, "RF write", 11); // the mov's 77, then the beat
             require(presented.size() == 2 && presented.back() == port,
                 name + "not presented at the RF port after the pipeline stage" + log);
             require(landed.at(11).size() == 2 && landed.at(11).back() == port + wd,
                 name + "did not land at port + Wd (after the mov's 77)");
-            require(issue(14) == port + wd + 1, name + "the waiting add did not issue at the visibility" + log);
+            require_eq(issue(14), port + wd + 1, name + "the waiting add's issue (at the visibility)", log);
             require(port + wd + 1 - i >= floor, name + "visible before the floor");
         }
         require(machine->read_reg(0, 5, 3) == 12 && machine->read_reg(0, 5, 7) == 0x100 + 64 + 5 &&
@@ -706,7 +710,7 @@ TEST(Rf, dependent_add_distance) {
         const auto what = depth_what(profile);
         const auto scheduled = qtx_program("add r1, r0, r0\nadd r2, r1, r1\nhalt\n", profile);
         const auto distance = nanosm::issue_to_visible(scheduled.instructions[0], profile) - nanosm::issue_register_stages;
-        require(scheduled.instructions[0].control.stall == distance, what + "qtxc's stall is not the helper's distance");
+        require_eq(scheduled.instructions[0].control.stall, distance, what + "qtxc's stall (the helper's distance)");
         const auto run = [&](uint64_t stall) {
             const auto text = hand_asm(profile, "sread r0, LANE_ID {pred=PT, stall=" +
                 std::to_string(alu_distance(profile)) + ", set=-, wait=-}\nadd r1, r0, r0 {pred=PT, stall=" +
@@ -715,7 +719,8 @@ TEST(Rf, dependent_add_distance) {
         };
         auto exact = run(distance);
         exact->run();
-        require(issued_at(*exact, 16).at(0) - issued_at(*exact, 8).at(0) == distance, what + "the consumer moved");
+        require_eq(issued_at(*exact, 16).at(0) - issued_at(*exact, 8).at(0), distance,
+            what + "the consumer's distance from its producer");
         require(exact->read_reg(0, 5, 2) == 20, what + "at the qtxc distance the add did not read the new r1");
         auto early = run(distance - 1);
 #if NANOSM_SANITIZER
@@ -742,7 +747,7 @@ TEST(Rf, waw_order) {
         const auto what = depth_what(profile);
         const auto scheduled = qtx_program("fadd r3, r1, r1\nadd r3, r2, r2\nhalt\n", profile);
         const uint64_t stall = profile.timing.fadd - profile.timing.alu + 1;
-        require(scheduled.instructions[0].control.stall == stall, what + "qtxc's WAW stall");
+        require_eq(scheduled.instructions[0].control.stall, stall, what + "qtxc's WAW stall");
         // r1 = 1.0f (0x3f8 << 20), r2 = 3; each mov / shli stalls its full
         // distance (assembled as written: the stalls under test are not raised).
         const auto run = [&](uint64_t fadd_stall) {
@@ -786,12 +791,11 @@ TEST(Rf, async_writer_vs_fixed_booking) {
             "add r6, r1, r1\n"
             "halt {pred=PT, stall=0, set=-, wait=sb0}\n");
         const auto landed = watch_registers(*machine, {3});
-        require(issued_at(*machine, 8) == std::vector<uint64_t>{add_issue}, what + "the add moved" + issue_log(*machine));
-        require(rf_events(*machine, "RF write", 6) == std::vector<uint64_t>{p} &&
-                rf_events(*machine, "RF write", 3) == std::vector<uint64_t>{p + 1},
-            what + "the booked add did not keep the port at P, or the lds was not written at P + 1");
-        require(landed.at(3) == std::vector<uint64_t>{p + 1 + wd} && machine->trace().summary().rf_async_waits == 1,
-            what + "the lds's write did not land at P + 1 + Wd after one wait");
+        require_eq(issued_at(*machine, 8), std::vector<uint64_t>{add_issue}, what + "the add's issue", issue_log(*machine));
+        require_eq(rf_events(*machine, "RF write", 6), std::vector<uint64_t>{p}, what + "the booked add's port cycle (P)");
+        require_eq(rf_events(*machine, "RF write", 3), std::vector<uint64_t>{p + 1}, what + "the lds's port cycle (P + 1)");
+        require_eq(landed.at(3), std::vector<uint64_t>{p + 1 + wd}, what + "the lds's landing (P + 1 + Wd)");
+        require_eq(machine->trace().summary().rf_async_waits, 1, what + "the lds's waits");
         require(machine->read_reg(0, 0, 3) == 0x100, what + "lds data");
     }
 }
@@ -897,7 +901,7 @@ TEST(Rf, back_to_back_same_bank_reads) {
         auto machine = debug_machine(profile, body, warps);
         machine->run();
         const auto log = " | issues" + issue_log(*machine);
-        require(machine->trace().summary().rf_simt_read_inhibited == 0, what + "a read was inhibited");
+        require_eq(machine->trace().summary().rf_simt_read_inhibited, 0, what + "reads inhibited");
         std::set<uint64_t> run_issues;
         std::set<uint64_t> bank0_rounds;            // the read rounds of run instructions that read bank 0
         std::map<uint64_t, uint32_t> bank0_samples; // SIMT samples of bank 0 by cycle
@@ -911,7 +915,7 @@ TEST(Rf, back_to_back_same_bank_reads) {
             std::vector<uint64_t> issues;
             for (std::size_t index = 0; index < sources.size(); ++index) {
                 const auto cycles = warp_issue_cycles(*machine, warp, static_cast<uint32_t>(96 + 8 * index));
-                require(cycles.size() == 1, what + "run instruction " + std::to_string(index) + " did not issue once" + log);
+                require_eq(cycles.size(), 1, what + "issues of run instruction " + std::to_string(index), log);
                 const auto cycle = cycles[0];
                 issues.push_back(cycle);
                 run_issues.insert(cycle);
@@ -928,29 +932,30 @@ TEST(Rf, back_to_back_same_bank_reads) {
                             ++samples;
                         }
                     }
-                    require(samples == 1, what + "r" + std::to_string(reg) + " of run instruction " +
-                        std::to_string(index) + " was not sampled at issue + 1" + log);
+                    require_eq(samples, 1, what + "samples of r" + std::to_string(reg) + " of run instruction " +
+                        std::to_string(index) + " at issue + 1", log);
                 }
             }
             if (warps == 1) {
                 for (std::size_t i = 1; i < issues.size(); ++i) {
-                    require(issues[i] == issues[0] + i, what + "the run did not issue back to back" + log);
+                    require_eq(issues[i], issues[0] + i, what + "run instruction " + std::to_string(i) +
+                        "'s issue (back to back)", log);
                 }
                 // The stg's command slot reads r9 in the lds's round.
                 bank0_rounds.insert(issues[7] + 1);
             }
-            for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-                const auto base = 4 * lane + 64 * warp;
-                require(machine->read_reg(warp, lane, 10) == 104 && machine->read_reg(warp, lane, 11) == 208 &&
-                        machine->read_reg(warp, lane, 13) == (12u ^ 5u) &&
-                        machine->read_reg(warp, lane, 14) == base + 1 && machine->read_reg(warp, lane, 17) == 24,
-                    what + "arithmetic data");
-                if (warps == 1) {
-                    require(machine->read_reg(warp, lane, 16) == 0x100 + 516 / 4 &&
-                            machine->read_reg(warp, lane, 19) == 0x100 + (2048 + base) / 4 &&
-                            machine->read_gmem_u32(4096 + base) == 100,
-                        what + "memory data");
-                }
+            const auto base = [warp](uint32_t lane) { return 4 * lane + 64 * warp; };
+            require_lanes(*machine, 10, 104, what + "arithmetic data", warp);
+            require_lanes(*machine, 11, 208, what + "arithmetic data", warp);
+            require_lanes(*machine, 13, 12u ^ 5u, what + "arithmetic data", warp);
+            require_lanes(*machine, 14, [&](uint32_t lane) { return base(lane) + 1; }, what + "arithmetic data", warp);
+            require_lanes(*machine, 17, 24, what + "arithmetic data", warp);
+            if (warps == 1) {
+                require_lanes(*machine, 16, 0x100 + 516 / 4, what + "memory data", warp);
+                require_lanes(*machine, 19, [&](uint32_t lane) { return 0x100 + (2048 + base(lane)) / 4; },
+                    what + "memory data", warp);
+                require_lanes([&](uint32_t lane) { return machine->read_gmem_u32(4096 + base(lane)); }, 100,
+                    what + "memory data (the stg)");
             }
         }
         // Full sampling rate: from the run's first issue to its last, an
@@ -959,11 +964,10 @@ TEST(Rf, back_to_back_same_bank_reads) {
         // (uniform base only), where it is not sampled at all.
         const auto first = *run_issues.begin();
         const auto last = *run_issues.rbegin();
-        require(run_issues.size() == last - first + 1, what + "the run's issues have a gap" + log);
+        require_eq(run_issues.size(), last - first + 1, what + "the run's issue cycles (no gap)", log);
         for (auto cycle = first + 1; cycle <= last + 1; ++cycle) {
             const auto expected = static_cast<uint32_t>(bank0_rounds.count(cycle));
-            require(bank0_samples[cycle] == expected, what + "bank 0 was not sampled " +
-                std::to_string(expected) + " time(s) at c" + std::to_string(cycle) + log);
+            require_eq(bank0_samples[cycle], expected, what + "bank 0 samples at c" + std::to_string(cycle), log);
         }
         check_read_capacity(*machine, profile);
     }
@@ -1043,11 +1047,9 @@ TEST(Rf, same_bank_sources_are_malformed) {
         halt
     )", profile), std::move(launch), {.timeline = true, .debug = true});
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 2) == 8 * lane && machine.read_reg(0, lane, 5) == nanosm::float_bits(2.0f) &&
-                machine.read_shmem_u32(64 + 4 * lane) == 4 * lane,
-            "a repeated source register computed the wrong value");
-    }
+    require_lanes(machine, 2, [](uint32_t lane) { return 8 * lane; }, "add with a repeated source register");
+    require_lanes(machine, 5, nanosm::float_bits(2.0f), "fma with a repeated source register");
+    require_lanes(shmem_lanes(machine, 64), [](uint32_t lane) { return 4 * lane; }, "sts with a repeated source register");
     check_read_capacity(machine, profile);
 }
 
@@ -1056,8 +1058,8 @@ TEST(Rf, same_bank_sources_are_malformed) {
 // tmem pointer is a uniform register: its own read round takes no RF port).
 // The acc.st, accepted at a, reaches its unit at a + issue_to_dispatch and
 // its beat wants bank 0 from a + 4, where the issue register (the addi
-// accepted at a + 3) owns bank 0: the beat is denied with service owed while
-// the addi accepted at a + 4 reads bank 0 too, so bank 0's read inhibit bit
+// accepted at a + 3) owns bank 0: the beat is denied while the addi accepted
+// at a + 4 takes bank 0's one read port too, so bank 0's read inhibit bit
 // is set for a + 5 -- the next candidate, an add reading banks 0 AND 1, is
 // refused at a + 5, all or none: nothing of it is read in a + 6, bank 1
 // included. At a + 6 the beat takes bank 0 and the add is accepted in the
@@ -1098,22 +1100,20 @@ TEST(Rf, async_reader_gets_the_hole) {
         const auto a = issued_at(*machine, 5 * 8).at(0);
         const std::vector<uint64_t> expected{a + 1, a + 2, a + 3, a + 4, a + 6};
         for (uint32_t i = 0; i < expected.size(); ++i) {
-            require(issued_at(*machine, (6 + i) * 8) == std::vector<uint64_t>{expected[i]},
-                "SIMT instruction " + std::to_string(i) + " did not issue at its cycle" + log);
+            require_eq(issued_at(*machine, (6 + i) * 8), std::vector<uint64_t>{expected[i]},
+                "SIMT instruction " + std::to_string(i) + "'s issue", log);
         }
-        require(refusals(*machine, 0, "RF read inhibited") == Slices{{a + 5, 1}},
-            "the refusal:" + describe(refusals(*machine, 0, "RF read inhibited")) + log);
+        require_eq(refusals(*machine, 0, "RF read inhibited"), Slices{{a + 5, 1}}, "the refusal (start, cycles)", log);
         const auto reads = warp0_reads(*machine);
         require(reads.contains(a + 6) && reads.at(a + 6) == std::vector<std::pair<uint32_t, uint32_t>>{{0, 0}},
             "in the hole cycle the beat was not the only read (a refused instruction read a register?)");
-        require(rf_events(*machine, "RF read", 27) == std::vector<uint64_t>{a + 2, a + 3, a + 4, a + 5, a + 7} &&
-                rf_events(*machine, "RF read", 28) == std::vector<uint64_t>{a + 7},
-            "an accepted instruction was not sampled at its issue + 1");
-        require(machine->trace().summary().rf_simt_read_inhibited == 1, "inhibited cycles");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_reg(0, lane, 4) == 12 && machine->read_reg(0, lane, 10) == lane,
-                "the add or the acc.st -> acc.ld round trip");
-        }
+        require_eq(rf_events(*machine, "RF read", 27), std::vector<uint64_t>{a + 2, a + 3, a + 4, a + 5, a + 7},
+            "samples of r27 (each accepted instruction's at its issue + 1)");
+        require_eq(rf_events(*machine, "RF read", 28), std::vector<uint64_t>{a + 7},
+            "samples of r28 (each accepted instruction's at its issue + 1)");
+        require_eq(machine->trace().summary().rf_simt_read_inhibited, 1, "inhibited cycles");
+        require_lanes(*machine, 4, 12, "the add");
+        require_lanes(*machine, 10, [](uint32_t lane) { return lane; }, "the acc.st -> acc.ld round trip");
         check_read_capacity(*machine, profile);
     }
     {
@@ -1172,7 +1172,7 @@ TEST(Rf, async_reader_gets_the_hole) {
             require(refusals(machine, warp, "RF read inhibited").empty(),
                 "warp " + std::to_string(warp) + " was inhibited although the bank-1 addi left the hole" + log);
         }
-        require(last_rf_read(machine, 0) == a + 6, "the beat did not take the hole at a + 6" + log);
+        require_eq(last_rf_read(machine, 0), a + 6, "the beat's read (the hole at a + 6)", log);
         for (uint32_t warp = 0; warp < 3; ++warp) {
             require(machine.read_reg(warp, 0, warp == 2 ? 4 : 2) == (warp == 2 ? 10u : 7u), "data");
         }
@@ -1185,8 +1185,8 @@ TEST(Rf, async_reader_gets_the_hole) {
 // a stream of addis reading r27 (bank 0) in round-robin order. First the
 // order: the acc.st (a) wants r0 from a + 4, the stg.v8 (a + 1) its r18 from
 // a + 4; the issue register's addi owns bank 0 there and at a + 5 (the addi
-// accepted at a + 4, before the inhibit bit is set), so both are denied with
-// service owed (refusal at a + 5); the hole at a + 6 goes to the acc.st; the
+// accepted at a + 4, before the inhibit bit is set), so both are denied
+// (refusal at a + 5); the hole at a + 6 goes to the acc.st; the
 // LSU is denied again at a + 6 and a + 7 (refusal at a + 8) and takes the
 // hole at a + 9. Then persistent pressure (60 addis) against acc.st.v8 and
 // stg.v8, both coming back to bank 0 every third register: no accepted read
@@ -1196,10 +1196,8 @@ TEST(Rf, async_reader_gets_the_hole) {
 // async reader the next cycle, and the data (tmem read back, gmem) are right.
 TEST(Rf, async_readers_round_robin) {
     const auto stg_data = [](const nanosm::Machine& machine) {
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            for (uint32_t j = 0; j < 8; ++j) {
-                require(machine.read_gmem_u32(32 * lane + 4 * j) == lane + 200 + 10 * j, "stg.v8 data");
-            }
+        for (uint32_t j = 0; j < 8; ++j) {
+            require_lanes(gmem_lanes(machine, 4 * j, 32), [&](uint32_t lane) { return lane + 200 + 10 * j; }, "stg.v8 data");
         }
     };
     {
@@ -1234,12 +1232,10 @@ TEST(Rf, async_readers_round_robin) {
         require(refused.size() >= 2 && refused[0] == std::pair<uint64_t, uint64_t>{a + 5, 1} &&
                 refused[1] == std::pair<uint64_t, uint64_t>{a + 8, 1},
             "the first two refusals:" + describe(refused) + log);
-        require(last_rf_read(*machine, 0) == a + 6 && last_rf_read(*machine, 18) == a + 9,
-            "the holes did not go acc.st, LSU in turn" + log);
+        require_eq(last_rf_read(*machine, 0), a + 6, "the acc.st's read (the first hole)", log);
+        require_eq(last_rf_read(*machine, 18), a + 9, "the LSU's read (the next hole)", log);
         require_holes_used(*machine, refused);
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_reg(0, lane, 50) == lane, "tmem data (acc.st -> acc.ld)");
-        }
+        require_lanes(*machine, 50, [](uint32_t lane) { return lane; }, "tmem data (acc.st -> acc.ld)");
         stg_data(*machine);
         check_read_capacity(*machine, profile);
     }
@@ -1287,10 +1283,8 @@ TEST(Rf, async_readers_round_robin) {
         require(longest <= 5, "an acc.st beat waited " + std::to_string(longest) + " cycles" + log);
         require(machine->trace().summary().rf_simt_read_inhibited > 0, "the pressure never needed an inhibition");
         require_holes_used(*machine, refusals(*machine, 0, "RF read inhibited"));
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            for (uint32_t j = 0; j < 8; ++j) {
-                require(machine->read_reg(0, lane, 50 + j) == lane + 10 * j, "tmem data (acc.st.v8 -> acc.ld.v8)");
-            }
+        for (uint32_t j = 0; j < 8; ++j) {
+            require_lanes(*machine, 50 + j, [&](uint32_t lane) { return lane + 10 * j; }, "tmem data (acc.st.v8 -> acc.ld.v8)");
         }
         stg_data(*machine);
         check_read_capacity(*machine, profile);
@@ -1322,7 +1316,7 @@ TEST(Rf, async_writer_under_a_booking_stream) {
     require(written.size() == 1 && written[0] > p, "the lds.uni's result was not denied at P" + log);
     require(written[0] <= p + d + 1, "the result waited " + std::to_string(written[0] - p) +
         " cycles under the stream (bound " + std::to_string(d + 1) + ")" + log);
-    require(machine->trace().summary().rf_async_waits == written[0] - p, "the result's waits");
+    require_eq(machine->trace().summary().rf_async_waits, written[0] - p, "the result's waits");
     require(machine->trace().summary().rf_simt_inhibited > 0, "the stream was never inhibited" + log);
     const auto inhibited = refusals(*machine, 0, "RF write inhibited");
     require(inhibited.size() == 1 && inhibited[0].first == p + 1 && inhibited[0].first + inhibited[0].second == written[0] + 1,
@@ -1375,10 +1369,8 @@ TEST(Rf, async_reader_under_a_read_stream) {
     require(longest >= 1 && longest <= 2, "the longest beat wait was " + std::to_string(longest) +
         " cycles (bound 2)" + log);
     require_holes_used(*machine, refusals(*machine, 0, "RF read inhibited"));
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        for (uint32_t j = 0; j < 8; ++j) {
-            require(machine->read_reg(0, lane, 50 + j) == lane + 10 * j, "tmem data (acc.st.v8 -> acc.ld.v8)");
-        }
+    for (uint32_t j = 0; j < 8; ++j) {
+        require_lanes(*machine, 50 + j, [&](uint32_t lane) { return lane + 10 * j; }, "tmem data (acc.st.v8 -> acc.ld.v8)");
     }
     check_read_capacity(*machine, profile);
 }
@@ -1418,12 +1410,11 @@ TEST(Rf, sixteen_warps) {
     }
     require(tracks.size() == 16 && *tracks.begin() == 100 && *tracks.rbegin() == 115, "16 warp tracks");
     for (uint32_t warp = 0; warp < 16; ++warp) {
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine.read_reg(warp, lane, 10) == 16 * warp + lane && machine.read_reg(warp, lane, 8) == warp + 100 &&
-                    machine.read_reg(warp, lane, 65) == warp + 101 &&
-                    machine.read_shmem_u32(1024 + 64 * warp + 4 * lane) == warp + 100,
-                "warp " + std::to_string(warp) + " lane " + std::to_string(lane) + " data");
-        }
+        const auto where = "warp " + std::to_string(warp) + " data";
+        require_lanes(machine, 10, [&](uint32_t lane) { return 16 * warp + lane; }, where + ": THREAD_ID", warp);
+        require_lanes(machine, 8, warp + 100, where + ": the lds behind its own sts", warp);
+        require_lanes(machine, 65, warp + 101, where + ": the addi after the barrier", warp);
+        require_lanes(shmem_lanes(machine, 1024 + 64 * warp), warp + 100, where + ": the sts");
         require(machine.read_ureg(warp, 0) == warp && machine.read_ureg(warp, 6) == 4096,
             "warp " + std::to_string(warp) + " uniform registers");
         for (uint8_t bar = 0; bar < 6; ++bar) require(machine.depbar_value(warp, bar) == 0, "a depbar left set");

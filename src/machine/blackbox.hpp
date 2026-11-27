@@ -18,8 +18,8 @@
 //              box in one cycle;
 //   latency    fixed, from the profile's delays;
 //   interval   a new input at most every `interval` cycles;
-//   operations an arithmetic unit's: the instructions it executes (its list
-//              in src/isa.cpp).
+//   operations an arithmetic unit's: the instructions it executes (the
+//              opcodes src/isa.hpp's table gives that unit).
 // What it costs is not part of it. The state report prints every black box's
 // contract.
 // The memories (memory.hpp) are black boxes by the same contract --

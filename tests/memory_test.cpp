@@ -91,11 +91,10 @@ TEST(Memory, objects_place_and_compute) {
     launch.args = {{"BIAS", uint64_t{1000}}};
     nanosm::Machine machine(profile, kernel, std::move(launch));
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_shmem_u32(704 + 4 * lane) == 1000 + lane, "a store through [%byte + BUF[1]] missed BUF[1]");
-        require(machine.read_reg(0, lane, number_of(kernel.register_names, "back")) == 1000 + lane,
-            "a load through [%byte + BUF[1]]");
-    }
+    require_lanes(shmem_lanes(machine, 704), [](uint32_t lane) { return 1000 + lane; },
+        "BUF[1] after a store through [%byte + BUF[1]]");
+    require_lanes(machine, number_of(kernel.register_names, "back"), [](uint32_t lane) { return 1000 + lane; },
+        "a load through [%byte + BUF[1]]");
     // 256 / 64 + 6 + (128 >> 4) + 64 + 48
     require(machine.read_ureg(0, number_of(kernel.register_names, "u")) == 4 + 6 + 8 + 64 + 48,
         "a constant expression over elements and properties");

@@ -15,7 +15,7 @@ namespace nanosm {
 // in one of them.
 bool Machine::urf_read_ports_held() const {
     const auto& rounds = urf_read_rounds_.cur();
-    return rounds.has_value() && rounds->round + 1 < uniform_read_rounds(rounds->header.instruction).size();
+    return rounds.has_value() && rounds->later_rounds != 0;
 }
 
 uint32_t Machine::uniform_at_next_sample(uint32_t warp, uint8_t reg) const {
@@ -30,6 +30,82 @@ uint32_t Machine::uniform_at_next_sample(uint32_t warp, uint8_t reg) const {
 uint32_t Machine::read_urf(uint32_t warp, uint8_t reg, const char* tag) {
     if (reg >= config_.urf_registers) throw SimError("internal: uniform register " + std::to_string(reg) + " read");
     return urf_.read(0, urf_row(warp, reg), tag)[0];
+}
+
+// ===========================================================================
+// The URF in the RF read stage (src/timing.hpp): the issue register's round
+// samples its uniform registers now (READ_FIRST: a write landing at this
+// cycle's edge is not seen), through the URF's two read ports; so do the URF
+// write pipeline's stage 0 and the round counter's round. Issue refused every
+// uniform reader that would sample with one of the counter's later rounds.
+// ===========================================================================
+
+// A round's uniform registers, in order, through the URF's read ports now:
+// counted for check_urf_round_reads.
+std::vector<uint32_t> Machine::read_urf_round(Wires& w, uint32_t warp, const std::vector<uint8_t>& regs, const char* tag) {
+    w.round_reads.urf += static_cast<uint32_t>(regs.size());
+    std::vector<uint32_t> values;
+    for (const auto reg : regs) values.push_back(read_urf(warp, reg, tag));
+    return values;
+}
+
+// The URF write pipeline's stage 0 (the issue register's instruction):
+// uniform arithmetic samples its uniform sources (in operand order; a
+// register named twice is one read), r2ur its vector source through the RF
+// round's read port (lane 0 is what it keeps). The operands latch in
+// step_urf.
+void Machine::sample_urf_pipe(Wires& w) {
+    const auto& write = urf_pipe_.cur().front();
+    if (!write.has_value()) return;
+    const auto& inst = write->instruction;
+    if (inst.opcode == Opcode::r2ur) {
+        w.urf_sample = std::vector<uint32_t>{read_rf_round(w, write->warp, inst.src0).at(0)};
+        return;
+    }
+    const auto sources = uniform_sources(inst);
+    w.round_reads.urf += static_cast<uint32_t>(rf_read_round(sources).size());
+    std::vector<uint32_t> values;
+    for (const auto reg : sources) values.push_back(read_urf(write->warp, reg, "URF read: uniform ALU sample"));
+    w.urf_sample = std::move(values);
+}
+
+// The round counter's round now (src/timing.hpp uniform_read_rounds): its
+// registers by operand position, in the counter's warp. A tma's pair and its
+// tag enter the TMA operand read's URF read stages; an mma.async's later
+// round (round 0 is its dispatch entry's own sample) joins its dispatch
+// entry, the one issued at the counter's issue cycle, k stages on at round k.
+void Machine::sample_urf_rounds(Wires& w) {
+    const auto& rounds = urf_read_rounds_.cur();
+    if (!rounds.has_value()) return;
+    const auto& inst = rounds->header.instruction;
+    const auto plan = uniform_read_rounds(inst);
+    const auto& registers = plan.at(rounds->round);
+    const auto warp = rounds->header.warp;
+    if (is_tma_opcode(inst.opcode)) {
+        TmaReadPair pair;
+        pair.round = rounds->round;
+        pair.last = rounds->later_rounds == 0;
+        if (rounds->round == 0) pair.header = rounds->header;
+        pair.words = read_urf_round(w, warp, registers, "URF read: a tma's round");
+        w.tma_sampled = std::move(pair);
+    } else if (rounds->round > 0) {
+        std::size_t first = 0;
+        for (uint32_t round = 0; round < rounds->round; ++round) first += plan[round].size();
+        w.dispatch_samples.push_back(
+            {rounds->round, first, warp, read_urf_round(w, warp, registers, "URF read: an mma.async's later round")});
+    }
+}
+
+// After the read stage: the URF's samples this cycle -- these and the one
+// memory-queue sample of the cycle (sample_newest) -- never exceed its read
+// ports.
+void Machine::check_urf_round_reads(const Wires& w) const {
+    auto reads = w.round_reads.urf;
+    if (w.queue_sample.has_value()) reads += static_cast<uint32_t>(w.queue_sample->uniform_operands.size());
+    if (reads > urf_read_ports) {
+        throw SimError("internal: the URF sampled " + std::to_string(reads) + " uniform registers at cycle " +
+            std::to_string(cycle_) + " (it has " + std::to_string(urf_read_ports) + " read ports)");
+    }
 }
 
 // ===========================================================================
@@ -60,7 +136,7 @@ void Machine::urf_ram_stage(Wires& w) {
 }
 
 // The pipeline's work this cycle, by stage. The write leaving
-// stage 0 latches the operands it sampled now (step_rf_reads). A uniform-
+// stage 0 latches the operands it sampled now (sample_urf_pipe). A uniform-
 // arithmetic write whose operands are at the URF output now (stage Lu)
 // executes on the uniform ALU, and its result rides the remaining stages as
 // the write's value (the ALU's Eu stages and the padding to L). r2ur's lane 0

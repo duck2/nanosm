@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include <utility>
 
 namespace nanosm {
@@ -46,10 +45,10 @@ namespace nanosm {
 
 // A probe's words at the port output. test_wait writes its predicate now
 // (write-first (a)); its warp issues again now (b). try_wait completes its
-// wait slot or parks it. The probing warp was blocked while the probe
-// travelled, so if its slot is gone, completed now (commit_shmem_writes ran
-// first) or another warp's, a wake ended the wait first: the stale probe does
-// nothing.
+// wait slot (its warp's) or parks it. The probing warp was blocked while the
+// probe travelled, so if its slot is gone or completed now
+// (commit_shmem_writes ran first), a wake ended the wait first: the stale
+// probe does nothing.
 void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
     const auto& request = *beat.probe;
     auto& warp = warps_.at(request.warp);
@@ -65,15 +64,15 @@ void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
     const bool complete = state.phase != (request.parity != 0);
     if (request.test) {
         // The predicate file (flip-flops) takes it at this cycle's edge; the
-        // warp issues from the next cycle (probe_in_flight).
+        // warp's probe bit clears at it too, so it issues from the next cycle.
         w.predicate_writes.push_back(
             PredicateWrite{warp.id, request.predicate_dst, complete ? full_mask() : 0, full_mask()});
         sanitizer_.record_pred_ready(warp.id, request.predicate_dst, cycle_ + 1);
         return;
     }
-    const auto index = request.wait_slot.value();
+    const auto index = warp.id;
     const auto& slot = mbar_wait_slots_.cur().at(index);
-    if (!slot.has_value() || slot->warp != warp.id || wait_slot_completed(w, index)) return; // stale
+    if (!slot.has_value() || wait_slot_completed(w, index)) return; // stale
     if (slot->byte_address != request.byte_address ||
         slot->parity != request.parity || slot->predicate_dst != request.predicate_dst) {
         throw SimError("internal mbar try-wait record mismatch");
@@ -83,11 +82,7 @@ void Machine::deliver_probe(const ReadBeat& beat, Wires& w) {
         complete_mbar_try_wait(w, index, true);
         return;
     }
-    const auto deadline = cycle_ > std::numeric_limits<uint64_t>::max() -
-            config_.mbar_try_wait_timeout_cycles
-        ? std::numeric_limits<uint64_t>::max()
-        : cycle_ + config_.mbar_try_wait_timeout_cycles;
-    w.shmem.park = std::make_pair(index, deadline);
+    w.shmem.park = index;
     trace_->mbar_sleep(cycle_, warp.id, request.byte_address, request.parity);
 }
 
@@ -325,31 +320,6 @@ std::string Machine::rmw_label(const ActiveMbarRmw& active) {
     return operation;
 }
 
-// The warp's probe has not come back: it waits in the read queue, the read
-// side's collect or serve stage, or travels the read pipeline up to the port
-// output (one at the output returns now: its predicate lands at this cycle's
-// edge and the warp issues from the next cycle). The scan stands for a
-// per-warp "probe outstanding" bit (set at issue, cleared when the probe
-// returns), the hardware form; both give the same answer every cycle.
-bool Machine::probe_in_flight(uint32_t warp) const {
-    for (const auto& entry : read_queue_.cur()) {
-        if (entry.warp == warp && is_mbar_predicate_writer(entry.instruction.opcode)) return true;
-    }
-    if (const auto& collect = read_collect_.cur();
-        collect.has_value() && collect->entry.warp == warp && is_mbar_predicate_writer(collect->entry.instruction.opcode)) {
-        return true;
-    }
-    if (const auto& serve = read_serve_.cur(); serve.has_value() && serve->probe.has_value() && serve->warp == warp) {
-        return true;
-    }
-    const auto& pipe = a_read_pipe_.cur();
-    for (std::size_t stage = 0; stage < pipe.size(); ++stage) {
-        const auto& beat = pipe[stage];
-        if (beat.has_value() && beat->client == ReadClient::probe && beat->probe->warp == warp) return true;
-    }
-    return false;
-}
-
 // ---- mbar wait slots (the scheduler-visible try-wait state) ----
 // Slot w is warp w's (sync.mbar_wait_slots of them: a try_wait by a warp
 // past the last is refused at issue, a PANIC), so a try_wait never waits for
@@ -376,7 +346,7 @@ void Machine::wake_mbar_waiters(Wires& w, uint32_t byte_address, uint8_t new_pha
             slot->parity == new_phase) {
             continue;
         }
-        trace_->mbar_wake(cycle_, slot->warp, byte_address, new_phase);
+        trace_->mbar_wake(cycle_, index, byte_address, new_phase);
         complete_mbar_try_wait(w, index, true);
     }
 }
@@ -390,18 +360,22 @@ void Machine::complete_mbar_try_wait(Wires& w, uint32_t index, bool result) {
         throw SimError("internal completion of an empty mbar try-wait slot");
     }
     const auto& slot = *slots[index];
-    w.predicate_writes.push_back(PredicateWrite{slot.warp, slot.predicate_dst, result ? full_mask() : 0, full_mask()});
-    sanitizer_.record_pred_ready(slot.warp, slot.predicate_dst, cycle_ + 1);
+    w.predicate_writes.push_back(PredicateWrite{index, slot.predicate_dst, result ? full_mask() : 0, full_mask()});
+    sanitizer_.record_pred_ready(index, slot.predicate_dst, cycle_ + 1);
     w.completed_waits.push_back(index);
 }
 
+// A parked slot whose countdown is at 0 times out now: its try_wait fails.
+// The countdown loads sync.mbar_try_wait_timeout_cycles - 1 at the park and
+// counts down each cycle after, so a slot parked at t times out at t + T
+// (t + 1 for T = 0 or 1).
 void Machine::decide_mbar_timeouts(Wires& w) {
     const auto& slots = mbar_wait_slots_.cur();
     for (uint32_t index = 0; index < slots.size(); ++index) {
         const auto& slot = slots[index];
-        if (!slot.has_value() || !slot->parked || cycle_ < slot->deadline_cycle) continue;
+        if (!slot.has_value() || !slot->parked || slot->timeout_left != 0) continue;
         if (wait_slot_completed(w, index)) continue; // woken this cycle: the phase flip wins
-        trace_->mbar_timeout(cycle_, slot->warp, slot->byte_address, slot->parity);
+        trace_->mbar_timeout(cycle_, index, slot->byte_address, slot->parity);
         complete_mbar_try_wait(w, index, false);
     }
 }
@@ -417,7 +391,7 @@ void Machine::decide_mbar_timeouts(Wires& w) {
 // that write grant (its unserviced write); an atomic's rD waits for the
 // depbar, cleared as the old-word register's RF write lands -- possibly
 // before the write grant.
-Machine::MbarRmwRequest Machine::entry_rmw_request(const ShmemEntry& entry) const {
+Machine::MbarRmwRequest Machine::entry_rmw_request(const QueuedEntry& entry) const {
     const auto& inst = entry.instruction;
     MbarRmwRequest request;
     request.warp = entry.warp;
@@ -459,7 +433,7 @@ Machine::MbarRmwRequest Machine::entry_rmw_request(const ShmemEntry& entry) cons
 
 // A probe's parity: its immediate or its uniform register, 0 or 1 (PANIC
 // otherwise).
-uint8_t Machine::entry_parity(const ShmemEntry& entry) const {
+uint8_t Machine::entry_parity(const QueuedEntry& entry) const {
     const auto& inst = entry.instruction;
     const bool immediate = inst.opcode == Opcode::mbar_test_wait_i || inst.opcode == Opcode::mbar_try_wait_i;
     const auto parity = immediate ? static_cast<uint32_t>(inst.imm) : entry_uniform(entry, inst.src1);
@@ -467,24 +441,35 @@ uint8_t Machine::entry_parity(const ShmemEntry& entry) const {
     return static_cast<uint8_t>(parity);
 }
 
-// mbar wait slots: completed slots free; a try-wait that found its phase
-// incomplete parks; a try_wait leaving the read queue installs its warp's.
+// mbar wait slots: a parked slot's countdown moves; completed slots free; a
+// try-wait that found its phase incomplete parks (its countdown loads); a
+// try_wait leaving the read queue installs its warp's.
 void Machine::drive_wait_slots(const Wires& w) {
-    if (w.completed_waits.empty() && !w.shmem.park.has_value() && !w.shmem.wait_slot.has_value()) return;
-    // (One calculation per slot touched now: free, then park, then take.)
+    const auto& slots = mbar_wait_slots_.cur();
+    const auto counting = [](const std::optional<MbarWaitSlot>& slot) {
+        return slot.has_value() && slot->parked && slot->timeout_left != 0;
+    };
+    // (One calculation per slot touched now: count down, free, then park,
+    // then take.)
     std::vector<uint32_t> touched(w.completed_waits.begin(), w.completed_waits.end());
-    if (w.shmem.park.has_value()) touched.push_back(w.shmem.park->first);
+    if (w.shmem.park.has_value()) touched.push_back(*w.shmem.park);
     if (w.shmem.wait_slot.has_value()) touched.push_back(w.shmem.wait_slot->slot);
+    for (uint32_t index = 0; index < slots.size(); ++index) {
+        if (counting(slots[index])) touched.push_back(index);
+    }
+    if (touched.empty()) return;
     std::sort(touched.begin(), touched.end());
     touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
     for (const auto index : touched) {
-        auto next = mbar_wait_slots_.cur().at(index);
+        auto next = slots.at(index);
+        if (counting(next)) --next->timeout_left;
         if (std::find(w.completed_waits.begin(), w.completed_waits.end(), index) != w.completed_waits.end()) {
             next.reset();
         }
-        if (const auto& park = w.shmem.park; park.has_value() && park->first == index) {
+        if (w.shmem.park == index) {
             next->parked = true;
-            next->deadline_cycle = park->second;
+            const auto timeout = config_.mbar_try_wait_timeout_cycles;
+            next->timeout_left = timeout == 0 ? 0 : timeout - 1;
         }
         if (const auto& taken = w.shmem.wait_slot; taken.has_value() && taken->slot == index) {
             if (next.has_value()) throw SimError("internal mbar wait slot allocated twice");
@@ -529,14 +514,14 @@ uint32_t Machine::mbar_address_operand(const DispatchEntry& op) const {
     return address;
 }
 
-uint32_t Machine::entry_uniform(const ShmemEntry& entry, uint8_t ureg) const {
+uint32_t Machine::entry_uniform(const QueuedEntry& entry, uint8_t ureg) const {
     for (std::size_t i = 0; i < entry.uniform_reads.size(); ++i) {
         if (entry.uniform_reads[i] == ureg) return entry.uniform_operands.at(i);
     }
     throw SimError("internal: ur" + std::to_string(ureg) + " used by a queued instruction but not read at issue");
 }
 
-uint32_t Machine::entry_mbar_address(const ShmemEntry& entry) const {
+uint32_t Machine::entry_mbar_address(const QueuedEntry& entry) const {
     const auto address = entry_uniform(entry, entry.instruction.src0);
     if (address % 8 != 0 || static_cast<uint64_t>(address) + 8 > shmem_bytes()) {
         panic(entry, "mbar address is not 8-byte aligned and in shmem");

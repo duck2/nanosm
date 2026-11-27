@@ -412,9 +412,7 @@ TEST(Basics, counted_loop_and_label_relocation) {
 
     nanosm::Machine machine(canonical_profile(), nanosm::assemble_asm(assembly, canonical_profile()), launch_warps(1));
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 0) == 4, "counted loop produced the wrong trip count");
-    }
+    require_lanes(machine, 0, 4, "the counted loop's trip count");
 }
 
 // bra.uni reads its predicate from lane 0 (src/machine/branch.cpp); one that
@@ -428,9 +426,7 @@ TEST(Basics, nonuniform_bra_uni_panics) {
     expect_panic(machine, {"bra.uni predicate is not warp-uniform"}, "a non-uniform bra.uni predicate");
 #else
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 5) == 2, "bra.uni (lane 0 takes it): lane " + std::to_string(lane));
-    }
+    require_lanes(machine, 5, 2, "bra.uni (lane 0 takes it)");
 #endif
 }
 
@@ -522,9 +518,7 @@ TEST(Basics, wait_on_matmul_operands) {
     write_u32(image_bytes(load_launch.gmem_image, 64), 0, 21);
     nanosm::Machine load_machine(profile, compile(load_source, profile), std::move(load_launch));
     load_machine.run(20000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-        require(load_machine.read_reg(0, lane, 3) == 42, "lane " + std::to_string(lane) + ": wrong sum after the wait");
-    }
+    require_lanes(load_machine, 3, 42, "the sum after the wait");
 }
 
 // nop in hand assembly: it carries a wait and a stall like any instruction
@@ -644,16 +638,12 @@ TEST(Basics, mbar_try_wait_immediate_success) {
             "\n@p0 bra.uni complete\nmov r1, 1\nhalt\ncomplete:\nmov r1, 2\nhalt\n", profile), std::move(launch));
         machine.run();
         for (uint32_t warp = 0; warp < row.warps; ++warp) {
-            for (uint32_t lane = 0; lane < 16; ++lane) {
-                require(machine.read_reg(warp, lane, 1) == (row.answer ? 2u : 1u), row.name + ": warp " +
-                    std::to_string(warp) + " lane " + std::to_string(lane) + " did not see " +
-                    (row.answer ? "true" : "false"));
-            }
+            require_lanes(machine, 1, row.answer ? 2u : 1u,
+                row.name + ": warp " + std::to_string(warp) + " seeing " + (row.answer ? "true" : "false"), warp);
         }
         const auto& summary = machine.trace().summary();
         const auto pin = [&](int64_t want, uint64_t got, const std::string& what) {
-            require(want < 0 || got == static_cast<uint64_t>(want),
-                row.name + ": " + what + " " + std::to_string(got) + ", want " + std::to_string(want));
+            if (want >= 0) require_eq(got, static_cast<uint64_t>(want), row.name + ": " + what);
         };
         pin(row.probes, summary.mbar_initial_probes, "initial probes");
         pin(row.immediate, summary.mbar_immediate_successes, "immediate successes");
@@ -743,13 +733,10 @@ TEST(Basics, launch_arguments_reach_the_kernel) {
         profile.gmem_sector_bytes;
     require(machine.read_gmem_u32(global + 8) == 41, "the host did not write the block into global memory");
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_gmem_u32(4096 + 4 * lane) == 41, "the u32 argument did not reach the kernel");
-        require(machine.read_gmem_u32(4160 + 4 * lane) == nanosm::float_bits(2.5f),
-            "the f32 argument did not reach the kernel");
-        require(machine.read_gmem_u32(4224 + 4 * lane) == nanosm::float_bits(1.5f), "the kernel's .data did not reach it");
-        require(machine.read_gmem_u32(4288 + 4 * lane) == 7, "a .data word named by an .equ is wrong");
-    }
+    require_lanes(gmem_lanes(machine, 4096), 41, "the u32 argument as the kernel saw it");
+    require_lanes(gmem_lanes(machine, 4160), nanosm::float_bits(2.5f), "the f32 argument as the kernel saw it");
+    require_lanes(gmem_lanes(machine, 4224), nanosm::float_bits(1.5f), "the kernel's .data as it saw it");
+    require_lanes(gmem_lanes(machine, 4288), 7, "a .data word named by an .equ");
     require(machine.read_shmem_u32(start + 140) == 0xff800000u && machine.read_shmem_u32(start + 148) == 9,
         ".data words are not where the block puts them");
     const auto barrier = nanosm::decode_mbar_state(machine.read_shmem_u32(start + 128) |

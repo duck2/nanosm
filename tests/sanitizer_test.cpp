@@ -146,8 +146,7 @@ TEST(Sanitizer, sanitizer_tma_and_mma_accept_conflicts) {
 
     nanosm::Machine waited_load(profile, compile(load_destination + wait_on("ur4") + "lds r21, [r20]\nhalt\n"), tma_launch());
     waited_load.run(20000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane)
-        require(waited_load.read_reg(0, lane, 21) == 5 * lane + 2, "the waited lds read the wrong value");
+    require_lanes(waited_load, 21, [](uint32_t lane) { return 5 * lane + 2; }, "the waited lds");
 
     // Two readers: a TMA store of an MMA operand stage is legal.
     nanosm::Machine readers(profile, compile(mma_header + tma_operands_asm(10, 1024, 4, 4168, 8) +
@@ -250,13 +249,12 @@ TEST(Sanitizer, sanitizer_tmem_ownership_both_directions) {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )"), profile), launch_warps(1));
     disjoint.run(2000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-        for (uint32_t j = 0; j < 8; ++j)
-            require(disjoint.read_reg(0, lane, static_cast<uint8_t>(24 + j)) == 0,
-                "the disjoint acc.ld read the concurrent store's rows (lane " + std::to_string(lane) + ")");
-        require(disjoint.tmem_word(static_cast<uint32_t>(nanosm::tmem_physical_word(1024 + 64 * lane, 64))) == 41,
-            "the concurrent acc.st did not land (row " + std::to_string(16 + lane) + ")");
+    for (uint32_t j = 0; j < 8; ++j) {
+        require_lanes(disjoint, 24 + j, 0, "the disjoint acc.ld (the concurrent store's rows are not its own)");
     }
+    require_lanes([&](uint32_t lane) {
+        return disjoint.tmem_word(static_cast<uint32_t>(nanosm::tmem_physical_word(1024 + 64 * lane, 64)));
+    }, 41, "the concurrent acc.st's row 16 + lane");
 }
 
 // Pointers alias: an m32n64 matmul writes rows 32..63 of a 64-row view at 0
@@ -300,9 +298,8 @@ TEST(Sanitizer, sanitizer_tmem_race_by_words) {
         halt
     )"), launch());
     clean.run(20000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-        require(clean.read_reg(0, lane, 24) == lane && clean.read_reg(0, lane, 25) == lane,
-            "a transfer beside a running matmul did not read the words it named");
+    for (const uint32_t reg : {24u, 25u}) {
+        require_lanes(clean, reg, [](uint32_t lane) { return lane; }, "a transfer beside a running matmul");
     }
 }
 
@@ -372,8 +369,7 @@ TEST(Sanitizer, sanitizer_row_spacing_tmem) {
 #endif
     nanosm::Machine machine(profile, compile(program(64)), launch_warps(1));
     machine.run(20000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane)
-        require(machine.read_reg(0, lane, 24) == lane, "acc.ld with the acc.st's spacing did not read it back");
+    require_lanes(machine, 24, [](uint32_t lane) { return lane; }, "acc.ld with the acc.st's spacing");
 }
 
 // A swizzle64 TMA store is not checked on rows it does not read: the clipped

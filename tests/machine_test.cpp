@@ -16,6 +16,48 @@ std::string replaced(std::string text, const std::string& from, const std::strin
     return text.replace(found, from.size(), to);
 }
 
+// An optional profile field: the canonical JSON declares `canonical`;
+// absent, it defaults to the same value (same fingerprint); negative,
+// fractional and values outside [low, high] are refused by parsing, and 0 by
+// validation when low is above 0; another value changes the fingerprint
+// (`make_valid` adjusts that other profile where the value alone breaks a
+// rule between fields; the comparison is then with the canonical profile
+// under the same adjustment, so the field is the only difference).
+void check_optional_field(const char* section, const char* field, uint32_t canonical,
+    uint32_t nanosm::DeviceProfile::*member, uint32_t low = 1, uint32_t high = 64,
+    const std::function<void(nanosm::DeviceProfile&)>& make_valid = {}) {
+    std::ifstream input("profiles/nanosm-v0.json");
+    nlohmann::json document;
+    input >> document;
+    const auto parsed = nanosm::parse_device_profile(document.dump());
+    const auto name = std::string(section) + "." + field;
+    require(parsed.*member == canonical && document[section].contains(field),
+        name + ": the canonical profile does not declare " + std::to_string(canonical));
+    auto defaulted = document;
+    defaulted[section].erase(field);
+    require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(defaulted.dump())) ==
+            nanosm::device_profile_fingerprint(parsed), name + ": the default is not " + std::to_string(canonical));
+    std::vector<nlohmann::json> refused = {nlohmann::json(-1), nlohmann::json(1.5), nlohmann::json(high + 1)};
+    if (low > 0) refused.push_back(nlohmann::json(low - 1));
+    for (const auto& value : refused) {
+        auto modified = document;
+        modified[section][field] = value;
+        (void)error_of<nanosm::ProfileError>([&] { (void)nanosm::parse_device_profile(modified.dump()); },
+            name + " = " + value.dump());
+    }
+    if (low > 0) {
+        auto zero = canonical_profile();
+        zero.*member = 0;
+        (void)error_of<nanosm::ProfileError>([&] { nanosm::validate_device_profile(zero); }, name + " = 0 in validation");
+    }
+    auto base = canonical_profile();
+    if (make_valid) make_valid(base);
+    auto other = base;
+    other.*member = canonical + 1;
+    require(nanosm::device_profile_fingerprint(other) != nanosm::device_profile_fingerprint(base),
+        name + " was omitted from the profile fingerprint");
+}
+
 // A test that must write a file writes it here: the system temp directory
 // plus this process's id and a per-process counter, so overlapping runs of
 // this binary (ctest -j, the sanitizer ON/OFF twin, build and build_nosan at
@@ -103,11 +145,8 @@ TEST(Machine, bank_conflict_serializes) {
         for (uint32_t lane = 0; lane < 16; ++lane) write_u32(shmem, lane * row.stride, word(lane));
         nanosm::Machine machine(canonical_profile(), compile(row.kernel), std::move(launch));
         machine.run();
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine.read_reg(0, lane, 1) == word(lane),
-                row.what + ": lane " + std::to_string(lane) + " has the wrong word");
-        }
-        require(machine.trace().summary().shmem_rounds == 16, row.what + ": not sixteen bank rounds");
+        require_lanes(machine, 1, word, row.what + ": each lane's word");
+        require_eq(machine.trace().summary().shmem_rounds, 16, row.what + ": bank rounds");
     }
 }
 
@@ -279,6 +318,79 @@ TEST(Machine, reserved_bits_refused) {
         "fma's fields and U bit taken for reserved");
     require(!nanosm::reserved_bit(word_of(nanosm::Opcode::halt) | (~uint64_t{0} >> 8 & ~payload)).has_value(),
         "a control field taken for reserved");
+}
+
+// A word whose opcode the instruction set does not have is refused at kernel
+// load, naming the pc, whatever its predicate field: an all-zero word and one
+// with PT and no depbar.
+TEST(Machine, unknown_opcode_refused) {
+    const auto& profile = canonical_profile();
+    const auto kernel = compile("mov r0, 1\nmov r0, 2\nhalt\n", profile);
+    namespace enc = nanosm::encoding;
+    const uint64_t plain = uint64_t{7} << enc::predicate_shift | uint64_t{7} << enc::set_depbar_shift;
+    for (const uint64_t word : {uint64_t{0}, uint64_t{0x55} << enc::opcode_shift | plain}) {
+        auto stray = kernel;
+        stray.words.at(1) = word;
+        const std::vector<std::string_view> needles = {"kernel pc 8", "which instruction-set revision"};
+        expect_error<nanosm::SimError>([&] { nanosm::Machine machine(profile, stray, launch_warps(1)); },
+            {needles[0], needles[1]}, "an unknown opcode at kernel load");
+        expect_error<nanosm::SimError>([&] { (void)nanosm::load_hex(nanosm::emit_hex(stray)); },
+            {needles[0], needles[1]}, "an unknown opcode in hex");
+    }
+}
+
+// Every opcode of the set (the mma.async block's on the profile's shapes):
+// an instruction of it encodes to a word that decodes back to it, and the
+// word's text with its control fields assembles back to the same word. (A
+// branch's text names a displacement, which assembly writes as a label: its
+// word is checked by decode alone.)
+TEST(Machine, every_opcode_round_trips) {
+    using namespace nanosm;
+    const auto& profile = canonical_profile();
+    std::string assembly =
+        ".profile " + profile.name + ", 0x" + format_profile_fingerprint(device_profile_fingerprint(profile)) + "\n";
+    std::vector<uint64_t> words;
+    const uint32_t spacing = profile.mma_layout == TileLayout::dense ? 16 : 64;
+    for (uint32_t value = 0; value < 256; ++value) {
+        const auto opcode = static_cast<Opcode>(value);
+        if (!is_known_opcode(opcode) || (is_mma_async(opcode) && mma_shape_index(opcode) >= profile.mma_shapes.size())) {
+            continue;
+        }
+        const auto& form = form_info(opcode);
+        Instruction inst;
+        inst.opcode = opcode;
+        const std::array<uint8_t, 4> numbers = {static_cast<uint8_t>(form.operands[0].file == RegisterFile::predicate ? 2 : 4),
+            1, 2, 3};
+        const std::array<uint8_t*, 4> fields = {&inst.dst, &inst.src0, &inst.src1, &inst.src2};
+        for (std::size_t slot = 0; slot < 4; ++slot) {
+            if (form.operands[slot].file != RegisterFile::none) *fields[slot] = numbers[slot];
+        }
+        inst.src1_uniform = takes_uniform_source(opcode) && value % 2 == 1;
+        switch (form.immediate) {
+        case ImmediateKind::none: break;
+        case ImmediateKind::s22:
+            inst.imm = opcode == Opcode::sread ? 0 : opcode == Opcode::usread ? 1 : is_mbar_predicate_writer(opcode) ? 1 : 16;
+            break;
+        case ImmediateKind::memory: inst.imm = 16; break;
+        case ImmediateKind::s14: inst.imm = 8; break;
+        case ImmediateKind::descriptor: inst.imm = 128; break;
+        case ImmediateKind::spacings: inst.imm = mma_spacing_immediate(spacing, spacing); break;
+        case ImmediateKind::word: inst.imm = 0x3f800000; break;
+        }
+        inst.control.set_depbar = sets_depbar(opcode) ? 1 : 7;
+        inst.control.read_depbar = has_read_depbar_field(opcode) ? 2 : 7;
+        const auto word = encode(inst);
+        require(DecodedInstruction(decode(word)) == DecodedInstruction(inst), opcode_name(opcode) + " decodes differently");
+        if (opcode_info(opcode).form == Form::branch) continue;
+        assembly += "        " + format_instruction(decode(word), true, &profile.mma_shapes) + "\n";
+        words.push_back(word);
+    }
+    require(words.size() > 100, "too few opcodes in the round trip");
+    const auto kernel = assemble_asm(assembly, profile);
+    for (std::size_t index = 0; index < words.size(); ++index) {
+        require_eq(kernel.words.at(index), words[index], "the word the text of pc " + std::to_string(8 * index) +
+            " assembles to", ":\n" + assembly);
+    }
 }
 
 TEST(Machine, trace_attribution_and_limit) {

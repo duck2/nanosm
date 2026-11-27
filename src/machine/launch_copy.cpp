@@ -60,6 +60,7 @@ void Machine::start_launch_copy(const LaunchRecord& record) {
     trace_->launch_copy_begin(0, command.id, record.global_address, record.shared_address, record.bytes);
     tma.commands.take(command, config_.tma_queue_commands);
     tma_.poke(std::move(tma));
+    credits_.poke(static_cast<std::size_t>(Credit::tma_queue), 1); // its queue slot, held from reset
     for (uint32_t warp = 0; warp < warps_.size(); ++warp) {
         auto counters = depbar_.cur().at(warp);
         for (const auto& flag : record.flags) counters.at(flag.bar) = 1;

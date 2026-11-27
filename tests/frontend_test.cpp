@@ -57,7 +57,7 @@ TEST(FrontEnd, lone_warp_issue_rate) {
         const auto issues = issue_records(*machine);
         const uint64_t round_trip = nanosm::fetch_to_issue + 2;
         const uint64_t words_per_trip = 2 * std::min<uint64_t>(packets, round_trip / 2);
-        require(issues.size() == 13, std::to_string(packets) + " packets: not 13 issues");
+        require_eq(issues.size(), 13, std::to_string(packets) + " packets: issues");
         for (uint64_t k = 0; k < issues.size(); ++k) {
             const auto expected = nanosm::fetch_to_issue + k / words_per_trip * round_trip + k % words_per_trip;
             require(issues[k].cycle == expected && issues[k].pc == 8 * k,
@@ -81,7 +81,7 @@ TEST(FrontEnd, warps_interleave) {
         auto machine = machine_as_written(profile, independent_movs(8) + "halt\n", warps);
         machine->run();
         const auto issues = issue_records(*machine);
-        require(issues.size() == 9u * warps, std::to_string(warps) + " warps: issue count");
+        require_eq(issues.size(), 9u * warps, std::to_string(warps) + " warps: issue count");
         for (std::size_t i = 0; i < issues.size(); ++i) {
             const auto& [cycle, warp, pc, opcode] = issues[i];
             const uint64_t k = pc / 8;
@@ -178,12 +178,11 @@ TEST(FrontEnd, conditional_branch) {
             require(waits == expected_waits, what + "the supply waits were not traced as launch, branch, refill");
             const auto& summary = machine->trace().summary();
             const auto supply = summary.warp_cycles[static_cast<std::size_t>(nanosm::WarpState::no_instruction)];
-            require(supply == 5 && summary.instruction_fifo_empty == 4 && summary.fetches_discarded == 7 &&
-                    summary.fetches == 8 && summary.instructions == 9,
-                what + "the supply counters: waiting " + std::to_string(supply) + ", FIFO empty " +
-                    std::to_string(summary.instruction_fifo_empty) + ", discarded " +
-                    std::to_string(summary.fetches_discarded) + ", fetches " + std::to_string(summary.fetches) +
-                    ", issued " + std::to_string(summary.instructions));
+            require_eq(supply, 5, what + "cycles waiting for an instruction");
+            require_eq(summary.instruction_fifo_empty, 4, what + "FIFO empty");
+            require_eq(summary.fetches_discarded, 7, what + "fetches discarded");
+            require_eq(summary.fetches, 8, what + "fetches");
+            require_eq(summary.instructions, 9, what + "instructions issued");
             const auto text = machine->trace().summary_text();
             require(text.find("  waiting for instruction    5\n") != std::string::npos &&
                     text.find("front end: fetches=8 discarded=7 waiting_for_instruction=5 fifo_empty=4\n") !=
@@ -216,8 +215,8 @@ TEST(FrontEnd, conditional_branch) {
         require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{t}, form + ": the branch did not issue at c5");
         const uint32_t next_pc = taken ? 5 * 8 : 4 * 8;
         const auto interval = taken ? nanosm::branch_taken_interval : nanosm::branch_not_taken_interval;
-        require(issued_at(*machine, next_pc) == std::vector<uint64_t>{t + interval},
-            form + ": the next instruction did not issue at t + " + std::to_string(interval) + ":" + issue_log(*machine));
+        require_eq(issued_at(*machine, next_pc), std::vector<uint64_t>{t + interval},
+            form + ": the next instruction's issue (t + " + std::to_string(interval) + ")", ":" + issue_log(*machine));
         require(machine->read_reg(0, 0, 4) == (taken ? 0u : 4u) && machine->read_reg(0, 0, 5) == 5, form + ": data");
     }
 }
@@ -264,9 +263,9 @@ TEST(FrontEnd, prefetch_through_waits) {
     const auto check = [](nanosm::Machine& machine, uint32_t waiting_pc, uint64_t release, const std::string& what) {
         machine.run();
         for (uint32_t i = 0; i < 3; ++i) {
-            require(issued_at(machine, waiting_pc + 8 * i) == std::vector<uint64_t>{release + i},
-                what + ": instruction " + std::to_string(i) + " after the wait did not issue at release + " +
-                    std::to_string(i) + ":" + issue_log(machine));
+            require_eq(issued_at(machine, waiting_pc + 8 * i), std::vector<uint64_t>{release + i},
+                what + ": instruction " + std::to_string(i) + " after the wait (release + " + std::to_string(i) + ")",
+                ":" + issue_log(machine));
         }
         require(machine.trace().summary().warp_cycles[static_cast<std::size_t>(nanosm::WarpState::no_instruction)] ==
                 nanosm::fetch_to_issue,

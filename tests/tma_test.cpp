@@ -94,8 +94,7 @@ struct TmaCounters {
 
 void require_counters(const nanosm::TraceSummary& summary, const TmaCounters& expected, const std::string& what) {
     const auto pin = [&](const std::optional<uint64_t>& value, uint64_t actual, const char* name) {
-        require(!value || *value == actual,
-            what + ": " + name + " " + std::to_string(actual) + ", expected " + std::to_string(value.value_or(0)));
+        if (value) require_eq(actual, *value, what + ": " + name);
     };
     pin(expected.commands, summary.tma_commands, "commands");
     pin(expected.completions, summary.tma_command_completions, "completions");
@@ -320,8 +319,8 @@ TEST(Tma, tma_store_entirely_out_of_range) {
                     summary.tma_sector_bytes == 0 && summary.tma_port_requests == 0,
                 "an out-of-range store (" + c.what + ") moved data");
         }
-        require(completion[1] == completion[0] + 32, "an out-of-range store (" + c.what + ") of 33 rows completed " +
-            std::to_string(completion[1] - completion[0]) + " cycles after one of 1 row, not 32 (one skip per row)");
+        require_eq(completion[1], completion[0] + 32, "the completion of an out-of-range store (" + c.what +
+            ") of 33 rows: 32 cycles after one of 1 row (one skip per row)");
     }
 }
 
@@ -684,16 +683,14 @@ TEST(TmaSlow, swizzle64_mma_reads_a_tma_tile) {
         for (uint32_t k = 0; k < 64; ++k) sum += static_cast<float>(whole_rows_a(m, k) * whole_rows_b(k, n));
         return nanosm::float_bits(sum);
     };
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        for (uint32_t j = 0; j < 8; ++j) {
-            require(machine.read_reg(0, lane, 20 + j) == expected(lane, j),
-                "C rows 0..15 are wrong: an operand read the wrong piece or row");
-            require(machine.read_reg(0, lane, 28 + j) == expected(48 + lane, 56 + j), "C's far corner is wrong");
-            require(machine.read_reg(0, lane, 36 + j) == expected(48 + lane, 8 + j),
-                "the m32 command at A's row 32 did not read rows 32..63");
-            require(machine.read_reg(0, lane, 44 + j) == expected(37 + lane, 8 + j),
-                "the m32 command at A's row 21 did not read rows 21..52");
-        }
+    for (uint32_t j = 0; j < 8; ++j) {
+        require_lanes(machine, 20 + j, [&](uint32_t lane) { return expected(lane, j); },
+            "C rows 0..15 (each operand's piece and row)");
+        require_lanes(machine, 28 + j, [&](uint32_t lane) { return expected(48 + lane, 56 + j); }, "C's far corner");
+        require_lanes(machine, 36 + j, [&](uint32_t lane) { return expected(48 + lane, 8 + j); },
+            "the m32 command at A's row 32 (rows 32..63)");
+        require_lanes(machine, 44 + j, [&](uint32_t lane) { return expected(37 + lane, 8 + j); },
+            "the m32 command at A's row 21 (rows 21..52)");
     }
     const auto& summary = machine.trace().summary();
     require(summary.mma_commands == 24 && summary.mma_a_block_reads == 8 * 16 + 2 * 8 * 8 &&
@@ -744,7 +741,7 @@ TEST(Tma, tma_byte_tile_longest_run) {
             const uint8_t expected = tile ? value(length * (row - 1) + column - 5) : 0x5a;
             require(machine->gmem()[address] == expected, "byte tile store: gmem byte " + std::to_string(address));
         }
-        require(machine->trace().summary().tma_sector_bytes == 384, "byte tile store: not 12 sectors");
+        require_eq(machine->trace().summary().tma_sector_bytes, 384, "byte tile store: sector bytes (12 sectors)");
     }
 }
 
@@ -786,9 +783,8 @@ TEST(Tma, tma_walker_start_stages) {
     }
     const uint64_t added[] = {0, 1, 2, 5};
     for (std::size_t k = 1; k < first_placement.size(); ++k) {
-        require(first_placement[k] == first_placement[0] + added[k], std::to_string(added[k]) + " start stages: the " +
-            "first placement came " + std::to_string(first_placement[k] - first_placement[0]) +
-            " cycles after none's, not " + std::to_string(added[k]));
+        require_eq(first_placement[k], first_placement[0] + added[k], std::to_string(added[k]) +
+            " start stages: the first placement (that many cycles after none's)");
         require(landed[k] == landed[0], "the start stages changed the landed bytes");
     }
 }
@@ -816,9 +812,8 @@ TEST(TmaSlow, tma_store_sector_registers) {
             const auto returns = tma_store_returns(config, 64).first;
             const auto period = std::max(l + d, n * d);
             for (std::size_t k = n; k + n < returns.size(); ++k) {
-                require(returns[k + n] - returns[k] == period, what + "sector " + std::to_string(k) + " -> " +
-                    std::to_string(k + n) + " took " + std::to_string(returns[k + n] - returns[k]) +
-                    " cycles, not max(L + d, N d) = " + std::to_string(period));
+                require_eq(returns[k + n] - returns[k], period, what + "cycles from sector " + std::to_string(k) +
+                    " to " + std::to_string(k + n) + " (max(L + d, N d))");
             }
         }
     }

@@ -191,13 +191,9 @@ inline constexpr uint32_t issue_to_sample = issue_register_stages;
 
 // Fixed-latency ALU/FPU/SFU work (MOV/SREAD and setp included) runs through
 // the arithmetic read pipeline. Everything else -- memory, TMA, mbar engines,
-// and mbar.test_wait's predicate broadcast -- is dispatched to its unit. The
-// Timing{1, 1, 1} probe only asks "is this opcode in the fixed-latency class
-// at all"; any nonzero dummy latencies would do.
+// and mbar.test_wait's predicate broadcast -- is dispatched to its unit.
 inline bool uses_arithmetic_pipeline(const Instruction& inst) {
-    if (inst.opcode == Opcode::mbar_test_wait_i) return false;
-    if (inst.opcode == Opcode::mbar_test_wait_r) return false;
-    return fixed_latency(inst, Timing{1, 1, 1}) != 0;
+    return is_arithmetic(inst.opcode);
 }
 
 // Accepted issue -> every operand at the RF output (execution starts, or the
@@ -266,11 +262,6 @@ inline constexpr uint32_t urf_write_ports = 1;
 // Accepted issue -> the sample of every uniform register the instruction
 // reads (the same round as its vector registers).
 inline constexpr uint32_t issue_to_urf_sample = issue_register_stages;
-
-// Accepted issue -> its uniform operands at the URF output.
-inline uint32_t issue_to_urf_operands(const DeviceProfile& profile) {
-    return issue_to_urf_sample + profile.urf_read_latency_cycles;
-}
 
 // The longest uniform-register writer's path to the URF write port (the
 // least L the profile may declare): the issue register, then the uniform

@@ -196,7 +196,7 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
 // event's command leaves before a presentation names a new one), its own
 // requests, its shmem transactions' ends, the ingress ticket, the write acks.
 // drive_tma_queue commits it with the command the operand read pushes now.
-// (Issue reads the queue's Q: a slot freed now is seen from the next cycle.)
+// (A slot freed now gives issue its credit back, seen from the next cycle.)
 void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
     tma_returns_traced_ = tma_returns_.count();
@@ -206,6 +206,7 @@ void Machine::step_tma(Wires& w) {
         if (done->state != TmaCommandState::launch_done) continue;
         trace_->tma_command_end(cycle_, done->id, done->logical_bytes, done->useful_bytes);
         tma.commands.release(done->id);
+        return_credit(w, Credit::tma_queue);
         trace_tma_depths(tma, cycle_);
     }
     // The command whose event the register holds ends in the cycle the RMW
@@ -216,6 +217,7 @@ void Machine::step_tma(Wires& w) {
         const auto& command = tma.commands.at(*tma.event_command);
         trace_->tma_command_end(cycle_ + 1, command.id, command.logical_bytes, command.useful_bytes);
         tma.commands.release(command.id);
+        return_credit(w, Credit::tma_queue);
         tma.event_command.reset();
         trace_tma_depths(tma, cycle_ + 1);
     }
@@ -623,19 +625,6 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     return command;
 }
 
-// The commands the TMA operand read holds (in Q), each counted as a slot of
-// the TMA queue since its accept: the one in the round counter, and each
-// whose last pair is in a URF read stage (the pair in the last stage is
-// pushed into the queue at this edge; it is not in the queue's Q yet).
-uint32_t Machine::tma_commands_being_read() const {
-    const auto& rounds = urf_read_rounds_.cur();
-    uint32_t commands = rounds.has_value() && is_tma_opcode(rounds->header.instruction.opcode) ? 1 : 0;
-    for (const auto& pair : tma_read_pairs_.cur()) {
-        if (pair.has_value() && pair->last) ++commands;
-    }
-    return commands;
-}
-
 // The TMA's event register: emptied by the RMW engine's claim, filled by the
 // TMA's presentation (never both in one cycle: the TMA presents only into an
 // empty register).
@@ -702,6 +691,7 @@ void Machine::drive_tma_operand_read(const Wires& w) {
     if (rounds.has_value() && urf_read_ports_held()) {
         UrfReadRounds advanced = *rounds;
         ++advanced.round;
+        --advanced.later_rounds;
         next_rounds = std::move(advanced);
     }
     if (w.issue.urf_rounds.has_value()) {

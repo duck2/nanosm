@@ -1,4 +1,6 @@
 // The tensor core: the MMA engine on port B, tensor memory, and the accumulator transfers.
+// The acc.ld pipeline's output presents an RF write (acc_ld_rf_write) and the acc.st engine
+// an RF read (acc_st_rf_read) at the register file's async ports (src/machine/rf.cpp).
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
@@ -81,8 +83,8 @@ uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32
 }
 
 // The MMA engine's cycle, computed on a copy of its queue and pipeline;
-// drive_mma commits it with the command dispatch hands over now. (Issue reads
-// the queue's Q: an entry freed now is seen from the next cycle.) Its tmem
+// drive_mma commits it with the command dispatch hands over now. (An entry
+// freed now gives issue its credit back, seen from the next cycle.) Its tmem
 // reads (C) and writes (results) use its own tmem services; the writes land
 // at this cycle's edge (w.mma_tmem_writes).
 void Machine::step_mma(Wires& w) {
@@ -127,6 +129,7 @@ void Machine::advance_mma(MmaPipeline& mma, Wires& w) {
            mma.slots.front().operands_consumed && mma.slots.front().outstanding_results == 0) {
         sanitizer_.record_mma_retired(mma.slots.front().id); // last result retired
         mma.slots.pop_front();
+        return_credit(w, Credit::mma_queue);
     }
     if (const auto& at_ram = mma_reads_.stage(config_.shmem_port_a_depth - 1); at_ram.has_value()) {
         w.mma_read_sampled = *at_ram;
@@ -188,6 +191,7 @@ std::optional<Machine::MmaFetch> Machine::next_mma_step(MmaPipeline& mma, Wires&
         request.byte_address = command.mbar_address;
         w.mma_present = std::move(request);
         mma.slots.pop_front();
+        return_credit(w, Credit::mma_queue);
         return std::nullopt;
     }
     // The command's shape sets the walk: rows in core_m blocks (8 for m32,
@@ -417,14 +421,14 @@ void Machine::declare_mma_core_black_box() {
 // bank's write port 0, an acc.st beat through write port 1 (one word per fine
 // bank each). They land at the clock edge, the acc.st beat's after the MMA's.
 void Machine::land_tmem_writes(const Wires& w) {
-    for (const auto* writes : {&w.mma_tmem_writes, &w.acc_st_tmem_writes}) {
-        const bool mma = writes == &w.mma_tmem_writes;
-        for (const auto& [word, value] : *writes) {
+    const auto land = [&](const auto& writes, const char* tag, uint32_t port) {
+        for (const auto& [word, value] : writes) {
             tmem_.write(word % config_.tmem_fine_banks, word / config_.tmem_fine_banks,
-                std::span<const uint32_t>(&value, 1), Memory<uint32_t>::every_element,
-                mma ? "MMA result write" : "acc.st write", mma ? tmem_port_mma : tmem_port_acc);
+                std::span<const uint32_t>(&value, 1), Memory<uint32_t>::every_element, tag, port);
         }
-    }
+    };
+    land(w.mma_tmem_writes, "MMA result write", tmem_port_mma);
+    land(w.acc_st_tmem_writes, "acc.st write", tmem_port_acc);
 }
 
 std::size_t Machine::tmem_index(uint64_t logical, uint32_t row_words) const {
@@ -463,8 +467,8 @@ std::vector<uint32_t> Machine::mma_block_words(const MmaTag& tag) const {
 // The two accumulator transfer engines (one acc.ld
 // engine, one acc.st engine for the whole machine, each with its own tmem
 // service in every fine bank), computed on copies of their registers
-// (drive_acc_transfers commits them). Issue reads the engines' Q: an engine
-// whose transfer ends now takes the next one's issue from the next cycle.
+// (drive_acc_transfers commits them). An engine whose transfer ends now gives
+// issue its credit back: the next transfer issues from the next cycle.
 // The acc.ld pipeline before the acc.st beat.
 void Machine::step_acc_transfers(Wires& w) {
     auto engines = acc_engines_.cur();
@@ -475,8 +479,8 @@ void Machine::step_acc_transfers(Wires& w) {
 
 // The acc.ld engine's pipeline. The beat at the tmem RAM stage samples its
 // words now (once).
-// Its output asks the RF write decision for service; this cycle's grant was
-// decided at the top of the cycle.
+// Its output asks the RF write decision for service (acc_ld_rf_write); this
+// cycle's grant was decided at the top of the cycle.
 //   output empty, or granted -> advance: every stage moves one toward the
 //                               output; stage 0 takes the engine's next read
 //                               if its transfer has a beat left, else stays
@@ -489,11 +493,24 @@ void Machine::step_acc_ld(std::optional<AccTransfer>& engine, Wires& w) {
         sample_acc_ld_beat(*w.acc_ld_sampled);
     }
     const bool output_valid = acc_ld_pipe_.last().has_value();
-    if (output_valid && !w.rf_write.granted_to(AsyncWriter::acc_ld, 0)) {
+    if (output_valid && w.rf_write.granted.acc_ld == 0) {
         w.acc_ld_hold = true;
         return;
     }
     w.acc_ld_launch = launch_acc_ld_beat(engine);
+    if (w.acc_ld_launch.has_value() && w.acc_ld_launch->last) return_credit(w, Credit::acc_ld); // the engine frees
+}
+
+// The acc.ld pipeline's output as the RF write request it presents: the beat's
+// words to every lane of its register, visible as it lands; the transfer's
+// last beat clears its depbar then. (Its tmem read-ownership ended at the
+// transfer's last tmem sample, sample_acc_ld_beat; the destination stays
+// not-ready until this write lands.)
+std::optional<Machine::RfWrite> Machine::acc_ld_rf_write() const {
+    const auto& output = acc_ld_pipe_.last();
+    if (!output.has_value()) return std::nullopt;
+    return RfWrite{output->warp, output->reg, output->values, full_mask(),
+        output->last ? std::optional<uint8_t>{output->depbar} : std::nullopt, {output->reg}};
 }
 
 // The engine's next read leaves for tmem now: the transfer's next column, all
@@ -529,7 +546,7 @@ void Machine::sample_acc_ld_beat(AccLdBeat& beat) {
 }
 
 // The acc.st engine's transfer: its beats are read from the RF one per cycle
-// when the RF read decision grants them (decide_rf_reads: sampled at the
+// when the RF read decision grants them (acc_st_rf_read, take_acc_st_read: sampled at the
 // grant, at the RF output Lr later, at the tmem RAM tmem.port_depth after
 // that); a beat at the tmem RAM now is written at this cycle's edge. The last
 // beat's write ends the transfer: its depbar clears, its tmem write-ownership
@@ -553,6 +570,26 @@ void Machine::step_acc_st(std::optional<AccTransfer>& engine, Wires& w) {
     // final tmem write: write-ownership ends
     sanitizer_.record_acc_transfer_final_beat(false);
     engine.reset();
+    return_credit(w, Credit::acc_st);
+}
+
+// The acc.st engine's RF read request: its transfer's next beat's register,
+// while it has beats left to read.
+std::optional<Machine::RfReadRequest> Machine::acc_st_rf_read() const {
+    const auto& engine = acc_engines_.cur()[1];
+    if (!engine.has_value() || engine->next_column >= engine->width) return std::nullopt;
+    return RfReadRequest{engine->warp, static_cast<uint8_t>(engine->rf_base + engine->next_column), std::nullopt};
+}
+
+// The acc.st engine takes its RF read grant: the beat's register is
+// read-owned no longer, and the beat with its words enters the acc.st
+// pipeline at this edge (drive_acc_transfers).
+void Machine::take_acc_st_read(Wires& w) {
+    const auto& words = w.rf_read.granted[RfReader::acc_st].words;
+    if (!words.has_value()) return;
+    const auto& engine = *acc_engines_.cur()[1];
+    sanitizer_.record_async_reader_done(engine.warp, engine.rf_base + engine.next_column, AsyncReader::acc_st);
+    w.acc_st_read = AccStBeat{engine.next_column, *words};
 }
 
 // What a transfer touches, for the sanitizer: the region and its tmem words.
@@ -561,7 +598,7 @@ TmemRegion Machine::tmem_region(uint32_t pointer, const Instruction& inst, std::
     region.pointer = pointer;
     region.row_words = static_cast<uint32_t>(inst.imm);
     region.rows = config_.lanes;
-    region.columns = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+    region.columns = register_span(inst.opcode);
     std::sort(words.begin(), words.end());
     region.words = std::move(words);
     return region;
@@ -660,7 +697,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
 }
 
 // acc.ld / acc.st: the pointer arrives now; the transfer runs one beat per
-// column in its engine (step_acc_transfers, and decide_rf_reads for acc.st):
+// column in its engine (step_acc_transfers, and the RF's read port for acc.st):
 // lane l moves row l of the region at the pointer (rows of S words, the
 // instruction's), beat j column j. Every word it touches must be in tmem
 // (the machine's PANIC); the alignment rule is the sanitizer's
@@ -668,7 +705,7 @@ void Machine::dispatch_mma(const DispatchEntry& op, Wires& w) {
 void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     const auto& inst = op.instruction;
     const bool load = is_acc_load(inst.opcode);
-    const uint32_t width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
+    const uint32_t width = register_span(inst.opcode);
     const uint8_t rf_base = load ? inst.dst : inst.src1;
     const auto row_words = static_cast<uint32_t>(inst.imm);
     const auto pointer = uniform_operand(op, inst.src0);
@@ -684,7 +721,6 @@ void Machine::dispatch_acc_transfer(const DispatchEntry& op, Wires& w) {
     sanitizer_.check_acc_transfer_vs_mma(site(op), region);
     sanitizer_.check_acc_transfer_overlap(site(op), region, load);
     AccTransfer transfer;
-    transfer.load = load;
     transfer.warp = op.warp;
     transfer.rf_base = rf_base;
     transfer.depbar = inst.control.set_depbar;
@@ -729,8 +765,7 @@ void Machine::drive_mma(const Wires& w) {
 // The two acc transfer engines: step_acc_transfers' result (acc.ld launches,
 // acc.st landings), plus this cycle's acc.st RF read (the beat enters the
 // acc.st pipeline) and dispatch's new transfer (its engine has been empty
-// since the transfer issued: issue asks for the engine's Q and the dispatch
-// pipeline's claims).
+// since the transfer issued: issue took the engine's credit).
 void Machine::drive_acc_transfers(const Wires& w) {
     auto next = w.acc_next;
     if (const auto& beat = w.acc_st_read; beat.has_value()) {

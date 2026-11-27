@@ -33,10 +33,9 @@ TEST(Registers, names_compute) {
         "the hex text lost the register names");
     nanosm::Machine machine(profile, kernel, launch_warps(1));
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, number_of(kernel.register_names, "kept")) == 5 * lane + 7 &&
-                machine.read_reg(0, lane, number_of(kernel.register_names, "sum")) == 5 * lane + 7,
-            "named registers computed the wrong value");
+    for (const auto* name : {"kept", "sum"}) {
+        require_lanes(machine, number_of(kernel.register_names, name), [](uint32_t lane) { return 5 * lane + 7; },
+            std::string("named register %") + name);
     }
     require(machine.read_ureg(0, number_of(kernel.register_names, "seven")) == 7, "a named uniform register");
 }
@@ -129,10 +128,8 @@ C:      add    %r2, %v, %z
     machine.run();
     // (Read through %all: a name's register holds its value only until the
     // last read that needs it.)
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, number_of(kernel.register_names, "all")) == 306 + 3 * lane,
-            "the repaired instructions computed the wrong value");
-    }
+    require_lanes(machine, number_of(kernel.register_names, "all"), [](uint32_t lane) { return 306 + 3 * lane; },
+        "the repaired instructions' value");
 
     // Inside a loop the copy is of a source the loop does not write (%v,
     // though it comes first), and the warning's advice is that one; when the
@@ -172,10 +169,8 @@ L:      add    %t0, %x, %y
     const auto loop_kernel = compile(loop, profile);
     nanosm::Machine loop_machine(profile, loop_kernel, launch_warps(1));
     loop_machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(loop_machine.read_reg(0, lane, number_of(loop_kernel.register_names, "all")) == 606 + 3 * lane,
-            "the loop's repaired instructions computed the wrong value");
-    }
+    require_lanes(loop_machine, number_of(loop_kernel.register_names, "all"),
+        [](uint32_t lane) { return 606 + 3 * lane; }, "the loop's repaired instructions' value");
     std::string all_written = "mov %p, 1\nmov %q, 2\nmov %r, 3\nmov %s, 4\numov %n, 0\nL:\n";
     for (const auto& [left, right] : std::vector<std::pair<std::string, std::string>>{
              {"p", "q"}, {"p", "r"}, {"p", "s"}, {"q", "r"}, {"q", "s"}, {"r", "s"}}) {
@@ -208,11 +203,9 @@ L:      add    %t0, %x, %y
     const auto continued_kernel = compile(early, profile);
     nanosm::Machine continued_machine(profile, continued_kernel, launch_warps(1));
     continued_machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        // x, y, z gain 100, 100, 101, 102 over the four passes.
-        require(continued_machine.read_reg(0, lane, number_of(continued_kernel.register_names, "all")) ==
-                1215 + 3 * lane, "the early-continue loop computed the wrong value");
-    }
+    // x, y, z gain 100, 100, 101, 102 over the four passes.
+    require_lanes(continued_machine, number_of(continued_kernel.register_names, "all"),
+        [](uint32_t lane) { return 1215 + 3 * lane; }, "the early-continue loop's value");
 }
 
 // A one-word store's address and data are read one after the other when the
@@ -232,10 +225,10 @@ TEST(Registers, one_bank_store) {
         (void)image_bytes(launch.gmem_image, 64);
         nanosm::Machine machine(profile, compile(source, profile), std::move(launch));
         machine.run();
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            const auto word = store == "sts" ? machine.read_shmem_u32(4 * lane) : machine.read_gmem_u32(4 * lane);
-            require(word == 37, store + " on one bank stored the wrong word");
-        }
+        const auto word = [&](uint32_t lane) {
+            return store == "sts" ? machine.read_shmem_u32(4 * lane) : machine.read_gmem_u32(4 * lane);
+        };
+        require_lanes(word, 37, store + " on one bank: the word stored");
     }
 }
 
@@ -358,11 +351,9 @@ TEST(Registers, sharing) {
     require(shared.register_count <= 6, "the temporaries did not share registers");
     nanosm::Machine small_machine(small, shared, launch_warps(1));
     small_machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(small_machine.read_reg(0, lane, number_of(shared.register_names, "y")) ==
-                (lane % 2 == 1 ? 9u : 7u) + lane,
-            "a masked write's skipped lanes were lost to a shared register");
-    }
+    require_lanes(small_machine, number_of(shared.register_names, "y"),
+        [](uint32_t lane) { return (lane % 2 == 1 ? 9u : 7u) + lane; },
+        "a masked write's skipped lanes beside a shared register");
 }
 
 // A predicate may be a name. %p0 .. %p6 are p0 .. p6 themselves; any other
@@ -391,11 +382,9 @@ TEST(Registers, predicate_names) {
     const auto kernel = compile(source, profile);
     nanosm::Machine machine(profile, kernel, launch_warps(1));
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        const uint32_t expected = (lane % 2 == 1 ? 2u : 1u) + (lane < 8 ? 10u : 0u) + (lane >= 12 ? 0u : 100u);
-        require(machine.read_reg(0, lane, number_of(kernel.register_names, "x")) == expected,
-            "masks by a named predicate, %p0 and p1 computed the wrong value");
-    }
+    require_lanes(machine, number_of(kernel.register_names, "x"),
+        [](uint32_t lane) { return (lane % 2 == 1 ? 2u : 1u) + (lane < 8 ? 10u : 0u) + (lane >= 12 ? 0u : 100u); },
+        "masks by a named predicate, %p0 and p1");
     qtx_refused("sread %a, LANE_ID\nsetp.ne.u32 %a, %a, 0\nhalt\n",
         "%a is used here as a predicate and on line 1 as a vector register", "one name as a register and a predicate");
     qtx_refused("mov %p0, 1\nhalt\n", "%p0 is the predicate p0, not a register", "%p0 as a register");

@@ -27,14 +27,9 @@ IssueSite Machine::site(const DispatchEntry& op) const {
     return IssueSite{cycle_, op.warp, op.pc, op.instruction, &config_.mma_shapes};
 }
 
-// A queued shared-memory instruction's site: this cycle, its issue's pc.
-IssueSite Machine::site(const ShmemEntry& entry) const {
-    return IssueSite{cycle_, entry.warp, entry.pc, entry.instruction, &config_.mma_shapes};
-}
-
-// A queued global-memory instruction's site, and its command's once it has
-// left the queue: this cycle, its issue's pc.
-IssueSite Machine::site(const LsuEntry& entry) const {
+// A queued instruction's site, and a global-memory one's command's once it
+// has left the queue: this cycle, its issue's pc.
+IssueSite Machine::site(const QueuedEntry& entry) const {
     return IssueSite{cycle_, entry.warp, entry.pc, entry.instruction, &config_.mma_shapes};
 }
 

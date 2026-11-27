@@ -14,26 +14,7 @@ namespace nanosm {
 
 namespace {
 
-// A shared-memory instruction's admission, from registers: the warp's own
-// order between the two sides -- a read waits for the warp's unserviced
-// writes, a write for its unserviced reads (each side keeps a warp's
-// accesses in order by itself) -- then a free entry in its queue.
-std::optional<Refusal> shmem_refusal(bool write, const ResourceView& view) {
-    if (write ? view.unserviced_read : view.unserviced_write) return Refusal::shmem_ordered;
-    if (!view.shmem_queue_room) return write ? Refusal::write_queue_full : Refusal::read_queue_full;
-    return std::nullopt;
-}
-
-} // namespace
-
-// ===========================================================================
-// Admission: metadata and resource state only.
-// These two functions see the instruction's wait mask, its plan (decoded
-// when its packet landed: Machine::predecode) and a ResourceView. They are
-// the only places issue decides whether to accept; Machine::try_issue calls
-// them before it captures any operand.
-// ===========================================================================
-
+// The first depbar in the instruction's wait mask that is still nonzero (Q).
 std::optional<uint8_t> depbar_wait(uint8_t wait_mask, const std::array<uint32_t, 6>& depbar) {
     for (uint8_t bar = 0; bar < 6; ++bar) {
         if ((wait_mask & (1u << bar)) != 0 && depbar[bar] != 0) return bar;
@@ -41,39 +22,74 @@ std::optional<uint8_t> depbar_wait(uint8_t wait_mask, const std::array<uint32_t,
     return std::nullopt;
 }
 
-// In a fixed order, which decides the reason reported when several apply.
+} // namespace
+
+// ===========================================================================
+// Admission: whether the warp's head instruction can be accepted now, from
+// its plan (decoded when its packet landed: Machine::predecode) and
+// registers only (Q), never an operand: a register's, a predicate's or
+// memory's contents. The plan selects WHICH register (a bank's inhibit bit,
+// the write calendar's tap, a credit, the warp's counts). Machine::try_issue
+// asks it before it captures anything. The refusals are tested in a fixed
+// order, which decides the reason reported when several apply:
+//   1. a bank the round reads has its read inhibit bit set (the RF read
+//      policy: set by an async reader denied last cycle, rf.cpp
+//      drive_rf_read_policy, so a denial is seen one cycle late);
+//   2. the round reads a uniform register while a tma's or an mma.async's
+//      later rounds own the URF's two read ports (src/timing.hpp
+//      uniform_read_rounds; a tma or an mma.async included);
+//   3. what the kind needs: arithmetic the SFU's occupancy countdown, then
+//      its write booking's calendar entry and its bank's write inhibit bit
+//      (the RF write policy, a cycle late like the read's); fence.sh every
+//      access of its warp at the RAM (its counts); a shared-memory access its
+//      warp's order between the two sides (a read waits for the warp's
+//      unserviced writes, a write for its unserviced reads; each side keeps a
+//      warp's accesses in order by itself), then its queue's credit; the
+//      tma, mma, acc.ld / acc.st and global-memory forms their credit. A
+//      uniform-register writer (or usetp) needs nothing more: its write port
+//      is its own pipeline stage (src/timing.hpp; usetp's predicate goes to
+//      the flip-flops at that stage). Nor do control, nop and halt.
 // A set depbar needs counter room too; no counter width is declared (S5),
 // and a warp can hold far fewer async operations than any width would
-// count, so that never refuses.
-std::optional<Refusal> structural_refusal(const IssuePlan& plan, const ResourceView& view) {
-    if (view.read_inhibited) return Refusal::rf_read_inhibited;
-    // A tma's or an mma.async's later operand rounds own the URF's two read
-    // ports (src/timing.hpp uniform_read_rounds): an instruction whose read round
-    // has a uniform register (a tma or an mma.async included) would sample in
-    // one of them.
-    if (view.urf_ports_held && !plan.uniform_reads.empty()) return Refusal::urf_read_ports_held;
-    switch (plan.kind) {
-    // A uniform-register writer (or usetp) needs nothing else: its write port
-    // is its own pipeline stage (src/timing.hpp; usetp's predicate goes to the
-    // flip-flops at that stage), its reads the issue register's round.
-    case IssueKind::uniform: return std::nullopt;
-    case IssueKind::arithmetic:
-        if (plan.sfu && !view.sfu_free) return Refusal::sfu_busy;
-        if (plan.write_reg.has_value() && !view.write_slot_free) return Refusal::rf_write_booked;
-        if (plan.write_reg.has_value() && view.write_inhibited) return Refusal::rf_write_inhibited;
+// count, so that never refuses. Space a unit frees at t is seen from t + 1.
+// ===========================================================================
+
+std::optional<Refusal> Machine::admission_refusal(const Warp& warp, const IssuePlan& plan) const {
+    for (const auto bank : plan.read_banks) {
+        if (rf_read_policy_.cur()[bank].inhibit != 0) return Refusal::rf_read_inhibited;
+    }
+    if (!plan.uniform_reads.empty() && urf_read_ports_held()) return Refusal::urf_read_ports_held;
+    const auto credit = [this](Credit which, Refusal refusal) {
+        return credit_free(which) ? std::nullopt : std::optional{refusal};
+    };
+    const auto& counts = shmem_counts_.cur().at(warp.id);
+    switch (plan.unit) {
+    case IssueUnit::alu:
+    case IssueUnit::fpu:
+    case IssueUnit::sfu:
+        if (plan.unit == IssueUnit::sfu && sfu_busy_.cur() != 0) return Refusal::sfu_busy;
+        if (plan.write_reg.has_value()) {
+            if (!write_slot_free(plan.write_bank, plan.write_delay)) return Refusal::rf_write_booked;
+            if (rf_write_policy_.cur()[plan.write_bank].inhibit != 0) return Refusal::rf_write_inhibited;
+        }
         return std::nullopt;
-    case IssueKind::tma: return view.tma_queue_room ? std::nullopt : std::optional{Refusal::tma_queue_full};
-    case IssueKind::mma: return view.mma_queue_room ? std::nullopt : std::optional{Refusal::mma_queue_full};
-    case IssueKind::acc_load:
-    case IssueKind::acc_store: return view.acc_engine_free ? std::nullopt : std::optional{Refusal::acc_engine_busy};
-    case IssueKind::fence: return view.own_shmem_at_ram ? std::nullopt : std::optional{Refusal::shmem_fence};
-    case IssueKind::shmem_read: return shmem_refusal(false, view);
-    case IssueKind::shmem_write: return shmem_refusal(true, view);
-    case IssueKind::lsu: return view.lsu_queue_room ? std::nullopt : std::optional{Refusal::lsu_queue_full};
-    case IssueKind::control:
-    case IssueKind::nop:
-    case IssueKind::halt: return std::nullopt;
-    case IssueKind::none: break;
+    case IssueUnit::tma: return credit(Credit::tma_queue, Refusal::tma_queue_full);
+    case IssueUnit::mma: return credit(Credit::mma_queue, Refusal::mma_queue_full);
+    case IssueUnit::acc_load: return credit(Credit::acc_ld, Refusal::acc_engine_busy);
+    case IssueUnit::acc_store: return credit(Credit::acc_st, Refusal::acc_engine_busy);
+    case IssueUnit::fence: return counts.not_at_ram == 0 ? std::nullopt : std::optional{Refusal::shmem_fence};
+    case IssueUnit::shared_read:
+        if (counts.writes != 0) return Refusal::shmem_ordered;
+        return credit(Credit::read_queue, Refusal::read_queue_full);
+    case IssueUnit::shared_write:
+        if (counts.reads != 0) return Refusal::shmem_ordered;
+        return credit(Credit::write_queue, Refusal::write_queue_full);
+    case IssueUnit::lsu: return credit(Credit::lsu_queue, Refusal::lsu_queue_full);
+    case IssueUnit::uniform:
+    case IssueUnit::control:
+    case IssueUnit::nop:
+    case IssueUnit::halt: return std::nullopt;
+    case IssueUnit::none: break;
     }
     throw SimError("internal: issue was given a word that is no instruction");
 }
@@ -163,7 +179,7 @@ void Machine::decide_issue(Wires& w) {
             states[index].state = WarpState::halted;
             continue;
         }
-        if (probe_in_flight(warp.id)) {
+        if (shmem_counts_.cur()[index].probe) {
             states[index] = {WarpState::mbar_wait, "mbar probe"};
             continue;
         }
@@ -217,8 +233,8 @@ void Machine::decide_issue(Wires& w) {
 //      the sanitizer's hazard checks against the cycles the round samples
 //      at (at every attempt: contention must not hide a missing
 //      stall);
-//   2. admission: structural_refusal, on the plan and resource state alone.
-//      A refusal books nothing and reads nothing;
+//   2. admission: admission_refusal, on the plan and registers alone. A
+//      refusal books nothing and reads nothing;
 //   3. acceptance: the read round into the issue register, the write
 //      booking (both in future cycles, past the issue register),
 //      the metadata share of each unit's work and, for a memory, engine or
@@ -233,16 +249,14 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
     const auto& head = head_entry(warp);
     const Instruction inst = head.instruction;
     const auto& plan = head.plan;
-    sanitizer_.record_issue_attempt(warp.id);
     panic_if_malformed(warp, inst);
     if (const auto bar = depbar_wait(inst.control.wait_mask, depbar_.cur().at(warp.id)); bar.has_value()) {
         return {false, WarpState::depbar, "sb" + std::to_string(*bar)};
     }
     check_issue_hazards(warp, inst);
-    if (const auto refusal = structural_refusal(plan, resource_view(warp, plan)); refusal.has_value()) {
+    if (const auto refusal = admission_refusal(warp, plan); refusal.has_value()) {
         return refuse(*refusal);
     }
-    sanitizer_.record_issue_accepted();
     accept(warp, inst, plan, w);
     return {true, WarpState::issued, {}};
 }
@@ -259,8 +273,7 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
         // (The pointer is a uniform register: check_issue_hazards checks it
         // against the URF.)
         const auto base = is_acc_load(inst.opcode) ? inst.dst : inst.src1;
-        const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8u : 1u;
-        if (static_cast<unsigned>(base) + width > 256) panic(warp, inst, "accumulator register encoding wraps");
+        if (base + register_span(inst.opcode) > 256) panic(warp, inst, "accumulator register encoding wraps");
     }
     if (inst.opcode == Opcode::sread && inst.imm != static_cast<int32_t>(SpecialReg::lane_id) &&
         inst.imm != static_cast<int32_t>(SpecialReg::thread_id)) {
@@ -278,10 +291,10 @@ void Machine::panic_if_malformed(const Warp& warp, const Instruction& inst) cons
 // at no operand value; the sanitizer's transfer-versus-matmul check looks at
 // the tmem pointer the round will sample (it has global knowledge).
 void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) const {
-    for (const auto reg : source_registers(inst)) {
+    for (const auto reg : vector_sources(inst)) {
         if (reg >= kernel_.register_count) panic(warp, inst, "source register out of range");
     }
-    const auto destination = destination_register(inst);
+    const auto destination = vector_destination(inst);
     if (destination.has_value() && *destination >= kernel_.register_count) {
         panic(warp, inst, "destination register out of range");
     }
@@ -306,9 +319,9 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     if (uniform_dst.has_value()) {
         sanitizer_.check_uniform_waw(site(warp, inst), *uniform_dst, cycle_ + issue_to_urf_visible(config_));
     }
-    if (is_setp(inst.opcode) || is_usetp(inst.opcode) || is_mbar_predicate_writer(inst.opcode)) {
-        if (inst.dst >= 7) panic(warp, inst, "predicate destination is not p0..p6");
-        sanitizer_.check_pred_waw(site(warp, inst), inst.dst);
+    if (const auto predicate = predicate_destination(inst); predicate.has_value()) {
+        if (*predicate >= 7) panic(warp, inst, "predicate destination is not p0..p6");
+        sanitizer_.check_pred_waw(site(warp, inst), *predicate);
     }
     // A branch's predicate and any other instruction's write mask are sampled in
     // the operand round (issue_to_predicate_sample = issue_to_sample).
@@ -323,60 +336,13 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
         // (an MMA command issued just before is accepted by the MMA only
         // then). The words are the ones the pointer the round samples next
         // cycle names (a region outside tmem is the dispatch PANIC's).
-        const uint32_t width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::acc_st_v8 ? 8 : 1;
         const auto pointer = uniform_at_next_sample(warp.id, inst.src0);
-        if (const auto words = tmem_region_words(pointer, static_cast<uint32_t>(inst.imm), config_.lanes, width);
+        if (const auto words = tmem_region_words(pointer, static_cast<uint32_t>(inst.imm), config_.lanes,
+                register_span(inst.opcode));
             words.has_value()) {
             sanitizer_.check_acc_transfer_vs_mma(site(warp, inst), tmem_region(pointer, inst, *words));
         }
     }
-}
-
-// The resource state admission may see: registers only (Q). The RF write
-// calendar; each bank's read and write inhibit bits (the RF policy
-// registers: set by an async reader or writer denied with service owed last
-// cycle, so a denial is seen one cycle late); unit occupancy, queue and engine
-// space less what the dispatch pipeline's instructions and the TMA operand
-// read will take; a shared-memory instruction's queue and its warp's counts;
-// the load / store unit's queue. Space a unit frees at t is seen from t + 1.
-// The plan selects WHICH resource (a register's bank, the write calendar's
-// tap, the engine, the queue); no register content is read.
-ResourceView Machine::resource_view(const Warp& warp, const IssuePlan& plan) const {
-    const auto claims = dispatch_claims();
-    ResourceView view;
-    for (const auto bank : plan.read_banks) {
-        if (rf_read_policy_.cur()[bank].inhibit != 0) view.read_inhibited = true;
-    }
-    view.sfu_free = sfu_busy_.cur() == 0;
-    if (plan.write_reg.has_value()) {
-        view.write_slot_free = write_slot_free(plan.write_bank, plan.write_delay);
-        view.write_inhibited = rf_write_policy_.cur()[plan.write_bank].inhibit != 0;
-    }
-    // A queue slot is counted as taken from a tma's accept: the queue's
-    // commands (Q) and the commands its operand read holds. A command that
-    // ends at t frees its slot for an issue at t + 1. So the push always fits.
-    view.tma_queue_room = tma_.cur().commands.size() + tma_commands_being_read() < config_.tma_queue_commands;
-    view.urf_ports_held = urf_read_ports_held();
-    // The tensor core's commands (Q) and those on their way in the dispatch
-    // pipeline: a command that ends at t frees its slot for an issue at t + 1.
-    view.mma_queue_room = mma_.cur().slots.size() + claims.mma_commands < config_.mma_queue_commands;
-    if (plan.kind == IssueKind::acc_load || plan.kind == IssueKind::acc_store) {
-        const bool load = plan.kind == IssueKind::acc_load;
-        // Its engine's register holds no transfer and none is on its way in
-        // the dispatch pipeline: an engine whose transfer ends at t takes the
-        // next one's issue from t + 1.
-        const std::size_t engine = load ? 0 : 1;
-        view.acc_engine_free = !acc_engines_.cur()[engine].has_value() && claims.acc[engine] == 0;
-    }
-    const auto& counts = shmem_counts_.cur().at(warp.id);
-    view.unserviced_read = counts.reads != 0;
-    view.unserviced_write = counts.writes != 0;
-    view.own_shmem_at_ram = counts.not_at_ram == 0;
-    view.shmem_queue_room = plan.kind == IssueKind::shmem_write
-        ? write_queue_.cur().size() < config_.shmem_write_queue_entries
-        : read_queue_.cur().size() < config_.shmem_read_queue_entries;
-    view.lsu_queue_room = lsu_queue_.cur().size() < config_.lsu_queue_entries;
-    return view;
 }
 
 // A refused attempt: the warp state and reason for the trace, and its counter.
@@ -429,21 +395,24 @@ Machine::IssueAttempt Machine::refuse(Refusal refusal) {
 // (the engines' instructions) enters the dispatch pipeline.
 void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     w.issue.popped = warp.id;
-    switch (plan.kind) {
-    case IssueKind::arithmetic:
+    w.issue.credit = credit_for(plan.unit);
+    switch (plan.unit) {
+    case IssueUnit::alu:
+    case IssueUnit::fpu:
+    case IssueUnit::sfu:
         accept_arithmetic(warp, inst, plan, w);
         return;
-    case IssueKind::uniform:
+    case IssueUnit::uniform:
         accept_uniform(warp, inst, plan, w);
         return;
-    case IssueKind::control:
+    case IssueUnit::control:
         w.issue.branch = IssuedBranch{warp.id, head_pc(warp.id), inst};
         break;
-    case IssueKind::fence:
+    case IssueUnit::fence:
         break; // its admission was the whole of it (own_shmem_at_ram)
-    case IssueKind::nop:
+    case IssueUnit::nop:
         break; // its wait mask held it until now; its stall is set below
-    case IssueKind::halt: {
+    case IssueUnit::halt: {
         // The sanitizer's view counts the warp's own control instruction
         // resolving this cycle: an ssy does not hold its warp, so the halt
         // right behind it issues in the cycle the ssy's push resolves, one
@@ -464,36 +433,34 @@ void Machine::accept(Warp& warp, const Instruction& inst, const IssuePlan& plan,
     // counter's (src/timing.hpp uniform_read_rounds); a tma reaches its queue
     // through the TMA operand read, an mma.async through the dispatch
     // pipeline like every other engine instruction.
-    case IssueKind::tma:
+    case IssueUnit::tma:
         if (!plan.later_uniform_rounds) throw SimError("internal: a tma whose operands fit one uniform round");
         load_urf_rounds(warp, inst, w);
         break;
-    case IssueKind::mma:
-    case IssueKind::acc_load:
-    case IssueKind::acc_store:
+    case IssueUnit::mma:
+    case IssueUnit::acc_load:
+    case IssueUnit::acc_store:
         if (plan.later_uniform_rounds) load_urf_rounds(warp, inst, w);
         accept_for_dispatch(warp, inst, plan, w);
         break;
-    case IssueKind::shmem_read:
-    case IssueKind::shmem_write:
-        accept_shmem(warp, inst, plan, w);
+    case IssueUnit::shared_read:
+    case IssueUnit::shared_write:
+    case IssueUnit::lsu:
+        accept_queued(warp, inst, plan, w);
         break;
-    case IssueKind::lsu:
-        accept_lsu(warp, inst, plan, w);
-        break;
-    case IssueKind::none:
+    case IssueUnit::none:
         throw SimError("internal: issue accepted a word that is no instruction");
     }
-    check_issue_latency(warp, inst);
     w.issue.stall = inst.control.stall;
     trace_->issue(cycle_, warp.id, head_pc(warp.id), inst);
 }
 
 // Fixed-latency work books its result write; its read round goes into the
-// issue register (the next cycle's samples). step_rf_reads captures the
+// issue register (the next cycle's samples). step_arithmetic_reads captures the
 // operands at the sample and executes the instruction when they are at the
 // RF output. A booking of the result's bank is what sets that bank's
-// async_owed bit; the read round sets its banks' read_owed bits.
+// async_owed bit; the read round's bank use goes into the issue register and,
+// where it takes every read port of a bank, may set that bank's read inhibit.
 void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     if (plan.write_reg.has_value()) {
         reserve_write(plan.write_bank, plan.write_delay, w);
@@ -501,7 +468,7 @@ void Machine::accept_arithmetic(Warp& warp, const Instruction& inst, const Issue
     }
     w.issue.rf_read_banks.assign(config_.rf_banks, 0);
     for (const auto bank : plan.read_banks) ++w.issue.rf_read_banks[bank];
-    if (plan.sfu) {
+    if (plan.unit == IssueUnit::sfu) {
         w.issue.sfu = true;
         trace_->sfu_accept(sfu_occupancy());
     }
@@ -566,27 +533,26 @@ void Machine::accept_uniform(Warp& warp, const Instruction& inst, const IssuePla
 // data (read-owned until each beat). It reads no vector register at issue;
 // its uniform registers are sampled at issue + 1 (an mma.async's urC a cycle
 // later), and it enters the dispatch pipeline; at issue_to_dispatch its unit
-// takes it with them (hand_over). Admission secured that unit's space.
+// takes it with them (hand_over). Admission took that unit's credit.
 void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     const auto opcode = inst.opcode;
-    const bool sets_depbar = is_acc_transfer(opcode) || is_mma_async(opcode);
-    if (sets_depbar && inst.control.set_depbar >= 6) {
+    if (sets_depbar(opcode) && inst.control.set_depbar >= 6) {
         if (is_mma_async(opcode)) {
             panic(warp, inst, opcode_name(opcode, &config_.mma_shapes) + " has no operand-consumed depbar");
         }
         panic(warp, inst, "accumulator transfer has no depbar");
     }
-    if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
+    if (sets_depbar(opcode)) admit_depbar(w, warp.id, inst.control.set_depbar);
     if (!plan.reads.empty()) throw SimError("internal: an engine instruction with an issue-round vector read");
     const auto not_ready = std::numeric_limits<uint64_t>::max();
-    if (const auto dst = destination_register(inst); dst.has_value()) {
-        const auto width = opcode == Opcode::acc_ld_v8 ? 8u : 1u;
-        for (uint32_t j = 0; j < width; ++j) sanitizer_.record_reg_ready(warp.id, *dst + j, not_ready); // until written
+    if (const auto dst = vector_destination(inst); dst.has_value()) {
+        for (uint32_t j = 0; j < register_span(opcode); ++j) {
+            sanitizer_.record_reg_ready(warp.id, *dst + j, not_ready); // until written
+        }
     }
     // WAR protection: a source read beat by beat stays read-owned until its beat.
     if (opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8) {
-        const auto width = opcode == Opcode::acc_st ? 1u : 8u;
-        for (uint32_t j = 0; j < width; ++j) sanitizer_.record_async_reader_add(warp.id, inst.src1 + j);
+        for (uint32_t j = 0; j < register_span(opcode); ++j) sanitizer_.record_async_reader_add(warp.id, inst.src1 + j);
     }
     DispatchEntry entry;
     entry.warp = warp.id;
@@ -603,128 +569,64 @@ void Machine::accept_for_dispatch(Warp& warp, const Instruction& inst, const Iss
     w.issue.dispatch = std::move(entry);
 }
 
-// A shared-memory instruction accepted now enters its side's queue at this
-// edge (src/machine/shmem.cpp), with the active mask; it samples its
-// predicate and uniform registers next cycle, and reads no vector register
-// at issue (its collect stage reads an lds's address and an sts's address
-// and data later). What depends on metadata alone happens now: the depbar it
-// sets and its read depbar, its warp's counts (drive_shmem_counts), the sanitizer's records for
-// its destination (not ready until written) and its vector sources
-// (read-owned until the collect stage reads them). Slot w of the mbar wait
-// slots is warp w's: a try_wait by a warp past the last slot is a PANIC.
-void Machine::accept_shmem(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
+// A shared or global memory instruction accepted now enters its queue at
+// this edge (src/machine/dispatch.cpp: shared memory's read or write side's,
+// the load / store unit's) with the active mask; it samples its predicate
+// and uniform registers next cycle, and reads no vector register at issue
+// (late_vector_reads: its collect stage, command slot or data beats read
+// them later). What depends on metadata alone happens now: the depbar it
+// sets and its read depbar (lowered at its last vector source read), a
+// shared access's warp counts (drive_shmem_counts), the sanitizer's records
+// for its destination and a probe's predicate (not ready until written) and
+// its vector sources (read-owned until read). Slot w of the mbar wait slots
+// is warp w's: a try_wait by a warp past the last slot is a PANIC.
+void Machine::accept_queued(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w) {
     const auto opcode = inst.opcode;
+    const auto queue = plan.unit == IssueUnit::lsu ? MemoryQueue::lsu
+        : plan.unit == IssueUnit::shared_write     ? MemoryQueue::shmem_write
+                                                   : MemoryQueue::shmem_read;
     if (is_mbar_try_wait(opcode) && warp.id >= config_.mbar_wait_slots) {
         panic(warp, inst, "mbar.try_wait by warp " + std::to_string(warp.id) + ": the profile has " +
             std::to_string(config_.mbar_wait_slots) + " wait slots (sync.mbar_wait_slots), one for each of the first " +
             std::to_string(config_.mbar_wait_slots) + " warps");
     }
-    const bool sets_depbar = is_shared_load(opcode) || opcode == Opcode::sts || is_atomic(opcode);
-    if (sets_depbar && inst.control.set_depbar >= 6) panic(warp, inst, opcode_name(opcode) + " has no depbar");
-    if (sets_depbar) admit_depbar(w, warp.id, inst.control.set_depbar);
-    admit_read_depbar(w, warp.id, inst); // lds, sts: lowered when the collect stage has read their registers
-    const auto not_ready = std::numeric_limits<uint64_t>::max();
-    if (const auto dst = destination_register(inst); dst.has_value()) sanitizer_.record_reg_ready(warp.id, *dst, not_ready);
-    if (is_mbar_predicate_writer(opcode)) sanitizer_.record_pred_ready(warp.id, inst.dst, not_ready); // until the probe returns
-    if (opcode == Opcode::lds || opcode == Opcode::sts) sanitizer_.record_async_reader_add(warp.id, inst.src0);
-    if (opcode == Opcode::sts && inst.src1 != inst.src0) sanitizer_.record_async_reader_add(warp.id, inst.src1);
-    ShmemEntry entry;
-    entry.warp = warp.id;
-    entry.pc = head_pc(warp.id);
-    entry.lanes = active_mask(warp.id);
-    entry.instruction = inst;
-    entry.uniform_reads = plan.uniform_reads;
-    // A try_wait's uniform operands must be at the URF output as it leaves
-    // the queue (its wait slot); anything else's when its collect stage
-    // starts, the cycle after it leaves.
-    const auto lu = config_.urf_read_latency_cycles;
-    entry.wait = plan.uniform_reads.empty() ? 0 : static_cast<uint8_t>(is_mbar_try_wait(opcode) ? lu : lu - 1);
-    w.issue.shmem = std::move(entry);
-    w.issue.shmem_write_side = plan.kind == IssueKind::shmem_write;
-}
-
-// A global-memory instruction accepted now enters the load / store unit's
-// queue at this edge (src/machine/lsu.cpp), with the active mask; it samples
-// its predicate (and an ldg.uni its base) next cycle, and reads no vector
-// register at issue (its command slot reads its address, and a scalar
-// stg's data, later; a stg.v8's data in beats). What depends on metadata
-// alone happens now: the depbar it sets and its read depbar, the
-// sanitizer's records for its destination (not ready until written) and
-// its vector sources (read-owned until its command slot or its data beats
-// read them).
-void Machine::accept_lsu(Warp& warp, const Instruction& inst, const IssuePlan&, Wires& w) {
-    const auto opcode = inst.opcode;
-    if (inst.control.set_depbar >= 6) panic(warp, inst, "global memory operation has no depbar");
-    admit_depbar(w, warp.id, inst.control.set_depbar);
-    admit_read_depbar(w, warp.id, inst); // ldg, stg, ldg.v8, stg.v8: lowered at their last vector source read
-    const auto not_ready = std::numeric_limits<uint64_t>::max();
-    if (const auto dst = destination_register(inst); dst.has_value()) {
-        const auto width = opcode == Opcode::ldg_v8 ? 8u : 1u;
-        for (uint32_t j = 0; j < width; ++j) sanitizer_.record_reg_ready(warp.id, *dst + j, not_ready); // until written
+    if (sets_depbar(opcode) && inst.control.set_depbar >= 6) {
+        panic(warp, inst, queue == MemoryQueue::lsu ? "global memory operation has no depbar" : opcode_name(opcode) + " has no depbar");
     }
-    if (opcode != Opcode::ldg_uni) sanitizer_.record_async_reader_add(warp.id, inst.src0);
-    if (opcode == Opcode::stg && inst.src1 != inst.src0) sanitizer_.record_async_reader_add(warp.id, inst.src1);
-    if (opcode == Opcode::stg_v8) {
-        for (uint32_t j = 0; j < 8; ++j) sanitizer_.record_async_reader_add(warp.id, inst.src1 + j);
+    if (sets_depbar(opcode)) admit_depbar(w, warp.id, inst.control.set_depbar);
+    admit_read_depbar(w, warp.id, inst);
+    const auto not_ready = std::numeric_limits<uint64_t>::max();
+    if (const auto dst = vector_destination(inst); dst.has_value()) {
+        for (uint32_t j = 0; j < register_span(opcode); ++j) sanitizer_.record_reg_ready(warp.id, *dst + j, not_ready);
     }
-    LsuEntry entry;
-    entry.warp = warp.id;
-    entry.pc = head_pc(warp.id);
-    entry.lanes = active_mask(warp.id);
-    entry.instruction = inst;
-    // An ldg.uni's base must be at the URF output as it leaves the queue
-    // (it is planned then).
-    entry.wait = opcode == Opcode::ldg_uni ? static_cast<uint8_t>(config_.urf_read_latency_cycles) : 0;
-    w.issue.lsu = std::move(entry);
+    if (is_mbar_predicate_writer(opcode)) sanitizer_.record_pred_ready(warp.id, inst.dst, not_ready);
+    for (const auto& [reg, reader] : late_vector_reads(inst)) sanitizer_.record_async_reader_add(warp.id, reg);
+    w.issue.queued = IssueDecision::QueuePush{queue, queued_entry(warp, inst, plan)};
 }
 
 // A tma or an mma.async accepted now: it loads the
 // URF's round counter, whose round 0 samples next cycle (the issue
-// register's) and whose later rounds one per cycle after that. A tma from now
-// on counts as a slot of the TMA queue (resource_view); it reads no vector
-// register and sets no depbar. Issue accepted it only with the counter free
+// register's) and whose later rounds one per cycle after that. A tma holds
+// its TMA queue credit from now on (accept); it reads no vector register and
+// sets no depbar. Issue accepted it only with the counter free
 // after this cycle (its last round, if any, is sampled now:
 // urf_read_ports_held).
 void Machine::load_urf_rounds(Warp& warp, const Instruction& inst, Wires& w) {
     UrfReadRounds rounds;
-    rounds.header.issue_cycle = cycle_;
     rounds.header.warp = warp.id;
     rounds.header.pc = head_pc(warp.id);
     rounds.header.active_mask = active_mask(warp.id);
     rounds.header.instruction = inst;
+    rounds.later_rounds = static_cast<uint32_t>(uniform_read_rounds(inst).size() - 1);
     w.issue.urf_rounds = std::move(rounds);
 }
 
-// What the dispatch pipeline's instructions will take when they reach their
-// units: the claims every later admission subtracts from the space it sees.
-Machine::DispatchClaims Machine::dispatch_claims() const {
-    DispatchClaims claims;
-    for (const auto& stage : dispatch_pipe_.cur()) {
-        if (!stage.has_value()) continue;
-        const auto opcode = stage->instruction.opcode;
-        if (is_mma_command(opcode)) ++claims.mma_commands;
-        if (is_acc_transfer(opcode)) ++claims.acc[is_acc_load(opcode) ? 0 : 1];
-    }
-    return claims;
-}
-
-// The ISA tables' invariant: outside the arithmetic pipeline only
-// mbar.test_wait has a fixed (one-cycle predicate) latency, and only the
-// listed opcodes may have none.
-void Machine::check_issue_latency(const Warp& warp, const Instruction& inst) const {
-    const auto latency = fixed_latency(inst, config_.timing);
-    const auto opcode = inst.opcode;
-    if (is_mbar_test_wait(opcode)) {
-        if (latency != 1) panic(warp, inst, "mbar.test_wait must have one-cycle predicate latency");
-    } else if (latency != 0) {
-        panic(warp, inst, "fixed-latency opcode bypassed the arithmetic read pipeline");
-    } else if (!is_shared_load(opcode) && opcode != Opcode::sts && !is_lsu_opcode(opcode) &&
-               !is_tma_opcode(opcode) && !is_acc_transfer(opcode) && !is_mma_command(opcode) &&
-               opcode != Opcode::bra && opcode != Opcode::bra_uni && opcode != Opcode::ssy &&
-               opcode != Opcode::sync && opcode != Opcode::fence_sh &&
-               !is_mbar_rmw(opcode) && !is_mbar_try_wait(opcode) && !is_atomic(opcode) &&
-               opcode != Opcode::nop && opcode != Opcode::halt) {
-        panic(warp, inst, "zero-latency RF writer is unsupported");
+// The issue register's bank use: the round of the instruction accepted now
+// samples in the next cycle; nothing accepted leaves it empty.
+void Machine::drive_issue_read_banks(const Wires& w) {
+    for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
+        const uint8_t next = w.issue.rf_read_banks.empty() ? 0 : w.issue.rf_read_banks[bank];
+        if (next != issue_read_banks_.cur()[bank]) issue_read_banks_.set_next(bank, next, "drive_issue_read_banks");
     }
 }
 
@@ -747,6 +649,35 @@ void Machine::drive_scheduler(const Wires& w) {
     const uint32_t busy = w.issue.sfu ? sfu_occupancy() : sfu_busy_.cur();
     const uint32_t next = busy == 0 ? 0 : busy - 1;
     if (next != sfu_busy_.cur()) sfu_busy_.set_next(next, "drive_scheduler");
+}
+
+uint32_t Machine::credit_capacity(Credit credit) const {
+    switch (credit) {
+    case Credit::tma_queue: return config_.tma_queue_commands;
+    case Credit::mma_queue: return config_.mma_queue_commands;
+    case Credit::acc_ld:
+    case Credit::acc_st: return 1;
+    case Credit::read_queue: return config_.shmem_read_queue_entries;
+    case Credit::write_queue: return config_.shmem_write_queue_entries;
+    case Credit::lsu_queue: return config_.lsu_queue_entries;
+    }
+    throw SimError("internal: an unknown credit");
+}
+
+// The credits: next = Q - the entries their units free now + issue's
+// accept (a credit is never taken and given back in one cycle: an entry
+// enters its resource at the accept's edge).
+void Machine::drive_credits(const Wires& w) {
+    const auto& cur = credits_.cur();
+    for (std::size_t k = 0; k < credit_kinds; ++k) {
+        const auto credit = static_cast<Credit>(k);
+        const uint32_t returned = w.credit_returns[k];
+        const uint32_t taken = w.issue.credit == credit ? 1 : 0;
+        if (returned > cur[k]) throw SimError("internal: credit " + std::to_string(k) + " given back but not held");
+        const uint32_t next = cur[k] - returned + taken;
+        if (next > credit_capacity(credit)) throw SimError("internal: credit " + std::to_string(k) + " past its capacity");
+        if (next != cur[k]) credits_.set_next(k, static_cast<uint8_t>(next), "drive_credits");
+    }
 }
 
 // depbar: next = Q - this cycle's completions + issue's admissions (the
@@ -787,128 +718,17 @@ void Machine::drive_depbar(const Wires& w) {
     }
 }
 
-// The vector registers an instruction reads. A uniform second source (the U
-// bit, src/isa.hpp takes_uniform_source) is the URF's, so the others are.
-std::vector<uint8_t> Machine::source_registers(const Instruction& inst) const {
-    if (is_mma_async(inst.opcode)) return {};
-    if (inst.src1_uniform && takes_uniform_source(inst.opcode)) {
-        if (inst.opcode == Opcode::fma) return {inst.src0, inst.src2};
-        return {inst.src0};
-    }
-    switch (inst.opcode) {
-    case Opcode::add:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::cvt_pack:
-    case Opcode::setp_eq:
-    case Opcode::setp_ne:
-    case Opcode::setp_lt:
-    case Opcode::setp_le:
-    case Opcode::setp_gt:
-    case Opcode::setp_ge:
-    case Opcode::setp_lt_s32:
-    case Opcode::setp_le_s32:
-    case Opcode::setp_gt_s32:
-    case Opcode::setp_ge_s32: return {inst.src0, inst.src1};
-    case Opcode::fma: return {inst.src0, inst.src1, inst.src2};
-    case Opcode::and_:
-    case Opcode::or_:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr: return {inst.src0, inst.src1};
-    case Opcode::addi:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::andi:
-    case Opcode::ori:
-    case Opcode::lds:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-    case Opcode::ex2:
-    case Opcode::rcp:
-    case Opcode::setpi_eq:
-    case Opcode::setpi_ne:
-    case Opcode::setpi_lt:
-    case Opcode::setpi_le:
-    case Opcode::setpi_gt:
-    case Opcode::setpi_ge:
-    case Opcode::setpi_lt_s32:
-    case Opcode::setpi_le_s32:
-    case Opcode::setpi_gt_s32:
-    case Opcode::setpi_ge_s32:
-    case Opcode::r2ur: return {inst.src0};
-    case Opcode::sts:
-    case Opcode::stg: return {inst.src0, inst.src1};
-    case Opcode::stg_v8: {
-        std::vector<uint8_t> result{inst.src0};
-        for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
-        return result;
-    }
-    case Opcode::acc_st: return {inst.src1};
-    case Opcode::acc_st_v8: {
-        std::vector<uint8_t> result;
-        for (uint16_t j = 0; j < 8; ++j) result.push_back(static_cast<uint8_t>(inst.src1 + j));
-        return result;
-    }
-    default: return {};
-    }
-}
-
-std::optional<uint8_t> Machine::destination_register(const Instruction& inst) const {
-    switch (inst.opcode) {
-    case Opcode::sread:
-    case Opcode::mov:
-    case Opcode::add:
-    case Opcode::addi:
-    case Opcode::and_:
-    case Opcode::andi:
-    case Opcode::or_:
-    case Opcode::ori:
-    case Opcode::xor_:
-    case Opcode::shl:
-    case Opcode::shr:
-    case Opcode::shli:
-    case Opcode::shri:
-    case Opcode::xori:
-    case Opcode::fadd:
-    case Opcode::fmul:
-    case Opcode::fsub:
-    case Opcode::fmax:
-    case Opcode::fma:
-    case Opcode::cvt_pack:
-    case Opcode::ex2:
-    case Opcode::rcp:
-    case Opcode::ur2r:
-    case Opcode::lds:
-    case Opcode::lds_uni:
-    case Opcode::ldg:
-    case Opcode::ldg_v8:
-    case Opcode::ldg_uni: return inst.dst;
-    case Opcode::acc_ld:
-    case Opcode::acc_ld_v8: return inst.dst;
-    case Opcode::atom_add_uni:
-    case Opcode::atom_and_uni:
-    case Opcode::atom_xor_uni:
-    case Opcode::atom_exch_uni: return inst.dst;
-    default: return std::nullopt;
-    }
-}
-
 // No scoreboard: a hazard is a PANIC, diagnosed by the sanitizer at the
 // cycles src/timing.hpp gives (each source's sample; the destination's earliest
 // landing), the same numbers qtxc schedules with. Only the destination range
 // check is a property of the instruction itself.
 void Machine::check_register_hazards(const Warp& warp, const Instruction& inst) const {
     std::vector<std::pair<uint8_t, uint64_t>> samples;
-    for (const auto reg : source_registers(inst)) samples.emplace_back(reg, cycle_ + issue_to_sample);
+    for (const auto reg : vector_sources(inst)) samples.emplace_back(reg, cycle_ + issue_to_sample);
     sanitizer_.check_rf_raw(site(warp, inst), samples);
-    if (const auto dst = destination_register(inst); dst.has_value()) {
-        const auto width = inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8 ? 8u : 1u;
-        if (static_cast<unsigned>(*dst) + width > kernel_.register_count)
-            panic(warp, inst, "RF destination range out of bounds");
+    if (const auto dst = vector_destination(inst); dst.has_value()) {
+        const auto width = register_span(inst.opcode);
+        if (*dst + width > kernel_.register_count) panic(warp, inst, "RF destination range out of bounds");
         sanitizer_.check_rf_waw_war(site(warp, inst), *dst, width, cycle_ + issue_to_visible_min(inst, config_));
     }
 }

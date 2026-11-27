@@ -51,6 +51,66 @@ inline void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+// A value as a failure message shows it: integers in decimal (and in hex from
+// 0x10000 up, where they are usually bit patterns), anything else as
+// GoogleTest prints it.
+template <typename T>
+std::string shown(const T& value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        return value ? "true" : "false";
+    } else if constexpr (std::is_integral_v<T>) {
+        if constexpr (std::is_signed_v<T>) {
+            if (value < 0) return std::to_string(value);
+        }
+        if (static_cast<uint64_t>(value) < 0x10000) return std::to_string(value);
+        std::ostringstream hex;
+        hex << std::hex << static_cast<uint64_t>(value);
+        return std::to_string(value) + " (0x" + hex.str() + ")";
+    } else {
+        return ::testing::PrintToString(value);
+    }
+}
+
+// actual == expected; a failure says `what`, both values, then `context` (an
+// issue log, say).
+template <typename Actual, typename Expected>
+void require_eq(const Actual& actual, const Expected& expected, const std::string& what, const std::string& context = {}) {
+    if (!(actual == expected)) {
+        throw std::runtime_error(what + ": " + shown(actual) + ", expected " + shown(expected) + context);
+    }
+}
+
+// For every lane: actual(lane) == expected(lane), or == expected when it is a
+// value. A failure says `what`, the lane and both values.
+template <typename Actual, typename Expected>
+void require_lanes(Actual&& actual, const Expected& expected, const std::string& what) {
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        if constexpr (std::is_invocable_v<const Expected&, uint32_t>) {
+            require_eq(actual(lane), expected(lane), what + ": lane " + std::to_string(lane));
+        } else {
+            require_eq(actual(lane), expected, what + ": lane " + std::to_string(lane));
+        }
+    }
+}
+
+// The same for register `reg` of warp `warp`.
+template <typename Expected>
+void require_lanes(const nanosm::Machine& machine, uint32_t reg, const Expected& expected, const std::string& what,
+    uint32_t warp = 0) {
+    require_lanes([&](uint32_t lane) { return machine.read_reg(warp, lane, reg); }, expected,
+        what + " (r" + std::to_string(reg) + ")");
+}
+
+// Lane l's word of a buffer in shared or global memory: the word at base +
+// stride x l (for require_lanes).
+inline auto shmem_lanes(const nanosm::Machine& machine, uint32_t base, uint32_t stride = 4) {
+    return [&machine, base, stride](uint32_t lane) { return machine.read_shmem_u32(base + stride * lane); };
+}
+
+inline auto gmem_lanes(const nanosm::Machine& machine, uint32_t base, uint32_t stride = 4) {
+    return [&machine, base, stride](uint32_t lane) { return machine.read_gmem_u32(base + stride * lane); };
+}
+
 // Every needle is in `message`.
 inline void require_mentions(
     const std::string& message, std::initializer_list<std::string_view> needles, const std::string& what) {
@@ -525,13 +585,6 @@ inline uint32_t issue_to_shmem_grant(const nanosm::DeviceProfile& profile, bool 
     return reads_registers ? 3 + profile.rf_read_latency_cycles : 2 + profile.urf_read_latency_cycles;
 }
 
-// An lds's result is written to the RF D + Lb + (issue to grant) - 1 after
-// its issue (vector_address: an lds; else an lds.uni).
-inline uint32_t lds_shift(const nanosm::DeviceProfile& profile = canonical_profile(), bool vector_address = false) {
-    return profile.shmem_port_a_depth + profile.shmem_read_latency_cycles +
-        issue_to_shmem_grant(profile, vector_address) - 1;
-}
-
 // An RMW's write is granted D + Lb + C cycles after its read (the read's
 // words reach the port output, then the update crosses the C ALU stages).
 // Its "mbar RMW" slice runs from its START (the store pause begins) to its
@@ -617,45 +670,6 @@ inline std::vector<RmwService> mbar_rmw_services(const nanosm::Machine& machine)
     return services;
 }
 
-// An RMW's START (its "mbar RMW" slice's start: the store pause begins at
-// that cycle's edge), and its read and write (the "rmw" grants on A-read and
-// A-write).
-struct RmwSlice {
-    uint64_t start = 0;
-    uint64_t read = 0;
-    uint64_t write = 0;
-    std::string detail;
-};
-
-inline std::string describe(const std::vector<RmwSlice>& rmws) {
-    std::string text;
-    for (const auto& rmw : rmws) {
-        text += " {" + rmw.detail + ": start c" + std::to_string(rmw.start) + ", read c" + std::to_string(rmw.read) +
-            ", write c" + std::to_string(rmw.write) + "}";
-    }
-    return text;
-}
-
-// An atomic: an RMW-engine operation whose "atomic RMW" slice runs from its
-// START (the store pause begins) to its write grant + 1; inside it, its read
-// and its write are the "rmw" grants on A-read and A-write.
-struct AtomicSlice {
-    uint64_t start = 0;
-    uint64_t end = 0;             // the write grant + 1
-    std::vector<uint64_t> reads;  // its read grant
-    std::vector<uint64_t> writes; // its write grant
-    std::string detail;
-};
-
-inline std::string describe(const AtomicSlice& atomic) {
-    std::string text = " {" + atomic.detail + ": start c" + std::to_string(atomic.start) + ", end c" +
-        std::to_string(atomic.end) + ", reads";
-    for (const auto cycle : atomic.reads) text += " " + std::to_string(cycle);
-    text += ", writes";
-    for (const auto cycle : atomic.writes) text += " " + std::to_string(cycle);
-    return text + "}";
-}
-
 // The smallest ISA shape (m32n64k8: A 512 B, B 1024 B) on a 4x4x4 core,
 // dense layout, one shmem bank: every port-B round is one word, so a step
 // that reloads A is sixteen rounds (eight A words, eight B words) and every
@@ -698,77 +712,6 @@ inline nanosm::DeviceProfile fast_bus_profile(uint32_t pluck) {
     return config;
 }
 
-// The RF-starvation setup of the LSU backpressure tests. A stream of movs
-// (latency 1) cannot starve an async writer by booking its bank every cycle:
-// one denial with service owed inhibits new bookings to the bank from the
-// next cycle, so a ready async writer waits at most for the bookings made up
-// to its denial. To hold one for
-// a while, the stream books booking_horizon cycles ahead: fadds whose result
-// reaches the write port that far after their issue (the issue register, Lr
-// and the fadd latency set by with_long_bookings, src/timing.hpp), one per
-// cycle, rotating over booking_horizon destination registers of `bank`. The
-// fadd latency is as long as the five-bit stall field allows at canonical RF
-// depths (window 1, Lr 2, Wd 2: 31 - 2 - 2 - 1 = 26), less a margin.
-inline constexpr uint32_t booking_latency = 24;
-
-inline constexpr uint32_t booking_horizon = 1 + 2 + booking_latency; // issue register + canonical Lr + latency
-
-inline void with_long_bookings(nanosm::DeviceProfile& config) {
-    config.timing.fadd = booking_latency;
-}
-
-inline std::string booking_stream(uint32_t bank, uint32_t count) {
-    std::string text;
-    for (uint32_t i = 0; i < count; ++i) {
-        text += "fadd r" + std::to_string(bank + 3 * (i % booking_horizon)) + ", r1, r1\n";
-    }
-    return text;
-}
-
-// ---- Profile fields ----
-
-// An optional profile field: the canonical JSON declares `canonical`;
-// absent, it defaults to the same value (same fingerprint); negative,
-// fractional and values outside [low, high] are refused by parsing, and 0 by
-// validation when low is above 0; another value changes the fingerprint
-// (`make_valid` adjusts that other profile where the value alone breaks a
-// rule between fields; the comparison is then with the canonical profile
-// under the same adjustment, so the field is the only difference).
-inline void check_optional_field(const char* section, const char* field, uint32_t canonical,
-    uint32_t nanosm::DeviceProfile::*member, uint32_t low = 1, uint32_t high = 64,
-    const std::function<void(nanosm::DeviceProfile&)>& make_valid = {}) {
-    std::ifstream input("profiles/nanosm-v0.json");
-    nlohmann::json document;
-    input >> document;
-    const auto parsed = nanosm::parse_device_profile(document.dump());
-    const auto name = std::string(section) + "." + field;
-    require(parsed.*member == canonical && document[section].contains(field),
-        name + ": the canonical profile does not declare " + std::to_string(canonical));
-    auto defaulted = document;
-    defaulted[section].erase(field);
-    require(nanosm::device_profile_fingerprint(nanosm::parse_device_profile(defaulted.dump())) ==
-            nanosm::device_profile_fingerprint(parsed), name + ": the default is not " + std::to_string(canonical));
-    std::vector<nlohmann::json> refused = {nlohmann::json(-1), nlohmann::json(1.5), nlohmann::json(high + 1)};
-    if (low > 0) refused.push_back(nlohmann::json(low - 1));
-    for (const auto& value : refused) {
-        auto modified = document;
-        modified[section][field] = value;
-        (void)error_of<nanosm::ProfileError>([&] { (void)nanosm::parse_device_profile(modified.dump()); },
-            name + " = " + value.dump());
-    }
-    if (low > 0) {
-        auto zero = canonical_profile();
-        zero.*member = 0;
-        (void)error_of<nanosm::ProfileError>([&] { nanosm::validate_device_profile(zero); }, name + " = 0 in validation");
-    }
-    auto base = canonical_profile();
-    if (make_valid) make_valid(base);
-    auto other = base;
-    other.*member = canonical + 1;
-    require(nanosm::device_profile_fingerprint(other) != nanosm::device_profile_fingerprint(base),
-        name + " was omitted from the profile fingerprint");
-}
-
 // ---- tensor core, sanitizer, ALU (mma_test, sanitizer_test, alu_test) ----
 
 // A tensor-core run in qtx: ur0 and ur1 hold the A and B objects' shmem
@@ -801,15 +744,7 @@ inline std::string mma_kernel(const MmaRun& run) {
     return text + "mma.commit [ur4]\n" + wait_on("ur4") + run.tail + "halt\n";
 }
 
-// ---- shared memory and the RMW engine (shmem_test, rmw_test) ----
-
-// Issue to dependent issue behind a uniform-register writer (umov, usread,
-// u* arithmetic, r2ur): visible issue_to_urf_visible after the writer's
-// issue, sampled issue_to_urf_sample after the reader's (src/timing.hpp; 4 at
-// canonical, where alu_distance is 6).
-inline uint64_t uniform_distance(const nanosm::DeviceProfile& profile) {
-    return nanosm::issue_to_urf_visible(profile) - nanosm::issue_to_urf_sample;
-}
+// ---- shared memory, the RMW engine, the LSU (shmem_test, rmw_test, lsu_test) ----
 
 // debug_machine's shmem (words 0..2047 hold 0x100 + word) changed by `setup`,
 // gmem words 0..1023 holding 5 * word + 2, and `declared` the launch's
@@ -865,8 +800,6 @@ inline std::vector<uint64_t> warp_issue_cycles(const nanosm::Machine& machine, u
     }
     return cycles;
 }
-
-// ---- TMA and global memory (tma_test, tma_operands_test, lsu_test) ----
 
 // ---- the rest (stepping, basics, divergence, machine, registers, memory) ----
 

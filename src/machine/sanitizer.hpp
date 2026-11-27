@@ -134,18 +134,6 @@ public:
     void check_uniform_raw(const IssueSite& site, const std::vector<uint8_t>& sources, uint64_t sample_cycle) const;
     void check_uniform_waw(const IssueSite& site, uint8_t dst, uint64_t visible_cycle) const;
 
-    // ---- admission reads no operand ----
-    // Every issue attempt opens with record_issue_attempt; record_issue_accepted
-    // marks the moment admission has decided. A capture in an attempt not
-    // (yet) accepted is an internal PANIC (a refused attempt must consume
-    // nothing). No machine path reads an operand at issue: RF operands and a
-    // conditional branch's
-    // predicate are sampled through the issue register, a cycle after
-    // acceptance. The tripwire stays for any future issue-time read.
-    void record_issue_attempt(uint32_t warp);
-    void record_issue_accepted();
-    void check_issue_capture(uint64_t cycle, uint32_t warp, uint8_t reg, bool predicate) const;
-
     // ---- declared uniformity ----
     // A declared-uniform operand taken from a per-lane file (the bra.uni
     // predicate; every other uniform operand is a uniform register) must
@@ -532,10 +520,6 @@ private:
     // last tmem sample, so its finishes come in acceptance order.
     std::array<std::deque<uint64_t>, 2> acc_transfer_in_engine_;
     std::vector<WarpHazards> warps_;
-    // The issue attempt in progress (record_issue_attempt) and whether
-    // admission has accepted it.
-    std::optional<uint32_t> attempt_warp_;
-    bool attempt_accepted_ = false;
     // Registers written this tick and their first writer's tag.
     std::vector<std::pair<uint32_t, const char*>> register_writes_;
     std::vector<std::deque<OrderedRequest>> ordered_requests_; // per ordered read ID
@@ -561,9 +545,6 @@ public:
     NANOSM_SANITIZER_NOOP(record_uniform_ready)
     NANOSM_SANITIZER_NOOP(check_uniform_raw)
     NANOSM_SANITIZER_NOOP(check_uniform_waw)
-    NANOSM_SANITIZER_NOOP(record_issue_attempt)
-    NANOSM_SANITIZER_NOOP(record_issue_accepted)
-    NANOSM_SANITIZER_NOOP(check_issue_capture)
     NANOSM_SANITIZER_NOOP(check_warp_uniform)
     NANOSM_SANITIZER_NOOP(check_uniform_mask)
     NANOSM_SANITIZER_NOOP(check_halt_converged)

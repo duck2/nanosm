@@ -112,19 +112,16 @@ JOIN:   stg [r3 + 0], r2
         const auto got = issued_at(machine, pc).at(0);
         const auto want = issued_at(machine, from).at(0) +
             std::max(interval, uint64_t{nanosm::decode(kernel.words.at(from / 8)).control.stall});
-        require(got == want, what + ": issued at c" + std::to_string(got) + ", want c" + std::to_string(want) + ":" +
-            issue_log(machine));
+        require_eq(got, want, what + ": issue cycle", ":" + issue_log(machine));
     };
 
     const auto kernel = if_else("setp.eq.u32 p0, r1, 0");
     const auto run = run_divergent(kernel);
     const auto& machine = *run.machine;
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_gmem_u32(4 * lane) == (lane % 2 == 0 ? 11u : 22u), "lane " + std::to_string(lane) + "'s word");
-    }
+    require_lanes(gmem_lanes(machine, 0), [](uint32_t lane) { return lane % 2 == 0 ? 11u : 22u; }, "each lane's word");
     require(run.masks == std::vector<uint64_t>{0xffff, 0xaaaa, 0x5555, 0xffff},
         "active masks:" + describe_masks(run.masks) + " (want full, odd, even, full)");
-    require(run.peak_depth == 2, "peak depth " + std::to_string(run.peak_depth) + " (want 2)");
+    require_eq(run.peak_depth, 2, "peak depth");
     require(issued_at(machine, 80).size() == 1, "the joined stg did not issue exactly once:" + issue_log(machine));
     require(issued_at(machine, 56).size() == 1 && issued_at(machine, 72).size() == 1, "each arm's sync issues once");
     expect(kernel, machine, "after ssy (no hold)", 40, 32, 1);
@@ -135,9 +132,7 @@ JOIN:   stg [r3 + 0], r2
 
     const auto falling = if_else("setp.lt.u32 p0, r1, 0");
     const auto all_fall = run_divergent(falling);
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(all_fall.machine->read_gmem_u32(4 * lane) == 22, "every lane falling: lane " + std::to_string(lane));
-    }
+    require_lanes(gmem_lanes(*all_fall.machine, 0), 22, "every lane falling");
     require(issued_at(*all_fall.machine, 64).empty(), "the empty even arm ran");
     expect(falling, *all_fall.machine, "the joined code after the odd arm's sync (past the even arm)", 80, 56,
         nanosm::branch_taken_interval);
@@ -168,8 +163,8 @@ U:      mov r2, 99
 K:      stg [r3 + 0], r2
         halt
     )");
-    for (uint32_t lane = 0; lane < 16; ++lane) require(run.machine->read_gmem_u32(4 * lane) == 13, "lane result");
-    require(run.peak_depth == 1, "peak depth " + std::to_string(run.peak_depth) + " (want 1: the ssys' only)");
+    require_lanes(gmem_lanes(*run.machine, 0), 13, "lane result");
+    require_eq(run.peak_depth, 1, "peak depth (1: the ssys' only)");
     require(run.masks == std::vector<uint64_t>{0xffff}, "the mask changed:" + describe_masks(run.masks));
     for (const uint32_t pc : {48u, 56u, 112u, 120u}) {
         require(issued_at(*run.machine, pc).empty(), "an arm no lane takes ran (pc " + std::to_string(pc) + ")");
@@ -261,8 +256,7 @@ TEST(Divergence, write_masks_are_lane_write_enables) {
             require(machine.read_shmem_u32(512 + 4 * lane) == (odd ? 0xbeefu : 0x55u), what + ": @!p0 sts");
             require(machine.read_reg(0, lane, 21) == (odd && lane < 8 ? 1u : 0u), what + ": mask 0xff AND @p0");
         }
-        require(machine.trace().summary().lsu_sectors == 16,
-            "gmem requests: " + std::to_string(machine.trace().summary().lsu_sectors) + " (want 8 + 8)");
+        require_eq(machine.trace().summary().lsu_sectors, 16, "gmem requests (8 + 8)");
     }
     {
         // An arithmetic write, a special register, ur2r, the special-function
@@ -343,9 +337,8 @@ B:          halt
             require(machine.read_shmem_u32(512 + 4 * lane) == (active ? 0x55u : 0xbeefu), what + ": sts");
         }
         const auto& summary = machine.trace().summary();
-        require(summary.lsu_sectors == 8, "gmem requests: " + std::to_string(summary.lsu_sectors) +
-            " (want 4 for the load and 4 for the store)");
-        require(summary.lsu_useful_bytes == 32, "useful bytes: " + std::to_string(summary.lsu_useful_bytes));
+        require_eq(summary.lsu_sectors, 8, "gmem requests (4 for the load and 4 for the store)");
+        require_eq(summary.lsu_useful_bytes, 32, "useful bytes");
     }
 }
 
@@ -447,10 +440,7 @@ TEST(Divergence, timing_ignores_the_write_mask) {
         require(ex2.size() == 2 && addi.size() == 2, "the region's instructions did not issue once each");
         distances.push_back({ex2[1] - ex2[0], addi[0] - ex2[1], addi[1] - addi[0]});
     }
-    require(distances[0] == distances[1], "issue distances under one lane differ from sixteen: " +
-        std::to_string(distances[0][0]) + "/" + std::to_string(distances[0][1]) + "/" + std::to_string(distances[0][2]) +
-        " vs " + std::to_string(distances[1][0]) + "/" + std::to_string(distances[1][1]) + "/" +
-        std::to_string(distances[1][2]));
+    require_eq(distances[0], distances[1], "issue distances under one lane, against sixteen");
 }
 
 // What refuses to be masked: qtxc, the assembler and kernel load, by name.
@@ -497,10 +487,8 @@ TEST(Divergence, write_mask_refusals) {
         halt
     )", zero), launch_warps(1));
     machine.run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 2) == ((lane & 1) != 0 ? 9u : 7u),
-            "lane " + std::to_string(lane) + ": a masked mov on a profile with no divergence stack");
-    }
+    require_lanes(machine, 2, [](uint32_t lane) { return (lane & 1) != 0 ? 9u : 7u; },
+        "a masked mov on a profile with no divergence stack");
     // What does need the divergence stack (ssy, a predicated bra, sync) is
     // refused on that profile by qtxc, the assembler and kernel load. The
     // kernel for the load is built under the canonical profile and stamped

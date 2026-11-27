@@ -82,48 +82,19 @@ Machine::BufferedInstruction Machine::predecode(uint64_t word) const {
     BufferedInstruction entry;
     entry.instruction = inst;
     auto& plan = entry.plan;
-    const bool lsu = is_lsu_opcode(opcode);
-    const bool shmem_write = opcode == Opcode::sts || is_mbar_rmw(opcode) || is_atomic(opcode);
-    const bool shmem_read = is_shared_load(opcode) || is_mbar_predicate_writer(opcode);
-    if (uses_arithmetic_pipeline(inst)) {
-        plan.kind = IssueKind::arithmetic;
-    } else if (uses_urf_pipeline(opcode)) {
-        plan.kind = IssueKind::uniform;
-    } else if (opcode == Opcode::bra || opcode == Opcode::bra_uni || opcode == Opcode::ssy || opcode == Opcode::sync) {
-        plan.kind = IssueKind::control;
-    } else if (opcode == Opcode::fence_sh) {
-        plan.kind = IssueKind::fence;
-    } else if (opcode == Opcode::nop) {
-        plan.kind = IssueKind::nop;
-    } else if (opcode == Opcode::halt) {
-        plan.kind = IssueKind::halt;
-    } else if (is_tma_opcode(opcode)) {
-        plan.kind = IssueKind::tma;
-    } else if (is_mma_command(opcode)) {
-        plan.kind = IssueKind::mma;
-    } else if (is_acc_transfer(opcode)) {
-        plan.kind = is_acc_load(opcode) ? IssueKind::acc_load : IssueKind::acc_store;
-    } else if (shmem_write || shmem_read) {
-        plan.kind = shmem_write ? IssueKind::shmem_write : IssueKind::shmem_read;
-    } else if (lsu) {
-        plan.kind = IssueKind::lsu;
-    } else {
+    plan.unit = opcode_info(opcode).unit;
+    if (plan.unit == IssueUnit::none) {
         throw SimError("internal: an instruction with no path through issue (kernel load checks every word)");
     }
-    plan.sfu = opcode == Opcode::ex2 || opcode == Opcode::rcp;
-    auto sources = source_registers(inst);
-    if (opcode == Opcode::acc_st || opcode == Opcode::acc_st_v8 || opcode == Opcode::lds || opcode == Opcode::sts || lsu) {
-        sources.clear();
-    }
-    plan.reads = rf_read_round(sources);
+    plan.reads = rf_read_round(issue_sources(inst));
     for (const auto reg : plan.reads) plan.read_banks.push_back(static_cast<uint8_t>(reg % config_.rf_banks));
     // The issue round's uniform registers: round 0 of src/timing.hpp's plan (a
     // tma's and an mma.async's later rounds are the round counter's).
     const auto rounds = uniform_read_rounds(inst);
     if (!rounds.empty()) plan.uniform_reads = rounds.front();
     plan.later_uniform_rounds = rounds.size() > 1;
-    const auto destination = destination_register(inst);
-    if (plan.kind == IssueKind::arithmetic && destination.has_value()) {
+    const auto destination = vector_destination(inst);
+    if (is_arithmetic(opcode) && destination.has_value()) {
         plan.write_reg = destination;
         plan.write_bank = static_cast<uint8_t>(*destination % config_.rf_banks);
         plan.write_delay = issue_to_port(inst, config_);

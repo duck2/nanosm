@@ -179,12 +179,9 @@ TEST(Mma, tmem_profile_metadata_and_round_trip) {
     require(machine.trace().summary().tmem_store_beats == 32 && machine.trace().summary().tmem_load_beats == 32,
         "tmem trace did not expose every vector beat");
     for (uint32_t warp = 0; warp < 4; ++warp) {
-        for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-            require(machine.read_reg(warp, lane, 40) == 0x7fc00000u, "tmem transfer did not preserve raw NaN payload bits");
-            for (uint32_t j = 1; j < 8; ++j)
-                require(machine.read_reg(warp, lane, 40 + j) == j, "RF -> tmem -> RF vector round trip changed bits");
-            require(machine.read_reg(warp, lane, 20) == 21, "concurrent arithmetic made no forward progress");
-        }
+        require_lanes(machine, 40, 0x7fc00000u, "tmem transfer of raw NaN payload bits", warp);
+        for (uint32_t j = 1; j < 8; ++j) require_lanes(machine, 40 + j, j, "RF -> tmem -> RF vector round trip", warp);
+        require_lanes(machine, 20, 21, "concurrent arithmetic", warp);
     }
 }
 
@@ -237,11 +234,10 @@ TEST(Mma, tmem_transfer_ordering_and_store_lifetime) {
     nanosm::Machine machine(profile, nanosm::assemble_asm(nanosm::emit_asm(scheduled), profile), launch_warps(1),
         {.timeline = true, .debug = true});
     machine.run(1000);
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane) {
-        require(machine.read_reg(0, lane, 2) == 17 && machine.read_reg(0, lane, 3) == 17,
-            "a younger overwrite changed a deferred accumulator-store source");
-        require(machine.read_reg(0, lane, 0) == 51, "the source overwrite did not execute after both stores completed");
+    for (const uint32_t reg : {2u, 3u}) {
+        require_lanes(machine, reg, 17, "a deferred accumulator-store source after a younger overwrite");
     }
+    require_lanes(machine, 0, 51, "the source overwrite after both stores completed");
     require(machine.trace().summary().tmem_store_beats == 16 && machine.trace().summary().tmem_load_beats == 2,
         "scalar transfer completion did not account for each final tmem/RF beat");
 
@@ -253,6 +249,69 @@ TEST(Mma, tmem_transfer_ordering_and_store_lifetime) {
     nanosm::Machine unsafe_machine(profile, std::move(unsafe), launch_warps(1));
     expect_panic(unsafe_machine, {"RF WAR hazard"}, "an acc.st source overwritten without its wait");
 #endif
+}
+
+// An acc.st and an older global store of the warp set different completion
+// depbars, so the writer of one of the acc.st's sources (r7, which then
+// addresses an independent load) waits for the acc.st and not for the stg:
+// it issues before the stg's command ends. The stored words, the load and
+// the tmem round trip are right (under the sanitizer in the default build).
+TEST(Mma, acc_store_counter_apart_from_global_stores) {
+    const auto& profile = canonical_profile();
+    const std::string source = R"(
+        sread r0, LANE_ID
+        addi r1, r0, 100
+        addi r2, r0, 200
+        addi r3, r0, 300
+        addi r4, r0, 400
+        addi r5, r0, 500
+        addi r6, r0, 600
+        addi r7, r0, 700
+        shli r10, r0, 2
+        stg [r10], r0
+        umov ur8, 0
+        acc.st.v8 [ur8, 64], r0
+        shli r7, r0, 2
+        ldg r20, [r7 + 256]
+        acc.ld.v8 r40, [ur8, 64]
+        halt
+    )";
+    const auto scheduled = qtx_program(source, profile);
+    const auto find = [&](nanosm::Opcode opcode, uint8_t dst = 0) {
+        const auto found = std::find_if(scheduled.instructions.begin(), scheduled.instructions.end(),
+            [&](const auto& inst) { return inst.opcode == opcode && (opcode != nanosm::Opcode::shli || inst.dst == dst); });
+        require(found != scheduled.instructions.end(), "an instruction of the kernel is missing");
+        return found;
+    };
+    const auto store = find(nanosm::Opcode::stg);
+    const auto acc_store = find(nanosm::Opcode::acc_st_v8);
+    const auto writer = find(nanosm::Opcode::shli, 7);
+    require(store->control.set_depbar < 6 && acc_store->control.set_depbar < 6 &&
+            store->control.set_depbar != acc_store->control.set_depbar,
+        "the acc.st shares the global store's completion depbar");
+    require((writer->control.wait_mask & (1u << acc_store->control.set_depbar)) != 0,
+        "the writer of an acc.st source does not wait for the acc.st");
+    require((writer->control.wait_mask & (1u << store->control.set_depbar)) == 0,
+        "the writer of an acc.st source waits for the unrelated global store");
+
+    auto launch = launch_warps(1);
+    auto& gmem = image_bytes(launch.gmem_image, 512);
+    for (uint32_t lane = 0; lane < 16; ++lane) write_u32(gmem, 256 + 4 * lane, 1000 + lane);
+    nanosm::Machine machine(profile, compile(source, profile), std::move(launch), {.timeline = true});
+    machine.run(10000);
+    const auto writer_pc = static_cast<uint32_t>(8 * (writer - scheduled.instructions.begin()));
+    const auto writer_issue = issued_at(machine, writer_pc);
+    uint64_t store_end = 0;
+    for (const auto& event : events_named(machine, "stg"))
+        if (event.category == nanosm::TraceCategory::gmem) store_end = event.start_cycle + event.duration_cycles;
+    require(writer_issue.size() == 1 && store_end != 0 && writer_issue[0] < store_end,
+        "the writer of r7 did not issue before the global store ended");
+    require_lanes(gmem_lanes(machine, 0), [](uint32_t lane) { return lane; }, "the global store's word");
+    require_lanes(machine, 20, [](uint32_t lane) { return 1000 + lane; }, "the independent load's word");
+    require_lanes(machine, 7, [](uint32_t lane) { return 4 * lane; }, "the writer's result");
+    for (uint32_t j = 0; j < 8; ++j) {
+        require_lanes(machine, 40 + j, [&](uint32_t lane) { return lane + 100 * j; }, "RF -> tmem -> RF through acc.st.v8");
+    }
 }
 
 TEST(Mma, mma_raw_window_numerics) {
@@ -356,9 +415,7 @@ TEST(Mma, mma_fusion_boundaries) {
         const auto fill = row.layout == nanosm::TileLayout::dense ? dense_tiles(64, 64, a, b) : tiles(a, b);
         auto machine = mma_machine(profile, compile(mma_kernel({.tail = acc_ld_r10}), profile), 1, fill);
         machine->run(20000);
-        for (uint32_t lane = 0; lane < profile.lanes; ++lane)
-            require(machine->read_reg(0, lane, 10) == row.expected,
-                std::string(row.what) + ": the MMA did not round at the core_k boundary");
+        require_lanes(*machine, 10, row.expected, std::string(row.what) + ": the MMA's rounding at the core_k boundary");
     }
 }
 
@@ -552,20 +609,19 @@ TEST(Mma, mma_multi_round_fetch_timing) {
     // 8 m blocks x 16 n blocks x 2 k blocks.
     const auto rounds = [](std::size_t step) -> uint64_t { return step % 16 == 0 ? 16 : 8; };
     require(inputs.size() == 256 && !writes.empty(), "one dense m32n64k8 command on a 4x4x4 core is 256 core steps");
-    for (std::size_t i = 1; i < inputs.size(); ++i)
-        require(inputs[i] == inputs[i - 1] + rounds(i - 1),
-            "step " + std::to_string(i) + ": the fetches did not serialize the port at one round per cycle");
+    for (std::size_t i = 1; i < inputs.size(); ++i) {
+        require_eq(inputs[i], inputs[i - 1] + rounds(i - 1),
+            "step " + std::to_string(i) + "'s start (the fetches serialize the port at one round per cycle)");
+    }
     const auto d = profile.shmem_port_a_depth;
     const auto lb = profile.shmem_read_latency_cycles;
-    require(writes.front().start_cycle == inputs[0] + 15 + d + lb + 12 + profile.tmem_port_depth,
-        "the result did not land at core entry (last round + D + Lb) plus the result latency plus Dt");
-    require(depbar_cleared == inputs[255] + rounds(255) - 1 + d,
-        "operand-consumed depbar did not clear at the final physical read (the last round's sample)");
-    require(machine->trace().summary().mma_recurrence_stalls == 0,
-        "a tile is revisited 128 steps (over a thousand rounds) later; no bubbles expected");
-    for (uint32_t lane = 0; lane < profile.lanes; ++lane)
-        require(machine->read_reg(0, lane, 10) == nanosm::float_bits(8.0f),
-            "per-round operand capture changed the numerical result");
+    require_eq(writes.front().start_cycle, inputs[0] + 15 + d + lb + 12 + profile.tmem_port_depth,
+        "the result's landing (core entry: last round + D + Lb; plus the result latency plus Dt)");
+    require_eq(depbar_cleared, inputs[255] + rounds(255) - 1 + d,
+        "the operand-consumed depbar's clear (at the final physical read: the last round's sample)");
+    require_eq(machine->trace().summary().mma_recurrence_stalls, 0,
+        "recurrence stalls (a tile is revisited 128 steps, over a thousand rounds, later)");
+    require_lanes(*machine, 10, nanosm::float_bits(8.0f), "the result under per-round operand capture");
 }
 
 // One command, step by step (hold A / stream B): for each A block (m0 = 4i),
@@ -600,20 +656,19 @@ TEST(Mma, hold_a_stream_b_walker) {
             require(static_cast<uint32_t>(inputs[s].value) == s &&
                     inputs[s].detail == (reads_a ? "rounds=2, reads A" : "rounds=1"),
                 step + " read its A block at the wrong step: " + inputs[s].detail);
-            if (s + 1 < steps)
-                require(inputs[s + 1].start_cycle == inputs[s].start_cycle + rounds,
-                    step + ": the next step did not start the cycle after this step's last round");
+            if (s + 1 < steps) {
+                require_eq(inputs[s + 1].start_cycle, inputs[s].start_cycle + rounds,
+                    step + ": the next step's start (the cycle after this step's last round)");
+            }
             const uint32_t tile = row.acc + 64 * (4 * (s / 16)) + 4 * (s % 16); // C + m0 * 64 + n0, n fastest
-            require(static_cast<uint32_t>(writes[s].value) == tile,
-                step + " wrote tile " + std::to_string(writes[s].value) + ", not " + std::to_string(tile));
-            require(writes[s].start_cycle == inputs[s].start_cycle + (rounds - 1) + d + lb +
-                        profile.mma_result_latency_cycles + profile.tmem_port_depth,
-                step + ": tmem write is not last round + D + Lb + result latency + Dt");
+            require_eq(static_cast<uint32_t>(writes[s].value), tile, step + ": the tile written");
+            require_eq(writes[s].start_cycle, inputs[s].start_cycle + (rounds - 1) + d + lb +
+                    profile.mma_result_latency_cycles + profile.tmem_port_depth,
+                step + ": tmem write (last round + D + Lb + result latency + Dt)");
         }
         const auto& summary = machine->trace().summary();
-        require(summary.mma_a_block_reads == row.a_reads && summary.mma_shmem_rounds == row.rounds,
-            what + "did not read " + std::to_string(row.a_reads) + " A blocks in " + std::to_string(row.rounds) +
-                " bank rounds");
+        require_eq(summary.mma_a_block_reads, row.a_reads, what + "A block reads");
+        require_eq(summary.mma_shmem_rounds, row.rounds, what + "bank rounds");
         for (uint32_t r = 0; r < row.rows; ++r)
             for (uint32_t col = 0; col < 64; ++col)
                 require(result_at(*machine, row.acc, 64, r, col) == product_reference(row.a / 16 + r, col),
@@ -630,21 +685,18 @@ TEST(Mma, back_to_back_throughput) {
     auto machine = mma_machine(canonical_profile(), compile(mma_kernel({.commands = commands, .tail = acc_ld_r10})), 1,
         tiles(filled(0x3c00), filled(0x3c00)));
     machine->run(100000);
-    for (uint32_t lane = 0; lane < 16; ++lane)
-        require(machine->read_reg(0, lane, 10) == nanosm::float_bits(8.0f * commands),
-            "back-to-back commands accumulated the wrong value");
+    require_lanes(*machine, 10, nanosm::float_bits(8.0f * commands), "back-to-back commands' accumulated value");
     const auto inputs = events_named(*machine, "MMA input step");
-    require(inputs.size() == 256 * commands, "back-to-back commands lost steps");
+    require_eq(inputs.size(), 256 * commands, "back-to-back commands' steps");
     uint64_t first = std::numeric_limits<uint64_t>::max(), last = 0;
     for (const auto& event : inputs) {
         first = std::min(first, event.start_cycle);
         last = std::max(last, event.start_cycle);
     }
     // The last step reads one round, so port B is busy through `last`.
-    require(last - first + 1 == 272 * commands,
-        "back-to-back commands did not keep port B busy one round per cycle: " + std::to_string(last - first + 1) +
-            " cycles for " + std::to_string(272 * commands) + " rounds");
-    require(machine->trace().summary().mma_recurrence_stalls == 0, "back-to-back commands hit recurrence stalls");
+    require_eq(last - first + 1, 272 * commands,
+        "cycles port B was busy for back-to-back commands' rounds (one round per cycle)");
+    require_eq(machine->trace().summary().mma_recurrence_stalls, 0, "back-to-back commands' recurrence stalls");
 }
 
 // Tmem is 16 fine banks, each with two read and two write services a cycle:
@@ -691,15 +743,16 @@ TEST(Mma, mma_beside_transfers) {
     const auto lb = profile.shmem_read_latency_cycles;
     for (std::size_t s = 0; s < inputs.size(); ++s) {
         const uint32_t rounds = s % 16 == 0 ? 2 : 1;
-        if (s + 1 < inputs.size())
-            require(inputs[s + 1].start_cycle == inputs[s].start_cycle + rounds,
-                "step " + std::to_string(s + 1) + " waited (the transfers stalled the MMA?)");
-        require(writes[s].start_cycle == inputs[s].start_cycle + (rounds - 1) + d + lb +
-                    profile.mma_result_latency_cycles + profile.tmem_port_depth,
-            "step " + std::to_string(s) + "'s tmem write moved (the transfers delayed the MMA?)");
+        if (s + 1 < inputs.size()) {
+            require_eq(inputs[s + 1].start_cycle, inputs[s].start_cycle + rounds,
+                "step " + std::to_string(s + 1) + "'s start (a wait: the transfers stalled the MMA?)");
+        }
+        require_eq(writes[s].start_cycle, inputs[s].start_cycle + (rounds - 1) + d + lb +
+                profile.mma_result_latency_cycles + profile.tmem_port_depth,
+            "step " + std::to_string(s) + "'s tmem write (moved: the transfers delayed the MMA?)");
     }
-    require(inputs.back().start_cycle - inputs.front().start_cycle + 1 == 272 * commands,
-        "back to back with transfers alongside, the MMA did not keep port B busy one round per cycle");
+    require_eq(inputs.back().start_cycle - inputs.front().start_cycle + 1, 272 * commands,
+        "cycles port B was busy back to back with transfers alongside (one round per cycle)");
     const auto first = inputs.front().start_cycle;
     const auto last = writes.back().start_cycle;
     const auto inside = [&](const std::string& name) {
@@ -710,10 +763,9 @@ TEST(Mma, mma_beside_transfers) {
     require(inside("acc.ld beat") >= 16 && inside("acc.st beat") >= 16,
         "the transfers did not run alongside the MMA (" + std::to_string(inside("acc.ld beat")) + " acc.ld and " +
             std::to_string(inside("acc.st beat")) + " acc.st beats inside it)");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_reg(0, lane, 10) == nanosm::float_bits(16.0f * commands), "MMA result");
-        for (uint32_t j = 0; j < 8; ++j)
-            require(machine->read_reg(1, lane, 16 + j) == lane + 100 * j, "acc.st -> acc.ld round trip");
+    require_lanes(*machine, 10, nanosm::float_bits(16.0f * commands), "MMA result");
+    for (uint32_t j = 0; j < 8; ++j) {
+        require_lanes(*machine, 16 + j, [&](uint32_t lane) { return lane + 100 * j; }, "acc.st -> acc.ld round trip", 1);
     }
 }
 
@@ -759,10 +811,12 @@ TEST(Mma, one_engine_of_each_kind) {
         return !refusals(m, 0, "acc transfer engine busy").empty() || !refusals(m, 1, "acc transfer engine busy").empty();
     };
     require(engine_waited(*machine), "no transfer ever waited for its engine");
-    for (uint32_t warp = 0; warp < 2; ++warp)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            for (uint32_t j = 0; j < 8; ++j)
-                require(machine->read_reg(warp, lane, 16 + j) == 1024 * warp + lane + 100 * j, "round trip data");
+    for (uint32_t warp = 0; warp < 2; ++warp) {
+        for (uint32_t j = 0; j < 8; ++j) {
+            require_lanes(*machine, 16 + j, [&](uint32_t lane) { return 1024 * warp + lane + 100 * j; },
+                "round trip data", warp);
+        }
+    }
 
     auto loads = mma_machine(profile, compile(R"(
         usread ur8, WARP_ID
@@ -814,13 +868,12 @@ TEST(Mma, tmem_depths) {
             what + "a beat or an RF event is missing from the trace");
         const auto g = reads.back(); // the acc.st's data read
         require(g >= st_issue + t + 1, what + "the acc.st's RF read before its engine had it");
-        require(st_beats.back().start_cycle == g + profile.rf_read_latency_cycles + dt,
-            what + "acc.st did not land at g + Lr + Dt");
+        require_eq(st_beats.back().start_cycle, g + profile.rf_read_latency_cycles + dt,
+            what + "acc.st's landing (g + Lr + Dt)");
         const auto launch = ld_issue + t + 1;
-        require(ld_beats.back().start_cycle == launch + dt, what + "acc.ld did not sample at its launch + Dt");
-        require(writes.back() == launch + dt + lt, what + "acc.ld was not at the RF port at its launch + Dt + Lt");
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine->read_reg(0, lane, 10) == lane, what + "acc.st -> acc.ld data");
+        require_eq(ld_beats.back().start_cycle, launch + dt, what + "acc.ld's sample (its launch + Dt)");
+        require_eq(writes.back(), launch + dt + lt, what + "acc.ld at the RF port (its launch + Dt + Lt)");
+        require_lanes(*machine, 10, [](uint32_t lane) { return lane; }, what + "acc.st -> acc.ld data");
 
         auto mma = mma_machine(profile, compile(mma_kernel({.tail = acc_ld_r10}), profile), 1,
             tiles(filled(0x3c00), filled(0x4000)));
@@ -831,8 +884,7 @@ TEST(Mma, tmem_depths) {
                 results.front().start_cycle == inputs.front().start_cycle + 1 + profile.shmem_port_a_depth +
                     profile.shmem_read_latency_cycles + profile.mma_result_latency_cycles + dt,
             what + "the first MMA step's tmem write is not its start + 1 + D + Lb + result latency + Dt");
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(mma->read_reg(0, lane, 10) == nanosm::float_bits(16.0f), what + "MMA data");
+        require_lanes(*mma, 10, nanosm::float_bits(16.0f), what + "MMA data");
     }
 }
 
@@ -1216,10 +1268,9 @@ TEST(Mma, two_m32_halves_equal_one_m64) {
         // The two m32 commands (steps 256..511) run back to back: the last
         // step reads one round, so port B is busy through its start.
         const auto inputs = events_named(*machine, "MMA input step");
-        require(inputs.back().start_cycle - inputs.at(256).start_cycle + 1 == 272,
-            what + "the two m32 commands did not keep port B busy 272 cycles: " +
-                std::to_string(inputs.back().start_cycle - inputs.at(256).start_cycle + 1));
-        require(summary.mma_recurrence_stalls == 0, what + "independent accumulators hit recurrence stalls");
+        require_eq(inputs.back().start_cycle - inputs.at(256).start_cycle + 1, 272,
+            what + "cycles the two m32 commands kept port B busy");
+        require_eq(summary.mma_recurrence_stalls, 0, what + "recurrence stalls of independent accumulators");
     }
 }
 
@@ -1242,11 +1293,11 @@ TEST(Mma, more_shapes_run) {
         const uint32_t blocks_m = shape.m / 4;
         const uint32_t steps = blocks_m * (shape.n / 4) * (shape.k / 8);
         const uint32_t a_reads = blocks_m * (shape.k / 8);
-        require(summary.mma_input_steps == steps && summary.mma_a_block_reads == a_reads &&
-                summary.mma_shmem_rounds == steps + a_reads && summary.mma_recurrence_stalls == 0,
-            nanosm::mma_shape_name(shape) + ": steps " + std::to_string(summary.mma_input_steps) + ", A reads " +
-                std::to_string(summary.mma_a_block_reads) + ", rounds " + std::to_string(summary.mma_shmem_rounds) +
-                ", recurrence stalls " + std::to_string(summary.mma_recurrence_stalls));
+        const auto name = nanosm::mma_shape_name(shape);
+        require_eq(summary.mma_input_steps, steps, name + ": steps");
+        require_eq(summary.mma_a_block_reads, a_reads, name + ": A reads");
+        require_eq(summary.mma_shmem_rounds, steps + a_reads, name + ": rounds");
+        require_eq(summary.mma_recurrence_stalls, 0, name + ": recurrence stalls");
     }
 
     auto partial = canonical_profile();
@@ -1291,8 +1342,7 @@ TEST(Mma, latency_bound) {
     for (uint32_t s = 0; s < 16; ++s) {
         const auto slack = static_cast<int64_t>(inputs[s + 16].start_cycle) - static_cast<int64_t>(writes[s].start_cycle);
         const bool reload = s % 4 == 0;
-        require(slack == (reload ? 3 : 4), "step " + std::to_string(s + 16) + " revisits its block with slack " +
-            std::to_string(slack) + " (expected " + std::to_string(reload ? 3 : 4) + ")");
+        require_eq(slack, reload ? 3 : 4, "the slack of step " + std::to_string(s + 16) + " revisiting its block");
         least = std::min(least, slack);
     }
     require(least == 3, "the least slack is the reloads' extra rounds less one");
@@ -1389,17 +1439,15 @@ TEST(Mma, acc_pointer_at_a_row_and_column) {
     )";
     nanosm::Machine machine(profile, compile(source, profile), launch_warps(1));
     machine.run(20000);
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        for (uint32_t j = 0; j < 8; ++j) {
-            const uint32_t stored = lane + 1 + 1000 * j;
-            require(result_word(machine, 1304, 64, lane, j) == stored,
-                "row " + std::to_string(20 + lane) + " column " + std::to_string(24 + j) + " is not where the rule puts it");
-            require(machine.read_reg(0, lane, static_cast<uint8_t>(40 + j)) == (lane < 4 ? 0 : stored - 4),
-                "the acc.ld.v8 at row 16, column 24, lane " + std::to_string(lane));
-        }
-        require(machine.read_reg(0, lane, 50) == (lane < 4 ? 12 + lane + 1 + 7000 : 0),
-            "the acc.ld at row 32, column 31, lane " + std::to_string(lane));
+    for (uint32_t j = 0; j < 8; ++j) {
+        const auto stored = [j](uint32_t lane) -> uint32_t { return lane + 1 + 1000 * j; };
+        require_lanes([&](uint32_t lane) { return result_word(machine, 1304, 64, lane, j); }, stored,
+            "row 20 + lane, column " + std::to_string(24 + j) + ": where the rule puts it");
+        require_lanes(machine, 40 + j, [&](uint32_t lane) { return lane < 4 ? 0 : stored(lane) - 4; },
+            "the acc.ld.v8 at row 16, column 24");
     }
+    require_lanes(machine, 50, [](uint32_t lane) { return lane < 4 ? 12 + lane + 1 + 7000 : 0; },
+        "the acc.ld at row 32, column 31");
 }
 
 // An mma.async reads three uniform registers: urA and urB in its issue round

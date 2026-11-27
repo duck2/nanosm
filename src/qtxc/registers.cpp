@@ -74,29 +74,22 @@ uint8_t field(const Instruction& inst, std::size_t slot) {
     }
 }
 
-// Asked of the functions that already know (metadata.cpp sources /
-// destination, src/isa.hpp uniform_sources / uniform_destination) by giving
-// a copy of the instruction four far-apart field values and seeing which
-// come back, so there is no second table to keep in step.
+// The instruction's form says it (src/isa.hpp): dst is written, the sources
+// read; a predicate is not a register here.
 Slots register_slots(const Instruction& inst) {
-    Instruction probe = inst;
-    static constexpr std::array<uint8_t, 4> marks = {0x10, 0x30, 0x50, 0x70};
-    for (std::size_t slot = 0; slot < 4; ++slot) field(probe, slot) = marks[slot];
     Slots slots;
-    const auto note = [&](uint8_t value, Kind kind, bool written) {
-        const std::size_t slot = (value >> 5) & 3;
+    const auto& form = form_info(inst.opcode);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        const auto& operand = form.operands[slot];
+        auto file = operand.file;
+        if (file == RegisterFile::either) file = inst.src1_uniform ? RegisterFile::uniform : RegisterFile::vector;
+        if (file != RegisterFile::vector && file != RegisterFile::uniform) continue;
         auto& entry = slots[slot];
-        entry.kind = kind;
-        entry.width = std::max<uint32_t>(entry.width, static_cast<uint32_t>(value - marks[slot]) + 1);
-        (written ? entry.written : entry.read) = true;
-    };
-    for (const auto value : sources(probe)) note(value, Kind::vector, false);
-    for (const auto value : uniform_sources(probe)) note(value, Kind::uniform, false);
-    if (const auto dst = destination(probe); dst.has_value()) {
-        note(*dst, Kind::vector, true);
-        if (inst.opcode == Opcode::acc_ld_v8 || inst.opcode == Opcode::ldg_v8) slots[(*dst >> 5) & 3].width = 8;
+        entry.kind = file == RegisterFile::vector ? Kind::vector : Kind::uniform;
+        entry.width = operand.width == OperandWidth::span ? register_span(inst.opcode)
+            : operand.width == OperandWidth::coordinates ? tma_coordinate_count(inst.opcode) : 1;
+        (slot == 0 ? entry.written : entry.read) = true;
     }
-    if (const auto dst = uniform_destination(probe); dst.has_value()) note(*dst, Kind::uniform, true);
     return slots;
 }
 
@@ -356,7 +349,7 @@ std::string replace_source(const Instruction& inst, const std::string& name, con
     auto head = inst.text.substr(0, space + 1);
     auto tail = inst.text.substr(space + 1);
     std::string kept;
-    if (destination(inst).has_value()) {
+    if (vector_destination(inst).has_value()) {
         const auto comma = tail.find(',');
         if (comma == std::string::npos) return inst.text;
         head += tail.substr(0, comma + 1);

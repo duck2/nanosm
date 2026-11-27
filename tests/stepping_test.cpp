@@ -76,10 +76,9 @@ ReuseRun run_reuse_after_final_drain(const std::string& old_load, const std::str
 // holds word k), or an ldg of word `lane` into r8.
 void require_old_load_data(const nanosm::Machine& machine, const std::string& old_load) {
     const bool vector = old_load.starts_with("ldg.v8");
-    for (uint32_t k = 0; k < (vector ? 8u : 1u); ++k)
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(machine.read_reg(0, lane, 8 + k) == pattern_word(vector ? k : lane),
-                old_load + ": r" + std::to_string(8 + k) + " lane " + std::to_string(lane) + " is wrong");
+    for (uint32_t k = 0; k < (vector ? 8u : 1u); ++k) {
+        require_lanes(machine, 8 + k, [&](uint32_t lane) { return pattern_word(vector ? k : lane); }, old_load);
+    }
 }
 
 } // namespace
@@ -530,9 +529,8 @@ TEST(Stepping, buffer_reuse_load_to_scalar_store) {
             "the store's valid bits were lost" + where);
         require(!load.owner.has_value() && load.valid_count == 0,
             "the load buffer is still owned after the load's final drain" + where);
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(run.machine->read_gmem_u32(2048 + 4 * lane) == 2048 + 4 * lane,
-                "the scalar store wrote the wrong word for lane " + std::to_string(lane) + where);
+        require_lanes(gmem_lanes(*run.machine, 2048), [](uint32_t lane) { return 2048 + 4 * lane; },
+            "the scalar store's word" + where);
     };
     const Check vector_store = [lr](const ReuseRun& run, const std::string& where) {
         // Its address read at reuse + 1, planned at reuse + 1 + Lr, its first
@@ -549,18 +547,17 @@ TEST(Stepping, buffer_reuse_load_to_scalar_store) {
         const auto& filled = run.after.at(first_beat + lr).second;
         require(filled.owner == 1u && filled.valid_count == canonical_profile().lsu_store_group_lanes,
             "the stg.v8's first read beat is not in the store buffer Lr after it" + where);
-        for (uint32_t j = 0; j < 8; ++j)
-            for (uint32_t lane = 0; lane < 16; ++lane)
-                require(run.machine->read_gmem_u32(2048 + 32 * lane + 4 * j) == 101 + j,
-                    "the stg.v8 wrote the wrong word: r" + std::to_string(24 + j) + " lane " + std::to_string(lane) + where);
+        for (uint32_t j = 0; j < 8; ++j) {
+            require_lanes(gmem_lanes(*run.machine, 2048 + 4 * j, 32), 101 + j,
+                "the stg.v8's word of r" + std::to_string(24 + j) + where);
+        }
     };
     const Check load = [](const ReuseRun& run, const std::string& where) {
         const auto& buffer = run.after.at(run.reuse_cycle).first;
         require(!buffer.owner.has_value() && buffer.valid_count == 0,
             "the load buffer is owned or not empty before the new load's first word returned" + where);
-        for (uint32_t lane = 0; lane < 16; ++lane)
-            require(run.machine->read_reg(0, lane, 16) == pattern_word(256 + lane),
-                "the new load returned the wrong word for lane " + std::to_string(lane) + where);
+        require_lanes(*run.machine, 16, [](uint32_t lane) { return pattern_word(256 + lane); },
+            "the new load's word" + where);
     };
     const std::vector<Row> rows = {
         {"ldg.v8 r8, [r0]", "stg [r5 + 2048], r6", "stg", scalar_store},
@@ -610,11 +607,9 @@ TEST(Stepping, simultaneous_depbar_completion_and_admission) {
     require(completion != sb0_events.end(), "the lds did not complete in the ldg's issue cycle");
     require(completion + 1 != sb0_events.end() && *(completion + 1) == std::make_pair(ldg_issue, std::string("value=1")),
         "the admission did not follow the completion in the same cycle");
-    require(sb0_after.at(ldg_issue) == 1, "sb0 is not 1 - 1 + 1 after the cycle");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine.read_reg(0, lane, 1) == 0xabcd && machine.read_reg(0, lane, 3) == 0x1234,
-            "a load's value was lost");
-    }
+    require_eq(sb0_after.at(ldg_issue), 1, "sb0 after the cycle (1 - 1 + 1)");
+    require_lanes(machine, 1, 0xabcd, "the first load's value");
+    require_lanes(machine, 3, 0x1234, "the second load's value");
 }
 
 // A full MMA queue (two entries): the third mma.async issues the cycle after
@@ -642,7 +637,77 @@ TEST(Stepping, full_queue_issue_after_the_retire_cycle) {
         if (event.category == nanosm::TraceCategory::mma && event.id == 1)
             head_retire = std::max(head_retire, event.start_cycle);
     require(!refusals(machine, 0, "MMA command queue full").empty(), "the third mma.async never found the queue full");
-    require(third_accept == head_retire + 1 + nanosm::issue_to_dispatch(canonical_profile()),
-        "the third mma.async did not issue the cycle after the head retired (accepted " + std::to_string(third_accept) +
-            " vs retired " + std::to_string(head_retire) + ")");
+    require_eq(third_accept, head_retire + 1 + nanosm::issue_to_dispatch(canonical_profile()),
+        "the third mma.async's acceptance (issued the cycle after the head retired at c" + std::to_string(head_retire) +
+            ")");
+}
+
+// The same for the TMA queue at one entry (tma.queue_commands = 1): of two
+// tma.load.1d back to back, the second issues the cycle after the first
+// command leaves the queue -- the cycle the RMW engine claims its completion
+// event ("complete_tx (tma)" starts), which is the end of its "tma command"
+// slice less one.
+TEST(Stepping, full_tma_queue_issue_after_the_retire_cycle) {
+    auto profile = canonical_profile();
+    profile.tma_queue_commands = 1;
+    constexpr uint32_t bytes = 256;
+    auto launch = launch_warps(1);
+    auto& shmem = image_bytes(launch.test_shmem, 8192);
+    write_tma_descriptor(shmem, 5120, plain_tma_1d(bytes / 4));
+    write_mbar(shmem, 4104, mbar_state(1, 0, static_cast<int32_t>(2 * bytes))); // both commands' bytes
+    fill_pattern(image_bytes(launch.gmem_image, bytes), 0, bytes / 4, 0);
+    const auto program = one_tma_operands(0) + "umov ur12, 1024\n"
+        "tma.load.1d [ur10], [5120, ur8], [ur11]\n"
+        "tma.load.1d [ur12], [5120, ur8], [ur11]\n" + wait_on("ur11") + "halt\n";
+    nanosm::Machine machine(profile, compile(program, profile), std::move(launch), {.timeline = true});
+    machine.run(20000);
+    std::vector<uint64_t> issues;
+    for (const auto& event : machine.trace().events())
+        if (is_issue_event(event) && event.name == "tma.load.1d") issues.push_back(event.start_cycle);
+    std::vector<uint64_t> claims; // the TMA's completion events' RMW starts
+    for (const auto& [start, detail] : mbar_rmw_services(machine))
+        if (detail.rfind("complete_tx (tma)", 0) == 0) claims.push_back(start);
+    std::vector<uint64_t> command_ends;
+    for (const auto& event : events_named(machine, "tma command"))
+        command_ends.push_back(event.start_cycle + event.duration_cycles);
+    std::sort(command_ends.begin(), command_ends.end());
+    require(issues.size() == 2 && claims.size() == 2 && command_ends.size() == 2, "two tma loads, two completions");
+    require(!refusals(machine, 0, "tma command queue full").empty(), "the second tma.load never found the queue full");
+    require(command_ends[0] == claims[0] + 1, "the first command did not leave the queue at its event's claim");
+    require_eq(issues[1], claims[0] + 1,
+        "the second tma.load's issue (the cycle after the first command left the queue at its claim)");
+    for (uint32_t i = 0; i < bytes / 4; ++i)
+        require(machine.read_shmem_u32(4 * i) == pattern_word(i) && machine.read_shmem_u32(1024 + 4 * i) == pattern_word(i),
+            "a tma load's word");
+}
+
+// One acc.ld engine: two warps' acc.ld.v8, the second refused ("acc transfer
+// engine busy") until the first transfer's last read has launched, at L
+// (its "acc.ld beat", the tmem sample, at L + tmem.port_depth: Mma.tmem_depths).
+// The engine is empty from L + 1, and the second transfer issues then.
+TEST(Stepping, busy_acc_engine_issue_after_it_empties) {
+    const auto& profile = canonical_profile();
+    auto launch = launch_warps(2);
+    nanosm::Machine machine(profile, compile(R"(
+        usread ur8, WARP_ID
+        ushli ur8, ur8, 10
+        acc.ld.v8 r16, [ur8, 64]
+        halt
+    )", profile), std::move(launch), {.timeline = true, .debug = true});
+    machine.run(20000);
+    std::array<std::vector<uint64_t>, 2> beats;
+    for (const auto& event : events_named(machine, "acc.ld beat"))
+        beats.at(event.detail.rfind("warp=0,", 0) == 0 ? 0 : 1).push_back(event.start_cycle);
+    std::array<std::vector<uint64_t>, 2> issues;
+    for (const auto& event : machine.trace().events())
+        if (is_issue_event(event) && event.name == "acc.ld.v8")
+            issues.at(event.detail.rfind("warp=0,", 0) == 0 ? 0 : 1).push_back(event.start_cycle);
+    require(beats[0].size() == 8 && beats[1].size() == 8 && issues[0].size() == 1 && issues[1].size() == 1,
+        "two acc.ld.v8, eight beats each");
+    const auto first = issues[0][0] < issues[1][0] ? 0u : 1u;
+    const auto second = 1 - first;
+    require(!refusals(machine, second, "acc transfer engine busy").empty(), "the second acc.ld never found the engine busy");
+    const auto last_launch = beats[first].back() - profile.tmem_port_depth;
+    require_eq(issues[second][0], last_launch + 1,
+        "the second acc.ld's issue (the cycle after the first transfer's last read launched)");
 }

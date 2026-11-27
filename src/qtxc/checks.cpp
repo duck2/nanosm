@@ -1,8 +1,8 @@
 // The rules an instruction must pass whoever wrote it (src/qtxc/), in one
 // place: check_instruction, applied per source line by qtxc's scheduler and
 // the assembler and per pc at kernel load (check_kernel), and the other
-// kernel-load checks (validate_kernel, the reserved bits of each word, the
-// uniform registers). It does not parse or schedule.
+// kernel-load checks (validate_kernel, each word's opcode and reserved bits,
+// the uniform registers). It does not parse or schedule.
 
 #include "qtxc/internal.hpp"
 #include "timing.hpp"
@@ -183,16 +183,23 @@ void check_instruction(const Instruction& inst, const DeviceProfile& profile, co
 
 namespace {
 
-// A word with a bit set that its form does not define (src/isa.hpp
-// reserved_bit): refused, naming the pc and the bit, before anything reads
-// the word's fields.
-void check_reserved_bits(const Kernel& kernel) {
+// A word whose opcode the instruction set does not have, or with a bit set
+// that its form does not define (src/isa.hpp reserved_bit): refused, naming
+// the pc and the opcode or the bit, before anything reads the word's fields.
+void check_words(const Kernel& kernel) {
     for (std::size_t index = 0; index < kernel.words.size(); ++index) {
         const auto word = kernel.words[index];
-        const auto bit = reserved_bit(word);
-        if (!bit.has_value()) continue;
         std::ostringstream hex;
         hex << std::hex << std::setw(16) << std::setfill('0') << word;
+        const auto opcode = static_cast<unsigned>((word >> encoding::opcode_shift) & encoding::opcode_mask);
+        if (!is_known_opcode(static_cast<Opcode>(opcode))) {
+            std::ostringstream value;
+            value << std::hex << std::setw(2) << std::setfill('0') << opcode;
+            throw SimError("kernel pc " + std::to_string(8 * index) + ": word 0x" + hex.str() + " has opcode 0x" +
+                value.str() + ", which instruction-set revision " + std::to_string(isa_revision) + " does not have");
+        }
+        const auto bit = reserved_bit(word);
+        if (!bit.has_value()) continue;
         throw SimError("kernel pc " + std::to_string(8 * index) + ": word 0x" + hex.str() + " ('" +
             format_instruction(decode(word), false) + "') sets bit " + std::to_string(*bit) +
             ", which its form does not define; a reserved bit must be zero (this reader is instruction-set "
@@ -206,7 +213,7 @@ void validate_kernel(const Kernel& kernel) {
     if (kernel.profile_name.empty()) throw SimError("kernel has no profile name");
     if (kernel.register_count > 256) throw SimError("kernel register count exceeds 256");
     if (kernel.words.empty()) throw SimError("kernel contains no instructions");
-    check_reserved_bits(kernel);
+    check_words(kernel);
     AssemblyProgram decoded;
     decoded.instructions.reserve(kernel.words.size());
     for (const auto word : kernel.words) decoded.instructions.push_back(decode(word));
@@ -216,7 +223,7 @@ void validate_kernel(const Kernel& kernel) {
 }
 
 void check_kernel(const Kernel& kernel, const DeviceProfile& profile) {
-    check_reserved_bits(kernel);
+    check_words(kernel);
     // What the profile has no unit for is refused for the kernel as a whole.
     for (const auto word : kernel.words) {
         if (const auto refusal = unsupported_by_profile(decode(word), profile); refusal.has_value()) {

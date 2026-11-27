@@ -11,8 +11,10 @@
 //      request pointer)
 //   3. ingress: ingress FIFO -> TMA sector register (TMA stream) or the load
 //      buffer (ldg.v8, gather, ldg.uni)
-//   4. RF stages: load buffer -> RF (in src/machine/rf.cpp's RF write port),
-//      RF -> store buffer (stg.v8)
+//   4. RF stages: load buffer -> RF, RF -> store buffer (stg.v8), each a
+//      client of the RF's async ports (src/machine/rf.cpp): the load buffer
+//      presents its next write, the store data its next beat's read, the
+//      command slots their next register read; each takes its grant here
 //   5. egress write port: store buffer / TMA store sector registers -> egress
 //      FIFO, one client per cycle, TMA priority
 //
@@ -27,23 +29,23 @@
 // The front end, in order (one queue, strictly first in first out, for
 // every warp):
 //   issue       an ldg / stg / ldg.v8 / stg.v8 / ldg.uni enters the queue at
-//               its issue's edge with the active mask; issue asks only for a
-//               free queue entry (Q). Its depbar and read depbar rise then.
-//   issue + 1   the newest entry samples its predicate (lanes = the active
-//               mask AND the write mask) and an ldg.uni its base register.
-//               An entry left with no lane leaves the queue then and gives
-//               back its entry and both depbars; it makes no request.
+//               its issue's edge; at issue + 1 it samples its predicate and
+//               an ldg.uni its base register, and one left with no lane
+//               leaves then and makes no request (the memory queues,
+//               src/machine/dispatch.cpp).
 //   head        the queue's head leaves for a command slot, in order, when a
 //               slot is free (as this cycle's releases leave them (d)) and,
 //               for a scalar stg, the store buffer is free (Q). An ldg.uni
 //               adds its immediate and is planned as it leaves (its base at
 //               the URF output then).
 //   slot        an unplanned command reads its vector registers through the
-//               RF's async read ports (decide_rf_reads, the owed-bit rule),
+//               RF's async read ports (it presents lsu_collect_rf_read and
+//               takes the grant in take_lsu_collect_read, below),
 //               the oldest first: its address; a scalar stg's address and
 //               data in one cycle when both banks are granted, else the
-//               address first. The grant of the last one lowers the read
-//               depbar (a stg.v8's falls at its last data beat).
+//               address first (the collect rule, src/machine/dispatch.cpp).
+//               The grant of the last one lowers the read depbar (a
+//               stg.v8's falls at its last data beat).
 //   plan        when the address is at the RF output (Lr after its grant)
 //               the command adds the immediate, checks every lane and plans
 //               its requests; a scalar stg's data at the RF output fills the
@@ -52,8 +54,8 @@
 // request channel's LSU candidate, so a warp's stg then ldg of one word
 // reach the controller in that order and the load reads the store.
 //
-// In this file: parts 2 to 5, then the front end's queue and command slots
-// (step_lsu_queue) and the unit's register drivers.
+// In this file: parts 2 to 5, then the front end's queue head and command
+// slots (step_lsu_queue) and the unit's register drivers.
 // (Machine is one class, src/machine/machine.hpp; the map of its files is at the top of
 // src/machine/machine.cpp.)
 
@@ -171,9 +173,9 @@ Machine::LsuFrontEnd::Plan Machine::plan_lsu_command(const LsuCommand& command, 
     return plan;
 }
 
-// The command an entry leaving the queue becomes, with `lanes` (its
-// sample's): unplanned, its number and slot still to be given.
-Machine::LsuCommand Machine::lsu_command_from(const LsuEntry& entry, uint64_t lanes) const {
+// The command an entry leaving the queue (with its sample) becomes:
+// unplanned, its number and slot still to be given.
+Machine::LsuCommand Machine::lsu_command_from(const QueuedEntry& entry) const {
     const auto& inst = entry.instruction;
     LsuCommand command;
     command.warp = entry.warp;
@@ -184,7 +186,7 @@ Machine::LsuCommand Machine::lsu_command_from(const LsuEntry& entry, uint64_t la
     // with the command to its last data read. Every other form's is lowered
     // when its command slot's read of its last register is granted.
     command.read_depbar = inst.control.read_depbar;
-    command.lanes = lanes;
+    command.lanes = entry.lanes;
     switch (inst.opcode) {
     case Opcode::ldg_v8:
         command.kind = LsuKind::vector_load;
@@ -470,7 +472,7 @@ void Machine::pluck_tma(const IngressPiece& piece, const TmaRun& run, TmaSectorR
 // free from now on (same-cycle reuse (d)).
 bool Machine::load_buffer_released(const Wires& w) const {
     const auto& start = lsu_buffers_.at(load_buffer).cur();
-    return w.rf_write.granted_to(AsyncWriter::lsu_buffer, load_buffer) && start.beats + 1 == start.beats_total;
+    return w.rf_write.granted.load_buffer != 0 && start.beats + 1 == start.beats_total;
 }
 
 // The load buffer as a word arriving for group `group` of `command` sees it
@@ -580,14 +582,93 @@ void Machine::note_first_return(uint64_t command) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. RF read stage (vector stores). The RF write stage (load buffer -> RF) is a
-// client of the RF write decision: decide_rf_writes in machine/rf.cpp.
+// 4. RF stages: the load buffer's RF write requests (load buffer -> RF) and
+// the store-data reads (RF -> store buffer, vector stores), each a client of
+// the RF's async ports (src/machine/rf.cpp).
 // ---------------------------------------------------------------------------
 
+// The buffer word an active lane's next write takes: a v8 group's lane l,
+// word j (the writes granted so far), at (l - the group's first lane) x 8 +
+// j; a gather group's lane l at l - its first lane.
+uint32_t Machine::load_buffer_word(const LsuCommand& command, const LsuBuffer& buffer, uint32_t lane) const {
+    const auto width = lsu_group_width(command);
+    return command.kind == LsuKind::vector_load ? (lane - buffer.group * width) * 8 + buffer.beats
+                                                : lane - buffer.group * width;
+}
+
+// The group's next write is its command's last: the group's last write, and
+// with it every active lane written.
+bool Machine::load_buffer_write_ends_command(const LsuCommand& command, const LsuBuffer& buffer) const {
+    const bool group_done = buffer.beats + 1 == buffer.beats_total;
+    const uint32_t lanes_done =
+        command.kind == LsuKind::uniform_load ? 1 : static_cast<uint32_t>(std::popcount(buffer.lanes));
+    return group_done && command.lanes_written + lanes_done == command.requests_total;
+}
+
+// The load buffer's RF write request, when it holds a complete group (in Q;
+// the store buffer never writes the RF): the group's next write, one a cycle
+// -- a v8 group's register rD + j with the group's active lanes enabled
+// (lane l's word j); a gather group's active lanes; an ldg.uni's one word to
+// every lane. The command's last write clears its depbar as it lands, and
+// rD..rD+7 count as in flight until then.
+std::optional<Machine::RfWrite> Machine::load_buffer_rf_write() const {
+    const auto& buffer = lsu_buffers_[load_buffer].cur();
+    if (!buffer.owner.has_value() || buffer.valid_count != buffer.expected) return std::nullopt;
+    const auto& command = lsu_commands_.cur().in_slot(*buffer.owner);
+    if (is_store(command.kind)) throw SimError("internal: the load buffer's owner is not a load");
+    const bool vector = command.kind == LsuKind::vector_load;
+    const bool uniform = command.kind == LsuKind::uniform_load;
+    RfWrite write;
+    write.warp = command.warp;
+    write.reg = static_cast<uint8_t>(command.reg + (vector ? buffer.beats : 0));
+    write.values.assign(config_.lanes, 0);
+    write.lane_enables = uniform ? full_mask() : buffer.lanes;
+    for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+        if (uniform) {
+            write.values[lane] = buffer.words[0];
+        } else if ((buffer.lanes >> lane & 1) != 0) {
+            write.values[lane] = buffer.words[load_buffer_word(command, buffer, lane)];
+        }
+    }
+    if (load_buffer_write_ends_command(command, buffer)) {
+        for (uint32_t j = 0; j < (vector ? 8u : 1u); ++j) write.visible_regs.push_back(static_cast<uint8_t>(command.reg + j));
+        write.clear_depbar = command.depbar;
+    }
+    return write;
+}
+
+// The load / store unit takes its RF write grant, after the write port: a
+// store whose last sector request was accepted last cycle gives up its
+// command slot now; a granted write drains its lanes from the load buffer
+// (the sanitizer checks each was filled) and, when it is the command's last,
+// releases the load's slot now (the write pipeline owns its data from here);
+// a denied one is a wait (T). `request`: the write it presented now.
+void Machine::take_load_buffer_grant(const std::optional<RfWrite>& request, Wires& w) {
+    release_requested_stores(w);
+    if (!request.has_value()) return;
+    const auto& buffer = lsu_buffers_[load_buffer].cur();
+    const auto& command = lsu_commands_.cur().in_slot(*buffer.owner);
+    if (w.rf_write.granted.load_buffer == 0) {
+        ++trace_->lsu_counters().lsu_rf_write_wait_cycles;
+        ++lsu_phases_[command.id].rf_wait;
+        return;
+    }
+    if (command.kind != LsuKind::uniform_load) {
+        for (uint32_t lane = 0; lane < config_.lanes; ++lane) {
+            if ((buffer.lanes >> lane & 1) == 0) continue;
+            sanitizer_.check_buffer_lanes_valid(cycle_, load_buffer, buffer.valid, load_buffer_word(command, buffer, lane),
+                1, "RF drain");
+        }
+    }
+    // The bytes written: the group's enabled lanes (every lane for ldg.uni).
+    probe(LsuEdge::rf_write_beat, command.id, request->reg, static_cast<uint32_t>(std::popcount(buffer.lanes)) * 4);
+    if (load_buffer_write_ends_command(command, buffer)) release_lsu_command(w, command.id);
+}
+
 // RF -> the store buffer (v8 stores): the LSU's async RF reader, one
-// full-width read beat per cycle at most (decide_rf_reads grants it a read
-// port the issue register leaves free). Stores use the one store buffer in
-// command order, so the only candidate is the OLDEST store that still has
+// full-width read beat per cycle at most (the RF read decision grants it a
+// read port the issue register leaves free). Stores use the one store buffer
+// in command order, so the only candidate is the OLDEST store that still has
 // data to move (in Q), when it is a v8 store. Its lanes go in fixed groups of
 // lsu.store_group_lanes: for a group it reads rS .. rS+7 once, one beat a
 // cycle (the beats follow each other through the RF read stages), and keeps
@@ -595,8 +676,9 @@ void Machine::note_first_return(uint64_t command) {
 // lane of the group) x 8 + j. The group's first beat needs the buffer free:
 // empty in Q, or its previous data's last word pushed into the egress FIFO
 // now (d). A stg.v8 reads its data once it is planned (in Q).
-// `egress`: this cycle's egress decision, for that drain.
-std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const EgressWrite& egress) const {
+// `egress`: this cycle's egress decision, for that drain. Its request is the
+// beat's register.
+std::optional<Machine::LsuStoreRead> Machine::lsu_store_read(const EgressWrite& egress) const {
     for (const auto* command : lsu_commands_.cur().oldest_first()) {
         if (!store_has_data_left(*command)) continue;
         if (command->kind != LsuKind::vector_store || !command->planned) return std::nullopt;
@@ -611,18 +693,51 @@ std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Egre
             return std::nullopt;
         }
         const auto width = config_.lsu_store_group_lanes;
-        RfReadRequest request{RfReader::lsu_store, 0, command->warp,
-            static_cast<uint8_t>(command->reg + beat), command->id, store_buffer, command->slot};
-        request.group = command->sectors.at(sector).lane / width;
-        request.beat = beat;
-        request.lanes = lsu_group_lanes(*command, request.group);
+        LsuStoreRead read;
+        read.command = command->id;
+        read.slot = command->slot;
+        read.warp = command->warp;
+        read.reg = static_cast<uint8_t>(command->reg + beat);
+        read.group = command->sectors.at(sector).lane / width;
+        read.beat = beat;
+        read.lanes = lsu_group_lanes(*command, read.group);
         // The command's last group: no active lane above it.
-        request.last_group = (request.group + 1) * width >= config_.lanes ||
-            (command->lanes >> ((request.group + 1) * width)) == 0;
-        request.read_depbar = command->read_depbar;
-        return request;
+        read.last_group = (read.group + 1) * width >= config_.lanes ||
+            (command->lanes >> ((read.group + 1) * width)) == 0;
+        read.read_depbar = command->read_depbar;
+        return read;
     }
     return std::nullopt;
+}
+
+std::optional<Machine::RfReadRequest> Machine::lsu_store_rf_read(const EgressWrite& egress) const {
+    const auto read = lsu_store_read(egress);
+    if (!read.has_value()) return std::nullopt;
+    return RfReadRequest{read->warp, read->reg, std::nullopt};
+}
+
+// The store-data beat takes its RF read grant: denied, a wait (T); granted,
+// its words go into the RF's read stages toward the store buffer
+// (drive_lsu_read_pipe). A stg.v8 reads rS + j once per lane group, so the
+// register is read-owned no longer after its last group's read; rS + 7's in
+// the last group is the command's last source read and lowers its read
+// depbar.
+void Machine::take_lsu_store_read(Wires& w) {
+    const auto read = lsu_store_read(w.egress);
+    if (!read.has_value()) return;
+    const auto& words = w.rf_read.granted[RfReader::lsu_store].words;
+    if (!words.has_value()) {
+        ++trace_->lsu_counters().lsu_rf_read_wait_cycles;
+        ++lsu_phases_[read->command].rf_wait;
+        return;
+    }
+    if (read->last_group) sanitizer_.record_async_reader_done(read->warp, read->reg, AsyncReader::stg_v8);
+    probe(LsuEdge::rf_read_beat, read->command, read->reg, config_.lanes * 4);
+    w.lsu_rf_read = LsuRfRead{read->slot, *words, read->group, read->beat, read->lanes};
+    if (read->last_group && read->beat == 7 && read->read_depbar < 6) {
+        record_depbar_completion(w, read->warp, read->read_depbar,
+            "depbar underflow on sb" + std::to_string(read->read_depbar) + " (a read depbar)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,8 +948,8 @@ void Machine::drive_store_acks(const Wires& w) {
         StoreAckRecord next = cur;
         if (cur.valid && cur.acks_owed == 0) {
             next = StoreAckRecord{};
-        } else if (const auto acks = w.controller.store_acks.find(index); acks != w.controller.store_acks.end()) {
-            next.acks_owed -= acks->second; // (checked when each was delivered)
+        } else if (index < w.controller.store_acks.size()) {
+            next.acks_owed -= w.controller.store_acks[index]; // (checked when each was delivered)
         }
         if (planned != nullptr && w.lsu.plan->ack_record == index) {
             if (cur.valid) throw SimError("internal: a store took an acknowledgement record in use");
@@ -857,99 +972,36 @@ void Machine::drive_store_acks(const Wires& w) {
 // entry's issue + 1 sample, the head's move into a command slot, and the plan
 // of the command whose address is at the RF output now.
 void Machine::step_lsu_queue(Wires& w) {
-    sample_lsu_entry(w);
+    sample_newest(MemoryQueue::lsu, w);
     advance_lsu_queue(w);
     plan_arriving_address(w);
 }
 
-// The entry that entered the queue at the last edge samples, in the issue
-// register's cycle (its issue + 1): its predicate, read from the predicate
-// file (lanes = the active mask AND the write mask), and an ldg.uni its base
-// through a URF read port (step_rf_reads counts it with the cycle's other
-// URF reads). The uniform operation's partial-mask rule is the sanitizer's
-// PANIC here. An entry with no lane left leaves the queue now (drop_lsu_entry).
-void Machine::sample_lsu_entry(Wires& w) {
-    const auto& queue = lsu_queue_.cur();
-    if (queue.empty() || queue.back().sampled) return;
-    const auto& entry = queue.back();
-    const auto& inst = entry.instruction;
-    LsuFrontEnd::Sample sample;
-    sample.lanes = entry.lanes;
-    if (has_write_mask(inst)) sample.lanes &= write_mask_lanes(warps_[entry.warp], inst);
-    if (inst.opcode == Opcode::ldg_uni) {
-        sanitizer_.check_uniform_mask(site(entry), entry.lanes, full_mask());
-        sample.base = read_urf(entry.warp, inst.src0, "URF read: a queued ldg.uni's sample");
-        sample.uniform_read = true;
-    }
-    sample.dropped = sample.lanes == 0;
-    if (sample.dropped) drop_lsu_entry(entry, w);
-    w.lsu.sample = sample;
-}
-
-// An ldg / stg / ldg.v8 / stg.v8 whose write mask turned every active lane
-// off: no register read, no command slot, no request. Its depbar and its
-// read depbar are decremented now (a waiting instruction sees them zero from
-// the next cycle, issue + 2); a load's destination keeps every lane's old
-// value and is not in flight from then on; its source registers are no
-// longer read; its queue entry is given back at this edge (drive_lsu_queue).
-// Only a write mask can leave no lane: the divergence stack's active mask is
-// never empty, and an ldg.uni refuses to be masked.
-void Machine::drop_lsu_entry(const LsuEntry& entry, Wires& w) {
-    const auto& inst = entry.instruction;
-    if (!can_be_masked(inst.opcode)) {
-        throw SimError("internal: " + opcode_name(inst.opcode) + " was queued with no active lane");
-    }
-    record_depbar_completion(w, entry.warp, inst.control.set_depbar,
-        "depbar underflow on sb" + std::to_string(inst.control.set_depbar));
-    lower_read_depbar(w, entry.warp, inst);
-    if (const auto dst = destination_register(inst); dst.has_value()) {
-        const uint32_t registers = inst.opcode == Opcode::ldg_v8 ? 8 : 1;
-        for (uint32_t j = 0; j < registers; ++j) sanitizer_.record_reg_ready(entry.warp, *dst + j, cycle_ + 1);
-    }
-    sanitizer_.record_async_reader_done(entry.warp, inst.src0, AsyncReader::lsu);
-    if (inst.opcode == Opcode::stg && inst.src1 != inst.src0) {
-        sanitizer_.record_async_reader_done(entry.warp, inst.src1, AsyncReader::lsu);
-    }
-    if (inst.opcode == Opcode::stg_v8) {
-        for (uint32_t j = 0; j < 8; ++j) sanitizer_.record_async_reader_done(entry.warp, inst.src1 + j, AsyncReader::stg_v8);
-    }
-}
-
-// The queue's head leaves for a command slot when it may: sampled (or
-// sampled now and not dropped), its wait over (an ldg.uni's base at the URF
-// output), a command slot free as this cycle's releases leave them, and for
-// a scalar stg the store buffer free (Q). It takes the lowest free slot
+// The queue's head leaves for a command slot when it may (head_may_leave:
+// its wait over -- an ldg.uni's base at the URF output -- and not dropped
+// now), a command slot is free as this cycle's releases leave them, and for
+// a scalar stg the store buffer is free (Q). It takes the lowest free slot
 // (drive_lsu_commands puts it there). An ldg.uni is planned as it leaves:
 // its one address needs no register read.
 void Machine::advance_lsu_queue(Wires& w) {
-    const auto& queue = lsu_queue_.cur();
-    if (queue.empty()) return;
-    const auto& head = queue.front();
-    uint64_t lanes = head.lanes;
-    uint32_t base = head.base;
-    if (!head.sampled) { // the head is the newest entry: its sample is now
-        const auto& sample = w.lsu.sample.value();
-        if (sample.dropped) return;
-        lanes = sample.lanes;
-        base = sample.base;
-    }
-    if (head.wait != 0) return;
+    if (!head_may_leave(MemoryQueue::lsu)) return;
     auto& counters = trace_->lsu_counters();
     const auto slot = lsu_commands_.cur().lowest_free(config_.lsu_active_commands, w.released_lsu_commands);
     if (!slot.has_value()) {
         ++counters.lsu_no_slot_cycles;
         return;
     }
+    const auto head = leaving_head(MemoryQueue::lsu, w);
     const auto& inst = head.instruction;
     if (inst.opcode == Opcode::stg && !store_buffer_free()) {
         ++counters.lsu_store_buffer_wait_cycles;
         return;
     }
-    auto command = lsu_command_from(head, lanes);
+    auto command = lsu_command_from(head);
     command.id = lsu_command_number_.cur();
     command.slot = *slot;
     if (command.kind == LsuKind::uniform_load) {
-        LaneWords bases(1, base);
+        LaneWords bases(1, entry_uniform(head, inst.src0));
         const auto plan = plan_lsu_command(command, bases);
         command.sectors = plan.sectors;
         command.requests_total = plan.requests_total;
@@ -961,7 +1013,7 @@ void Machine::advance_lsu_queue(Wires& w) {
     lsu_phases_[command.id].admit_cycle = cycle_;
     // Sanitizer: the admitted set never exceeds the command slots.
     sanitizer_.check_lsu_admitted(lsu_commands_.cur().size() - w.released_lsu_commands.size() + 1);
-    w.lsu.queue_pop = true;
+    pop_queue(w, MemoryQueue::lsu);
     w.lsu.entering = std::move(command);
 }
 
@@ -1001,63 +1053,61 @@ void Machine::plan_arriving_address(Wires& w) {
     if (arriving->data.has_value()) w.lsu.store_data = std::make_pair(arriving->slot, *arriving->data);
 }
 
-// The command slots' next RF read, from Q: the oldest command with a register
-// still unread (its address; a scalar store's address and data, the data
-// read with the address in one cycle when its bank has a port left, else
-// next as this requester's own read; one register when they are the same).
-// `data`: that pair's second register.
-std::optional<Machine::RfReadRequest> Machine::lsu_collect_read_request(bool data) const {
+// The command slots' reader, from Q: the oldest command with a register still
+// unread (next_collect_register; a scalar store's address and data are a
+// pair).
+const Machine::LsuCommand* Machine::lsu_collect_command() const {
     for (const auto* command : lsu_commands_.cur().oldest_first()) {
-        const bool pair = command->kind == LsuKind::scalar_store;
-        const bool data_unread = pair && !command->data_read;
-        if (command->address_read && !data_unread) continue; // its reads are granted
-        const auto& inst = command->instruction;
-        RfReadRequest request;
-        request.reader = data ? RfReader::lsu_collect_data : RfReader::lsu_collect;
-        request.warp = command->warp;
-        request.lsu_command = command->id;
-        request.lsu_slot = command->slot;
-        if (data) {
-            if (!pair || command->address_read || inst.src1 == inst.src0) return std::nullopt;
-            request.reg = inst.src1;
-            return request;
+        if (next_collect_register(command->instruction, command->kind == LsuKind::scalar_store, command->address_read,
+                command->data_read, false).has_value()) {
+            return command;
         }
-        request.reg = command->address_read ? inst.src1 : inst.src0;
-        return request;
     }
-    return std::nullopt;
+    return nullptr;
 }
 
-// The LSU's queue, in one calculation: its head leaves for a command slot
-// (popped) or, the newest entry, it has no lane left (dropped); the newest
-// entry takes its issue + 1 sample; every other entry's `wait` counts down;
-// issue's new entry enters at the tail.
-void Machine::drive_lsu_queue(const Wires& w) {
-    const bool push = w.issue.lsu.has_value();
-    const auto& sample = w.lsu.sample;
-    bool changed = w.lsu.queue_pop || push || sample.has_value();
-    auto next = lsu_queue_.cur();
-    for (auto& entry : next) {
-        if (entry.wait != 0) {
-            --entry.wait;
-            changed = true;
+// The command slots' RF read request: that command's next register -- its
+// address, or a scalar store's data -- and a scalar store's data wanted with
+// its address in one cycle.
+std::optional<Machine::RfReadRequest> Machine::lsu_collect_rf_read() const {
+    const auto* command = lsu_collect_command();
+    if (command == nullptr) return std::nullopt;
+    const auto next = [&](bool with_address) {
+        return next_collect_register(command->instruction, command->kind == LsuKind::scalar_store,
+            command->address_read, command->data_read, with_address);
+    };
+    return RfReadRequest{command->warp, *next(false), next(true)};
+}
+
+// The command slots take their RF read grant: each granted register is
+// read-owned no longer (the sanitizer) and its words go into the slots' read
+// stages as the collect rule says (collect_read: the address, the data, or
+// both for one register; a scalar store's data is the store buffer's,
+// probed). The read of the command's last vector register -- a scalar
+// store's data, any other's address (a stg.v8's falls at its last data beat
+// instead) -- lowers its read depbar.
+void Machine::take_lsu_collect_read(Wires& w) {
+    const auto& grant = w.rf_read.granted[RfReader::lsu_collect];
+    if (!grant.words.has_value()) return;
+    const auto& command = *lsu_collect_command();
+    const auto request = lsu_collect_rf_read();
+    auto& sampled = w.lsu.read;
+    sampled = LsuOperandRead{command.slot, command.id, {}, {}};
+    const auto latch = [&](uint8_t reg, const LaneWords& words, bool named) {
+        sanitizer_.record_async_reader_done(command.warp, reg, AsyncReader::lsu);
+        const auto got = collect_read(command.instruction, command.kind == LsuKind::scalar_store, command.address_read,
+            named);
+        if (got.address) sampled->address = words;
+        if (got.data) {
+            sampled->data = words;
+            probe(LsuEdge::rf_read_beat, command.id, reg, config_.lanes * 4); // the store buffer's data
         }
-    }
-    if (sample.has_value()) {
-        if (sample->dropped) {
-            next.resize(next.size() - 1); // the newest entry; also the head when it alone is queued
-        } else {
-            auto& newest = next.back();
-            newest.lanes = sample->lanes;
-            newest.base = sample->base;
-            newest.sampled = true;
-        }
-    }
-    if (w.lsu.queue_pop) next.pop_front();
-    if (push) next.push_back(*w.issue.lsu);
-    if (!changed) return;
-    if (next.size() > config_.lsu_queue_entries) throw SimError("internal: the LSU queue holds more than lsu.queue_entries");
-    lsu_queue_.set_next(std::move(next), "drive_lsu_queue");
+    };
+    latch(request->reg, *grant.words, true);
+    if (grant.pair_words.has_value()) latch(*request->pair, *grant.pair_words, false);
+    const bool last = command.kind == LsuKind::scalar_store ? sampled->data.has_value()
+        : command.kind != LsuKind::vector_store;
+    if (last) lower_read_depbar(w, command.warp, command.instruction);
 }
 
 // The command slots' reads in flight: the one sampled now enters the RF's
@@ -1173,7 +1223,7 @@ void Machine::drive_lsu_buffers(const Wires& w) {
             if (!next.has_value()) next = cur;
             return *next;
         };
-        if (w.rf_write.granted_to(AsyncWriter::lsu_buffer, load_buffer)) {
+        if (w.rf_write.granted.load_buffer != 0) {
             if (load_buffer_released(w)) clear(edit());
             else ++edit().beats;
         }

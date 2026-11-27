@@ -71,9 +71,8 @@ void require_tile(const nanosm::Machine& machine, uint32_t buffer, std::array<in
             auto at = origin;
             at[0] += x;
             at[row_dimension] += y;
-            const auto actual = machine.read_shmem_u32(buffer + 4 * (8 * y + x));
-            require(actual == tensor_word(at), what + ": element (" + std::to_string(x) + ", " + std::to_string(y) +
-                ") is " + std::to_string(actual) + ", expected " + std::to_string(tensor_word(at)));
+            require_eq(machine.read_shmem_u32(buffer + 4 * (8 * y + x)), tensor_word(at),
+                what + ": element (" + std::to_string(x) + ", " + std::to_string(y) + ")");
         }
     }
 }
@@ -198,8 +197,8 @@ TEST(TmaOperands, uniform_reader_refused_during_the_rounds) {
     const auto readers = issues_named(refused, "uaddi");
     const auto pushes = command_pushes(refused);
     require(four.size() == 1 && two.size() == 1 && readers.size() == 2 && pushes.size() == 2, "the run's issues");
-    require(readers[0] == four[0] + 3, "the reader behind the .4d issued at T + " + std::to_string(readers[0] - four[0]));
-    require(readers[1] == two[0] + 2, "the reader behind the .2d issued at T + " + std::to_string(readers[1] - two[0]));
+    require_eq(readers[0], four[0] + 3, "the issue of the reader behind the .4d (T + 3)");
+    require_eq(readers[1], two[0] + 2, "the issue of the reader behind the .2d (T + 2)");
     require(pushes[0] == four[0] + 4 && pushes[1] == two[0] + 3, "the commands were pushed at the wrong cycles");
     require(refused.trace().summary().urf_read_ports_held == 3, "three refused warp-cycles");
     require(refused.trace().summary_text().find("urf: writes=10 read_ports_held=3\n") != std::string::npos,
@@ -232,7 +231,7 @@ TEST(TmaOperands, uniform_reader_refused_during_the_rounds) {
     require(issues_named(per_lane, "add") == std::vector<uint64_t>{behind.at(0) + 3},
         "the add with a uniform source behind the .4d did not issue at T + 3");
     require(per_lane.trace().summary().urf_read_ports_held == 2, "two refused warp-cycles for the add");
-    for (uint32_t lane = 0; lane < 16; ++lane) require(per_lane.read_reg(0, lane, 3) == 7, "the add's result");
+    require_lanes(per_lane, 3, 7, "the add's result");
 
     nanosm::Machine two_warps(profile, compile(R"(
         usread ur0, WARP_ID

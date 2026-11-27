@@ -1089,6 +1089,11 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.control.predicate = prefix_predicate->first;
             inst.control.predicate_invert = prefix_predicate->second;
         }
+        // The opcode the mnemonic names (src/isa.hpp; the first where a register
+        // and an immediate form share one) and its form, by which the regular
+        // instructions are read.
+        const auto mnemonic_opcode = opcode_for_mnemonic(op);
+        const auto named_form = mnemonic_opcode.has_value() ? opcode_info(*mnemonic_opcode).form : Form::no_operands;
 
         if (op == "sread") {
             // The per-lane special registers. The warp-uniform ones live on the
@@ -1127,28 +1132,15 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 inst.opcode = Opcode::umovi;
                 inst.imm = parse_word(args[1], constants, line_number);
             }
-        } else if (op == "uadd" || op == "usub" || op == "ushl" || op == "ushr" ||
-                   op == "uand" || op == "uor" || op == "uxor") {
+        } else if (named_form == Form::uniform_binary) {
             expect_count(args, 3, line_number);
-            inst.opcode = op == "uadd" ? Opcode::uadd
-                : op == "usub" ? Opcode::usub
-                : op == "ushl" ? Opcode::ushl
-                : op == "ushr" ? Opcode::ushr
-                : op == "uand" ? Opcode::uand
-                : op == "uor" ? Opcode::uor
-                : Opcode::uxor;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_ureg(args[0], line_number, profile);
             inst.src0 = parse_ureg(args[1], line_number, profile);
             inst.src1 = parse_ureg(args[2], line_number, profile);
-        } else if (op == "uaddi" || op == "ushli" || op == "ushri" || op == "uandi" ||
-                   op == "uori" || op == "uxori") {
+        } else if (named_form == Form::uniform_binary_imm) {
             expect_count(args, 3, line_number);
-            inst.opcode = op == "uaddi" ? Opcode::uaddi
-                : op == "ushli" ? Opcode::ushli
-                : op == "ushri" ? Opcode::ushri
-                : op == "uandi" ? Opcode::uandi
-                : op == "uori" ? Opcode::uori
-                : Opcode::uxori;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_ureg(args[0], line_number, profile);
             inst.src0 = parse_ureg(args[1], line_number, profile);
             inst.imm = parse_value(args[2], constants, line_number);
@@ -1177,28 +1169,9 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                 inst.opcode = Opcode::mov;
                 inst.imm = parse_value(args[1], constants, line_number);
             }
-        } else if (op == "add" || op == "fadd") {
+        } else if (named_form == Form::vector_binary) {
             expect_count(args, 3, line_number);
-            inst.opcode = op == "add" ? Opcode::add : Opcode::fadd;
-            inst.dst = parse_reg(args[0], line_number);
-            with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
-                read_source(args[2], true, line_number, profile)}, args);
-        } else if (op == "and" || op == "or" || op == "xor" || op == "shl" || op == "shr") {
-            expect_count(args, 3, line_number);
-            inst.opcode = op == "and" ? Opcode::and_
-                : op == "or" ? Opcode::or_
-                : op == "xor" ? Opcode::xor_
-                : op == "shl" ? Opcode::shl
-                : Opcode::shr;
-            inst.dst = parse_reg(args[0], line_number);
-            with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
-                read_source(args[2], true, line_number, profile)}, args);
-        } else if (op == "fmul" || op == "fsub" || op == "fmax" || op == "cvt.pack.f16x2") {
-            expect_count(args, 3, line_number);
-            inst.opcode = op == "fmul" ? Opcode::fmul
-                : op == "fsub" ? Opcode::fsub
-                : op == "fmax" ? Opcode::fmax
-                : Opcode::cvt_pack;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             with_uniform_source(inst, {read_source(args[1], false, line_number, profile),
                 read_source(args[2], true, line_number, profile)}, args);
@@ -1211,9 +1184,9 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             with_uniform_source(inst, {read_source(args[1], true, line_number, profile),
                 read_source(args[2], true, line_number, profile), read_source(args[3], false, line_number, profile)},
                 args);
-        } else if (op == "ex2" || op == "rcp") {
+        } else if (named_form == Form::vector_unary) {
             expect_count(args, 2, line_number);
-            inst.opcode = op == "ex2" ? Opcode::ex2 : Opcode::rcp;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = parse_reg(args[1], line_number);
         } else if (op.starts_with("setp.")) {
@@ -1249,15 +1222,9 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.text = opcode_name(inst.opcode) + clean.substr(op.size());
             if (immediate) inst.imm = parse_value(args[2], constants, line_number);
             else inst.src1 = parse_ureg(args[2], line_number, profile);
-        } else if (op == "addi" || op == "shli" || op == "shri" || op == "xori" ||
-                   op == "andi" || op == "ori") {
+        } else if (named_form == Form::vector_binary_imm) {
             expect_count(args, 3, line_number);
-            inst.opcode = op == "addi" ? Opcode::addi
-                : op == "shli" ? Opcode::shli
-                : op == "shri" ? Opcode::shri
-                : op == "andi" ? Opcode::andi
-                : op == "ori" ? Opcode::ori
-                : Opcode::xori;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             inst.src0 = parse_reg(args[1], line_number);
             inst.imm = parse_value(args[2], constants, line_number);
@@ -1317,44 +1284,41 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             inst.imm = 0;
             inst.text = "lds.uni " + args[0] + ", [%qtxc_param]";
             names_text = param->name; // its launch flag, below
-        } else if (op == "lds" || op == "lds.uni" || op == "ldg" || op == "ldg.v8" || op == "ldg.uni") {
+        } else if (named_form == Form::load || named_form == Form::uniform_load) {
             expect_count(args, 2, line_number);
-            inst.opcode = op == "lds" ? Opcode::lds
-                : op == "lds.uni" ? Opcode::lds_uni
-                : op == "ldg" ? Opcode::ldg
-                : op == "ldg.uni" ? Opcode::ldg_uni
-                : Opcode::ldg_v8;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             // lds.uni / ldg.uni: the base is a uniform register.
-            const bool uniform = op == "lds.uni" || op == "ldg.uni";
-            const auto addr = uniform ? parse_uniform_address(args[1], constants, line_number, profile)
-                                      : parse_address(args[1], constants, line_number);
+            const auto addr = named_form == Form::uniform_load
+                ? parse_uniform_address(args[1], constants, line_number, profile)
+                : parse_address(args[1], constants, line_number);
             inst.src0 = addr.base;
             inst.imm = addr.offset;
-            if (op == "ldg.v8") require_group(inst.dst, false, 8, line_number, "ldg.v8 writes");
-            if (op == "ldg.v8" && static_cast<unsigned>(inst.dst) + 8 > 256)
-                throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
-        } else if (op == "sts" || op == "stg" || op == "stg.v8") {
+            if (register_span(inst.opcode) > 1) {
+                require_group(inst.dst, false, 8, line_number, op + " writes");
+                if (static_cast<unsigned>(inst.dst) + 8 > 256)
+                    throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
+            }
+        } else if (named_form == Form::store) {
             expect_count(args, 2, line_number);
-            inst.opcode = op == "sts" ? Opcode::sts : op == "stg" ? Opcode::stg : Opcode::stg_v8;
+            inst.opcode = *mnemonic_opcode;
             const auto addr = parse_address(args[0], constants, line_number);
             inst.src0 = addr.base;
             inst.imm = addr.offset;
             inst.src1 = parse_reg(args[1], line_number);
-            if (op == "stg.v8") require_group(inst.src1, false, 8, line_number, "stg.v8 stores");
-            if (op == "stg.v8" && static_cast<unsigned>(inst.src1) + 8 > 256)
-                throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
-        } else if (op == "atom.add.uni" || op == "atom.and.uni" || op == "atom.xor.uni" || op == "atom.exch.uni") {
+            if (register_span(inst.opcode) > 1) {
+                require_group(inst.src1, false, 8, line_number, op + " stores");
+                if (static_cast<unsigned>(inst.src1) + 8 > 256)
+                    throw SimError("line " + std::to_string(line_number) + ": global vector register range wraps");
+            }
+        } else if (named_form == Form::atomic) {
             // Uniform shared atomics on signed int32. One word
             // per warp instruction (its address and operand are uniform
             // registers); its old value comes back to every lane's rD (async,
             // through a load slot: a depbar like lds.uni). The offset is a
             // signed 14-bit field.
             expect_count(args, 3, line_number);
-            inst.opcode = op == "atom.add.uni" ? Opcode::atom_add_uni
-                : op == "atom.and.uni" ? Opcode::atom_and_uni
-                : op == "atom.xor.uni" ? Opcode::atom_xor_uni
-                : Opcode::atom_exch_uni;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             const auto addr = parse_uniform_address(args[1], constants, line_number, profile);
             inst.src0 = addr.base;
@@ -1440,30 +1404,30 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
                     std::to_string(first) + " .. ur" + std::to_string(first + coordinates - 1) +
                     " pass this profile's last uniform register, ur" + std::to_string(profile.urf_registers - 1));
             }
-        } else if (op == "acc.ld" || op == "acc.ld.v8") {
+        } else if (named_form == Form::acc_load) {
             // acc.ld rD, [urT, S] (src/layout.hpp): lane l reads row l of the
             // region at the pointer in urT, whose rows are S words; .v8 reads
             // eight columns into rD .. rD + 7.
             expect_count(args, 2, line_number);
-            inst.opcode = op == "acc.ld" ? Opcode::acc_ld : Opcode::acc_ld_v8;
+            inst.opcode = *mnemonic_opcode;
             inst.dst = parse_reg(args[0], line_number);
             const auto [pointer, row_words] = parse_tmem_operand(args[1], constants, line_number, profile);
             inst.src0 = pointer;
             inst.imm = row_words;
-            const auto width = op == "acc.ld.v8" ? 8u : 1u;
+            const auto width = register_span(inst.opcode);
             require_group(inst.dst, false, width, line_number, "acc.ld.v8 writes");
             if (static_cast<unsigned>(inst.dst) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
             }
-        } else if (op == "acc.st" || op == "acc.st.v8") {
+        } else if (named_form == Form::acc_store) {
             // acc.st [urT, S], rS: the same region, vector data.
             expect_count(args, 2, line_number);
-            inst.opcode = op == "acc.st" ? Opcode::acc_st : Opcode::acc_st_v8;
+            inst.opcode = *mnemonic_opcode;
             const auto [pointer, row_words] = parse_tmem_operand(args[0], constants, line_number, profile);
             inst.src0 = pointer;
             inst.imm = row_words;
             inst.src1 = parse_reg(args[1], line_number);
-            const auto width = op == "acc.st.v8" ? 8u : 1u;
+            const auto width = register_span(inst.opcode);
             require_group(inst.src1, false, width, line_number, "acc.st.v8 stores");
             if (static_cast<unsigned>(inst.src1) + width > 256) {
                 throw SimError("line " + std::to_string(line_number) + ": accumulator register range wraps");
@@ -1483,7 +1447,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             expect_count(args, 1, line_number);
             inst.opcode = Opcode::mma_commit;
             inst.src0 = parse_mbar_address(args[0], line_number, profile);
-        } else if (op == "bra" || op == "bra.uni" || op == "ssy") {
+        } else if (named_form == Form::branch) {
             // bra / bra.uni TARGET; @p bra TARGET is the divergent branch.
             // ssy LABEL: the pc its entry
             // holds, where a sync that pops it sends the warp; any instruction.
@@ -1492,7 +1456,7 @@ AssemblyProgram parse_program(std::string_view source, bool allow_control, const
             if (!std::regex_match(args[0], target_pattern)) {
                 throw SimError("line " + std::to_string(line_number) + ": bad branch target '" + args[0] + "'");
             }
-            inst.opcode = op == "bra" ? Opcode::bra : op == "bra.uni" ? Opcode::bra_uni : Opcode::ssy;
+            inst.opcode = *mnemonic_opcode;
             pending_branches.push_back({program.instructions.size(), args[0], line_number});
         } else if (op == "sync") {
             expect_count(args, 0, line_number);

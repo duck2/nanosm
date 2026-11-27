@@ -161,12 +161,12 @@ TEST(Shmem, lds_uni_one_round_one_write) {
         auto machine = table_machine("sread r1, LANE_ID\n" + std::string(uniform ? "umov" : "mov") + " " + base +
             ", 60\n" + operation + " r1, [" + base + " + 16]\nhalt\n", table_launch(), profile);
         const auto writes = watch_register(*machine, 1);
-        require(writes.size() == 2, what + ": r1 was not written exactly twice (sread, load)");
+        require_eq(writes.size(), 2, what + ": writes of r1 (the sread, the load)");
         const auto& load = writes[1];
-        require(load.lanes_changed == 16, what + ": the load did not write all sixteen lanes at once");
-        for (const auto value : load.values) require(value == table_word(76), what + ": a lane missed the word");
-        require(shmem_request_rounds(*machine) == std::vector<uint32_t>{rounds}, what + ": wrong round count");
-        require(machine->trace().summary().shmem_rounds == rounds, what + ": port A served extra rounds");
+        require_eq(load.lanes_changed, 16, what + ": lanes the load wrote at once");
+        require_lanes([&](uint32_t lane) { return load.values[lane]; }, table_word(76), what + ": the load's word");
+        require_eq(shmem_request_rounds(*machine), std::vector<uint32_t>{rounds}, what + ": round counts");
+        require_eq(machine->trace().summary().shmem_rounds, rounds, what + ": rounds port A served");
         const auto issue = issued_at(*machine, 16);
         require(issue.size() == 1 && load.cycle == issue[0] + issue_to_shmem_grant(profile, !uniform) + rounds +
                 profile.shmem_port_a_depth + profile.shmem_read_latency_cycles + profile.rf_write_depth_cycles,
@@ -208,17 +208,14 @@ TEST(Shmem, rounds_are_max_lanes_per_bank) {
     for (const auto& c : cases) {
         auto load = table_machine(table_program("lds r1, [r0]"), table_launch(c.addresses));
         load->run();
-        require(shmem_request_rounds(*load) == std::vector<uint32_t>{1, c.rounds}, c.what + ": lds rounds");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(load->read_reg(0, lane, 1) == table_word(c.addresses[lane]), c.what + ": lds lane value");
-        }
+        require_eq(shmem_request_rounds(*load), std::vector<uint32_t>{1, c.rounds}, c.what + ": lds rounds");
+        require_lanes(*load, 1, [&](uint32_t lane) { return table_word(c.addresses[lane]); }, c.what + ": lds lane value");
         if (!c.distinct_words) continue;
         auto store = table_machine(table_program("addi r1, r2, 500\nsts [r0], r1"), table_launch(c.addresses));
         store->run();
-        require(shmem_request_rounds(*store) == std::vector<uint32_t>{1, c.rounds}, c.what + ": sts rounds");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(store->read_shmem_u32(c.addresses[lane]) == 500 + 4 * lane, c.what + ": sts lane value");
-        }
+        require_eq(shmem_request_rounds(*store), std::vector<uint32_t>{1, c.rounds}, c.what + ": sts rounds");
+        require_lanes([&](uint32_t lane) { return store->read_shmem_u32(c.addresses[lane]); },
+            [](uint32_t lane) { return 500 + 4 * lane; }, c.what + ": sts lane value");
     }
 }
 
@@ -241,13 +238,13 @@ TEST(Shmem, sts_bank_serves_lanes_in_order) {
             }
         }
     }
-    require(shmem_request_rounds(*machine) == std::vector<uint32_t>{1, 2}, "sts: bank 0 holds two lanes");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_shmem_u32(addresses[lane]) == 1000 + 4 * lane, "sts: lane value");
-    }
-    require(written.at(0) == written.at(64) + 1, "bank 0 did not serve lane 0 before lane 1");
+    require_eq(shmem_request_rounds(*machine), std::vector<uint32_t>{1, 2}, "sts rounds (bank 0 holds two lanes)");
+    require_lanes([&](uint32_t lane) { return machine->read_shmem_u32(addresses[lane]); },
+        [](uint32_t lane) { return 1000 + 4 * lane; }, "sts: lane value");
+    require_eq(written.at(0), written.at(64) + 1, "the write of lane 1's word (the cycle after lane 0's on bank 0)");
     for (uint32_t lane = 2; lane < 16; ++lane) {
-        require(written.at(addresses[lane]) == written.at(64), "a lane alone on its bank missed round 0");
+        require_eq(written.at(addresses[lane]), written.at(64),
+            "the write of lane " + std::to_string(lane) + "'s word (alone on its bank: round 0)");
     }
 }
 
@@ -411,12 +408,11 @@ TEST(Shmem, divergence) {
         halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
     )");
     machine->run();
-    require(shmem_request_rounds(*machine) == std::vector<uint32_t>{4, 4}, "four active lanes are four rounds");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        const bool active = lane >= 4 && lane < 8;
-        require(machine->read_shmem_u32(64 * lane) == (active ? 0x55 : 0x100 + 16 * lane), "sts lane");
-        require(machine->read_reg(0, lane, 3) == (active ? 0x100 + 16 * lane + 1 : 0x77), "lds lane");
-    }
+    require_eq(shmem_request_rounds(*machine), std::vector<uint32_t>{4, 4}, "rounds (four active lanes are four rounds)");
+    const auto active = [](uint32_t lane) { return lane >= 4 && lane < 8; };
+    require_lanes(shmem_lanes(*machine, 0, 64), [&](uint32_t lane) { return active(lane) ? 0x55 : 0x100 + 16 * lane; },
+        "sts lane");
+    require_lanes(*machine, 3, [&](uint32_t lane) { return active(lane) ? 0x100 + 16 * lane + 1 : 0x77; }, "lds lane");
 }
 
 // Two stores back to back on the write side, and done() when the last
@@ -454,13 +450,13 @@ TEST(Shmem, stores_back_to_back_and_done) {
     require(grants_of(*machine, "A-write") == std::vector<Grant>{{gx, "A-write", "simt", 0}, {gy, "A-write", "simt", 0}},
         "the two stores were not granted at gx and gy:" + describe(grants_of(*machine)) + " | issues" +
             issue_log(*machine));
-    require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{x + 1}, "Y did not issue right after X");
+    require_eq(issued_at(*machine, 4 * 8), std::vector<uint64_t>{x + 1}, "Y's issue (right after X)");
     require(!after.at(gx + d - 1).x_landed && after.at(gx + d).x_landed, "X did not reach the RAM at gx + D");
     require(!after.at(gy + d - 1).y_landed && after.at(gy + d).y_landed, "Y did not reach the RAM at gy + D");
-    require(issued_at(*machine, 5 * 8) == std::vector<uint64_t>{x + 2}, "halt");
+    require_eq(issued_at(*machine, 5 * 8), std::vector<uint64_t>{x + 2}, "halt's issue");
     require(!after.at(gy + d - 1).done && after.at(gy + d).done,
         "done() did not cover the store travelling to its write edge");
-    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(576 + 4 * lane) == 0xa1, "Y's data");
+    require_lanes(shmem_lanes(*machine, 576), 0xa1, "Y's data");
 }
 
 // A-read and A-write are independent services: one warp's sixteen-round lds
@@ -493,14 +489,12 @@ TEST(Shmem, a_read_and_a_write_same_cycle) {
     uint32_t together = 0;
     for (const auto& grant : grants_of(*machine, "A-write")) together += read_cycles.contains(grant.cycle) ? 1 : 0;
     const auto apart = 1 + nanosm::branch_taken_interval - nanosm::branch_not_taken_interval + alu_distance(profile);
-    require(issued_at(*machine, 9 * 8).at(0) == issued_at(*machine, 6 * 8).at(0) + apart,
-        "the sts did not issue 1 + taken - not taken + alu_distance after the lds:" + issue_log(*machine));
-    require(read_cycles.size() == 16 && together == 16 - apart,
-        "A-read and A-write were not granted in the same cycles (" + std::to_string(together) + ")");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_reg(0, lane, 3) == 0x100 + 16 * lane, "the load's words");
-        require(machine->read_shmem_u32(64 * lane + 32) == 0x44, "the store's words");
-    }
+    require_eq(issued_at(*machine, 9 * 8).at(0), issued_at(*machine, 6 * 8).at(0) + apart,
+        "the sts's issue (1 + taken - not taken + alu_distance after the lds)", ":" + issue_log(*machine));
+    require_eq(read_cycles.size(), 16, "A-read grant cycles");
+    require_eq(together, 16 - apart, "cycles both A-read and A-write granted");
+    require_lanes(*machine, 3, [](uint32_t lane) { return 0x100 + 16 * lane; }, "the load's words");
+    require_lanes(shmem_lanes(*machine, 32, 64), 0x44, "the store's words");
 }
 
 // ONE round-robin pointer over the read side and the TMA's reads, moved only
@@ -647,8 +641,7 @@ TEST(ShmemSlow, read_first_across_services) {
             expected += 2.0f * (landed < sampled[word] ? 2.0f : 1.0f); // two fp16 halves per word, B = 1.0
         }
         const auto row0 = nanosm::bits_float(mma->read_reg(0, 0, 10));
-        require(row0 == expected, what + ": row 0 = " + std::to_string(row0) +
-            ", but the words the fetch sampled sum to " + std::to_string(expected));
+        require_eq(row0, expected, what + ": row 0 (the sum of the words the fetch sampled)");
         outcomes.insert(mma->read_reg(0, 0, 10));
 #endif
     }
@@ -686,12 +679,12 @@ TEST(Shmem, rmw_compute_stage) {
         const auto what = "C = " + std::to_string(c) + ": ";
         const auto grants = grants_of(*machine);
         const auto arrive = issued_at(*machine, 8);
-        require(arrive.size() == 1, what + "the arrive did not issue once");
+        require_eq(arrive.size(), 1, what + "the arrive's issues");
         const auto r = arrive[0] + issue_to_shmem_grant(profile);
         require(grants == std::vector<Grant>{{r, "A-read", "rmw", 0}, {r + d + lb + c, "A-write", "rmw", 0}},
             what + "the read was not granted as the arrive entered serve, or the write D + Lb + C after "
             "it:" + describe(grants));
-        require(flipped == r + d + lb + c + d, what + "the update did not reach the RAM D cycles after its write grant");
+        require_eq(flipped, r + d + lb + c + d, what + "the update's landing (D cycles after its write grant)");
         const auto slices = events_named(*machine, "mbar RMW");
         require(slices.size() == 1 && slices[0].duration_cycles == d + lb + c + 1,
             what + "not one RMW busy D + Lb + C + 1 cycles");
@@ -733,19 +726,17 @@ TEST(Shmem, probe_behind_own_sts) {
         machine->run();
         const auto s = nanosm::fetch_to_issue + 3 * alu_distance(profile) + 1; // sread, xori, shli; mov r6; the sts
         const auto g = s + issue_to_shmem_grant(profile, true);
-        require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{s},
-            what + "the sts did not issue at s:" + issue_log(*machine));
-        require(issued_at(*machine, 7 * 8) == std::vector<uint64_t>{g + 16},
-            what + "the probe was not admitted the cycle after the sts's last grant");
-        require(refusals(*machine, 0, "ordered behind own access") ==
-                std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, g + 15 - s}},
-            what + "the probe was not ordered behind the sts (s + 1 .. g + 15)");
+        require_eq(issued_at(*machine, 6 * 8), std::vector<uint64_t>{s}, what + "the sts's issue (s)",
+            ":" + issue_log(*machine));
+        require_eq(issued_at(*machine, 7 * 8), std::vector<uint64_t>{g + 16},
+            what + "the probe's admission (the cycle after the sts's last grant)");
+        require_eq(refusals(*machine, 0, "ordered behind own access"),
+            std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, g + 15 - s}},
+            what + "the probe ordered behind the sts (start, cycles: s + 1 .. g + 15)");
         const auto reads = grants_of(*machine, "A-read");
         require(reads == std::vector<Grant>{{g + 16 + issue_to_shmem_grant(profile), "A-read", "probe", 0}},
             what + "probe grant:" + describe(reads));
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_reg(0, lane, 9) == 1, what + "the probe did not see its own sts's last round");
-        }
+        require_lanes(*machine, 9, 1, what + "the probe's view of its own sts's last round");
     }
 }
 
@@ -887,10 +878,8 @@ TEST(Shmem, rmw_read_behind_a_read_transaction) {
         expected.push_back({g + 16 + d + lb + c, "A-write", "rmw", 0});
         const auto grants = grants_of(*machine);
         require(grants == expected, what + "the RMW's read preempted the lds or waited too long:" + describe(grants));
-        require(mbar_rmw_services(*machine).front().first == g + 2, what + "the RMW did not start at g + 2");
-        for (uint32_t lane = 0; lane < 16; ++lane) {
-            require(machine->read_reg(0, lane, 6) == 0x100 + 16 * lane + 3, what + "lds data");
-        }
+        require_eq(mbar_rmw_services(*machine).front().first, g + 2, what + "the RMW's start (g + 2)");
+        require_lanes(*machine, 6, [](uint32_t lane) { return 0x100 + 16 * lane + 3; }, what + "lds data");
     }
 }
 
@@ -1089,9 +1078,7 @@ TEST(Shmem, missing_fence_panics) {
         "lds -> TMA load");
     fenced = machine(read_then_load, true, tma_load, one_tma_image(1024));
     fenced->run();
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(fenced->read_reg(0, lane, 21) == 0x100 + lane, "the fenced lds did not read the old word");
-    }
+    require_lanes(*fenced, 21, [](uint32_t lane) { return 0x100 + lane; }, "the fenced lds (the old word)");
     for (uint32_t i = 0; i < 256; ++i) require(fenced->read_shmem_u32(4 * i) == 5 * i + 2, "the fenced TMA load");
 }
 
@@ -1316,8 +1303,8 @@ TEST(Shmem, write_side_keeps_a_warps_order) {
     const auto log = " | issues" + issue_log(*machine);
     const auto s = issued_at(*machine, 6 * 8).at(0);
     for (uint32_t k = 1; k < 4; ++k) {
-        require(issued_at(*machine, (6 + k) * 8) == std::vector<uint64_t>{s + k},
-            "instruction " + std::to_string(k) + " after the first sts did not issue back to back" + log);
+        require_eq(issued_at(*machine, (6 + k) * 8), std::vector<uint64_t>{s + k},
+            "the issue of instruction " + std::to_string(k) + " after the first sts (back to back)", log);
     }
     require(refusals(*machine, 0, "ordered behind own access").empty(), "a write waited behind the warp's writes" + log);
     const auto writes = grants_of(*machine, "A-write");
@@ -1327,7 +1314,7 @@ TEST(Shmem, write_side_keeps_a_warps_order) {
             writes[1].cycle < writes[2].cycle && reads.size() == 1 && reads[0].client == "rmw" &&
             reads[0].cycle > writes[2].cycle,
         "the stores and the arrive did not reach the memory in issue order:" + describe(grants_of(*machine)) + log);
-    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(256 + 4 * lane) == 3, "the last store's word");
+    require_lanes(shmem_lanes(*machine, 256), 3, "the last store's word");
     const auto state = machine->read_mbar_state(4160);
     require(state.phase && state.remaining == 1, "the arrive did not complete the phase");
 }
@@ -1357,7 +1344,7 @@ TEST(Shmem, sts_registers_in_one_bank) {
     const auto writes = grants_of(*machine, "A-write");
     require(writes.size() == 1 && writes[0].cycle == i + issue_to_shmem_grant(profile, true) + 1,
         "the store was not granted one cycle later than with two banks:" + describe(writes));
-    for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(64 + 4 * lane) == 9, "sts data");
+    require_lanes(shmem_lanes(*machine, 64), 9, "sts data");
 }
 
 // A queued lds / sts reads its vector registers late, in its collect stage,
@@ -1406,11 +1393,9 @@ TEST(Shmem, writer_of_a_queued_source_waits) {
         "the writer of the lds's address did not issue before the load was granted" + log);
     const auto x = number_of(kernel.register_names, "x");
     const auto a = number_of(kernel.register_names, "a");
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_shmem_u32(256 + 4 * lane) == 7, "the store did not write the data it was issued with");
-        require(machine->read_reg(0, lane, x) == 0x100 + 128 + lane, "the load did not use the address it was issued with");
-        require(machine->read_reg(0, lane, a) == 4 * lane + 64, "the addi");
-    }
+    require_lanes(shmem_lanes(*machine, 256), 7, "the store's data (as issued)");
+    require_lanes(*machine, x, [](uint32_t lane) { return 0x100 + 128 + lane; }, "the load's word (from its address as issued)");
+    require_lanes(*machine, a, [](uint32_t lane) { return 4 * lane + 64; }, "the addi");
 }
 
 // SANITIZER: a write to a queued sts's data register before its collect
@@ -1457,27 +1442,27 @@ TEST(Shmem, masked_off_queued_instruction_gives_back) {
             bars[machine->cycle()] = {machine->depbar_value(0, 0), machine->depbar_value(0, 2)};
         }
         const auto s = issued_at(*machine, 3 * 8).at(0);
-        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 2} &&
-                refusals(*machine, 0, "write queue full") == std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, 1}},
-            "the masked-off sts did not give its queue entry back at issue + 1:" +
-                describe(refusals(*machine, 0, "write queue full")) + issue_log(*machine));
-        require(bars.at(s + 1) == std::pair<uint32_t, uint32_t>{1, 1} && bars.at(s + 2) == std::pair<uint32_t, uint32_t>{0, 0},
-            "the masked-off sts's depbar and read depbar were not given back at issue + 1");
+        require_eq(issued_at(*machine, 4 * 8), std::vector<uint64_t>{s + 2},
+            "the next sts's issue (the masked-off sts's queue entry given back at its issue + 1)", issue_log(*machine));
+        require_eq(refusals(*machine, 0, "write queue full"), std::vector<std::pair<uint64_t, uint64_t>>{{s + 1, 1}},
+            "the next sts refused for the write queue (start, cycles)", issue_log(*machine));
+        require_eq(bars.at(s + 1), std::pair<uint32_t, uint32_t>{1, 1}, "the masked-off sts's sb0 and sb2 at issue + 1");
+        require_eq(bars.at(s + 2), std::pair<uint32_t, uint32_t>{0, 0},
+            "the masked-off sts's sb0 and sb2 at issue + 2 (given back at issue + 1)");
         const auto writes = grants_of(*machine, "A-write");
         require(writes.size() == 1 && writes[0].cycle > s + 2, "the masked-off sts made an access:" + describe(writes));
-        for (uint32_t lane = 0; lane < 16; ++lane) { // (the image's word w holds 0x100 + w)
-            require(machine->read_shmem_u32(256 + 4 * lane) == 0x100 + 64 + lane &&
-                    machine->read_shmem_u32(512 + 4 * lane) == 7,
-                "store data");
-        }
+        // (the image's word w holds 0x100 + w)
+        require_lanes(shmem_lanes(*machine, 256), [](uint32_t lane) { return 0x100 + 64 + lane; },
+            "the masked-off sts's words, unwritten");
+        require_lanes(shmem_lanes(*machine, 512), 7, "the next sts's data");
     }
     for (const std::string& behind : {std::string("lds r6, [r0 + 512] {pred=PT, stall=0, set=sb1, wait=-}"),
              std::string("fence.sh")}) {
         auto machine = debug_machine(canonical_profile(), head + behind + "\nhalt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2}\n");
         machine->run();
         const auto s = issued_at(*machine, 3 * 8).at(0);
-        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 2},
-            "'" + behind + "' did not issue at issue + 2 of the masked-off sts:" + issue_log(*machine));
+        require_eq(issued_at(*machine, 4 * 8), std::vector<uint64_t>{s + 2},
+            "the issue of '" + behind + "' (issue + 2 of the masked-off sts)", ":" + issue_log(*machine));
         require(grant_cycles(*machine, "A-write", "simt").empty(), "the masked-off sts made an access");
     }
     {
@@ -1494,10 +1479,11 @@ TEST(Shmem, masked_off_queued_instruction_gives_back) {
             bars[machine->cycle()] = {machine->depbar_value(0, 0), machine->depbar_value(0, 2)};
         }
         const auto s = issued_at(*machine, 2 * 8).at(0);
-        require(bars.at(s + 1) == std::pair<uint32_t, uint32_t>{1, 1} && bars.at(s + 2) == std::pair<uint32_t, uint32_t>{0, 0},
-            "the masked-off lds's depbar and read depbar were not given back at issue + 1");
-        require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{s + 2},
-            "the writer of the masked-off lds's address did not issue at its issue + 2" + issue_log(*machine));
+        require_eq(bars.at(s + 1), std::pair<uint32_t, uint32_t>{1, 1}, "the masked-off lds's sb0 and sb2 at issue + 1");
+        require_eq(bars.at(s + 2), std::pair<uint32_t, uint32_t>{0, 0},
+            "the masked-off lds's sb0 and sb2 at issue + 2 (given back at issue + 1)");
+        require_eq(issued_at(*machine, 3 * 8), std::vector<uint64_t>{s + 2},
+            "the issue of the writer of the masked-off lds's address (its issue + 2)", issue_log(*machine));
         require(grant_cycles(*machine, "A-read", "simt").empty(), "the masked-off lds made an access");
     }
 }
@@ -1521,7 +1507,7 @@ TEST(Shmem, trace_of_a_dropped_entry) {
         )");
         machine->run();
         const auto s = issued_at(*machine, 3 * 8).at(0);
-        require(issued_at(*machine, 4 * 8) == std::vector<uint64_t>{s + 1}, "the stores did not issue back to back");
+        require_eq(issued_at(*machine, 4 * 8), std::vector<uint64_t>{s + 1}, "the second store's issue (back to back)");
         const auto waits = machine->trace().summary().shmem_write_head_waits;
         require(pred == "PT" ? waits != 0 : waits == 0,
             "write head waits " + std::to_string(waits) + " with the second store's pred=" + pred);
@@ -1539,13 +1525,14 @@ TEST(Shmem, trace_of_a_dropped_entry) {
         sb0[machine->cycle()] = machine->depbar_value(0, 0);
     }
     const auto s = issued_at(*machine, 2 * 8).at(0);
-    require(issued_at(*machine, 3 * 8) == std::vector<uint64_t>{s + 1} && sb0.at(s + 2) == 1,
-        "the second lds did not issue at the drop's cycle, or sb0 is not 1 after it" + issue_log(*machine));
+    require_eq(issued_at(*machine, 3 * 8), std::vector<uint64_t>{s + 1}, "the second lds's issue (the drop's cycle)",
+        issue_log(*machine));
+    require_eq(sb0.at(s + 2), 1, "sb0 after the drop's cycle");
     std::optional<std::string> last;
     for (const auto& event : events_named(*machine, "depbar sb0")) {
         if (event.start_cycle == s + 1) last = event.detail;
     }
-    require(last == "value=1", "the trace's last sb0 value in the drop's cycle is " + last.value_or("missing"));
+    require_eq(last, "value=1", "the trace's last sb0 value in the drop's cycle");
 }
 
 // A read depbar counts every access that names it, as the set depbar does:
@@ -1580,9 +1567,7 @@ TEST(Shmem, read_depbar_counts_each_queued_access) {
     require(stores.size() == 6 && issued_at(*machine, 9 * 8).at(0) < stores.back() + profile.shmem_port_a_depth,
         "the writer of the stores' data did not issue before the last store completed:" + describe(grants_of(*machine)) +
             issue_log(*machine));
-    for (uint32_t k = 0; k < 6; ++k) {
-        for (uint32_t lane = 0; lane < 16; ++lane) require(machine->read_shmem_u32(256 + 64 * k + 4 * lane) == 7, "store data");
-    }
+    for (uint32_t k = 0; k < 6; ++k) require_lanes(shmem_lanes(*machine, 256 + 64 * k), 7, "store data");
 }
 
 // The predicate of a masked queued instruction is sampled at its issue + 1,
@@ -1601,12 +1586,11 @@ TEST(Shmem, predicate_sampled_at_issue_plus_one) {
         halt {pred=PT, stall=0, set=-, wait=sb0}
     )");
     machine->run();
-    require(issued_at(*machine, 5 * 8).at(0) == issued_at(*machine, 4 * 8).at(0) + 4,
-        "the masked sts did not issue four cycles after the setp" + issue_log(*machine));
-    for (uint32_t lane = 0; lane < 16; ++lane) { // (the image's word w holds 0x100 + w)
-        require(machine->read_shmem_u32(256 + 4 * lane) == (lane % 2 == 1 ? 7u : 0x100 + 64 + lane),
-            "lane " + std::to_string(lane) + ": the sts did not use the setp's predicate");
-    }
+    require_eq(issued_at(*machine, 5 * 8).at(0), issued_at(*machine, 4 * 8).at(0) + 4,
+        "the masked sts's issue (four cycles after the setp)", issue_log(*machine));
+    // (the image's word w holds 0x100 + w)
+    require_lanes(shmem_lanes(*machine, 256), [](uint32_t lane) { return lane % 2 == 1 ? 7u : 0x100 + 64 + lane; },
+        "the sts under the setp's predicate");
 }
 
 // fence.sh behind a store still waiting in the write queue: the sixteen-round
@@ -1628,16 +1612,15 @@ TEST(Shmem, fence_with_a_queued_store) {
     )");
     machine->run();
     const auto stores = grant_cycles(*machine, "A-write", "simt");
-    require(stores.size() == 17, "sixteen rounds and one:" + describe(grants_of(*machine)));
+    require_eq(stores.size(), 17, "store rounds (sixteen and one)", ":" + describe(grants_of(*machine)));
     const auto gy = stores.back();
     const auto y = issued_at(*machine, 5 * 8).at(0);
     require(gy == stores.front() + 16 && gy > y + issue_to_shmem_grant(profile, true),
         "Y was not granted after X's last round, or did not wait:" + describe(grants_of(*machine)));
-    require(issued_at(*machine, 6 * 8) == std::vector<uint64_t>{gy + profile.shmem_port_a_depth + 1},
-        "fence.sh was not admitted the cycle after the queued store reached the RAM" + issue_log(*machine));
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        require(machine->read_shmem_u32(64 * lane + 8) == 7 && machine->read_shmem_u32(2048 + 4 * lane) == 7, "store data");
-    }
+    require_eq(issued_at(*machine, 6 * 8), std::vector<uint64_t>{gy + profile.shmem_port_a_depth + 1},
+        "fence.sh's admission (the cycle after the queued store reached the RAM)", issue_log(*machine));
+    require_lanes(shmem_lanes(*machine, 8, 64), 7, "X's store data");
+    require_lanes(shmem_lanes(*machine, 2048), 7, "Y's store data");
 }
 
 // A try_wait behind its warp's own arrive: a read behind an unserviced write,
@@ -1663,33 +1646,57 @@ TEST(Shmem, try_wait_behind_its_warps_arrive) {
     require(summary.mbar_immediate_successes == 1 && summary.mbar_sleeps == 0, "the try_wait did not succeed at once");
 }
 
-// A full queue refuses issue, and only that warp: warp 0 issues five
-// sixteen-round lds into a two-entry read queue and is refused "read queue
-// full" while the read side works through them; warp 1's independent
-// arithmetic issues in those cycles.
-TEST(Shmem, full_queue_refuses_only_its_warp) {
+// A full queue refuses issue, and only that warp: warp 0 issues five loads
+// into a short queue and is refused while its unit works through them; warp
+// 1's independent arithmetic issues in those cycles. Shared memory: five
+// sixteen-round lds into a two-entry read queue ("read queue full"). The LSU:
+// five ldg into a one-entry queue in front of two command slots ("LSU queue
+// full").
+namespace {
+
+struct FullQueueCase {
+    std::string unit;
+    uint32_t nanosm::DeviceProfile::*queue_entries;
+    uint32_t entries;
+    std::string load; // the opcode
+    uint32_t shift;   // load k of lane l reads 2^shift x l + 4 (k + 1)
+    std::string reason;
+    uint64_t nanosm::TraceSummary::*counter;
+    uint32_t (*word)(uint32_t lane, uint32_t k); // what load k gives lane l
+};
+
+void PrintTo(const FullQueueCase& c, std::ostream* out) {
+    *out << c.unit;
+}
+
+class FullQueue : public ::testing::TestWithParam<FullQueueCase> {};
+
+} // namespace
+
+TEST_P(FullQueue, refuses_only_its_warp) {
+    const auto& c = GetParam();
     auto profile = canonical_profile();
-    profile.shmem_read_queue_entries = 2;
+    profile.*c.queue_entries = c.entries;
+    std::string loads;
+    for (uint32_t k = 0; k < 5; ++k) {
+        loads += c.load + " r" + std::to_string(3 + k) + ", [r0 + " + std::to_string(4 * (k + 1)) +
+            "] {pred=PT, stall=0, set=sb" + std::to_string(k) + ", wait=-}\n";
+    }
     std::string movs = "math: ";
     for (uint32_t k = 0; k < 40; ++k) movs += "mov r" + std::to_string(10 + k % 12) + ", " + std::to_string(k) + "\n";
-    auto machine = debug_machine(profile, R"(
+    const auto text = R"(
         usread ur9, WARP_ID
         ur2r r29, ur9
         setp.eq.u32 p6, r29, 1
         bra.uni math {pred=p6, stall=0, set=-, wait=-}
         sread r0, LANE_ID
-        shli r0, r0, 6
-        lds r3, [r0 + 4] {pred=PT, stall=0, set=sb0, wait=-}
-        lds r4, [r0 + 8] {pred=PT, stall=0, set=sb1, wait=-}
-        lds r5, [r0 + 12] {pred=PT, stall=0, set=sb2, wait=-}
-        lds r6, [r0 + 16] {pred=PT, stall=0, set=sb3, wait=-}
-        lds r7, [r0 + 20] {pred=PT, stall=0, set=sb4, wait=-}
-        halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4}
-    )" + movs + "halt\n", 2);
+        shli r0, r0, )" + std::to_string(c.shift) + "\n" + loads +
+        "halt {pred=PT, stall=0, set=-, wait=sb0|sb1|sb2|sb3|sb4}\n" + movs + "halt\n";
+    auto machine = c.unit == "lsu" ? gmem_debug_machine(profile, text, 2) : debug_machine(profile, text, 2);
     machine->run();
-    const auto refused = refusals(*machine, 0, "read queue full");
-    require(!refused.empty() && machine->trace().summary().shmem_read_queue_full != 0,
-        "warp 0 was never refused for the full read queue" + issue_log(*machine));
+    const auto refused = refusals(*machine, 0, c.reason);
+    require(!refused.empty() && machine->trace().summary().*c.counter != 0,
+        "warp 0 was never refused for '" + c.reason + "'" + issue_log(*machine));
     uint64_t during = 0; // warp 1's movs (only warp 1 runs them, from pc 96)
     for (uint32_t k = 0; k < 40; ++k) {
         for (const auto cycle : issued_at(*machine, 96 + 8 * k)) {
@@ -1699,9 +1706,17 @@ TEST(Shmem, full_queue_refuses_only_its_warp) {
         }
     }
     require(during != 0, "warp 1 issued nothing while warp 0 was refused:" + describe(refused) + issue_log(*machine));
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-        for (uint32_t k = 0; k < 5; ++k) {
-            require(machine->read_reg(0, lane, 3 + k) == 0x100 + 16 * lane + 1 + k, "lds data");
-        }
+    for (uint32_t k = 0; k < 5; ++k) {
+        require_lanes(*machine, 3 + k, [&](uint32_t lane) { return c.word(lane, k); }, c.load + " data");
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(Unit, FullQueue,
+    ::testing::Values(
+        FullQueueCase{"shmem", &nanosm::DeviceProfile::shmem_read_queue_entries, 2, "lds", 6, "read queue full",
+            &nanosm::TraceSummary::shmem_read_queue_full,
+            [](uint32_t lane, uint32_t k) { return 0x100 + 16 * lane + 1 + k; }},
+        FullQueueCase{"lsu", &nanosm::DeviceProfile::lsu_queue_entries, 1, "ldg", 2, "LSU queue full",
+            &nanosm::TraceSummary::lsu_queue_full_cycles,
+            [](uint32_t lane, uint32_t k) { return 5 * (lane + 1 + k) + 2; }}),
+    [](const auto& info) { return info.param.unit; });
