@@ -700,8 +700,9 @@ inline nanosm::DeviceProfile fast_bus_profile(uint32_t pluck) {
 
 // The RF-starvation setup of the LSU backpressure tests. A stream of movs
 // (latency 1) cannot starve an async writer by booking its bank every cycle:
-// one denial with service owed inhibits new bookings to the bank, so a ready
-// async writer waits at most for the bookings already made. To hold one for
+// one denial with service owed inhibits new bookings to the bank from the
+// next cycle, so a ready async writer waits at most for the bookings made up
+// to its denial. To hold one for
 // a while, the stream books booking_horizon cycles ahead: fadds whose result
 // reaches the write port that far after their issue (the issue register, Lr
 // and the fadd latency set by with_long_bookings, src/timing.hpp), one per

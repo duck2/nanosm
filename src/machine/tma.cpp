@@ -195,8 +195,8 @@ Machine::TmaWalkerPlan Machine::plan_tma_walker(const TmaCommand& command, const
 // The TMA's cycle, computed on a copy of its queue: the command end (the old
 // event's command leaves before a presentation names a new one), its own
 // requests, its shmem transactions' ends, the ingress ticket, the write acks.
-// Issue looks ahead at the result (queue entries (c)); drive_tma_queue
-// commits it with issue's new command.
+// drive_tma_queue commits it with the command the operand read pushes now.
+// (Issue reads the queue's Q: a slot freed now is seen from the next cycle.)
 void Machine::step_tma(Wires& w) {
     auto tma = tma_.cur();
     tma_returns_traced_ = tma_returns_.count();
@@ -623,16 +623,15 @@ Machine::TmaCommand Machine::tma_command_from(const TmaReadHolding& holding, Wir
     return command;
 }
 
-// The commands the TMA operand read holds after this cycle, each counted as
-// a slot of the TMA queue since its accept: the one in the round counter, and
-// each whose last pair is still in the URF read stages (the pair in the last
-// stage arrives now: tma_pushed).
+// The commands the TMA operand read holds (in Q), each counted as a slot of
+// the TMA queue since its accept: the one in the round counter, and each
+// whose last pair is in a URF read stage (the pair in the last stage is
+// pushed into the queue at this edge; it is not in the queue's Q yet).
 uint32_t Machine::tma_commands_being_read() const {
     const auto& rounds = urf_read_rounds_.cur();
     uint32_t commands = rounds.has_value() && is_tma_opcode(rounds->header.instruction.opcode) ? 1 : 0;
-    const auto& pairs = tma_read_pairs_.cur();
-    for (std::size_t stage = 0; stage + 1 < pairs.size(); ++stage) {
-        if (pairs[stage].has_value() && pairs[stage]->last) ++commands;
+    for (const auto& pair : tma_read_pairs_.cur()) {
+        if (pair.has_value() && pair->last) ++commands;
     }
     return commands;
 }

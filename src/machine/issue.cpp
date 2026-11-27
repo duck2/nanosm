@@ -239,7 +239,7 @@ Machine::IssueAttempt Machine::try_issue(Warp& warp, Wires& w) {
         return {false, WarpState::depbar, "sb" + std::to_string(*bar)};
     }
     check_issue_hazards(warp, inst);
-    if (const auto refusal = structural_refusal(plan, resource_view(warp, plan, w)); refusal.has_value()) {
+    if (const auto refusal = structural_refusal(plan, resource_view(warp, plan)); refusal.has_value()) {
         return refuse(*refusal);
     }
     sanitizer_.record_issue_accepted();
@@ -332,34 +332,41 @@ void Machine::check_issue_hazards(const Warp& warp, const Instruction& inst) con
     }
 }
 
-// The resource state admission may see, as this cycle leaves it (c): the RF
-// write calendar and this cycle's RF read / write decisions, unit occupancy,
-// queue and slot space less what the dispatch pipeline's instructions will
-// take (dispatch_claims). A shared or global memory instruction's terms are
-// registers only: its queue's occupancy (and a shared-memory one's, the
-// warp's counts). The plan selects WHICH resource (a register's bank, the
-// write calendar's tap, the engine, the queue); no register content is read.
-ResourceView Machine::resource_view(const Warp& warp, const IssuePlan& plan, const Wires& w) const {
+// The resource state admission may see: registers only (Q). The RF write
+// calendar; each bank's read and write inhibit bits (the RF policy
+// registers: set by an async reader or writer denied with service owed last
+// cycle, so a denial is seen one cycle late); unit occupancy, queue and engine
+// space less what the dispatch pipeline's instructions and the TMA operand
+// read will take; a shared-memory instruction's queue and its warp's counts;
+// the load / store unit's queue. Space a unit frees at t is seen from t + 1.
+// The plan selects WHICH resource (a register's bank, the write calendar's
+// tap, the engine, the queue); no register content is read.
+ResourceView Machine::resource_view(const Warp& warp, const IssuePlan& plan) const {
     const auto claims = dispatch_claims();
     ResourceView view;
     for (const auto bank : plan.read_banks) {
-        if (w.rf_read.banks.at(bank).inhibit_simt) view.read_inhibited = true;
+        if (rf_read_policy_.cur()[bank].inhibit != 0) view.read_inhibited = true;
     }
     view.sfu_free = sfu_busy_.cur() == 0;
     if (plan.write_reg.has_value()) {
         view.write_slot_free = write_slot_free(plan.write_bank, plan.write_delay);
-        view.write_inhibited = w.rf_write.banks.at(plan.write_bank).inhibit_simt;
+        view.write_inhibited = rf_write_policy_.cur()[plan.write_bank].inhibit != 0;
     }
-    // A queue slot is counted as taken from a tma's accept: the queue after
-    // this cycle, the command its operand read pushes now, the commands it
-    // still holds. So the push always fits.
-    view.tma_queue_room = w.tma_next.commands.size() + (w.tma_pushed.has_value() ? 1 : 0) +
-        tma_commands_being_read() < config_.tma_queue_commands;
+    // A queue slot is counted as taken from a tma's accept: the queue's
+    // commands (Q) and the commands its operand read holds. A command that
+    // ends at t frees its slot for an issue at t + 1. So the push always fits.
+    view.tma_queue_room = tma_.cur().commands.size() + tma_commands_being_read() < config_.tma_queue_commands;
     view.urf_ports_held = urf_read_ports_held();
-    view.mma_queue_room = w.mma_next.slots.size() + claims.mma_commands < config_.mma_queue_commands;
+    // The tensor core's commands (Q) and those on their way in the dispatch
+    // pipeline: a command that ends at t frees its slot for an issue at t + 1.
+    view.mma_queue_room = mma_.cur().slots.size() + claims.mma_commands < config_.mma_queue_commands;
     if (plan.kind == IssueKind::acc_load || plan.kind == IssueKind::acc_store) {
         const bool load = plan.kind == IssueKind::acc_load;
-        view.acc_engine_free = acc_engine_available(w, load) && claims.acc[load ? 0 : 1] == 0;
+        // Its engine's register holds no transfer and none is on its way in
+        // the dispatch pipeline: an engine whose transfer ends at t takes the
+        // next one's issue from t + 1.
+        const std::size_t engine = load ? 0 : 1;
+        view.acc_engine_free = !acc_engines_.cur()[engine].has_value() && claims.acc[engine] == 0;
     }
     const auto& counts = shmem_counts_.cur().at(warp.id);
     view.unserviced_read = counts.reads != 0;

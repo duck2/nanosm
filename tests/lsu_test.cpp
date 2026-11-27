@@ -771,8 +771,9 @@ TEST(Lsu, lsu_backpressure_chain) {
     };
     const auto [linked, summary] = run(true);
     // Each write bound for bank 0 (r0, r3, r6, r9, r12, r15, per group)
-    // waits out at most the bookings already made when it was denied (the
-    // owed bit then inhibits warp 1): blocked, but never starved.
+    // waits out at most the bookings made up to the cycle it was denied (from
+    // the next cycle bank 0's inhibit bit refuses warp 1's): blocked, but
+    // never starved.
     // A group's eight writes follow each other, so only a group's first
     // bank-0 write meets a full horizon of old bookings; the later ones wait
     // out only what was booked since.

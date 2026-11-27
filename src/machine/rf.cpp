@@ -20,21 +20,24 @@ namespace nanosm {
 // Fixed issue never contests the current cycle's RF ports (the issue
 // register): its read round samples at issue + 1, its fixed write is booked
 // in the write calendar at issue + issue_to_port. What the current cycle
-// leaves goes to the asynchronous clients, decided from Q before issue:
+// leaves goes to the asynchronous clients, decided from Q:
 //   READS   decide_rf_reads: the issue
 //           register's instruction owns the read ports its round samples
 //           now; acc.st beats, the LSU's store-data read, the shared-
 //           memory collect stages and the LSU's command slots (their
 //           addresses, a scalar store's data) share the rest by
-//           round-robin. A denied
-//           reader whose bank's read_owed bit is set inhibits the acceptance
-//           of new SIMT reads of that bank, so the bank's ports are free one
-//           cycle later (the mirrored rule).
+//           round-robin. A reader
+//           denied with its bank's read_owed bit set, in a cycle whose
+//           accepted instruction reads that bank, sets the bank's read
+//           inhibit bit: the next cycle issue accepts no read of the bank,
+//           so its ports are free the cycle after (the mirrored rule).
 //   WRITES  decide_rf_writes: the shared-memory write-back buffer and
 //           old-word register, the LSU's load buffer and the acc.ld
 //           pipelines share the current write port's unbooked ports;
-//           a denied writer whose bank's async_owed bit is set inhibits new
-//           fixed write bookings to that bank.
+//           a writer denied with its bank's async_owed bit set sets the
+//           bank's write inhibit bit: from the next cycle issue makes no
+//           fixed write booking to the bank.
+// Each inhibit bit is a register: issue sees a denial one cycle after it.
 // A read SAMPLES the RF at its cycle and has its operand Lr cycles later; a
 // write PRESENTED at the port lands at the clock edge Wd cycles later and is
 // visible to samples from the next cycle (no same-edge forwarding).
@@ -135,14 +138,14 @@ std::vector<std::optional<Machine::AsyncWrite>> Machine::ready_async_writers(
 }
 
 // The RF write decision (make an opening, then choose a writer): one per RF
-// bank, from Q only, before issue.
+// bank, from Q only.
 //   async_ready  = a ready async holder targets the bank
 //   async_grant  = async_ready AND one of this cycle's write ports is unbooked
-//   inhibit_simt = async_ready AND NOT async_grant AND async_owed
 // The holders granted (round-robin from the bank's cursor) enter the write
-// pipeline now; the owed bit and the cursor take their next values in
-// drive_rf_write_policy. Old bookings always execute; issue's outcome cannot
-// change these grants.
+// pipeline now; the owed bit, the inhibit bit and the cursor take their next
+// values in drive_rf_write_policy. Old bookings always execute; issue's
+// outcome cannot change these grants. A bank that is ready, not granted and
+// owed refuses issue's bookings from the next cycle (its inhibit bit).
 Machine::RfWriteDecision Machine::decide_rf_writes() const {
     RfWriteDecision decision;
     decision.lsu_presented = lsu_rf_presented();
@@ -162,7 +165,6 @@ Machine::RfWriteDecision Machine::decide_rf_writes() const {
         auto& state = decision.banks[bank];
         state.ready = std::find(ready.begin(), ready.end(), 1) != ready.end();
         state.granted = !choice.granted.empty();
-        state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
     }
     return decision;
@@ -365,16 +367,39 @@ void Machine::drive_predicates(const Wires& w) {
     }
 }
 
+// The async RF readers of the round robin, in its order, each with its
+// request when it wants a read now: the acc.st engine's next beat, the LSU's
+// stg.v8 data beat, the read side's collect stage, the write side's, the
+// LSU's command slot. `egress` as for lsu_store_read_request.
+std::vector<std::optional<Machine::RfReadRequest>> Machine::async_rf_readers(const EgressWrite& egress) const {
+    std::vector<std::optional<RfReadRequest>> readers;
+    const auto& store_engine = acc_engines_.cur()[1];
+    if (store_engine.has_value() && store_engine->next_column < store_engine->width) {
+        readers.push_back(RfReadRequest{RfReader::acc_st, 0, store_engine->warp,
+            static_cast<uint8_t>(store_engine->rf_base + store_engine->next_column), 0, 0});
+    } else {
+        readers.emplace_back();
+    }
+    readers.push_back(lsu_store_read_request(egress));
+    readers.push_back(collect_read_request(false, false));
+    readers.push_back(collect_read_request(true, false));
+    readers.push_back(lsu_collect_read_request(false));
+    return readers;
+}
+
 // The async RF readers' decision (the write decision's rule, mirrored), per
-// RF bank, from Q before issue:
+// RF bank, from Q and this cycle's egress decision:
 //   read_ready   = an async reader wants the bank now
 //   read_grant   = read_ready AND the issue register's round leaves one of
 //                  the bank's read ports free (simt_read_now: its bank use)
-//   inhibit_simt = read_ready AND NOT read_grant AND read_owed
-// A candidate instruction whose round uses an inhibited bank is not accepted
-// this cycle (resource_view), so the issue register leaves that bank free
-// next cycle: the hole the denied reader is owed. Reads already accepted are
-// never stopped. The readers granted (round-robin from the bank's cursor)
+// A bank that is ready, not granted and owed, in a cycle whose accepted
+// instruction reads it, sets its read inhibit bit (drive_rf_read_policy):
+// the next cycle issue accepts no instruction whose round uses the bank, so
+// the issue register leaves it free the cycle after -- the hole the denied
+// reader is owed. (If this cycle's accepted instruction does not read the
+// bank, the issue register leaves it free next cycle anyway, and no bubble is
+// needed.) Reads already accepted are never stopped. The readers granted
+// (round-robin from the bank's cursor)
 // sample the RF now: an acc.st beat is at the RF output Lr later and at the
 // tmem RAM tmem.port_depth after that; the LSU's beat fills the store
 // buffer Lr later; a collect stage's or a command slot's register is at the
@@ -385,23 +410,13 @@ void Machine::drive_predicates(const Wires& w) {
 // (the address is the named requester; the data is read later, as the
 // requester's own read, if not now). A denied reader holds (an acc.st keeps
 // its beat, the LSU its candidate, a collect stage its access, a command
-// slot its read; a source stays read-owned). The owed bit and cursor change
-// in drive_rf_read_policy.
+// slot its read; a source stays read-owned). The owed bit, the inhibit bit
+// and the cursor change in drive_rf_read_policy.
 Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
     RfReadDecision decision;
-    const auto& store_engine = acc_engines_.cur()[1];
-    if (store_engine.has_value() && store_engine->next_column < store_engine->width) {
-        decision.holders.push_back(RfReadRequest{RfReader::acc_st, 0, store_engine->warp,
-            static_cast<uint8_t>(store_engine->rf_base + store_engine->next_column), 0, 0});
-    } else {
-        decision.holders.emplace_back();
-    }
-    decision.holders.push_back(lsu_store_read_request(w));
-    decision.holders.push_back(collect_read_request(false, false));
-    const std::size_t write_collect = decision.holders.size();
-    decision.holders.push_back(collect_read_request(true, false));
-    const std::size_t lsu_collect = decision.holders.size();
-    decision.holders.push_back(lsu_collect_read_request(false));
+    decision.holders = async_rf_readers(w.egress);
+    const std::size_t write_collect = 3;
+    const std::size_t lsu_collect = 4;
     const std::size_t round_robin = decision.holders.size();
     decision.holders.push_back(collect_read_request(true, true));
     decision.holders.push_back(lsu_collect_read_request(true));
@@ -426,7 +441,6 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         auto& state = decision.banks[bank];
         state.ready = std::find(ready.begin(), ready.end(), 1) != ready.end();
         state.granted = !choice.granted.empty();
-        state.inhibit_simt = state.ready && !state.granted && policy.at(bank).owed != 0;
         state.cursor_after = choice.cursor_after;
     }
     for (const auto& [data_holder, named] : pairs) {
@@ -496,7 +510,7 @@ Machine::RfReadDecision Machine::decide_rf_reads(Wires& w) {
         }
         if (read->reader == RfReader::acc_st) {
             sanitizer_.record_async_reader_done(warp.id, read->reg, AsyncReader::acc_st);
-            w.acc_st_read = AccStBeat{store_engine->next_column, std::move(values)};
+            w.acc_st_read = AccStBeat{acc_engines_.cur()[1]->next_column, std::move(values)};
         } else {
             // A stg.v8 reads rS + j once per lane group; the register is free
             // to be overwritten after the last group's read.
@@ -675,7 +689,11 @@ void Machine::step_rf_reads(Wires& w) {
 // The RF write decision's state, per bank:
 //   async_owed_next = simt_booked_this_cycle OR (async_owed AND NOT async_grant)
 // (a successful SIMT booking sets it, an actual async grant clears it, set
-// wins); the cursor moves past the holder granted last, only on a grant.
+// wins);
+//   inhibit_next    = async_ready AND NOT async_grant AND async_owed
+// (issue refuses every booking to the bank while it is set: from the cycle
+// after a denial with service owed through the cycle of the grant); the cursor
+// moves past the holder granted last, only on a grant.
 void Machine::drive_rf_write_policy(const Wires& w) {
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
         const auto& cur = rf_write_policy_.cur()[bank];
@@ -683,6 +701,7 @@ void Machine::drive_rf_write_policy(const Wires& w) {
         const bool booked = w.issue.rf_write_bank == bank;
         RfWritePolicy next;
         next.owed = booked || (cur.owed != 0 && !decision.granted) ? 1 : 0;
+        next.inhibit = decision.ready && !decision.granted && cur.owed != 0 ? 1 : 0;
         next.cursor = decision.cursor_after;
         if (next != cur) rf_write_policy_.set_next(bank, next, "drive_rf_write_policy");
     }
@@ -691,8 +710,13 @@ void Machine::drive_rf_write_policy(const Wires& w) {
 // The RF read decision's state, per bank (the write decision's, mirrored):
 //   read_owed_next = simt_accepted_using_bank OR (read_owed AND NOT read_grant)
 // (an accepted instruction whose round uses the bank sets it, an actual async
-// read grant clears it, set wins); the cursor moves past the reader granted
-// last, only on a grant.
+// read grant clears it, set wins);
+//   inhibit_next   = read_ready AND NOT read_grant AND read_owed
+//                    AND simt_accepted_using_bank
+// (issue refuses every instruction whose round uses the bank while it is
+// set; the accepted term: an issue register that will not read the bank next
+// cycle leaves its ports free without a bubble); the cursor moves past the
+// reader granted last, only on a grant.
 void Machine::drive_rf_read_policy(const Wires& w) {
     for (uint32_t bank = 0; bank < config_.rf_banks; ++bank) {
         const auto& cur = rf_read_policy_.cur()[bank];
@@ -700,6 +724,7 @@ void Machine::drive_rf_read_policy(const Wires& w) {
         const bool accepted = !w.issue.rf_read_banks.empty() && w.issue.rf_read_banks[bank] != 0;
         RfReadPolicy next;
         next.owed = accepted || (cur.owed != 0 && !decision.granted) ? 1 : 0;
+        next.inhibit = decision.ready && !decision.granted && cur.owed != 0 && accepted ? 1 : 0;
         next.cursor = decision.cursor_after;
         if (next != cur) rf_read_policy_.set_next(bank, next, "drive_rf_read_policy");
     }

@@ -617,11 +617,11 @@ TEST(Stepping, simultaneous_depbar_completion_and_admission) {
     }
 }
 
-// A full MMA queue (two entries): the third mma.async issues in the cycle the
-// head retires (issue sees the queue as that cycle leaves it) and reaches the
-// queue issue_to_dispatch later, so the pop and the push land in different
-// cycles. The "mma.async" event is the queue's acceptance, at dispatch.
-TEST(Stepping, full_queue_issue_in_the_retire_cycle) {
+// A full MMA queue (two entries): the third mma.async issues the cycle after
+// the head retires (issue reads the queue's register) and reaches the queue
+// issue_to_dispatch later. The "mma.async" event is the queue's acceptance,
+// at dispatch.
+TEST(Stepping, full_queue_issue_after_the_retire_cycle) {
     auto launch = launch_warps(1);
     image_bytes(launch.test_shmem, 4096);
     nanosm::Machine machine(canonical_profile(), compile(R"(
@@ -642,7 +642,7 @@ TEST(Stepping, full_queue_issue_in_the_retire_cycle) {
         if (event.category == nanosm::TraceCategory::mma && event.id == 1)
             head_retire = std::max(head_retire, event.start_cycle);
     require(!refusals(machine, 0, "MMA command queue full").empty(), "the third mma.async never found the queue full");
-    require(third_accept == head_retire + nanosm::issue_to_dispatch(canonical_profile()),
-        "the third mma.async did not issue in the cycle the head retired (accepted " + std::to_string(third_accept) +
+    require(third_accept == head_retire + 1 + nanosm::issue_to_dispatch(canonical_profile()),
+        "the third mma.async did not issue the cycle after the head retired (accepted " + std::to_string(third_accept) +
             " vs retired " + std::to_string(head_retire) + ")");
 }

@@ -80,19 +80,11 @@ uint32_t mma_operand_address(const Config& config, const MmaShape& shape, uint32
     return mma_operand_element(config, shape, base, spacing, a_operand, outer, k);
 }
 
-// The acc.ld (load) or acc.st engine, as this cycle leaves it (look-ahead
-// (c)): free if it runs no transfer. The MMA never matters here -- it has
-// tmem services of its own; a transfer racing MMA
-// work is the sanitizer's business.
-bool Machine::acc_engine_available(const Wires& w, bool load) const {
-    return !w.acc_next[load ? 0 : 1].has_value();
-}
-
-// The MMA engine's cycle, computed on a copy of its queue and pipeline:
-// issue looks ahead at the queue entries it frees (c), so the next state is a
-// wire; drive_mma commits it with issue's new command. Its tmem reads (C) and
-// writes (results) use its own tmem services; the writes land at this
-// cycle's edge (w.mma_tmem_writes).
+// The MMA engine's cycle, computed on a copy of its queue and pipeline;
+// drive_mma commits it with the command dispatch hands over now. (Issue reads
+// the queue's Q: an entry freed now is seen from the next cycle.) Its tmem
+// reads (C) and writes (results) use its own tmem services; the writes land
+// at this cycle's edge (w.mma_tmem_writes).
 void Machine::step_mma(Wires& w) {
     auto mma = mma_.cur();
     advance_mma(mma, w);
@@ -470,9 +462,10 @@ std::vector<uint32_t> Machine::mma_block_words(const MmaTag& tag) const {
 
 // The two accumulator transfer engines (one acc.ld
 // engine, one acc.st engine for the whole machine, each with its own tmem
-// service in every fine bank), computed on copies of their registers: issue
-// looks ahead at them (c) and may give a freed engine its next transfer now
-// (d). The acc.ld pipeline before the acc.st beat.
+// service in every fine bank), computed on copies of their registers
+// (drive_acc_transfers commits them). Issue reads the engines' Q: an engine
+// whose transfer ends now takes the next one's issue from the next cycle.
+// The acc.ld pipeline before the acc.st beat.
 void Machine::step_acc_transfers(Wires& w) {
     auto engines = acc_engines_.cur();
     step_acc_ld(engines[0], w);
@@ -735,8 +728,9 @@ void Machine::drive_mma(const Wires& w) {
 
 // The two acc transfer engines: step_acc_transfers' result (acc.ld launches,
 // acc.st landings), plus this cycle's acc.st RF read (the beat enters the
-// acc.st pipeline) and dispatch's new transfer (into an engine freed this
-// cycle, possibly).
+// acc.st pipeline) and dispatch's new transfer (its engine has been empty
+// since the transfer issued: issue asks for the engine's Q and the dispatch
+// pipeline's claims).
 void Machine::drive_acc_transfers(const Wires& w) {
     auto next = w.acc_next;
     if (const auto& beat = w.acc_st_read; beat.has_value()) {

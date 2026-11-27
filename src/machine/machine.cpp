@@ -387,24 +387,25 @@ void Machine::set_driver_shuffle_seed(uint64_t seed) {
 //      (b) None from a completion to issue: a depbar clear, an mbar wait
 //          slot's completion (wake, immediate success, timeout), a probe's
 //          return reach issue through their registers, the next cycle.
-//      (c) Issue looks ahead: an instruction accepted at t occupies its
-//          resources from t+1, so issue sees the space this cycle frees
-//          (the TMA, MMA and acc engines' queues and slots) -- less the
-//          space the dispatch pipeline's instructions will take
-//          (dispatch_claims). Not shared or global memory: their questions
-//          (a queue's free entries, a warp's shared-memory counts, fence.sh's
-//          count) read Q only, so an entry or an order freed at t is seen
-//          from t + 1. The RF write decision's fairness inhibit and the
-//          acc.ld engine its grant lets advance are still seen at t.
+//      (c) None into issue's admission: every question it asks reads Q
+//          (resource_view). A queue entry, an engine, a slot or an order
+//          freed at t is seen from t + 1 -- the TMA and MMA queues and the
+//          acc engines (less what the dispatch pipeline's instructions and
+//          the TMA operand read will take), the shared-memory queues and a
+//          warp's counts, fence.sh's count, the load / store unit's queue.
+//          A bank's read and write inhibits are bits of the RF policy
+//          registers, set from the RF decisions of the cycle before: an
+//          async reader or writer denied with service owed at t refuses
+//          issue's use of its bank from t + 1.
 //      (d) Same-cycle space reuse: a register drained at t may be refilled at
 //          t (the load and store buffers, a shared-memory collect or serve
 //          stage whose access moves on at t, the TMA sector / store
 //          registers, the MMA event register, an LSU command slot taken by
-//          the LSU queue's head as the RF write grant releases it, an acc
-//          slot reallocated by dispatch). The refill's data is visible at
-//          t+1; nothing passes through. (Not the write-back buffer or the
-//          old-word register: an entry whose RF write is granted at t is
-//          free from t + 1.)
+//          the LSU queue's head as the RF write grant releases it). The
+//          refill's data is visible at t+1; nothing passes through. (Not the
+//          write-back buffer or the old-word register: an entry whose RF
+//          write is granted at t is free from t + 1. Not an acc engine: its
+//          next transfer issues after it is empty in Q.)
 //      (e) (None: a stg.v8 reads its data only once its command is planned,
 //          from Q.)
 //      (f) Inside the MMA: a step whose tile's previous result lands at this
@@ -455,9 +456,8 @@ void Machine::tick() {
     w.branch = resolve_branch();
     w.divergence_refilled = divergence_memory_output();
 
-    // The RF write path, from Q and before any SIMT candidate: the one RF
-    // write decision (the ready async holders share this cycle's unbooked
-    // write ports; banks whose service is owed inhibit new SIMT bookings),
+    // The RF write path, from Q: the one RF write decision (the ready async
+    // holders share this cycle's unbooked write ports),
     // the write port (booked results and granted holders enter their ports'
     // write pipelines) and the RAM stage (the writes landing at this cycle's
     // edge, and their completions).
@@ -488,10 +488,10 @@ void Machine::tick() {
     w.channel = select_request_channel(w.tma, w.lsu_want);
     step_shmem(w);
 
-    // Units whose next state issue looks ahead at (c). The MMA's commit may
-    // present into the event register the RMW engine claimed just now (d).
+    // The MMA and the acc engines, each on a copy of its Q. The MMA's commit
+    // may present into the event register the RMW engine claimed just now (d).
     step_mma(w);
-    step_acc_transfers(w);        // acc.ld advances on its RF grant; acc.st books its RF read before issue
+    step_acc_transfers(w);        // acc.ld advances on its RF grant
     decide_mbar_timeouts(w);      // a wake this cycle wins over the deadline
     w.ingress = decide_ingress(w);
     step_gmem_controller(w);
@@ -509,12 +509,13 @@ void Machine::tick() {
     // The async RF readers (acc.st beats, the LSU's stg.v8 data beats and
     // its command slots' address and stg data reads, the shared-memory
     // collect stages) take the read ports the issue register's instruction
-    // leaves free now, from Q, before issue.
+    // leaves free now, from Q and the egress decision.
     w.rf_read = decide_rf_reads(w);
 
-    // The scheduler. Its write booking is in a future cycle and its read
-    // round is the next cycle's (the issue register); it updates the owed
-    // bits' next state.
+    // The scheduler. Its admission reads Q only (c): no decision above
+    // reaches it. Its write booking is in a future cycle and its read round
+    // is the next cycle's (the issue register); with the RF decisions above
+    // it sets the owed and inhibit bits' next state.
     decide_issue(w);
 
     // The front ends' next state: issue's pop (and halt), the landing word,

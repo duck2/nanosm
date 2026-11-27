@@ -229,14 +229,15 @@ TEST(Rf, lds_issue_ignores_its_rounds) {
 }
 
 // The RF write decision against fixed bookings. A ready async result denied
-// by a booking of its bank leaves service owed, and while it is owed the
-// bank is inhibited: fixed bookings to it are refused until the result is
-// written (the booking made in the grant cycle sets owed again). With
-// nothing owed, a denied result lets one more booking through; a booking
-// refused for its port changes nothing. Inhibition refuses only fixed
-// bookings to the inhibited bank (a destination of an lds.uni is not a
-// booking), and with no async writer ready nothing is inhibited. Cycles are
-// relative to the first issue s; X = lds_shift.
+// by a booking of its bank with service owed sets the bank's inhibit bit:
+// from the next cycle through the cycle the result is written, fixed
+// bookings to the bank are refused (a booking made in the denial cycle
+// itself still goes through). With nothing owed, a denied result lets one
+// more booking through; a booking refused for its port changes nothing.
+// Inhibition refuses only fixed bookings to the inhibited bank (a
+// destination of an lds.uni is not a booking), and with no async writer
+// ready nothing is inhibited. Cycles are relative to the first issue s;
+// X = lds_shift.
 TEST(Rf, rf_owed_inhibits_after_denial) {
     auto profile = canonical_profile();
     const auto x = lds_shift(profile);
@@ -262,9 +263,11 @@ TEST(Rf, rf_owed_inhibits_after_denial) {
             lds.uni r3, [ur1] {pred=PT, stall=)" + stall + R"(, set=sb0, wait=-}
             fadd r12, r4, r4
             fadd r15, r4, r4
+            fadd r18, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )",
-            {{3, {s + 3}}, {5, {s + 7 + x}}}, {{3, {s + 7 + x + wd}}}, Slices{{s + 5 + x, 2}}, std::nullopt,
+            {{3, {s + 3}}, {5, {s + 5 + x}}, {6, {s + 8 + x}}}, {{3, {s + 7 + x + wd}}}, Slices{{s + 6 + x, 2}},
+            std::nullopt,
             {{"async waits", &nanosm::TraceSummary::rf_async_waits, 2},
                 {"SIMT inhibited", &nanosm::TraceSummary::rf_simt_inhibited, 2},
                 {"async writes", &nanosm::TraceSummary::rf_async_writes, 1}}},
@@ -277,10 +280,11 @@ TEST(Rf, rf_owed_inhibits_after_denial) {
             mov r2, 1
             fadd r15, r4, r4
             fadd r18, r4, r4
+            fadd r21, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )",
-            {{6, {s + 6 + x}}}, {{3, {s + 5 + x + wd}}, {12, {s + 8 + x + wd}}}, Slices{{s + 7 + x, 1}},
-            std::nullopt, {}},
+            {{6, {s + 6 + x}}, {7, {s + 7 + x}}, {8, {s + 9 + x}}}, {{3, {s + 5 + x + wd}}, {12, {s + 8 + x + wd}}},
+            Slices{{s + 8 + x, 1}}, std::nullopt, {}},
         // The add's booking is only issue_to_dispatch + alu ahead of its
         // issue: latency 5 + X puts the fadd's port on the add's.
         {"a booking refused for its port", static_cast<uint32_t>(5 + x), R"(
@@ -293,7 +297,9 @@ TEST(Rf, rf_owed_inhibits_after_denial) {
             halt {pred=PT, stall=0, set=-, wait=sb0}
         )",
             {}, {}, std::nullopt, Slices{{s + 5 + x, 1}}, {}},
-        // The second lds.uni's result meets fadd r12's booking: X later too.
+        // Bank 0's inhibit bit is set at s + 6 + X and s + 7 + X: the lds.uni
+        // and the bank-1 mov issued then are not refused. The second
+        // lds.uni's result meets fadd r12's booking: X later too.
         {"inhibition is bank- and booking-local", shifted_fadd_latency(profile, 4), R"(
             mov r61, 0
             fadd r6, r4, r4
@@ -302,10 +308,12 @@ TEST(Rf, rf_owed_inhibits_after_denial) {
             fadd r12, r4, r4
             mov r13, 1
             lds.uni r21, [ur1] {pred=PT, stall=0, set=sb1, wait=-}
+            mov r16, 1
             fadd r15, r4, r4
             halt {pred=PT, stall=0, set=-, wait=sb0|sb1}
         )",
-            {{5, {s + 5 + x}}, {6, {s + 6 + x}}}, {{3, {s + 7 + x + wd}}, {21, {s + 9 + 2 * x + wd}}},
+            {{5, {s + 5 + x}}, {6, {s + 6 + x}}, {7, {s + 7 + x}}, {8, {s + 8 + x}}},
+            {{3, {s + 7 + x + wd}}, {21, {s + 9 + 2 * x + wd}}},
             std::nullopt, std::nullopt, {{"SIMT inhibited", &nanosm::TraceSummary::rf_simt_inhibited, 0}}},
         {"no async writer ready", profile.timing.fadd, R"(
             mov r1, 0
@@ -383,9 +391,10 @@ TEST(Rf, round_robin_grant) {
 // (A the acc.ld's issue). Six fadds book bank 1 for P .. P + 5: the whole
 // pipeline holds -- no tmem read launches or samples, the depbar stays set,
 // done() is false -- while the add r46 that wants bank 1 is held, first by
-// its own booked port, then (P + 2 .. P + 5) by the inhibition. Beats 0-5
-// are written at P + 6 .. P + 11 with no refill bubble; beat 6 (bank 1)
-// meets r43's booking at P + 12 and goes at P + 13, beat 7 at P + 14; the
+// its own booked port, then (P + 2 .. P + 6) by the inhibit bit (set from
+// the cycle after beat 0's first denial through its grant). Beats 0-5 are
+// written at P + 6 .. P + 11 with no refill bubble; beat 6 (bank 1) meets
+// r43's booking at P + 12 and goes at P + 13, beat 7 at P + 14; the
 // depbar clears as the last beat lands. A calibration run (fadd latency 1)
 // measures A and the first fadd's issue, from which the fadd latency that
 // puts the bookings on P follows.
@@ -417,7 +426,7 @@ TEST(Rf, acc_ld_pipeline_freeze) {
         fadd r37, r10, r10
         fadd r40, r10, r10
         acc.ld.v8 r16, [ur8, 64] {pred=PT, stall=)" + std::to_string(r46_after) + R"(, set=sb1, wait=-}
-        add r46, r10, r10 {pred=PT, stall=2, set=-, wait=-}
+        add r46, r10, r10 {pred=PT, stall=1, set=-, wait=-}
         add r43, r10, r10
         halt {pred=PT, stall=0, set=-, wait=sb1}
     )";
@@ -471,7 +480,7 @@ TEST(Rf, acc_ld_pipeline_freeze) {
     }
     require(seen.at(port[7] + wd - 1).sb1 == 1 && seen.at(port[7] + wd).sb1 == 0,
         "the depbar did not clear exactly as the last beat's write landed");
-    require(refusals(*machine, 0, "RF write inhibited") == Slices{{p + 2, 4}},
+    require(refusals(*machine, 0, "RF write inhibited") == Slices{{p + 2, 5}},
         "the add was not inhibited while beat 0 was denied with service owed" + log);
     require(machine->trace().summary().tmem_load_beats == 8 && machine->trace().summary().rf_async_writes == 8,
         "beats launched or written more than once");
@@ -492,7 +501,7 @@ TEST(Rf, acc_ld_pipeline_freeze) {
 TEST(Rf, writeback_buffer) {
     auto profile = canonical_profile();
     const auto wd = profile.rf_write_depth_cycles;
-    profile.timing.fadd = shifted_fadd_latency(profile, 9);
+    profile.timing.fadd = shifted_fadd_latency(profile, 8);
     auto machine = debug_machine(profile, R"(
         sread r20, LANE_ID
         mov r21, 7
@@ -803,6 +812,32 @@ TEST(Rf, profile_fields) {
         "a fixed dependency longer than the stall field");
 }
 
+// The ALU's, FPU's and SFU's fixed write delays (canonical issue + 4, 7, 14)
+// may be equal or two or more apart, never exactly one (src/profile.cpp): the
+// refusal names the two units, their profile fields and values.
+TEST(Rf, write_delays_one_apart_are_refused) {
+    auto equal = canonical_profile();
+    equal.timing.fadd = equal.timing.alu; // 4 and 4
+    nanosm::validate_device_profile(equal);
+    auto two_apart = canonical_profile();
+    two_apart.timing.fadd = static_cast<uint8_t>(two_apart.timing.sfu - 2); // 12 and 14
+    nanosm::validate_device_profile(two_apart);
+    auto fpu = canonical_profile();
+    fpu.timing.fadd = static_cast<uint8_t>(fpu.timing.alu + 1); // 4 and 5
+    expect_error<nanosm::ProfileError>([&] { nanosm::validate_device_profile(fpu); },
+        {"the ALU's and the FPU's fixed RF write delays differ by exactly one cycle",
+            "issue + 4 from core.alu_latency_cycles = 1", "issue + 5 from core.fadd_latency_cycles = 2",
+            "equal or at least two cycles apart"},
+        "an FPU one cycle behind the ALU");
+    auto sfu = canonical_profile();
+    sfu.timing.fadd = static_cast<uint8_t>(sfu.timing.sfu + 1); // 15 and 14
+    expect_error<nanosm::ProfileError>([&] { nanosm::validate_device_profile(sfu); },
+        {"the FPU's and the special-function unit's fixed RF write delays differ by exactly one cycle",
+            "issue + 15 from core.fadd_latency_cycles = 12",
+            "issue + 14 from sfu.latency_cycles = 8 with sfu.lanes = 4 of 16 lanes (11 cycles)"},
+        "an FPU one cycle behind the SFU");
+}
+
 // Back-to-back same-bank reads. Nine independent instructions issue in
 // consecutive cycles: six read RF bank 0 in their issue round (r0, r3, r6,
 // r9: two-source adds, a repeated register, xori, addi, setp), an lds.uni
@@ -1021,22 +1056,25 @@ TEST(Rf, same_bank_sources_are_malformed) {
 // tmem pointer is a uniform register: its own read round takes no RF port).
 // The acc.st, accepted at a, reaches its unit at a + issue_to_dispatch and
 // its beat wants bank 0 from a + 4, where the issue register (the addi
-// accepted at a + 3) owns bank 0: the beat is denied with service owed, an
-// inhibition -- the next candidate, an add reading banks 0 AND 1, is refused
-// at a + 4, all or none: nothing of it is read in a + 5, bank 1 included. At
-// a + 5 the beat takes bank 0 and the add is accepted in the same cycle.
-// Every accepted instruction samples at its issue + 1; the stream loses
-// exactly one cycle.
+// accepted at a + 3) owns bank 0: the beat is denied with service owed while
+// the addi accepted at a + 4 reads bank 0 too, so bank 0's read inhibit bit
+// is set for a + 5 -- the next candidate, an add reading banks 0 AND 1, is
+// refused at a + 5, all or none: nothing of it is read in a + 6, bank 1
+// included. At a + 6 the beat takes bank 0 and the add is accepted in the
+// same cycle. Every accepted instruction samples at its issue + 1; the beat
+// waits two cycles and the stream loses exactly one.
 //
 // Unrelated banks proceed: three warps, warps 0 and 1 reading bank 0 (r27)
 // every cycle they issue, warp 2 only bank 1 (r28); warp 0 issues an acc.st
 // of r0 amid its stream. In steady round-robin (w0, w1, w2) the beat wants
-// bank 0 at a + 4, right after warp 0's addi at a + 3: warp 1's bank-0 addi
-// is refused at a + 4, warp 2's bank-1 addi is accepted in that cycle, and
-// the beat takes the hole at a + 5. The warps first meet at an mbar barrier
-// so that every stream starts with its FIFO full (three warps issuing every
-// cycle share one fetch a cycle, so a stream started behind a taken branch
-// would get its words just in time, not early).
+// bank 0 at a + 4, right after warp 0's addi at a + 3, and is denied at a + 4
+// and a + 5 (warp 1's bank-0 addi, accepted at a + 4). Warp 2's bank-1 addi,
+// accepted at a + 5, reads no bank 0, so no inhibit bit is set and no warp is
+// refused: the beat takes the hole that addi leaves at a + 6. The warps
+// first meet at an mbar barrier so that every stream starts with its FIFO
+// full (three warps issuing every cycle share one fetch a cycle, so a stream
+// started behind a taken branch would get its words just in time, not
+// early).
 TEST(Rf, async_reader_gets_the_hole) {
     const auto& profile = canonical_profile();
     {
@@ -1050,26 +1088,26 @@ TEST(Rf, async_reader_gets_the_hole) {
             addi r1, r27, 1
             addi r2, r27, 2
             addi r5, r27, 3
-            add r4, r27, r28
             addi r7, r27, 4
+            add r4, r27, r28
             acc.ld r10, [ur2, 64] {pred=PT, stall=0, set=sb1, wait=sb0}
             halt {pred=PT, stall=0, set=-, wait=sb1}
         )");
         machine->run();
         const auto log = " | issues" + issue_log(*machine);
         const auto a = issued_at(*machine, 5 * 8).at(0);
-        const std::vector<uint64_t> expected{a + 1, a + 2, a + 3, a + 5, a + 6};
+        const std::vector<uint64_t> expected{a + 1, a + 2, a + 3, a + 4, a + 6};
         for (uint32_t i = 0; i < expected.size(); ++i) {
             require(issued_at(*machine, (6 + i) * 8) == std::vector<uint64_t>{expected[i]},
                 "SIMT instruction " + std::to_string(i) + " did not issue at its cycle" + log);
         }
-        require(refusals(*machine, 0, "RF read inhibited") == Slices{{a + 4, 1}},
+        require(refusals(*machine, 0, "RF read inhibited") == Slices{{a + 5, 1}},
             "the refusal:" + describe(refusals(*machine, 0, "RF read inhibited")) + log);
         const auto reads = warp0_reads(*machine);
-        require(reads.contains(a + 5) && reads.at(a + 5) == std::vector<std::pair<uint32_t, uint32_t>>{{0, 0}},
+        require(reads.contains(a + 6) && reads.at(a + 6) == std::vector<std::pair<uint32_t, uint32_t>>{{0, 0}},
             "in the hole cycle the beat was not the only read (a refused instruction read a register?)");
-        require(rf_events(*machine, "RF read", 27) == std::vector<uint64_t>{a + 2, a + 3, a + 4, a + 6, a + 7} &&
-                rf_events(*machine, "RF read", 28) == std::vector<uint64_t>{a + 6},
+        require(rf_events(*machine, "RF read", 27) == std::vector<uint64_t>{a + 2, a + 3, a + 4, a + 5, a + 7} &&
+                rf_events(*machine, "RF read", 28) == std::vector<uint64_t>{a + 7},
             "an accepted instruction was not sampled at its issue + 1");
         require(machine->trace().summary().rf_simt_read_inhibited == 1, "inhibited cycles");
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -1128,11 +1166,13 @@ TEST(Rf, async_reader_gets_the_hole) {
         };
         require(warp_issued_at(0, a + 3) && warp_issued_at(1, a + 1) && warp_issued_at(2, a + 2),
             "the three warps were not in steady round-robin around the acc.st" + log);
-        require(refusals(machine, 1, "RF read inhibited") == Slices{{a + 4, 1}},
-            "warp 1's bank-0 addi was not refused exactly at a + 4:" + describe(refusals(machine, 1, "RF read inhibited")) + log);
-        require(warp_issued_at(2, a + 4), "warp 2's bank-1 addi did not issue in the inhibited cycle" + log);
-        require(refusals(machine, 2, "RF read inhibited").empty(), "warp 2 was inhibited for a bank it does not read");
-        require(last_rf_read(machine, 0) == a + 5, "the beat did not take the hole at a + 5" + log);
+        require(warp_issued_at(1, a + 4) && warp_issued_at(2, a + 5),
+            "warp 1's bank-0 addi and warp 2's bank-1 addi did not follow at a + 4 and a + 5" + log);
+        for (uint32_t warp = 0; warp < 3; ++warp) {
+            require(refusals(machine, warp, "RF read inhibited").empty(),
+                "warp " + std::to_string(warp) + " was inhibited although the bank-1 addi left the hole" + log);
+        }
+        require(last_rf_read(machine, 0) == a + 6, "the beat did not take the hole at a + 6" + log);
         for (uint32_t warp = 0; warp < 3; ++warp) {
             require(machine.read_reg(warp, 0, warp == 2 ? 4 : 2) == (warp == 2 ? 10u : 7u), "data");
         }
@@ -1144,16 +1184,16 @@ TEST(Rf, async_reader_gets_the_hole) {
 // and an stg.v8's store-data beats (the LSU, holder 1) -- take the holes in
 // a stream of addis reading r27 (bank 0) in round-robin order. First the
 // order: the acc.st (a) wants r0 from a + 4, the stg.v8 (a + 1) its r18 from
-// a + 4; the issue register's addi owns bank 0 there, so both are denied
-// with service owed (refusal at a + 4); the hole at a + 5 goes to the acc.st,
-// whose grant lifts the inhibition; at a + 6 the LSU is denied again
-// (refusal) and at a + 7 it takes the hole. Then persistent pressure (60
-// addis) against acc.st.v8 and stg.v8, both coming back to bank 0 every
-// third register: no accepted read is ever stopped, every acc.st beat is
-// granted within 2 x 2 - 1 = 3 cycles of wanting its bank (in bank 0 one hole
-// per two cycles, the other reader at most ahead of it). In both, every
-// inhibited cycle's hole goes to an async reader the next cycle, and the
-// data (tmem read back, gmem) are right.
+// a + 4; the issue register's addi owns bank 0 there and at a + 5 (the addi
+// accepted at a + 4, before the inhibit bit is set), so both are denied with
+// service owed (refusal at a + 5); the hole at a + 6 goes to the acc.st; the
+// LSU is denied again at a + 6 and a + 7 (refusal at a + 8) and takes the
+// hole at a + 9. Then persistent pressure (60 addis) against acc.st.v8 and
+// stg.v8, both coming back to bank 0 every third register: no accepted read
+// is ever stopped, every acc.st beat is granted within 2 x 3 - 1 = 5 cycles
+// of wanting its bank (in bank 0 one hole per three cycles, the other reader
+// at most ahead of it). In both, every inhibited cycle's hole goes to an
+// async reader the next cycle, and the data (tmem read back, gmem) are right.
 TEST(Rf, async_readers_round_robin) {
     const auto stg_data = [](const nanosm::Machine& machine) {
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -1191,10 +1231,10 @@ TEST(Rf, async_readers_round_robin) {
         const auto log = " | issues" + issue_log(*machine);
         const auto a = issued_at(*machine, 14 * 8).at(0);
         const auto refused = refusals(*machine, 0, "RF read inhibited");
-        require(refused.size() >= 2 && refused[0] == std::pair<uint64_t, uint64_t>{a + 4, 1} &&
-                refused[1] == std::pair<uint64_t, uint64_t>{a + 6, 1},
+        require(refused.size() >= 2 && refused[0] == std::pair<uint64_t, uint64_t>{a + 5, 1} &&
+                refused[1] == std::pair<uint64_t, uint64_t>{a + 8, 1},
             "the first two refusals:" + describe(refused) + log);
-        require(last_rf_read(*machine, 0) == a + 5 && last_rf_read(*machine, 18) == a + 7,
+        require(last_rf_read(*machine, 0) == a + 6 && last_rf_read(*machine, 18) == a + 9,
             "the holes did not go acc.st, LSU in turn" + log);
         require_holes_used(*machine, refused);
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -1244,7 +1284,7 @@ TEST(Rf, async_readers_round_robin) {
             longest = std::max(longest, static_cast<uint32_t>(grant - ready));
             ready = grant + 1;
         }
-        require(longest <= 3, "an acc.st beat waited " + std::to_string(longest) + " cycles" + log);
+        require(longest <= 5, "an acc.st beat waited " + std::to_string(longest) + " cycles" + log);
         require(machine->trace().summary().rf_simt_read_inhibited > 0, "the pressure never needed an inhibition");
         require_holes_used(*machine, refusals(*machine, 0, "RF read inhibited"));
         for (uint32_t lane = 0; lane < 16; ++lane) {
@@ -1255,6 +1295,92 @@ TEST(Rf, async_readers_round_robin) {
         stg_data(*machine);
         check_read_capacity(*machine, profile);
     }
+}
+
+// Contention, write side: a stream of movs books RF bank 0's one write port
+// every cycle, D = issue_to_port(mov) ahead (4 at canonical), and an
+// lds.uni's result (r3, bank 0) reaches the port at P amid it. It is denied
+// at P with service owed, so bank 0's inhibit bit refuses the stream's
+// bookings from P + 1 (one cycle late: the mov accepted at P still books
+// P + D). The bookings made up to P hold the port through P + D, so the
+// result is written within D + 1 cycles of P: the bound. The stream goes on
+// after the write.
+TEST(Rf, async_writer_under_a_booking_stream) {
+    const auto& profile = canonical_profile();
+    nanosm::Instruction mov;
+    mov.opcode = nanosm::Opcode::mov;
+    const auto d = nanosm::issue_to_port(mov, profile);
+    std::string stream;
+    for (uint32_t i = 0; i < 40; ++i) stream += "mov r" + std::to_string(6 + 3 * (i % 8)) + ", " + std::to_string(i) + "\n";
+    auto machine = debug_machine(profile,
+        "lds.uni r3, [ur1] {pred=PT, stall=0, set=sb0, wait=-}\n" + stream +
+        "halt {pred=PT, stall=0, set=-, wait=sb0}\n");
+    machine->run();
+    const auto log = " | issues" + issue_log(*machine);
+    const auto p = issued_at(*machine, 0).at(0) + lds_shift(profile) + 2;
+    const auto written = rf_events(*machine, "RF write", 3);
+    require(written.size() == 1 && written[0] > p, "the lds.uni's result was not denied at P" + log);
+    require(written[0] <= p + d + 1, "the result waited " + std::to_string(written[0] - p) +
+        " cycles under the stream (bound " + std::to_string(d + 1) + ")" + log);
+    require(machine->trace().summary().rf_async_waits == written[0] - p, "the result's waits");
+    require(machine->trace().summary().rf_simt_inhibited > 0, "the stream was never inhibited" + log);
+    const auto inhibited = refusals(*machine, 0, "RF write inhibited");
+    require(inhibited.size() == 1 && inhibited[0].first == p + 1 && inhibited[0].first + inhibited[0].second == written[0] + 1,
+        "the stream was not refused from P + 1 through the write:" + describe(inhibited) + log);
+    require(machine->read_reg(0, 0, 3) == 0x100 && machine->read_reg(0, 0, 6 + 3 * (39 % 8)) == 39, "data");
+}
+
+// Contention, read side: addis read r27 (RF bank 0's one read port) every
+// cycle while an acc.st.v8 reads r0 .. r7 beat by beat (r0, r3, r6 in bank
+// 0). A bank-0 beat that wants its bank at w is denied at w (the issue
+// register's addi) and at w + 1 (the addi accepted at w, before bank 0's
+// inhibit bit, set from the denial at w, refuses the next one at w + 1), and
+// takes the hole at w + 2: the bound, 2 cycles for one reader. No accepted
+// read is stopped, and the data read back from tmem are right.
+TEST(Rf, async_reader_under_a_read_stream) {
+    const auto& profile = canonical_profile();
+    std::string setup = "sread r0, LANE_ID\n";
+    for (uint32_t j = 1; j < 8; ++j) setup += "addi r" + std::to_string(j) + ", r0, " + std::to_string(10 * j) + "\n";
+    std::string pressure;
+    for (uint32_t i = 0; i < 40; ++i) pressure += "addi r41, r27, " + std::to_string(i) + "\n";
+    auto machine = debug_machine(profile, R"(
+        umov ur2, 0
+        umov ur3, 0
+    )" + setup + R"(
+        mov r27, 5 {pred=PT, stall=8, set=-, wait=-}
+        acc.st.v8 [ur2, 64], r0 {pred=PT, stall=0, set=sb0, wait=-}
+    )" + pressure + R"(
+        acc.ld.v8 r50, [ur2, 64] {pred=PT, stall=0, set=sb3, wait=sb0}
+        halt {pred=PT, stall=0, set=-, wait=sb3}
+    )");
+    machine->run();
+    const auto log = " | issues" + issue_log(*machine);
+    const uint32_t acc_st = 11; // after two umovs, 8 setup instructions and the mov r27
+    const auto a = issued_at(*machine, acc_st * 8).at(0);
+    std::set<uint64_t> expected_r27;
+    for (uint32_t i = 0; i < 40; ++i) expected_r27.insert(issued_at(*machine, (acc_st + 1 + i) * 8).at(0) + 1);
+    const auto r27 = rf_events(*machine, "RF read", 27);
+    require(std::set<uint64_t>(r27.begin(), r27.end()) == expected_r27 && r27.size() == 40,
+        "an accepted addi was not sampled at its issue + 1" + log);
+    // Beat j wants its bank from its transfer's dispatch + 1 (beat 0) or the
+    // cycle after beat j - 1's grant.
+    uint32_t longest = 0;
+    auto ready = a + nanosm::issue_to_dispatch(profile) + 1;
+    for (uint32_t j = 0; j < 8; ++j) {
+        const auto grant = last_rf_read(*machine, static_cast<uint8_t>(j));
+        require(grant >= ready, "a beat was read before it was wanted");
+        longest = std::max(longest, static_cast<uint32_t>(grant - ready));
+        ready = grant + 1;
+    }
+    require(longest >= 1 && longest <= 2, "the longest beat wait was " + std::to_string(longest) +
+        " cycles (bound 2)" + log);
+    require_holes_used(*machine, refusals(*machine, 0, "RF read inhibited"));
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+        for (uint32_t j = 0; j < 8; ++j) {
+            require(machine->read_reg(0, lane, 50 + j) == lane + 10 * j, "tmem data (acc.st.v8 -> acc.ld.v8)");
+        }
+    }
+    check_read_capacity(*machine, profile);
 }
 
 // 16 warps, each touching its own state: its RF rows and predicates, its

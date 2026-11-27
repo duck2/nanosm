@@ -595,16 +595,18 @@ void Machine::note_first_return(uint64_t command) {
 // lane of the group) x 8 + j. The group's first beat needs the buffer free:
 // empty in Q, or its previous data's last word pushed into the egress FIFO
 // now (d). A stg.v8 reads its data once it is planned (in Q).
-std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const Wires& w) const {
+// `egress`: this cycle's egress decision, for that drain.
+std::optional<Machine::RfReadRequest> Machine::lsu_store_read_request(const EgressWrite& egress) const {
     for (const auto* command : lsu_commands_.cur().oldest_first()) {
         if (!store_has_data_left(*command)) continue;
         if (command->kind != LsuKind::vector_store || !command->planned) return std::nullopt;
-        const bool drained_now = w.egress.lsu_group_drained && w.egress.lsu_command == command->id;
+        const bool drained_now = egress.lsu_group_drained && egress.lsu_command == command->id;
+        const bool buffer_drained_now = egress.lsu_store_drained;
         const uint32_t sector = command->sectors_pushed + (drained_now ? 1 : 0);
         if (sector == command->requests_total) return std::nullopt; // its last group has just left
         const uint32_t beat = drained_now ? 0 : command->group_beats_read;
         if (beat == 8) return std::nullopt; // the group's eight beats are read; it is landing or draining
-        if (beat == 0 && !drained_now && !w.egress.lsu_store_drained &&
+        if (beat == 0 && !drained_now && !buffer_drained_now &&
             lsu_buffers_.at(store_buffer).cur().owner.has_value()) {
             return std::nullopt;
         }

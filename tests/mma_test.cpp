@@ -424,12 +424,13 @@ TEST(Mma, mbar_engine_tma_event_does_not_stall_mma_queue) {
     };
 
     // Reference, no TMA event: the commit presents in r, the cycle its
-    // predecessor retires; the mma.async behind it issues then and is
-    // accepted at its dispatch, fetching from the next cycle.
+    // predecessor retires; the mma.async behind it issues the cycle after
+    // (issue reads the queue's register) and is accepted at its dispatch,
+    // fetching from the next cycle.
     nanosm::Machine reference(canonical_profile(), kernel, make_launch(), {.timeline = true});
     reference.run(5000);
     const auto [accept, fetch] = queued_accept_and_fetch(reference);
-    const auto r = accept - nanosm::issue_to_dispatch(canonical_profile());
+    const auto r = accept - nanosm::issue_to_dispatch(canonical_profile()) - 1;
     require(r > 2 && fetch == accept + 1, "reference: the queued mma.async did not fetch the cycle after its acceptance");
     require(mbar_rmw_services(reference) == std::vector<RmwService>{{r + 1, "arrive (mma.commit), address=4096"}},
         "reference commit was not served at r + 1");

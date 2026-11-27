@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <fstream>
 #include <iostream>
@@ -315,6 +316,40 @@ void validate_device_profile(const DeviceProfile& p) {
         p.gmem_sector_bytes % 4 != 0 || p.gmem_bus_bytes_per_dram_tick == 0 ||
         p.gmem_queue_sectors == 0) {
         throw ProfileError("device profile: zero, range or alignment constraint failed");
+    }
+    // The three fixed RF write delays (issue -> the write port: issue_to_operands
+    // + the class's execution, src/timing.hpp) are equal or at least two cycles
+    // apart, never exactly one. Then a write-calendar booking made in cycle c is
+    // never the entry an instruction issued in cycle c + 1 looks at, so hardware
+    // may write the booking into the calendar a cycle late and keep one stored
+    // "my calendar entry is free" bit per warp.
+    {
+        struct WriteDelay {
+            const char* unit;
+            uint32_t execution;
+            std::string from;
+        };
+        const std::array<WriteDelay, 3> delays{{
+            {"ALU", p.timing.alu, "core.alu_latency_cycles = " + std::to_string(p.timing.alu)},
+            {"FPU", p.timing.fadd, "core.fadd_latency_cycles = " + std::to_string(p.timing.fadd)},
+            {"special-function unit", p.timing.sfu,
+                "sfu.latency_cycles = " + std::to_string(p.sfu_latency_cycles) + " with sfu.lanes = " +
+                    std::to_string(p.sfu_lanes) + " of " + std::to_string(p.lanes) + " lanes (" +
+                    std::to_string(p.timing.sfu) + " cycles)"}}};
+        const auto base = issue_to_operands(p);
+        for (std::size_t i = 0; i < delays.size(); ++i) {
+            for (std::size_t j = i + 1; j < delays.size(); ++j) {
+                const uint32_t a = delays[i].execution;
+                const uint32_t b = delays[j].execution;
+                if (a + 1 != b && b + 1 != a) continue;
+                throw ProfileError("device profile: the " + std::string(delays[i].unit) + "'s and the " +
+                    delays[j].unit + "'s fixed RF write delays differ by exactly one cycle (issue + " +
+                    std::to_string(base + a) + " from " + delays[i].from + "; issue + " + std::to_string(base + b) +
+                    " from " + delays[j].from + "). They must be equal or at least two cycles apart, so that a "
+                    "write-calendar booking made in one cycle is never the entry an instruction issued in the "
+                    "next cycle looks at");
+            }
+        }
     }
     if ((p.mbar_wait_slots == 0) != (p.mbar_try_wait_timeout_cycles == 0)) {
         throw ProfileError(

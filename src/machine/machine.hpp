@@ -148,17 +148,17 @@ struct IssuePlan {
     bool operator==(const IssuePlan&) const = default;
 };
 
-// Resource state as issue sees it this cycle: Q, plus what this cycle's
-// decisions free (look-ahead (c) in Machine::tick).
+// Resource state as issue sees it this cycle: registers only (Q). Space that
+// a unit frees in a cycle is seen from the next one.
 struct ResourceView {
-    bool read_inhibited = false;     // the RF read decision inhibits new SIMT reads of a bank the round uses
+    bool read_inhibited = false;     // a bank the round uses has its read inhibit bit set (RfReadPolicy)
     bool sfu_free = false;           // the SFU is free by this op's execution start
     bool write_slot_free = false;    // the write booking's (bank, cycle) has a free port
-    bool write_inhibited = false;    // the RF write decision inhibits new bookings to that bank
+    bool write_inhibited = false;    // the booking's bank has its write inhibit bit set (RfWritePolicy)
     bool tma_queue_room = false;     // counting the commands the TMA operand read holds
     bool urf_ports_held = false;     // a tma's or an mma.async's uniform read has rounds still to start after this cycle
-    bool mma_queue_room = false;
-    bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine takes this transfer
+    bool mma_queue_room = false;     // counting the commands in the dispatch pipeline
+    bool acc_engine_free = false;    // the acc.ld (load) or acc.st (store) engine holds no transfer and none is on its way
     // shmem, from the warp's counts and the queues (Q):
     bool unserviced_read = false;    // the warp has a read (lds, lds.uni, probe) whose last round is not granted
     bool unserviced_write = false;   // ... a write (sts, barrier change, atomic) whose last write is not granted
@@ -1712,19 +1712,24 @@ private:
     };
 
     // The RF read decision's state (the write decision's rule, mirrored),
-    // per RF bank: the read_owed bit and the round-robin cursor
-    // over the async readers.
+    // per RF bank: the read_owed bit, the inhibit bit issue reads (set: a
+    // reader was denied last cycle with the bank owed while the instruction
+    // accepted then reads the bank) and the round-robin cursor over the async
+    // readers. All three change in the same calculation.
     struct RfReadPolicy {
         uint8_t owed = 0;
+        uint8_t inhibit = 0;
         uint32_t cursor = 0;
         bool operator==(const RfReadPolicy&) const = default;
     };
 
-    // The RF write decision's state, per RF bank: the
-    // async_owed bit and the round-robin cursor over the async holders. Both
+    // The RF write decision's state, per RF bank: the async_owed bit, the
+    // inhibit bit issue reads (set: a holder was denied last cycle with the
+    // bank owed) and the round-robin cursor over the async holders. All three
     // change in the same calculation.
     struct RfWritePolicy {
         uint8_t owed = 0;
+        uint8_t inhibit = 0;
         uint32_t cursor = 0;
         // (The LSU has ONE RF write path: the load buffer,
         // one lane-wide vector per cycle. No cursor: there is one buffer.)
@@ -1862,18 +1867,17 @@ private:
     };
 
     // One bank's part of the RF write or read decision: a holder is ready for
-    // it, a holder was granted it, SIMT is inhibited there, and the bank's
-    // round-robin cursor after this cycle. (The write decision's names:
-    // async_ready, async_grant, async_denied AND async_owed; the read
-    // decision's below.)
+    // it, a holder was granted it, and the bank's round-robin cursor after
+    // this cycle. (The write decision's names: async_ready, async_grant; the
+    // read decision's below. Issue reads the bank's inhibit bit, which these
+    // drive for the next cycle: drive_rf_write_policy, drive_rf_read_policy.)
     struct RfBankDecision {
         bool ready = false;
         bool granted = false;
-        bool inhibit_simt = false;
         uint32_t cursor_after = 0;
     };
 
-    // The RF write decision of this cycle, computed from Q before issue.
+    // The RF write decision of this cycle, computed from Q.
     struct RfWriteDecision {
         std::vector<std::optional<AsyncWrite>> holders; // every holder in round-robin order; set when ready
         std::vector<uint8_t> granted;                    // per holder: written into the RF this cycle
@@ -1910,11 +1914,10 @@ private:
         uint8_t read_depbar = 7;     // lsu_store: the command's read depbar (its last group's rS + 7 lowers it)
     };
 
-    // The RF read decision of this cycle, from Q before issue:
+    // The RF read decision of this cycle, from Q and the egress decision:
     //   read_ready   = an async reader wants this bank
     //   read_grant   = read_ready AND the issue register's instruction leaves
     //                  one of the bank's read ports free now
-    //   inhibit_simt = read_ready AND NOT read_grant AND read_owed
     struct RfReadDecision {
         std::vector<std::optional<RfReadRequest>> holders;
         std::vector<uint8_t> granted;
@@ -2169,7 +2172,7 @@ private:
         std::optional<uint32_t> rf_write_bank;           // a fixed RF-write booking was made to this bank
         std::optional<std::size_t> rf_write_stage;       // ... at this stage of the write calendar
         std::optional<ArithmeticRead> arithmetic;        // a fixed-latency instruction enters the arithmetic pipeline
-        std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed)
+        std::vector<uint8_t> rf_read_banks;              // per bank: its round's reads (into the issue register; read_owed, read inhibit)
         std::optional<DispatchEntry> dispatch;           // an engine instruction enters the dispatch pipeline
         std::optional<ShmemEntry> shmem;                 // a shared-memory instruction enters its queue
         bool shmem_write_side = false;                   // ... the write queue (else the read queue)
@@ -2234,7 +2237,8 @@ private:
         // The divergence stack memory's output now: a pop's read of the new
         // top, for its warp's top copy (warp, entry).
         std::optional<std::pair<uint32_t, DivergenceEntry>> divergence_refilled;
-        // The RF write port: async grants and SIMT inhibition.
+        // The RF write decision: the async grants, and per bank what the
+        // policy registers (owed, inhibit, cursor) take next.
         RfWriteDecision rf_write;
         // LSU commands leaving their slots: a load whose last RF write is
         // granted now, a store whose last sector request was accepted last cycle.
@@ -2259,8 +2263,9 @@ private:
         LsuRequestWant lsu_want;
         RequestChannel channel;
         ShmemCycle shmem;
-        // Next state of the units issue looks ahead at (committed by their
-        // drivers, with issue's additions).
+        // Next state of the MMA, the acc engines and the TMA queue, each
+        // computed in one calculation on a copy of its Q (committed by its
+        // driver, with dispatch's or the operand read's addition).
         MmaPipeline mma_next;
         // The MMA's pipelines this cycle: the round at the shmem RAM with the
         // elements it sampled, and the round port B granted (it enters the
@@ -2672,8 +2677,8 @@ private:
     [[nodiscard]] static std::size_t predicate_index(uint32_t warp, uint32_t predicate) {
         return std::size_t{warp} * predicates_per_warp + predicate;
     }
-    Regs<RfWritePolicy> rf_write_policy_{clocked_,Unit::register_file, "RF write policy (async_owed, cursor), per bank"};
-    Regs<RfReadPolicy> rf_read_policy_{clocked_,Unit::register_file, "RF read policy (read_owed, cursor), per bank"};
+    Regs<RfWritePolicy> rf_write_policy_{clocked_,Unit::register_file, "RF write policy (async_owed, inhibit, cursor), per bank"};
+    Regs<RfReadPolicy> rf_read_policy_{clocked_,Unit::register_file, "RF read policy (read_owed, inhibit, cursor), per bank"};
     // The issue register's RF bank use: per bank,
     // how many registers the instruction accepted last cycle samples now (at
     // most rf.read_ports_per_bank: one bit per bank at the canonical one
@@ -2853,7 +2858,7 @@ private:
     void serve_a_read(Wires& w);
     void serve_a_write(Wires& w);
     void serve_b_write(Wires& w);
-    // ---- units whose next state issue looks ahead at ----
+    // ---- the MMA and the acc engines: one calculation each on a copy of Q ----
     void step_mma(Wires& w);
     void step_acc_transfers(Wires& w);
     void step_acc_ld(std::optional<AccTransfer>& engine, Wires& w);
@@ -2910,11 +2915,12 @@ private:
     [[nodiscard]] bool write_serve_rmw_ready() const;
     // ---- the async RF readers (the read ports free now), before issue ----
     RfReadDecision decide_rf_reads(Wires& w);
-    [[nodiscard]] std::optional<RfReadRequest> lsu_store_read_request(const Wires& w) const;
+    [[nodiscard]] std::optional<RfReadRequest> lsu_store_read_request(const EgressWrite& egress) const;
+    [[nodiscard]] std::vector<std::optional<RfReadRequest>> async_rf_readers(const EgressWrite& egress) const;
     // ---- issue (the scheduler): admission, then acceptance ----
     void decide_issue(Wires& w);
     IssueAttempt try_issue(Warp& warp, Wires& w);
-    [[nodiscard]] ResourceView resource_view(const Warp& warp, const IssuePlan& plan, const Wires& w) const;
+    [[nodiscard]] ResourceView resource_view(const Warp& warp, const IssuePlan& plan) const;
     IssueAttempt refuse(Refusal refusal);
     void accept(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
     void accept_arithmetic(Warp& warp, const Instruction& inst, const IssuePlan& plan, Wires& w);
@@ -3075,7 +3081,6 @@ private:
     void wake_mbar_waiters(Wires& w, uint32_t byte_address, uint8_t new_phase);
 
     // MMA, acc.
-    [[nodiscard]] bool acc_engine_available(const Wires& w, bool load) const;
     void advance_mma(MmaPipeline& mma, Wires& w);
     [[nodiscard]] std::optional<MmaFetch> next_mma_step(MmaPipeline& mma, Wires& w);
     [[nodiscard]] MmaRead grant_mma_round(MmaPipeline& mma);
