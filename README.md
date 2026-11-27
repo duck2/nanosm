@@ -64,25 +64,27 @@ Other differences:
 
 ## Realism
 
-Right now this only exists as a C++ simulator. It is still tethered to reality by careful
-tracking of register state and writers, together with my spidey senses of what constitutes
-a long logic chain. When I couldn't tell logic or pipeline latency in a certain path I tried
-to make it adjustable in the device profile.
+Right now this only exists as a C++ simulator. That doesn't mean the machine is fake! There are
+a few good reasons for doing it this way:
 
-I would give it a ~80% chance that this can be prompted into existence as synthesizable RTL
-without major changes in the design. The machine shouldn't have any causality issues
-and I paid special attention to reducing logic levels in the issue loop which is the only
-place that would cause problems trying to add registers. The rest of the machine can be implemented
-with flexible state and latency.
+1. An RTL implementation would either be behavioral (C++ with extra steps) or coupled to its
+target FPGA (opaque). It would also pull in HW design tooling which is finicky compared to
+good old `g++`.
 
-The code could be much shorter if written in behavioral RTL. I decided against that because
-a) models are more comfortable in C++, and b) I wanted to eventually compile to WASM and was
-afraid going through Verilator could mess with that. As a result, a lot of the lines in
-the simulator are spent reinventing an event model and trying to ensure causality.
+2. Most of the paths in the machine are feed-forward, such as the arithmetic units, TMA,
+LSU, tensor core, etc. They can be implemented however you like without much change in machine
+design and functionality. Their actual latency can be added to the [device profile](#device-profile)
+and the simulator would work.
 
-The microarchitecture is FPGA minded, making use of multi-port memory blocks and opting to use
-state/memory instead of logic where possible. An ASIC implementation would need to take different
-tradeoffs but honestly I would be surprised if anyone attempted that.
+3. There are a few feedback paths, i.e. state that *has* to be recomputed in one cycle. Examples
+are the issue unit, queue state/counters, atomics etc. I went over those multiple times to
+make sure an implementation would not spend more than 6-7 LUT6 levels. If I missed anything,
+that would be a design flaw regardless of a Verilog or C++ implementation.
+
+The simulator is careful in enforcing causality and keeping state in clocked registers at all times
+(except for "black boxes", see point 2 above) It also doesn't take any shortcuts and simulates every
+interaction cycle by cycle. All in all I am confident in this machine being a possible thing in
+the physical world.
 
 ### Sanitizer
 
@@ -185,6 +187,10 @@ The model names are mentioned in the "Assisted-by:" line of each commit.
 <!-- human written end -->
 
 ## Credits and license
+
+Thanks to Huerta et al. for their ([2025 paper](https://dl.acm.org/doi/10.1145/3725843.3756041))
+documenting the Ampere microarch in detail. It was immensely helpful for comparing challenges and
+seeing the OG solutions to them.
 
 - The tensor core's arithmetic is adapted from SF Tensor's tcgen05 model
   (https://github.com/sf-tensor/tcgen05, MIT, `third_party/tcgen05-LICENSE`).
